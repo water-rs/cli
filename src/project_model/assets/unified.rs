@@ -17,8 +17,9 @@ const ASSET_ROOT_DIR: &str = "waterui_assets";
 const ANDROID_VALUES_DIR: &str = "app/src/main/res/values";
 const ANDROID_VALUES_NIGHT_DIR: &str = "app/src/main/res/values-night";
 const ANDROID_DRAWABLE_DIR: &str = "app/src/main/res/drawable";
-const ANDROID_DEFAULT_LAUNCHER_FOREGROUND_XML: &str =
-    include_str!("../templates/android/app/src/main/res/drawable/ic_launcher_foreground.xml.tpl");
+const ANDROID_DEFAULT_LAUNCHER_FOREGROUND_XML: &str = include_str!(
+    "../../templates/android/app/src/main/res/drawable/ic_launcher_foreground.xml.tpl"
+);
 const ANDROID_MIPMAP_DIRS: &[(&str, u32)] = &[
     ("mipmap-mdpi", 48),
     ("mipmap-hdpi", 72),

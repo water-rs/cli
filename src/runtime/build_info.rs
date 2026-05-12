@@ -151,7 +151,7 @@ mod tests {
         );
         assert_eq!(
             manifest_scaffold_field(&cli_manifest, "waterui-preview-version"),
-            package_version(&workspace_root.join("components/preview/Cargo.toml")),
+            package_version(&workspace_root.join("components/devtools/preview/runtime/Cargo.toml"))
         );
         assert_eq!(
             manifest_scaffold_field(&cli_manifest, "android-kotlin-version"),

@@ -1678,7 +1678,7 @@ pub mod hydrolysis {
                             WATERUI_VERSION,
                             &[],
                             Some(NativeBackendDependencyPathKind::WorkspaceSubdir(
-                                "components/preview",
+                                "components/devtools/preview/runtime",
                             )),
                         ),
                     )

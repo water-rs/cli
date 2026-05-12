@@ -29,7 +29,7 @@ const RUNTIME_FINGERPRINT_ROOT_DIRS: [&str; 9] = [
     "macros",
     "backends",
     "kit",
-    "icon-packs",
+    "icon",
 ];
 
 /// Build input extensions relevant to runtime compatibility.
