@@ -1,0 +1,251 @@
+name: Release
+
+# Two entry points:
+#
+# * `workflow_run` on CI: a green `dev` run refreshes the release-plz pull
+#   request; a green `main` run (a merged dev→main release PR) tags the
+#   released version `v<version>` and opens the GitHub release. release-plz
+#   only computes versions, updates the changelog and pushes the tag —
+#   `publish = false` in release-plz.toml; crates.io publishing happens in
+#   this same workflow's tag-triggered jobs below.
+# * `push` on a `v*` tag: cargo-dist builds the six ship targets, the
+#   artifacts attach to the GitHub release, the dist-generated Homebrew
+#   formula is handed to water-rs/homebrew-water, and the crate publishes to
+#   crates.io through OIDC trusted publishing.
+#
+# release-plz acts under the org release PAT rather than the workflow's
+# GITHUB_TOKEN because tags pushed under GITHUB_TOKEN do not trigger the
+# `push: tags` jobs — the binary build would never run.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [dev, main]
+    types: [completed]
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  DIST_VERSION: 0.30.2
+
+jobs:
+  release:
+    name: Tag the released version
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false"
+      # `release-plz release` verify-builds the manifest it tags.
+      - uses: ./.github/actions/setup-linux-deps
+      - uses: ./.github/actions/release-plz
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  release-pr:
+    name: Prepare the next release
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'dev'
+    concurrency:
+      group: release-plz-dev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false"
+      - uses: ./.github/actions/setup-linux-deps
+      # Under the PAT for the same reason as `release`: the release pull
+      # request's pushes must trigger CI.
+      - uses: ./.github/actions/release-plz
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: "false"
+      # `cargo publish` verify-builds the package.
+      - uses: ./.github/actions/setup-linux-deps
+      # Mint a short-lived crates.io token from the GitHub OIDC identity
+      # instead of a stored CARGO_REGISTRY_TOKEN (trusted publishing is
+      # configured per crate on crates.io).
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: crates-io-auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+
+  dist:
+    name: dist / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          shared-key: dist-${{ matrix.target }}
+
+      - uses: ./.github/actions/setup-linux-deps
+        if: runner.os == 'Linux'
+
+      - uses: ./.github/actions/install-dxc
+        if: runner.os == 'Windows'
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@${{ env.DIST_VERSION }}
+
+      - name: Build artifacts
+        shell: bash
+        run: |
+          dist build \
+            --tag "${{ github.ref_name }}" \
+            --artifacts=local \
+            --target "${{ matrix.target }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            target/distrib/*${{ matrix.target }}*.tar.*
+            target/distrib/*${{ matrix.target }}*.zip*
+            target/distrib/*${{ matrix.target }}*-dist-manifest.json
+
+  release-assets:
+    name: Upload release assets
+    needs: [publish, dist]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Install cargo-dist
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dist@${{ env.DIST_VERSION }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib
+          merge-multiple: true
+
+      - name: Build global release artifacts
+        run: dist build --tag "${{ github.ref_name }}" --artifacts=global
+
+      # The patterns must not overlap. `*.tar.*` also matched every
+      # `…tar.xz.sha256`, which `*.sha256` matched again, so each checksum
+      # beside a tarball was listed twice; the action then issued two deletes
+      # for the one existing asset of that name and the second answered
+      # `Not Found`, failing the step. Invisible on a first release, where
+      # there is nothing to delete — and fatal on the re-run that recovers
+      # one. `.tar.xz`, `.tar.gz`, `.zip`, `.sha256` and `sha256.sum` are
+      # disjoint suffixes, so each file is named once.
+      - name: Upload assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            target/distrib/*.tar.xz
+            target/distrib/*.tar.gz
+            target/distrib/*.zip
+            target/distrib/*.sha256
+            target/distrib/sha256.sum
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: water-rs/homebrew-water
+          token: ${{ secrets.HOMEBREW_PAT }}
+          path: homebrew-water
+
+      - name: Stage dist-generated Homebrew formula
+        run: cp target/distrib/water.rb homebrew-water/Formula/water.rb
+
+      # The tap's `dev` is ruled like every other branch in the organisation:
+      # changes arrive through a pull request and commits carry a verified
+      # signature. This job can satisfy neither directly — a commit made on a
+      # runner is unsigned, and `HOMEBREW_PAT` may write contents there but
+      # not pull requests (`Resource not accessible by personal access
+      # token`). So it pushes the branch and stops. water-rs/homebrew-water's
+      # own `publish-formula.yml` picks it up, opens the pull request and
+      # merges it under that repository's `GITHUB_TOKEN`, and the squash
+      # commit GitHub writes is signed.
+      #
+      # `--force` because a re-run of a release pushes the same branch again.
+      - name: Push the Homebrew formula branch
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          cd homebrew-water
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/water.rb
+          if git diff --cached --quiet; then
+            echo "No Homebrew changes to publish."
+            exit 0
+          fi
+          git commit -m "water ${version}"
+          git push --force origin "HEAD:refs/heads/water-${version}"
