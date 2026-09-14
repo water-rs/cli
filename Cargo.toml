@@ -148,6 +148,9 @@ nix = { version = "0.31", features = ["signal"] }
 # dependency does not belong in a Linux or Windows build of the CLI.
 icns = "0.4"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 zenwave = { version = "0.6.1", default-features = false, features = ["hyper-backend", "rustls"] }
 

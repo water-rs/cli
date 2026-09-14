@@ -180,6 +180,7 @@ exit /b 0
 :adb
 if "%*"=="version" (echo Android Debug Bridge version 1.0.41 & echo Version %WATERUI_FAKE_ADB_VERSION% & exit /b 0)
 if "%*"=="devices -l" (echo List of devices attached & call :respond_or_empty ADB_DEVICES & exit /b 0)
+if "%*"=="start-server" (if defined WATERUI_FAKE_ADB_START_SERVER_STATUS (exit /b %WATERUI_FAKE_ADB_START_SERVER_STATUS%) else (exit /b 0))
 set "args=%*"
 call :contains args "emu avd name" && (call :respond_or_empty ADB_EMU_AVD_NAME & exit /b 0)
 call :contains args getprop && (call :respond_or_empty ADB_GETPROP & exit /b 0)

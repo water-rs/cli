@@ -19,6 +19,8 @@ use smol::{io::AsyncReadExt as _, process::Command, unblock};
 
 use crate::utils::{CommandError, format_failure_stream, std_output_enabled};
 
+mod detached;
+
 /// The machine a toolchain check probes.
 ///
 /// A `Host` carries its own environment map (including `PATH`), a working
@@ -200,6 +202,7 @@ impl Host {
     /// for the CLI's capture/inherit policy.
     #[must_use]
     pub fn command(&self, program: impl AsRef<OsStr>) -> Command {
+        withhold_std_handles_from_children();
         let mut command = Command::new(self.resolve_program(program.as_ref()));
         command.env_clear().envs(&self.env).current_dir(&self.cwd);
         command
@@ -212,6 +215,7 @@ impl Host {
     /// groups, spawning from a non-async thread).
     #[must_use]
     pub fn std_command(&self, program: impl AsRef<OsStr>) -> std::process::Command {
+        withhold_std_handles_from_children();
         let mut command = std::process::Command::new(self.resolve_program(program.as_ref()));
         command.env_clear().envs(&self.env).current_dir(&self.cwd);
         command
@@ -320,6 +324,44 @@ impl Host {
         }
     }
 
+    /// Run `program` to completion with nothing of this process in its hands:
+    /// no stdio and, on Windows, no inherited handles at all.
+    ///
+    /// This is how a daemon launcher is run. A child spawned the ordinary way
+    /// receives every inheritable handle this process holds — including
+    /// strays our own parent passed down — and hands them on to whatever it
+    /// spawns with inheritance on. `adb start-server` is the case that
+    /// matters: its server outlives `water`, and a pipe it inherited stays
+    /// open until the server exits. The exit status is the caller's to judge,
+    /// because a launcher's own output is discarded here.
+    ///
+    /// # Errors
+    /// [`CommandError::Spawn`] when the program cannot be started or waited
+    /// on.
+    pub async fn run_detached(
+        &self,
+        program: impl AsRef<OsStr>,
+        args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    ) -> Result<std::process::ExitStatus, CommandError> {
+        let program_name = program.as_ref().to_string_lossy().into_owned();
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        tracing::debug!(program = %program_name, ?args, "spawning detached");
+        let resolved = self.resolve_program(program.as_ref());
+        let env = self.env.clone();
+        let cwd = self.cwd.clone();
+        let status = unblock(move || detached::run(&resolved, &args, &env, &cwd))
+            .await
+            .map_err(|source| CommandError::Spawn {
+                program: program_name.clone(),
+                source,
+            })?;
+        tracing::debug!(program = %program_name, %status, "detached launcher exited");
+        Ok(status)
+    }
+
     /// Resolve a bare program name against this host's `PATH`.
     ///
     /// `CreateProcess` searches the *parent's* `PATH`, never the child's, so
@@ -354,6 +396,55 @@ impl Host {
                 .expect("PATH entries produced by split_paths re-join into a PATH string"),
         )
     }
+}
+
+/// A child of this process must hold only the stdio it is given, never this
+/// process's own standard handles.
+///
+/// `CreateProcess` hands a child every inheritable handle of its parent, and
+/// the standard handles a shell passes in arrive inheritable, so a child
+/// spawned with piped stdio still receives this process's stdout and stderr
+/// as stray handles — and so does anything the child spawns with inheritance
+/// on. `adb` is the case that bites: its first client command launches the
+/// server daemon, which then outlives `water` holding the pipe whoever ran
+/// `water` is reading, and that reader never sees end-of-file. Clearing the
+/// inherit flag on our own standard handles ends the chain at the source;
+/// `Stdio::inherit` still works, because the standard library duplicates the
+/// handle inheritably for the one child that is meant to have it.
+#[cfg(windows)]
+fn withhold_std_handles_from_children() {
+    use windows_sys::Win32::{
+        Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation},
+        System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+    };
+
+    for (name, id) in [
+        ("stdin", STD_INPUT_HANDLE),
+        ("stdout", STD_OUTPUT_HANDLE),
+        ("stderr", STD_ERROR_HANDLE),
+    ] {
+        // SAFETY: querying this process's own standard handle table.
+        let handle = unsafe { GetStdHandle(id) };
+        // A process started without that stream has nothing to withhold.
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: `handle` is a live handle of this process; clearing its
+        // inherit flag changes nothing about how this process uses it.
+        let cleared = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        assert!(
+            cleared != 0,
+            "failed to make {name} non-inheritable: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(windows))]
+const fn withhold_std_handles_from_children() {
+    // POSIX children receive only the descriptors we pass: every descriptor
+    // the standard library opens is close-on-exec, and daemons detach through
+    // fork rather than handle inheritance.
 }
 
 /// Drain a piped child stream to EOF.

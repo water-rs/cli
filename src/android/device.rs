@@ -6,12 +6,13 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use tracing::{debug, error};
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::{
+    android::adb::Adb,
     android::platform::AndroidAbi,
     android::toolchain::AndroidSdk,
     device::{
@@ -66,7 +67,7 @@ enum AdbCommandError {
 
 async fn run_bounded_adb_output<A, S>(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     args: A,
     operation: &str,
 ) -> Result<Output, AdbCommandError>
@@ -79,8 +80,11 @@ where
         .map(|argument| argument.as_ref().to_os_string())
         .collect::<Vec<_>>();
     let operation = operation.to_owned();
-    let command =
-        Box::pin(async move { host.output(adb, &args).await.map_err(AdbCommandError::from) });
+    let command = Box::pin(async move {
+        host.output(adb.path(), &args)
+            .await
+            .map_err(AdbCommandError::from)
+    });
     let timeout = Box::pin(async move {
         smol::Timer::after(ADB_DEVICE_COMMAND_TIMEOUT).await;
         Err(AdbCommandError::Timeout {
@@ -97,7 +101,7 @@ where
 
 async fn run_bounded_adb_command<A, S>(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     args: A,
     operation: &str,
 ) -> Result<String, AdbCommandError>
@@ -160,9 +164,8 @@ impl Device for AndroidDevice {
     }
 
     async fn launch(&self, host: &Host) -> eyre::Result<()> {
-        let adb = AndroidSdk::adb_path(host)
-            .ok_or_else(|| eyre::eyre!("Android SDK not found or adb not installed"))?;
-        host.run(&adb, ["-s", &self.identifier, "wait-for-device"])
+        let adb = Adb::locate(host).await?;
+        host.run(adb.path(), ["-s", &self.identifier, "wait-for-device"])
             .await?;
         Ok(())
     }
@@ -177,14 +180,18 @@ impl Device for AndroidDevice {
     }
 
     async fn scan(host: &Host) -> eyre::Result<Vec<Self>> {
-        let adb = AndroidSdk::adb_path(host)
-            .ok_or_else(|| eyre::eyre!("Android SDK not found or adb not installed"))?;
+        let adb = Adb::locate(host).await?;
         Self::scan_with_adb(host, &adb).await
     }
 }
 
 impl AndroidDevice {
-    async fn scan_with_adb(host: &Host, adb: &Path) -> eyre::Result<Vec<Self>> {
+    /// The connected devices `adb` reports, with the ABI of each.
+    ///
+    /// # Errors
+    /// Returns an error when `adb devices` fails or a device's ABI cannot be
+    /// read.
+    pub async fn scan_with_adb(host: &Host, adb: &Adb) -> eyre::Result<Vec<Self>> {
         let output =
             run_bounded_adb_command(host, adb, ["devices", "-l"], "listing Android devices")
                 .await
@@ -252,8 +259,9 @@ async fn run_on_android(
     artifact: Artifact,
     options: RunOptions,
 ) -> Result<Running, FailToRun> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| FailToRun::Run(eyre!("Android SDK not found or adb not installed")))?;
+    let adb = Adb::locate(host)
+        .await
+        .map_err(|error| FailToRun::Run(error.into()))?;
     let env_vars = options
         .env_vars()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -309,12 +317,12 @@ async fn run_on_android(
 
 async fn install_android_artifact(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     device_id: &str,
     artifact_path: &Path,
 ) -> Result<(), FailToRun> {
     let install_output = host
-        .command(adb)
+        .command(adb.path())
         .args(["-s", device_id, "install", "-r"])
         .arg(artifact_path)
         .stdout(Stdio::piped())
@@ -366,12 +374,12 @@ fn build_android_start_args(
 /// so the dev-server URL it receives resolves on the device as printed.
 async fn reverse_dev_server_port(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     device_id: &str,
     port: u16,
 ) -> Result<(), FailToRun> {
     let output = host
-        .command(adb)
+        .command(adb.path())
         .args(crate::web::adb_reverse_args(device_id, port))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -392,11 +400,11 @@ async fn reverse_dev_server_port(
 
 async fn launch_android_app(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     start_args: Vec<String>,
 ) -> Result<(), FailToRun> {
     let output = host
-        .command(adb)
+        .command(adb.path())
         .args(&start_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -415,13 +423,13 @@ async fn launch_android_app(
     )))
 }
 
-fn spawn_android_force_stop(host: &Host, adb: PathBuf, device_id: String, bundle_id: String) {
+fn spawn_android_force_stop(host: &Host, adb: Adb, device_id: String, bundle_id: String) {
     let host = host.clone();
     let spawn_result = std::thread::Builder::new()
         .name("waterui-android-force-stop".to_string())
         .spawn(move || {
             let result = host
-                .std_command(&adb)
+                .std_command(adb.path())
                 .args(["-s", &device_id, "shell", "am", "force-stop", &bundle_id])
                 .output();
 
@@ -447,7 +455,7 @@ fn spawn_android_force_stop(host: &Host, adb: PathBuf, device_id: String, bundle
 
 struct AndroidRuntimeTaskContext<'a> {
     host: &'a Host,
-    adb: &'a Path,
+    adb: &'a Adb,
     device_id: &'a str,
     bundle_id: &'a str,
     pid: u32,
@@ -468,7 +476,7 @@ fn spawn_android_runtime_tasks(context: AndroidRuntimeTaskContext<'_>) {
     let sender_for_monitor = sender.clone();
     let sender_for_runtime_event = sender.clone();
     let sender_for_logs = sender;
-    let adb_for_monitor = adb.to_path_buf();
+    let adb_for_monitor = adb.clone();
     let host_for_monitor = host.clone();
     let device_id_for_monitor = device_id.to_string();
     let bundle_id_for_monitor = bundle_id.to_string();
@@ -527,7 +535,7 @@ fn format_android_panic(info: &PanicInfo) -> String {
 /// Wait for an app to start and return its PID.
 async fn wait_for_app_pid(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     device_id: &str,
     bundle_id: &str,
 ) -> Result<u32, FailToRun> {
@@ -586,7 +594,7 @@ async fn wait_for_app_pid(
 /// Returns an error if the device isn't an emulator or adb doesn't return a name.
 pub async fn emulator_avd_name_with_adb(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     emulator_id: &str,
 ) -> eyre::Result<String> {
     if !emulator_id.starts_with("emulator-") {
@@ -612,14 +620,13 @@ pub async fn emulator_avd_name_with_adb(
 /// # Errors
 /// Returns an error if adb isn't available or the emulator doesn't return a name.
 pub async fn emulator_avd_name(host: &Host, emulator_id: &str) -> eyre::Result<String> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| eyre!("Android SDK not found or adb not installed"))?;
+    let adb = Adb::locate(host).await?;
     emulator_avd_name_with_adb(host, &adb, emulator_id).await
 }
 
 async fn try_find_running_emulator_for_avd(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     avd_name: &str,
 ) -> eyre::Result<Option<AndroidDevice>> {
     let devices = AndroidDevice::scan_with_adb(host, adb).await?;
@@ -643,7 +650,7 @@ async fn try_find_running_emulator_for_avd(
     Ok(None)
 }
 
-async fn adb_emulator_states(host: &Host, adb: &Path) -> eyre::Result<String> {
+async fn adb_emulator_states(host: &Host, adb: &Adb) -> eyre::Result<String> {
     let output = run_bounded_adb_command(
         host,
         adb,
@@ -666,7 +673,7 @@ async fn adb_emulator_states(host: &Host, adb: &Path) -> eyre::Result<String> {
     Ok(states.join("; "))
 }
 
-async fn adb_emulator_boot_completed(host: &Host, adb: &Path, emulator_id: &str) -> bool {
+async fn adb_emulator_boot_completed(host: &Host, adb: &Adb, emulator_id: &str) -> bool {
     run_bounded_adb_command(
         host,
         adb,
@@ -684,7 +691,7 @@ fn adb_reports_device_ready(output: &str, device_id: &str) -> bool {
     })
 }
 
-async fn adb_device_is_ready(host: &Host, adb: &Path, device_id: &str) -> eyre::Result<bool> {
+async fn adb_device_is_ready(host: &Host, adb: &Adb, device_id: &str) -> eyre::Result<bool> {
     let output = run_bounded_adb_command(
         host,
         adb,
@@ -718,7 +725,7 @@ async fn avd_process_is_running(avd_name: &str) -> bool {
     .await
 }
 
-async fn adb_package_manager_ready(host: &Host, adb: &Path, emulator_id: &str) -> bool {
+async fn adb_package_manager_ready(host: &Host, adb: &Adb, emulator_id: &str) -> bool {
     run_bounded_adb_command(
         host,
         adb,
@@ -736,7 +743,7 @@ async fn adb_package_manager_ready(host: &Host, adb: &Path, emulator_id: &str) -
 /// Monitor an Android process and send events when it crashes or exits.
 async fn monitor_android_process(
     host: Host,
-    adb: PathBuf,
+    adb: Adb,
     device_id: &str,
     bundle_id: &str,
     pid: u32,
@@ -835,7 +842,7 @@ async fn monitor_android_process(
 
 async fn query_android_process_pids(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     device_id: &str,
     bundle_id: &str,
 ) -> eyre::Result<Vec<u32>> {
@@ -913,7 +920,7 @@ fn android_log_line_looks_like_crash(line: &str) -> bool {
 /// Returns a receiver that fires when the Activity finishes or the runtime crashes.
 fn start_android_log_stream(
     host: &Host,
-    adb: &Path,
+    adb: &Adb,
     device_id: &str,
     pid: u32,
     log_level: Option<LogLevel>,
@@ -935,7 +942,7 @@ fn start_android_log_stream(
 
     // Build logcat command with PID filter and minimum priority
     let pid_arg = format!("--pid={pid}");
-    let mut cmd = host.command(adb);
+    let mut cmd = host.command(adb.path());
     cmd.args(["-s", device_id, "logcat", "-v", "threadtime"])
         .arg(pid_arg)
         .arg(format!("*:{priority}"))
@@ -1185,8 +1192,7 @@ impl Device for AndroidEmulator {
     async fn launch(&self, host: &Host) -> eyre::Result<()> {
         let emulator_path = AndroidSdk::emulator_path(host)
             .ok_or_else(|| eyre::eyre!("Android emulator not found"))?;
-        let adb_path = AndroidSdk::adb_path(host)
-            .ok_or_else(|| eyre::eyre!("Android SDK not found or adb not installed"))?;
+        let adb = Adb::locate(host).await?;
 
         let mut emulator_process = if avd_process_is_running(&self.avd_name).await {
             debug!(
@@ -1256,13 +1262,13 @@ impl Device for AndroidEmulator {
                 );
             }
 
-            last_emulator_states = match adb_emulator_states(host, &adb_path).await {
+            last_emulator_states = match adb_emulator_states(host, &adb).await {
                 Ok(states) => states,
                 Err(err) => format!("failed to query emulator state via adb: {err}"),
             };
 
             if let Some(device) =
-                try_find_running_emulator_for_avd(host, &adb_path, &self.avd_name).await?
+                try_find_running_emulator_for_avd(host, &adb, &self.avd_name).await?
             {
                 if device.abi() != self.expected_abi {
                     eyre::bail!(
@@ -1274,9 +1280,8 @@ impl Device for AndroidEmulator {
                 }
 
                 let emulator_id = device.identifier().to_string();
-                let boot_completed =
-                    adb_emulator_boot_completed(host, &adb_path, &emulator_id).await;
-                let package_ready = adb_package_manager_ready(host, &adb_path, &emulator_id).await;
+                let boot_completed = adb_emulator_boot_completed(host, &adb, &emulator_id).await;
+                let package_ready = adb_package_manager_ready(host, &adb, &emulator_id).await;
 
                 if !boot_completed || !package_ready {
                     debug!(
@@ -1371,8 +1376,7 @@ async fn read_avd_abi(host: &Host, avd_name: &str) -> eyre::Result<AndroidAbi> {
 /// Returns an error if the screenshot command fails, the device is not
 /// available, or the output file cannot be written.
 pub async fn screenshot(host: &Host, device_id: &str, output: &Path) -> eyre::Result<()> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| eyre!("Android SDK not found or adb not installed"))?;
+    let adb = Adb::locate(host).await?;
 
     let output_result = run_bounded_adb_output(
         host,
@@ -1403,8 +1407,7 @@ pub async fn screenshot(host: &Host, device_id: &str, output: &Path) -> eyre::Re
 ///
 /// Returns an error if the tap command fails or the device is not available.
 pub async fn tap(host: &Host, device_id: &str, x: u32, y: u32) -> eyre::Result<()> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| eyre!("Android SDK not found or adb not installed"))?;
+    let adb = Adb::locate(host).await?;
 
     run_bounded_adb_command(
         host,
@@ -1446,8 +1449,7 @@ pub async fn swipe(
     to: (u32, u32),
     duration_ms: Option<u32>,
 ) -> eyre::Result<()> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| eyre!("Android SDK not found or adb not installed"))?;
+    let adb = Adb::locate(host).await?;
 
     let mut args = vec!["-s", device_id, "shell", "input", "swipe"];
 
@@ -1480,8 +1482,7 @@ pub async fn swipe(
 ///
 /// Returns an error if the text input command fails or the device is not available.
 pub async fn text(host: &Host, device_id: &str, input: &str) -> eyre::Result<()> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| eyre!("Android SDK not found or adb not installed"))?;
+    let adb = Adb::locate(host).await?;
 
     // Escape special characters for shell
     let escaped = input
@@ -1516,8 +1517,7 @@ pub async fn text(host: &Host, device_id: &str, input: &str) -> eyre::Result<()>
 ///
 /// Returns an error if the screenshot command fails or the device is not available.
 pub async fn screenshot_bytes(host: &Host, device_id: &str) -> eyre::Result<Vec<u8>> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| eyre!("Android SDK not found or adb not installed"))?;
+    let adb = Adb::locate(host).await?;
 
     let output = run_bounded_adb_output(
         host,
@@ -1543,8 +1543,7 @@ pub async fn screenshot_bytes(host: &Host, device_id: &str) -> eyre::Result<Vec<
 ///
 /// Returns an error if adb is not available or the command fails.
 pub async fn describe(host: &Host, device_id: &str) -> eyre::Result<String> {
-    let adb = AndroidSdk::adb_path(host)
-        .ok_or_else(|| eyre!("Android SDK not found or adb not installed"))?;
+    let adb = Adb::locate(host).await?;
 
     // Dump UI hierarchy to a temp file on device
     let dump_path = "/sdcard/window_dump.xml";
@@ -1577,7 +1576,7 @@ pub async fn describe(host: &Host, device_id: &str) -> eyre::Result<String> {
 
     // Clean up
     let _ = host
-        .run(&adb, ["-s", device_id, "shell", "rm", dump_path])
+        .run(adb.path(), ["-s", device_id, "shell", "rm", dump_path])
         .await;
 
     Ok(json)
