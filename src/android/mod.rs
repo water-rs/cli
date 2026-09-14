@@ -1,5 +1,7 @@
 //! Android platform support.
 
+/// The `adb` client with its server running.
+pub mod adb;
 /// Android backend implementation.
 pub mod backend;
 /// Android device detection and management.

@@ -1,0 +1,25 @@
+# Local runs keep nextest's defaults.
+[profile.default]
+# Surface anything pathologically slow rather than letting CI hang on it.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# A test is "leaky" when its stdout/stderr pipe is still open after the
+# process has exited. Every child process a test here spawns — `cargo
+# metadata`, `git`, the `water` binary under test — is reaped with
+# `.output()` before the test continues, and threads cannot outlive their
+# process. So a leak report here is nextest's own pipe reader losing the race
+# for the window under load, and past the widened window the report is a
+# failure, not a passing test with a footnote.
+leak-timeout = { period = "500ms", result = "fail" }
+
+[profile.ci]
+# Report every failure in one run: stopping at the first turns a multi-failure
+# break into one CI round trip per failure.
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "retry"
+# Tests that shell out to cargo or git are occasionally flaky on shared
+# runners; a retry keeps that from failing the branch, and the retry is
+# reported.
+retries = { backoff = "fixed", count = 2, delay = "1s" }
+slow-timeout = { period = "120s", terminate-after = 5 }

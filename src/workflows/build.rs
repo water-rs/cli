@@ -122,15 +122,21 @@ impl RustDynamicLibraries {
     /// # Errors
     /// Returns an error when either required dynamic library is absent or ambiguous.
     pub async fn resolve(lib_dir: &Path, triple: &Triple) -> eyre::Result<Self> {
-        let waterui = lib_dir
-            .join("deps")
-            .join(dynamic_library_file_name("waterui_dylib", triple));
-        if !waterui.is_file() {
-            bail!(
+        let file_name = dynamic_library_file_name("waterui_dylib", triple);
+        // Cargo emits a dependency's final dylib artifact in `deps/` on stable
+        // and at the profile directory root on current nightlies; accept both.
+        let waterui = [
+            lib_dir.join(&file_name),
+            lib_dir.join("deps").join(&file_name),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            eyre::eyre!(
                 "Shared WaterUI runtime was not built at {}",
-                waterui.display()
-            );
-        }
+                lib_dir.join("deps").join(&file_name).display()
+            )
+        })?;
 
         let target_libdir = rust_target_libdir(triple).await?;
         let resolution_triple = triple.clone();
@@ -311,6 +317,9 @@ pub struct BuildOptions {
     target_triple: Option<Triple>,
     /// Rust runtime linkage used by the final native application.
     linkage: RustLinkage,
+    /// Whether `include_web!` mounts are dev-server-served and skipped when
+    /// the build stages assets (Hydrolysis stages at build time).
+    dev_server: bool,
 }
 
 impl BuildOptions {
@@ -323,6 +332,7 @@ impl BuildOptions {
             sccache_path: None,
             target_triple: None,
             linkage: RustLinkage::SharedRuntime,
+            dev_server: false,
         }
     }
 
@@ -346,6 +356,7 @@ impl BuildOptions {
             sccache_path: None,
             target_triple: None,
             linkage: RustLinkage::Static,
+            dev_server: false,
         }
     }
 
@@ -353,6 +364,19 @@ impl BuildOptions {
     #[must_use]
     pub const fn is_release(&self) -> bool {
         self.release
+    }
+
+    /// Mark web mounts as dev-server-served for asset staging this build does.
+    #[must_use]
+    pub const fn with_dev_server(mut self, dev_server: bool) -> Self {
+        self.dev_server = dev_server;
+        self
+    }
+
+    /// Whether web mounts are dev-server-served and skipped during staging.
+    #[must_use]
+    pub const fn uses_dev_server(&self) -> bool {
+        self.dev_server
     }
 
     /// Get the output directory, if specified

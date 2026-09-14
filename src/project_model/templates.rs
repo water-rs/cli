@@ -83,7 +83,7 @@ pub fn scaffold_template_digest() -> String {
     })
 }
 
-mod embedded {
+pub mod embedded {
     use super::{Dir, include_dir};
 
     pub static APPLE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/apple");
@@ -121,6 +121,16 @@ impl IosPermissionTemplateEntry {
 pub struct FontRegistrationTemplateEntry {
     pub family_name: String,
     pub file_name: String,
+}
+
+/// What the launch screen staged into the Apple asset catalog contains, so
+/// the generated Xcode project names only the assets that exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchTemplateEntry {
+    /// A `LaunchBackground` color set was staged (a background is configured).
+    pub has_background: bool,
+    /// A `LaunchImage` image set was staged (`Launch.*` exists).
+    pub has_image: bool,
 }
 
 /// ESP32 harness parameters substituted into the generated firmware crate.
@@ -280,11 +290,24 @@ pub struct TemplateContext {
     pub preview_app_dependency: Option<(CrateName, PathBuf)>,
     /// Package type of the project being scaffolded.
     pub package_type: crate::project::PackageType,
+    /// The `include_web!` argument when the root view is a web frontend:
+    /// `"web"` for the conventional layout, a path relative to the project
+    /// root for a frontend referenced in place. `None` renders the demo
+    /// `lib.rs` instead.
+    pub web_frontend_arg: Option<String>,
     /// ESP32 harness parameters used by the esp32 templates.
     pub esp32: Esp32TemplateEntry,
+    /// The launch screen assets the Apple templates refer to.
+    pub launch: LaunchTemplateEntry,
 }
 
 impl TemplateContext {
+    /// The `include_web!` argument rendered into `web_lib.rs.tpl`.
+    #[must_use]
+    pub fn web_arg(&self) -> &str {
+        self.web_frontend_arg.as_deref().unwrap_or("web")
+    }
+
     /// Build a template context for a new root project scaffold.
     #[must_use]
     pub fn for_create_options(
@@ -318,7 +341,9 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type: options.package_type,
+            web_frontend_arg: options.web.as_ref().map(|web| web.include_arg.clone()),
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
@@ -356,7 +381,9 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type: manifest.package.package_type,
+            web_frontend_arg: manifest.web.as_ref().map(|_| "web".to_string()),
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
@@ -407,7 +434,9 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type: crate::project::PackageType::Playground,
+            web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
@@ -501,6 +530,13 @@ impl TemplateContext {
     #[must_use]
     pub fn with_ios_permissions(mut self, permissions: Vec<IosPermissionTemplateEntry>) -> Self {
         self.ios_permissions = permissions;
+        self
+    }
+
+    /// Name the launch screen assets staged into the Apple asset catalog.
+    #[must_use]
+    pub const fn with_launch(mut self, launch: LaunchTemplateEntry) -> Self {
+        self.launch = launch;
         self
     }
 
@@ -640,10 +676,23 @@ use_remote_dev_backend=false requires waterui_path or android_backend_path"
     /// The path to the local Apple backend checkout `[backend.apple]`
     /// `backend_path` names, resolved from the Xcode project's directory.
     /// `None` consumes the remote Swift package instead.
+    ///
+    /// Without a manifest override, `waterui_path/backends/apple` is used when
+    /// it is a real Swift package: playground manifests cannot declare
+    /// `[backends.*]`, and dropping this fallback silently retargeted every
+    /// playground build — including the backend's own e2e suite — onto the
+    /// pinned remote release.
     fn compute_apple_backend_path(&self) -> Option<String> {
         self.apple_backend_path
             .as_ref()
             .map(|path| self.backend_relative_path(path))
+            .or_else(|| {
+                let local = self.waterui_workspace_root()?.join("backends/apple");
+                local
+                    .join("Package.swift")
+                    .is_file()
+                    .then(|| self.backend_relative_path(&local))
+            })
     }
 
     /// Compute the relative path from the Android project to the `WaterUI` Android backend.
@@ -1017,6 +1066,7 @@ define_scaffold_templates! {
     AssetsReadmeTemplate => (Root, "src/templates/assets_readme.md.tpl"),
     AppleProjectTemplate => (Apple, "src/templates/apple/AppName.xcodeproj/project.pbxproj.tpl"),
     AppleAppTemplate => (Apple, "src/templates/apple/AppName/AppNameApp.swift.tpl"),
+    AppleInfoPlistTemplate => (Apple, "src/templates/apple/AppName/Info.plist.tpl"),
     AppleBuildScriptTemplate => (Apple, "src/templates/apple/build-rust.sh.tpl"),
     AndroidGradleAppTemplate => (Android, "src/templates/android/app/build.gradle.kts.tpl"),
     AndroidManifestTemplate => (Android, "src/templates/android/app/src/main/AndroidManifest.xml.tpl"),
@@ -1029,6 +1079,7 @@ define_scaffold_templates! {
     Gtk4BuildScriptTemplate => (Gtk4, "src/templates/gtk4/build.rs.tpl"),
     Gtk4MainTemplate => (Gtk4, "src/templates/gtk4/src/main.rs.tpl"),
     HydrolysisBuildScriptTemplate => (Hydrolysis, "src/templates/hydrolysis/build.rs.tpl"),
+    RootWebLibTemplate => (Root, "src/templates/web_lib.rs.tpl"),
     HydrolysisLibTemplate => (Hydrolysis, "src/templates/hydrolysis/src/lib.rs.tpl"),
     HydrolysisMainTemplate => (Hydrolysis, "src/templates/hydrolysis/src/main.rs.tpl"),
     HydrolysisPreviewRuntimeTemplate => (Hydrolysis, "src/templates/hydrolysis/src/preview_runtime.rs.tpl"),
@@ -1048,8 +1099,8 @@ define_scaffold_templates! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserTemplateContext, Esp32TemplateEntry, ResolvedWebViewBackend, TemplateContext,
-        TemplateNamespace, embedded, gtk4, jitpack_dependency_coordinate,
+        BrowserTemplateContext, Esp32TemplateEntry, LaunchTemplateEntry, ResolvedWebViewBackend,
+        TemplateContext, TemplateNamespace, embedded, gtk4, jitpack_dependency_coordinate,
         normalize_path_for_config, preview_ffi, render_scaffold_template,
     };
     use crate::framework::test_fixtures::stable_framework;
@@ -1088,7 +1139,9 @@ mod tests {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type,
+            web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
@@ -1355,18 +1408,20 @@ mod tests {
         let manifest = super::render_native_backend_bin_cargo_toml(&ctx, "waterui-test-gtk4", &[])
             .expect("generated manifest renders");
 
-        let core_path = checkout.join("core").to_string_lossy().into_owned();
-        assert!(
-            manifest.contains(&format!(
-                "[patch.crates-io.waterui-core]\npath = \"{core_path}\""
-            )),
-            "{manifest}"
-        );
-        assert!(
-            manifest.contains(&format!(
-                "[patch.\"https://github.com/water-rs/waterui\".waterui-core]\npath = \"{core_path}\""
-            )),
-            "{manifest}"
+        let core_path = checkout.join("core");
+        let manifest: toml::Value = toml::from_str(&manifest).expect("generated manifest parses");
+        let patched_path = |source: &str| {
+            manifest["patch"][source]["waterui-core"]["path"]
+                .as_str()
+                .map_or_else(
+                    || panic!("no waterui-core path patch under [patch.{source:?}]:\n{manifest}"),
+                    std::path::PathBuf::from,
+                )
+        };
+        assert_eq!(patched_path("crates-io"), core_path);
+        assert_eq!(
+            patched_path("https://github.com/water-rs/waterui"),
+            core_path
         );
     }
 
@@ -1413,6 +1468,49 @@ mod tests {
             "/waterui/backends/apple"
         };
         assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn waterui_path_backends_apple_is_used_when_no_manifest_override() {
+        let waterui_root = tempdir().expect("tempdir");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Package.swift"),
+            "// swift-tools-version:5.9\n",
+        )
+        .expect("Package.swift");
+        let project_root = tempdir().expect("tempdir");
+
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(project_root.path().join("managed_backends/apple")),
+            Some(project_root.path().to_path_buf()),
+            crate::project::PackageType::Playground,
+        );
+
+        let path = ctx
+            .compute_apple_backend_path()
+            .expect("waterui_path/backends/apple must resolve");
+        assert!(
+            path.ends_with("backends/apple"),
+            "expected the staged backend path, got {path}"
+        );
+    }
+
+    #[test]
+    fn missing_local_apple_backend_falls_back_to_remote_package() {
+        let waterui_root = tempdir().expect("tempdir");
+        std::fs::create_dir_all(waterui_root.path().join("backends")).expect("backends dir");
+
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(PathBuf::from("managed_backends/apple")),
+            None,
+            crate::project::PackageType::Playground,
+        );
+
+        assert!(ctx.compute_apple_backend_path().is_none());
     }
 
     #[test]
@@ -1513,6 +1611,66 @@ mod tests {
         assert!(rendered.contains(ctx.framework.scaffold_value("apple-backend-url")));
         assert!(rendered.contains(ctx.framework.apple_backend_version().unwrap()));
         assert!(rendered.contains("kind = exactVersion;"));
+    }
+
+    #[test]
+    fn apple_project_names_only_the_launch_assets_that_were_staged() {
+        let render = |ctx: &TemplateContext, file: &str| {
+            let template = embedded::APPLE
+                .get_file(file)
+                .expect("apple template must exist")
+                .contents_utf8()
+                .expect("apple template must be utf-8");
+            render_scaffold_template(
+                TemplateNamespace::Apple,
+                std::path::Path::new(file),
+                template,
+                ctx,
+            )
+            .expect("apple template render")
+        };
+        let project = "AppName.xcodeproj/project.pbxproj.tpl";
+        let info_plist = "AppName/Info.plist.tpl";
+
+        let bare = app_ctx();
+        let rendered = render(&bare, project);
+        assert!(rendered.contains(&format!(
+            "INFOPLIST_FILE = \"{}/Info.plist\";",
+            bare.app_name
+        )));
+        assert!(rendered.contains("GENERATE_INFOPLIST_FILE = YES;"));
+        // UILaunchScreen has no INFOPLIST_KEY_ build setting for its sub-keys;
+        // Xcode silently drops such keys, so the project must not carry them.
+        assert!(!rendered.contains("INFOPLIST_KEY_UILaunchScreen"));
+        // Info.plist lives in the synchronized app folder; without this
+        // exception Xcode also copies it as a bundle resource and the build
+        // fails with two producers of the app's Info.plist.
+        assert!(
+            rendered.contains("membershipExceptions = (\n\t\t\t\tInfo.plist,\n\t\t\t);"),
+            "{rendered}"
+        );
+        let plist = render(&bare, info_plist);
+        assert!(
+            plist.contains("<key>UILaunchScreen</key>\n\t<dict>\n\t</dict>"),
+            "{plist}"
+        );
+
+        let configured = app_ctx().with_launch(LaunchTemplateEntry {
+            has_background: true,
+            has_image: true,
+        });
+        let plist = render(&configured, info_plist);
+        assert!(plist.contains("<key>UIColorName</key>\n\t\t<string>LaunchBackground</string>"));
+        assert!(plist.contains("<key>UIImageName</key>\n\t\t<string>LaunchImage</string>"));
+        assert!(plist.contains("<key>UIImageRespectsSafeAreaInsets</key>\n\t\t<true/>"));
+
+        let color_only = app_ctx().with_launch(LaunchTemplateEntry {
+            has_background: true,
+            has_image: false,
+        });
+        let plist = render(&color_only, info_plist);
+        assert!(plist.contains("LaunchBackground"));
+        assert!(!plist.contains("LaunchImage"));
     }
 
     #[test]
@@ -1644,6 +1802,8 @@ mod tests {
         .expect("android MainActivity render");
 
         assert!(activity.contains("enableEdgeToEdge()"));
+        // The dev-server URL is forwarded only on debuggable builds.
+        assert!(activity.contains(r#"envVar == "WATERUI_DEV_URL" && !BuildConfig.DEBUG"#));
         assert!(activity.contains("waterUiApplication.acquireRuntime(this)"));
         assert!(activity.contains("androidRuntimeLease.close()"));
         assert!(activity.contains("val reportActivityFinished = !isChangingConfigurations"));
@@ -2069,6 +2229,9 @@ mod tests {
         assert_eq!(managed(), "pins v2");
     }
 
+    /// A `waterui_path` ctx resolves `waterui-preview` through `cargo
+    /// metadata` on the checkout, so the checkout is a minimal fixture
+    /// workspace carrying that one member.
     #[test]
     fn preview_ffi_scaffold_emits_dylib_only_wrapper() {
         let tempdir = tempdir().expect("temporary preview ffi scaffold dir");
@@ -2078,10 +2241,21 @@ mod tests {
             .join("cache")
             .join("managed_backends")
             .join("preview_ffi");
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("CLI crate should be inside the WaterUI workspace")
-            .to_path_buf();
+        let workspace_root = tempdir.path().join("waterui");
+        std::fs::create_dir_all(workspace_root.join("preview/src"))
+            .expect("fixture workspace member dir");
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"preview\"]\n",
+        )
+        .expect("fixture workspace manifest");
+        std::fs::write(
+            workspace_root.join("preview/Cargo.toml"),
+            "[package]\nname = \"waterui-preview\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("fixture member manifest");
+        std::fs::write(workspace_root.join("preview/src/lib.rs"), "")
+            .expect("fixture member source");
         let ctx = ctx(
             Some(workspace_root),
             Some(preview_ffi_dir.clone()),
@@ -3961,7 +4135,7 @@ fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::Patc
 /// `waterui-*` dependencies against — the source a `[patch]` table must name
 /// to redirect those dependencies.
 fn framework_git_source() -> String {
-    env!("CARGO_PKG_REPOSITORY")
+    env!("WATERUI_FRAMEWORK_REPOSITORY")
         .trim_end_matches(".git")
         .to_string()
 }
@@ -4442,10 +4616,7 @@ pub mod root {
     /// workflow work out of the box: the planner walks the assets root
     /// recursively, so the directory has to exist before the first `assets!`
     /// call, and a tracked file is what keeps it present in git.
-    static ROOT_TEMPLATES: &[(&str, &str)] = &[
-        ("lib.rs.tpl", "src/lib.rs"),
-        (".gitignore.tpl", ".gitignore"),
-    ];
+    static ROOT_TEMPLATES: &[(&str, &str)] = &[(".gitignore.tpl", ".gitignore")];
 
     /// Write root templates to the given directory.
     ///
@@ -4464,11 +4635,22 @@ pub mod root {
         generate_cargo_toml(base_dir, ctx).await?;
 
         let assets_readme = format!("{assets_dir}/README.md");
-        let templates: Vec<(&str, String)> = ROOT_TEMPLATES
-            .iter()
-            .map(|(template, dest)| (*template, (*dest).to_string()))
-            .chain(core::iter::once(("assets_readme.md.tpl", assets_readme)))
-            .collect();
+        // A web-frontend project gets the `include_web!` root view
+        // instead of the demo form.
+        let lib_template = if ctx.web_frontend_arg.is_some() {
+            "web_lib.rs.tpl"
+        } else {
+            "lib.rs.tpl"
+        };
+        let templates: Vec<(&str, String)> =
+            core::iter::once((lib_template, "src/lib.rs".to_string()))
+                .chain(
+                    ROOT_TEMPLATES
+                        .iter()
+                        .map(|(template, dest)| (*template, (*dest).to_string())),
+                )
+                .chain(core::iter::once(("assets_readme.md.tpl", assets_readme)))
+                .collect();
         // The WaterUI logo is the starting app icon; the planner picks up any
         // root-level `Icon.*` asset, so replacing the file rebrands the app.
         // Builds without SVG support scaffold a rendered PNG instead.
@@ -4534,7 +4716,7 @@ pub mod root {
             )]),
             dependencies: BTreeMap::from([("waterui".to_string(), waterui_dependency.clone())]),
             build_dependencies: BTreeMap::new(),
-            target: native_target_section(waterui_dependency),
+            target: native_target_section(waterui_dependency, ctx.web_frontend_arg.is_some()),
             workspace: GeneratedWorkspaceSection {},
             patch: match &ctx.waterui_path {
                 Some(waterui_path) => {
@@ -4564,17 +4746,24 @@ pub mod root {
 
     fn native_target_section(
         waterui_dependency: GeneratedDependencyDetail,
+        web_frontend: bool,
     ) -> BTreeMap<String, GeneratedTargetSection<GeneratedDependencyDetail>> {
         // Desktop conveniences only: `media` pulls the GPU stack, which does
         // not exist on espidf targets, so firmware builds must fall through
         // to the bare default-features-off dependency for the scaffolded app
         // to cross-compile for ESP32 chips at all.
+        // `include_web!` expands against both the assets bundle API and the
+        // webview surface, so a web-frontend project enables both.
+        let mut waterui_features = vec!["assets", "media", "flow-markdown"];
+        if web_frontend {
+            waterui_features.push("webview");
+        }
         BTreeMap::from([(
             "cfg(not(any(target_arch = \"wasm32\", target_os = \"espidf\")))".to_string(),
             GeneratedTargetSection {
                 dependencies: BTreeMap::from([(
                     "waterui".to_string(),
-                    waterui_dependency.with_features(&["assets", "media", "flow-markdown"]),
+                    waterui_dependency.with_features(&waterui_features),
                 )]),
             },
         )])
@@ -5015,15 +5204,16 @@ pub mod inspector {
 
     #[cfg(test)]
     mod tests {
-        /// The scaffolder resolves the Inspector crate by path, so a move that
-        /// nobody updates here breaks `water inspector` silently — which is
-        /// exactly what happened when the crate moved under `devtools/`.
+        /// The scaffolder resolves the Inspector crate by path inside a
+        /// `waterui_path` checkout, so a move that nobody updates here breaks
+        /// `water inspector` silently — which is exactly what happened when the
+        /// crate moved under `devtools/`. The checkout is the pinned framework
+        /// revision, cloned on demand.
         #[test]
+        #[ignore = "clones the pinned framework revision"]
         fn the_inspector_app_crate_path_exists() {
-            let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("the CLI crate lives inside the repository");
-            let crate_path = repository.join(super::INSPECTOR_APP_CRATE);
+            let checkout = crate::pinned_framework::checkout();
+            let crate_path = checkout.path().join(super::INSPECTOR_APP_CRATE);
             assert!(
                 crate_path.join("Cargo.toml").is_file(),
                 "inspector app crate is not at {}",

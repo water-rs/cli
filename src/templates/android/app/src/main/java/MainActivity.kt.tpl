@@ -6,6 +6,7 @@ import android.system.Os
 import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.enableEdgeToEdge
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import dev.waterui.android.runtime.WaterUiRootView
 import java.io.File
 import java.lang.Runtime
@@ -31,6 +32,10 @@ class MainActivity : AppCompatActivity() {
 
                 val envVar = key.removePrefix(ENV_PREFIX)
                 val value = extras.getString(key) ?: continue
+
+                // A dev-server URL may only ever redirect a debuggable
+                // build; a release APK always renders its staged bundle.
+                if (envVar == "WATERUI_DEV_URL" && !BuildConfig.DEBUG) continue
 
                 try {
                     Os.setenv(envVar, value, true)
@@ -148,6 +153,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var androidRuntimeLease: AndroidRuntimeLease
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // The launch screen the system showed from the tap on the icon stays
+        // until this activity's first frame; the view tree is built
+        // synchronously below, so that frame is the app itself.
+        installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 

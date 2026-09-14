@@ -132,7 +132,7 @@ mod tests {
     /// known font rather than whichever one the machine happened to offer.
     const TEST_FONT: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../testing/fonts/Roboto-Regular.ttf"
+        "/tests/fixtures/fonts/Roboto-Regular.ttf"
     ));
 
     fn host_font() -> Vec<u8> {

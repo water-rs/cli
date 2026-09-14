@@ -1,0 +1,25 @@
+# Line endings are part of this repository's content, not a per-platform
+# preference: tests assert on text generated from committed templates and
+# fixtures, and on a Windows checkout with the default `core.autocrlf=true`
+# those files arrive with CRLF and the assertions stop matching. Normalizing
+# here makes every checkout byte-identical.
+* text=auto eol=lf
+
+# Windows batch launchers need CRLF to run at all.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.jar binary

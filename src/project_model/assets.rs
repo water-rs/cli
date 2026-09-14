@@ -16,6 +16,7 @@ use smol::fs;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 use waterui_assets_core::{AtomicWriteOutcome, download_remote_bytes, write_bytes_atomically};
+use waterui_assets_planner::BundleManifest;
 
 use crate::project::Project;
 use crate::project_model::project_types::PermissionKey;
@@ -56,9 +57,8 @@ struct FontRegistry {
 impl FontRegistry {
     /// The registry shipped with this CLI.
     fn builtin() -> eyre::Result<Self> {
-        toml::from_str(include_str!("assets/fonts.toml")).wrap_err(
-            "built-in font registry `cli/src/project_model/assets/fonts.toml` is malformed",
-        )
+        toml::from_str(include_str!("assets/fonts.toml"))
+            .wrap_err("built-in font registry `src/project_model/assets/fonts.toml` is malformed")
     }
 
     /// Where `name` is fetched from, if the registry offers it.
@@ -203,8 +203,31 @@ struct FontMetadata {
 /// permissions) into every other app in the repository. The generated FFI companion depends on exactly this
 /// app plus the waterui crates with no default features, so its graph answers
 /// "what does *this* app enable" precisely.
+///
+/// Only the Apple and Android backends scaffold that companion; every other
+/// generated backend crate depends on the app the same way, so the first
+/// manifest on disk beside `ffi/` answers the same question. A project with
+/// no backend crates at all falls back to its root manifest — weaker
+/// (workspace-unioned), but never a path that cannot exist.
 fn app_closure_manifest(project: &Project) -> std::path::PathBuf {
-    project.ffi_crate_path().join("Cargo.toml")
+    let ffi_manifest = project.ffi_crate_path().join("Cargo.toml");
+    if ffi_manifest.exists() {
+        return ffi_manifest;
+    }
+    if let Some(backends_root) = project.ffi_crate_path().parent()
+        && let Ok(entries) = std::fs::read_dir(backends_root)
+    {
+        let mut candidates: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path().join("Cargo.toml"))
+            .filter(|path| path.is_file())
+            .collect();
+        candidates.sort();
+        if let Some(manifest) = candidates.into_iter().next() {
+            return manifest;
+        }
+    }
+    project.root().join("Cargo.toml")
 }
 
 /// Scans all dependencies for font declarations in their Cargo.toml metadata.
@@ -778,19 +801,28 @@ fn sha256_hex(s: &str) -> String {
 }
 
 /// Stage project assets for Apple packaging (Asset Catalog + raw resources).
+///
+/// `sccache_path` feeds the host library build whose symbol table carries the
+/// `include_bundle!` mount metadata; pass `None` when no sccache binary was
+/// detected. Returns the staged manifest so callers can scan it (fonts, for
+/// example) without rebuilding the host artifact.
 pub async fn stage_project_assets_for_apple(
     project: &Project,
     dest_dir: &Path,
-) -> eyre::Result<()> {
-    unified::stage_for_apple(project, dest_dir).await
+    sccache_path: Option<&Path>,
+    dev_server: bool,
+) -> eyre::Result<BundleManifest> {
+    unified::stage_for_apple(project, dest_dir, sccache_path, dev_server).await
 }
 
 /// Stage project assets for Android packaging (res + assets/raw).
 pub async fn stage_project_assets_for_android(
     project: &Project,
     backend_path: &Path,
-) -> eyre::Result<()> {
-    unified::stage_for_android(project, backend_path).await
+    sccache_path: Option<&Path>,
+    dev_server: bool,
+) -> eyre::Result<BundleManifest> {
+    unified::stage_for_android(project, backend_path, sccache_path, dev_server).await
 }
 
 /// Render the project's macOS `.icns` app icon for hand-assembled bundles.
@@ -816,12 +848,15 @@ pub async fn stage_hicolor_icons(project: &Project, icons_root: &Path) -> eyre::
 pub async fn stage_project_assets_for_gtk(
     project: &Project,
     resources_dir: &Path,
-) -> eyre::Result<()> {
-    unified::stage_for_gtk(project, resources_dir).await
+    sccache_path: Option<&Path>,
+    dev_server: bool,
+) -> eyre::Result<BundleManifest> {
+    unified::stage_for_gtk(project, resources_dir, sccache_path, dev_server).await
 }
 
-pub fn scan_project_font_assets(project: &Project) -> eyre::Result<Vec<ResolvedFont>> {
-    unified::scan_project_fonts(project)
+/// Resolves the fonts declared inside an already-staged bundle manifest.
+pub fn scan_project_font_assets(manifest: &BundleManifest) -> eyre::Result<Vec<ResolvedFont>> {
+    unified::scan_project_fonts(manifest)
 }
 
 pub use unified::LaunchAssets;
