@@ -279,15 +279,115 @@ mod tests {
         );
     }
 
+    /// The `web_meta` fixture staged against the pinned framework: its sources
+    /// copied beside a manifest whose `waterui` dependency is the git pin this
+    /// crate's own manifest carries, so the revision lives in one place.
+    fn web_meta_fixture() -> tempfile::TempDir {
+        #[derive(serde::Serialize)]
+        struct Manifest {
+            package: Package,
+            workspace: toml::Table,
+            dependencies: std::collections::BTreeMap<&'static str, Dependency>,
+            patch: Patch,
+        }
+        #[derive(serde::Serialize)]
+        struct Patch {
+            #[serde(rename = "crates-io")]
+            crates_io: std::collections::BTreeMap<&'static str, GitSource>,
+        }
+        #[derive(serde::Serialize)]
+        struct GitSource {
+            git: String,
+            rev: String,
+        }
+        #[derive(serde::Serialize)]
+        struct Package {
+            name: &'static str,
+            version: &'static str,
+            edition: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct Dependency {
+            git: String,
+            rev: String,
+            #[serde(rename = "default-features")]
+            default_features: bool,
+            features: Vec<&'static str>,
+        }
+
+        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        fs_extra::dir::copy(
+            &sources,
+            fixture.path(),
+            &fs_extra::dir::CopyOptions::new().content_only(true),
+        )
+        .expect("the fixture sources copy");
+        let (git, rev) = crate::pinned_framework::source();
+        // The lean facade: `include_web!` expands against `waterui::webview`
+        // and `waterui::Bundle`, nothing else of the framework is needed.
+        let manifest = Manifest {
+            package: Package {
+                name: "web-meta",
+                version: "0.0.0",
+                edition: "2024",
+            },
+            workspace: toml::Table::new(),
+            dependencies: std::iter::once((
+                "waterui",
+                Dependency {
+                    git: git.clone(),
+                    rev: rev.clone(),
+                    default_features: false,
+                    features: vec!["webview", "assets"],
+                },
+            ))
+            .collect(),
+            // The extracted `waterui-image` the facade links from crates.io
+            // depends on the registry copies of these crates; without the
+            // redirect the graph carries two of each and every `View` is a
+            // different type on either side.
+            patch: Patch {
+                crates_io: [
+                    "waterui-core",
+                    "waterui-graphics",
+                    "waterui-layout",
+                    "waterui-macros",
+                ]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name,
+                        GitSource {
+                            git: git.clone(),
+                            rev: rev.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            },
+        };
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            toml::to_string(&manifest).expect("the manifest serializes"),
+        )
+        .expect("the manifest is written");
+        fixture
+    }
+
     /// `include_web!` is the one web mount an application declares; its
     /// metadata must reach the CLI through the same `waterui_meta_bundle_*`
     /// channel a plain `include_bundle!` uses, carrying the frontend project
-    /// root so `water run` knows what to build (#587).
+    /// root so `water run` knows what to build (#587). The macro expands
+    /// against the `waterui` facade, which this crate does not link, so cargo
+    /// fetches the pinned framework revision to build the fixture — network
+    /// work that belongs to the nightly job.
     #[test]
+    #[ignore = "fetches the pinned framework revision"]
     fn reads_include_web_mount_meta_from_built_rlib() {
         futures_lite::future::block_on(async {
-            let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
-            let rlib = build_host_rlib(&fixture, None)
+            let fixture = web_meta_fixture();
+            let rlib = build_host_rlib(fixture.path(), None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
@@ -306,7 +406,7 @@ mod tests {
             assert_eq!(
                 meta.project.as_deref(),
                 Some(
-                    dunce::canonicalize(fixture.join("web"))
+                    dunce::canonicalize(fixture.path().join("web"))
                         .as_deref()
                         .expect("web root")
                 )
