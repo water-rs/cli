@@ -2,19 +2,17 @@
 //!
 //! Embeds the git commit and the CLI-owned scaffold metadata the binary reads
 //! at runtime. Framework-owned scaffold facts are not embedded in the CLI at
-//! all: they live in the root manifest's `[package.metadata.waterui]` and reach
-//! a scaffolded project through the published `framework.json`.
+//! all: they live in the framework root manifest's `[package.metadata.waterui]`
+//! and reach a scaffolded project through the published `framework.json`.
 
 use std::{
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use toml::Value;
-
-#[path = "src/android/ndk_version.rs"]
-mod ndk_version;
 
 fn main() {
     let cli_manifest_dir = PathBuf::from(
@@ -31,40 +29,19 @@ fn main() {
         for key in table.keys() {
             assert!(
                 key == "android-kotlin-version",
-                "cli/Cargo.toml [package.metadata.waterui-scaffold].{key} is \
-                 framework-owned: declare it in the root manifest's \
-                 [package.metadata.waterui] table instead"
+                "Cargo.toml [package.metadata.waterui-scaffold].{key} is \
+                 framework-owned: declare it in the water-rs/waterui root \
+                 manifest's [package.metadata.waterui] table instead"
             );
         }
     }
     let kotlin_version = manifest_scaffold_string(scaffold_metadata, "android-kotlin-version");
     println!("cargo:rustc-env=WATERUI_CLI_ANDROID_KOTLIN_VERSION={kotlin_version}");
 
-    // `ANDROID_NDK_VERSION` is a source literal in `android::ndk_version` so it
-    // survives `cargo publish` — a packaged CLI still knows which NDK
-    // `sdkmanager` package to install. When this build runs inside a WaterUI
-    // checkout, pin the literal to the runtime Gradle declaration so the two
-    // can never drift.
-    let runtime_gradle = cli_manifest_dir
-        .join("..")
-        .join(ndk_version::RUNTIME_BUILD_GRADLE_RELATIVE_PATH);
-    println!("cargo:rerun-if-changed={}", runtime_gradle.display());
-    if let Ok(contents) = fs::read_to_string(&runtime_gradle) {
-        let declared = ndk_version::parse_android_ndk_version_from_runtime_build_gradle(&contents)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no `ndkVersion` declaration in {}",
-                    runtime_gradle.display()
-                )
-            });
-        assert_eq!(
-            declared,
-            ndk_version::ANDROID_NDK_VERSION,
-            "cli/src/android/ndk_version.rs ANDROID_NDK_VERSION drifted from \
-             {} — update the literal with the runtime Gradle `ndkVersion`",
-            runtime_gradle.display()
-        );
-    }
+    println!(
+        "cargo:rustc-env=WATERUI_FRAMEWORK_REPOSITORY={}",
+        framework_repository(&manifest)
+    );
 
     let cli_commit =
         git(&cli_manifest_dir, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
@@ -105,6 +82,27 @@ fn register_git_head_rerun(repo_root: &Path) {
         "cargo:rerun-if-changed={}",
         git_dir_path.join("refs").display()
     );
+}
+
+/// The repository the `waterui-*` git dependencies pin — where certified
+/// manifests, releases, and `dev` revisions live. Declared once in
+/// `Cargo.toml`; baked in here so runtime code never guesses it.
+fn framework_repository(manifest: &Value) -> &str {
+    let mut repositories: BTreeSet<&str> = ["dependencies", "dev-dependencies"]
+        .into_iter()
+        .filter_map(|table| manifest[table].as_table())
+        .flat_map(|dependencies| dependencies.values())
+        .filter_map(|dependency| dependency.get("git").and_then(Value::as_str))
+        .filter(|git| git.trim_end_matches(".git").ends_with("water-rs/waterui"))
+        .collect();
+    assert!(
+        repositories.len() == 1,
+        "Cargo.toml must pin its waterui-* dependencies on exactly one \
+         water-rs/waterui repository"
+    );
+    repositories
+        .pop_first()
+        .expect("the length check leaves one repository")
 }
 
 fn manifest_scaffold_string(scaffold_metadata: &Value, key: &str) -> String {

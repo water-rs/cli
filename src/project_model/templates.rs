@@ -4119,7 +4119,7 @@ fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::Patc
 /// `waterui-*` dependencies against — the source a `[patch]` table must name
 /// to redirect those dependencies.
 fn framework_git_source() -> String {
-    env!("CARGO_PKG_REPOSITORY")
+    env!("WATERUI_FRAMEWORK_REPOSITORY")
         .trim_end_matches(".git")
         .to_string()
 }
