@@ -1741,8 +1741,15 @@ async fn resolve_cargo_layout(
 /// Run `cargo tree` for the application package rooted at `project_root`'s
 /// manifest, over the given edge kinds, and return the `{p}`-formatted tree.
 async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
-    let manifest_path = project_root.join("Cargo.toml");
-    let metadata_manifest = manifest_path.clone();
+    // `dunce`, not `std::fs::canonicalize`: on Windows the standard one returns
+    // an extended-length path (`\\?\D:\...`), while `cargo metadata` reports the
+    // plain one, so comparing the two never matched and the package below was
+    // always "omitted" (part of #152). Canonicalize before invoking metadata,
+    // not just on the looked-up side: metadata echoes the manifest path it is
+    // given, so under a symlinked `TMPDIR` (`/var` → `/private/var` on macOS)
+    // a non-canonical input can never match what metadata reports.
+    let application_manifest = dunce::canonicalize(project_root.join("Cargo.toml"))?;
+    let metadata_manifest = application_manifest.clone();
     let metadata = unblock(move || {
         cargo_metadata::MetadataCommand::new()
             .no_deps()
@@ -1750,11 +1757,6 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
             .exec()
     })
     .await?;
-    // `dunce`, not `std::fs::canonicalize`: on Windows the standard one returns
-    // an extended-length path (`\\?\D:\...`), while `cargo metadata` reports the
-    // plain one, so comparing the two never matched and the package below was
-    // always "omitted" (part of #152). Everywhere else this is `canonicalize`.
-    let application_manifest = dunce::canonicalize(&manifest_path)?;
     let root = metadata
         .packages
         .iter()
@@ -1769,7 +1771,7 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
     let output = Command::new("cargo")
         .arg("tree")
         .arg("--manifest-path")
-        .arg(&manifest_path)
+        .arg(&application_manifest)
         .arg("--package")
         .arg(package_spec)
         .arg("--edges")
@@ -1784,7 +1786,7 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
     if !output.status.success() {
         return Err(eyre::eyre!(
             "failed to resolve runtime dependency graph for {}: {}",
-            manifest_path.display(),
+            application_manifest.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
