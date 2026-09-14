@@ -1,0 +1,16 @@
+[workspace]
+pr_draft = false
+pr_labels = ["release"]
+git_release_name = "v{{ version }}"
+# crates.io publishing happens in release.yml's tag-triggered `publish` job
+# through OIDC trusted publishing; release-plz only computes versions,
+# updates the changelog and pushes the tag.
+publish = false
+release_always = true
+git_tag_enable = true
+changelog_update = true
+
+[[package]]
+name = "waterui-cli"
+git_release_name = "v{{ version }}"
+git_tag_name = "v{{ version }}"
