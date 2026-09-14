@@ -80,7 +80,8 @@ at build time:
   a toolchain that reports the wrong shape — each is an error naming what was
   found and what was required, never a silent substitute. `doctor` classifies a
   problem as fixable or not; it does not paper over it.
-- Diagnostics go through `tracing` (`water … --logs debug`), never `println!`.
+- Diagnostics go through `tracing` (`RUST_LOG=debug water …` prints them to
+  stderr; `--logs` on `water run` is the *device* log level), never `println!`.
   Structured text is serialized (`serde`) or rendered from a typed `askama`
   template under `templates/`, never concatenated.
 - No blind sleeps: waiting is on a readiness signal (a port, a file, a device
