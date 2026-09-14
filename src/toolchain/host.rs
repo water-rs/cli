@@ -238,9 +238,15 @@ impl Host {
     ) -> Result<Output, CommandError> {
         let program = program.as_ref();
         let program_name = program.to_string_lossy().into_owned();
+        let args = args
+            .into_iter()
+            .map(|argument| argument.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        tracing::debug!(program = %program_name, ?args, "spawning");
+        let started = std::time::Instant::now();
         let mut command = self.command(program);
         command
-            .args(args)
+            .args(&args)
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -270,9 +276,15 @@ impl Host {
             source,
         })?;
         let stderr = stderr_task.await.map_err(|source| CommandError::Spawn {
-            program: program_name,
+            program: program_name.clone(),
             source,
         })?;
+        tracing::debug!(
+            program = %program_name,
+            %status,
+            elapsed_ms = started.elapsed().as_millis(),
+            "exited"
+        );
         Ok(Output {
             status,
             stdout,
