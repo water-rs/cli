@@ -16,7 +16,6 @@ use waterui_assets_planner::{
 use super::icon::encode_macos_icns;
 use super::icon::{
     IconSource, LINUX_HICOLOR_SIZES, WINDOW_ICON_SIZE, encode_png, render_android_foreground,
-    render_apple_icon,
 };
 use crate::project::Project;
 
@@ -510,14 +509,13 @@ async fn write_apple_app_icon(source: &IconSource, xcassets_dest: &Path) -> eyre
         ("ios-marketing", "1024x1024", "1x", 1024),
     ];
 
+    // Every slot is full-bleed: the OS applies its own mask, and on macOS 26
+    // catalog icons are drawn inside the system icon plate — baking the
+    // icon-grid margin into `mac` slots would shrink the artwork twice.
     let mut images = Vec::new();
     for (idiom, size, scale, pixels) in specs {
         let file_name = format!("AppIcon-{idiom}-{size}@{scale}.png");
-        write_png(
-            &render_apple_icon(source, idiom, pixels)?,
-            &appicon_dir.join(&file_name),
-        )
-        .await?;
+        write_png(&source.render(pixels)?, &appicon_dir.join(&file_name)).await?;
         images.push(ImageItem {
             idiom,
             size,

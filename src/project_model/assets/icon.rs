@@ -1,11 +1,14 @@
 //! App-icon rendering shared by every staged platform.
 //!
 //! One square source image (SVG or raster) is turned into each platform's
-//! launcher format: full-bleed squares where the OS applies its own mask
-//! (iOS, iPadOS), the inset rounded-rectangle shape macOS expects, and
-//! adaptive-icon layers that survive Android's circular mask. SVG sources are
-//! re-rendered from vector data at every requested pixel size so the largest
-//! formats stay sharp.
+//! launcher format. Asset-catalog slots are always full-bleed squares — the
+//! OS applies its own mask and, on macOS 26+, draws the artwork inside the
+//! system icon plate. The inset rounded-rectangle shape from Apple's
+//! icon-grid template is baked only into the hand-assembled `.icns` that
+//! self-drawn backends ship as `CFBundleIconFile`, which `LaunchServices` draws
+//! as authored. Android additionally gets adaptive-icon layers that survive
+//! its circular mask. SVG sources are re-rendered from vector data at every
+//! requested pixel size so the largest formats stay sharp.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -35,7 +38,9 @@ const ANDROID_VISIBLE_RATIO: f64 = 72.0 / 108.0;
 /// macOS icon-grid geometry from Apple's design template: on a 1024 px
 /// canvas the icon shape is an 824 px rounded rectangle with a 185.4 px
 /// corner radius.
+#[cfg(target_os = "macos")]
 const MACOS_SHAPE_RATIO: f64 = 824.0 / 1024.0;
+#[cfg(target_os = "macos")]
 const MACOS_CORNER_RADIUS_RATIO: f64 = 185.4 / 1024.0;
 
 /// Resolution used to inspect an icon's edges and content extent.
@@ -208,24 +213,19 @@ fn load_svg(path: &Path) -> eyre::Result<IconSource> {
     Ok(IconSource::Svg(Box::new(tree)))
 }
 
-/// Renders one Apple icon slot.
+/// Renders the macOS icon-grid shape baked into hand-assembled `.icns`
+/// files: the artwork as an inset rounded rectangle on a transparent canvas.
 ///
-/// The `mac` idiom receives the inset rounded-rectangle shape from Apple's
-/// icon-grid template; iOS and iPadOS idioms are full-bleed squares that the
-/// OS masks itself.
+/// `LaunchServices` draws `CFBundleIconFile` icons as authored, so the shape
+/// carries its own margin. Asset-catalog `mac` slots must not use this —
+/// the system icon plate masks and insets full-bleed artwork itself, and a
+/// baked margin would shrink the icon a second time.
 ///
 /// # Errors
 ///
 /// Fails when rendering fails.
-pub fn render_apple_icon(
-    source: &IconSource,
-    idiom: &str,
-    pixels: u32,
-) -> eyre::Result<image::RgbaImage> {
-    if idiom != "mac" {
-        return source.render(pixels);
-    }
-
+#[cfg(target_os = "macos")]
+fn render_macos_icon_shape(source: &IconSource, pixels: u32) -> eyre::Result<image::RgbaImage> {
     let shape_size = round_to_u32(f64::from(pixels) * MACOS_SHAPE_RATIO);
     let radius = f64::from(pixels) * MACOS_CORNER_RADIUS_RATIO;
     let mut shape = source.render(shape_size)?;
@@ -242,8 +242,7 @@ pub fn render_apple_icon(
 const MACOS_ICNS_SIZES: &[u32] = &[16, 32, 64, 128, 256, 512, 1024];
 
 /// Encodes the macOS icon family (`.icns`) for hand-assembled app bundles,
-/// using the same inset rounded-rectangle shape as the asset-catalog `mac`
-/// idiom.
+/// using the inset rounded-rectangle shape `LaunchServices` draws as authored.
 ///
 /// Only the macOS packaging path assembles a bundle, and that path is gated the
 /// same way, so this is not built when cross-compiling from Linux or Windows.
@@ -257,7 +256,7 @@ const MACOS_ICNS_SIZES: &[u32] = &[16, 32, 64, 128, 256, 512, 1024];
 pub fn encode_macos_icns(source: &IconSource) -> eyre::Result<Vec<u8>> {
     let mut family = icns::IconFamily::new();
     for &size in MACOS_ICNS_SIZES {
-        let rendered = render_apple_icon(source, "mac", size)?;
+        let rendered = render_macos_icon_shape(source, size)?;
         let image =
             icns::Image::from_data(icns::PixelFormat::RGBA, size, size, rendered.into_raw())
                 .map_err(|error| {
@@ -539,6 +538,7 @@ fn content_bbox(image: &image::RgbaImage, background: [u8; 3]) -> Option<Content
 
 /// Multiplies the image's alpha by an antialiased rounded-rectangle mask
 /// covering the whole image.
+#[cfg(target_os = "macos")]
 fn apply_rounded_rect_mask(image: &mut image::RgbaImage, radius: f64) {
     let (width, height) = image.dimensions();
     let half_width = f64::from(width) / 2.0;
@@ -612,22 +612,23 @@ mod tests {
     }
 
     #[test]
-    fn ios_icon_is_full_bleed() {
+    fn catalog_icon_is_full_bleed() {
         let logo = IconSource::default_logo();
-        let icon = render_apple_icon(&logo, "iphone", 180).expect("render must succeed");
+        let icon = logo.render(180).expect("render must succeed");
         assert_eq!(icon.dimensions(), (180, 180));
         assert_eq!(
             *icon.get_pixel(0, 0),
             image::Rgba([255, 255, 255, 255]),
-            "iOS icons are masked by the OS, so the artwork covers the corner"
+            "asset-catalog icons are masked by the OS, so the artwork covers the corner"
         );
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn mac_icon_is_inset_and_rounded() {
         let logo = IconSource::default_logo();
         let size = 512;
-        let icon = render_apple_icon(&logo, "mac", size).expect("render must succeed");
+        let icon = render_macos_icon_shape(&logo, size).expect("render must succeed");
         assert_eq!(icon.dimensions(), (size, size));
         assert_eq!(
             icon.get_pixel(0, 0).0[3],
@@ -725,17 +726,18 @@ mod tests {
     /// `cargo nextest run -p waterui-cli -E 'test(export_app_icon_gallery_images)'`
     /// writes to `<tempdir>/waterui_app_icon_gallery/`.
     #[test]
+    #[cfg(target_os = "macos")]
     fn export_app_icon_gallery_images() {
         let out_dir = std::env::temp_dir().join("waterui_app_icon_gallery");
         std::fs::create_dir_all(&out_dir).expect("gallery dir must be creatable");
         let logo = IconSource::default_logo();
 
-        let ios = render_apple_icon(&logo, "iphone", 1024).expect("ios render");
-        ios.save(out_dir.join("apple-ios-1024.png"))
-            .expect("save ios");
+        let ios = logo.render(1024).expect("catalog render");
+        ios.save(out_dir.join("apple-catalog-1024.png"))
+            .expect("save catalog");
 
-        let mac = render_apple_icon(&logo, "mac", 1024).expect("mac render");
-        mac.save(out_dir.join("apple-mac-1024.png"))
+        let mac = render_macos_icon_shape(&logo, 1024).expect("mac render");
+        mac.save(out_dir.join("macos-icns-1024.png"))
             .expect("save mac");
 
         let edge = logo.edge_color().expect("edge probe");
