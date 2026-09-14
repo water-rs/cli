@@ -288,7 +288,7 @@ impl ResolvedFramework {
         let metadata = framework_metadata(&manifest)?;
         let minimum_cli_version = minimum_cli_version(&metadata)?;
         if let Some(minimum) = &minimum_cli_version {
-            validate_installed_cli(minimum, &local_cli_update(root))?;
+            validate_installed_cli(minimum, &checkout_cli_update())?;
         }
         let mut scaffold = framework_scaffold(&manifest)?;
         let lock: Lockfile = smol::fs::read_to_string(root.join("Cargo.lock"))
@@ -348,7 +348,7 @@ impl ResolvedFramework {
     /// Returns an error when the file cannot be read or parsed, fails
     /// verification, or the revision it certifies cannot be fetched.
     pub(crate) async fn resolve_manifest(path: &Path) -> Result<(Self, Option<Vec<u8>>)> {
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let slug = repository_slug(repository)?;
         let certification = load_manifest(path, repository).await?;
         let revision = certification.revision.clone();
@@ -359,17 +359,9 @@ impl ResolvedFramework {
         if let Some(minimum) = &self.minimum_cli_version {
             let update = match &self.source {
                 Source::Stable { .. } => registry_cli_update(minimum),
-                Source::Dev {
-                    repository,
-                    revision,
-                    ..
+                Source::Dev { .. } | Source::Nightly { .. } | Source::Local { .. } => {
+                    checkout_cli_update()
                 }
-                | Source::Nightly {
-                    repository,
-                    revision,
-                    ..
-                } => git_cli_update(repository, revision),
-                Source::Local { root } => local_cli_update(root),
             };
             validate_installed_cli(minimum, &update)?;
         }
@@ -787,7 +779,7 @@ impl ResolvedFramework {
     /// Returns an error when the channel has no eligible release, the manifest
     /// fails verification, or the certified revision cannot be fetched.
     pub(crate) async fn resolve(channel: FrameworkChannel) -> Result<(Self, Option<Vec<u8>>)> {
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let slug = repository_slug(repository)?;
         match channel {
             FrameworkChannel::Stable | FrameworkChannel::Nightly => {
@@ -835,9 +827,7 @@ impl ResolvedFramework {
         if let Some(minimum) = &minimum_cli_version {
             let update = match channel {
                 FrameworkChannel::Stable => registry_cli_update(minimum),
-                FrameworkChannel::Dev | FrameworkChannel::Nightly => {
-                    git_cli_update(repository, revision)
-                }
+                FrameworkChannel::Dev | FrameworkChannel::Nightly => checkout_cli_update(),
             };
             validate_installed_cli(minimum, &update)?;
         }
@@ -991,6 +981,14 @@ fn backend_name(submodule_path: &str) -> &str {
         .expect("a submodule path has a basename")
 }
 
+/// The repository the CLI's pinned `waterui-*` dependencies resolve from —
+/// where certified manifests, releases, and `dev` revisions live. `build.rs`
+/// bakes it in from the git source in `Cargo.toml` so the pin is declared
+/// exactly once.
+fn framework_repository() -> &'static str {
+    env!("WATERUI_FRAMEWORK_REPOSITORY").trim_end_matches(".git")
+}
+
 /// The framework repository's `owner/name` slug, from its GitHub URL.
 fn repository_slug(repository: &str) -> Result<&str> {
     repository
@@ -1090,13 +1088,6 @@ fn registry_cli_update(minimum: &cargo_toml::SemVer) -> String {
     )
 }
 
-fn git_cli_update(repository: &str, revision: &str) -> String {
-    format!(
-        "cargo install {} --git {repository} --rev {revision} --locked",
-        env!("CARGO_PKG_NAME")
-    )
-}
-
 fn validate_installed_cli(minimum: &cargo_toml::SemVer, update: &str) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION")
         .parse()
@@ -1147,20 +1138,8 @@ pub(crate) fn validate_resolved_cli(metadata: &cargo_metadata::Metadata) -> Resu
             .map(|source| source.repr.parse::<cargo_lock::SourceId>())
             .transpose()?;
         let update = match source {
-            Some(source) if source.is_git() => git_cli_update(
-                source.url().as_str(),
-                source
-                    .precise()
-                    .ok_or_else(|| eyre!("resolved framework has no Git revision"))?,
-            ),
-            Some(_) => registry_cli_update(&minimum),
-            None => local_cli_update(
-                package
-                    .manifest_path
-                    .parent()
-                    .expect("package manifest has a parent")
-                    .as_std_path(),
-            ),
+            Some(source) if !source.is_git() => registry_cli_update(&minimum),
+            Some(_) | None => checkout_cli_update(),
         };
         validate_installed_cli(&minimum, &update)?;
     }
@@ -1740,9 +1719,7 @@ fn verify_certification(
     if let Some(minimum) = &minimum_cli_version(&certification.metadata)? {
         let update = match channel {
             FrameworkChannel::Stable => registry_cli_update(minimum),
-            FrameworkChannel::Dev | FrameworkChannel::Nightly => {
-                git_cli_update(repository, &certification.revision)
-            }
+            FrameworkChannel::Dev | FrameworkChannel::Nightly => checkout_cli_update(),
         };
         validate_installed_cli(minimum, &update)?;
     }
