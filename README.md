@@ -14,16 +14,16 @@ This separation ensures all business logic lives in the library, while the termi
 
 ## Installation
 
-Install the CLI from source within the `WaterUI` workspace:
+Install the CLI from a clone of this repository:
 
 ```bash
-cargo install --path cli
+cargo install --path .
 ```
 
 Or build for development (not added to PATH):
 
 ```bash
-cargo build -p waterui-cli
+cargo build
 ```
 
 ## Quick Start
@@ -207,11 +207,6 @@ water create my-app --waterui-path /path/to/waterui --backends apple,android
 ```
 
 This creates a project that uses the local `WaterUI` repository.
-
-When the `water` CLI itself was built from a local, non-release `WaterUI` checkout and you run
-`water create` from somewhere inside the `WaterUI` repository, it automatically detects the repo
-root and uses it as the local `waterui_path`. Use `--waterui-path` explicitly when running that
-development CLI outside the repository.
 
 ### Build Without Running
 
