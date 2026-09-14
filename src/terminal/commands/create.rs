@@ -499,14 +499,16 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     use super::validate_backends_on_host;
 
-    /// Scaffolds a `WaterUI` project plus a `create vite` frontend into `root`,
-    /// applies the brand overlay, and installs dependencies — the same steps
-    /// `run()` performs for `--template web`.
-    async fn scaffold_web_project(root: &std::path::Path, name: &str, vite_template: &str) {
-        let waterui_checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("cli/ has a parent")
-            .to_path_buf();
+    /// Scaffolds a `WaterUI` project plus a `create vite` frontend into `root`
+    /// against the framework checkout at `waterui_checkout`, applies the brand
+    /// overlay, and installs dependencies — the same steps `run()` performs
+    /// for `--template web`.
+    async fn scaffold_web_project(
+        root: &std::path::Path,
+        waterui_checkout: &std::path::Path,
+        name: &str,
+        vite_template: &str,
+    ) {
         let shell = Shell::new(false);
         let project = waterui_cli::project::Project::create(
             root,
@@ -517,7 +519,7 @@ mod tests {
                 )
                 .expect("bundle identifier"),
                 package_type: PackageType::App,
-                waterui_path: Some(waterui_checkout),
+                waterui_path: Some(waterui_checkout.to_path_buf()),
                 channel: None,
                 framework_manifest: None,
                 framework: None,
@@ -570,19 +572,17 @@ mod tests {
 
     /// End-to-end `--template web`: scaffolds a project plus a Vite frontend
     /// into a tempdir, verifies the brand overlay landed, `bun run build`s
-    /// the frontend, and `cargo check`s the result against this checkout.
-    ///
-    /// Gated on `bun` being on PATH; skipped in environments without it.
+    /// the frontend, and `cargo check`s the result against the pinned
+    /// framework revision, cloned on demand. `bun` must be on `PATH`; the
+    /// nightly job installs it.
     #[test]
+    #[ignore = "clones the pinned framework revision"]
     fn create_template_web_scaffolds_and_checks() {
-        if which::which("bun").is_err() {
-            eprintln!("skipping: bun is not installed");
-            return;
-        }
         smol::block_on(async {
+            let checkout = crate::pinned_framework::checkout();
             let temp = tempfile::tempdir().expect("tempdir");
             let project_path = temp.path().join("web-app");
-            scaffold_web_project(&project_path, "WaterUI App", "vanilla-ts").await;
+            scaffold_web_project(&project_path, checkout.path(), "WaterUI App", "vanilla-ts").await;
 
             assert!(project_path.join("web/package.json").exists());
             let water_toml =
@@ -640,19 +640,16 @@ mod tests {
     }
 
     /// The React overlay compiles: `react-ts` scaffolds get a branded
-    /// `App.tsx` that `tsc -b && vite build` accepts.
-    ///
-    /// Gated on `bun` being on PATH; skipped in environments without it.
+    /// `App.tsx` that `tsc -b && vite build` accepts. `bun` must be on
+    /// `PATH`; the nightly job installs it.
     #[test]
+    #[ignore = "clones the pinned framework revision"]
     fn create_template_web_react_frontend_builds() {
-        if which::which("bun").is_err() {
-            eprintln!("skipping: bun is not installed");
-            return;
-        }
         smol::block_on(async {
+            let checkout = crate::pinned_framework::checkout();
             let temp = tempfile::tempdir().expect("tempdir");
             let project_path = temp.path().join("web-app");
-            scaffold_web_project(&project_path, "WaterUI App", "react-ts").await;
+            scaffold_web_project(&project_path, checkout.path(), "WaterUI App", "react-ts").await;
 
             let app_tsx = project_path.join("web/src/App.tsx");
             assert!(app_tsx.is_file(), "react-ts scaffolds src/App.tsx");

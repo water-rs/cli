@@ -1,6 +1,12 @@
 //! `WaterUI` CLI entry point.
 
 mod commands;
+/// The library's view of the pinned framework revision, compiled into this
+/// binary's tests too: the `create --template web` tests scaffold against a
+/// clone of it.
+#[cfg(test)]
+#[path = "../pinned_framework/clone.rs"]
+mod pinned_framework;
 mod project_path;
 mod shell;
 

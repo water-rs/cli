@@ -68,6 +68,8 @@ jobs:
       - uses: ./.github/actions/setup-linux-deps
         if: runner.os == 'Linux'
       - uses: taiki-e/install-action@nextest
+      # The `create --template web` tests scaffold and build a Vite frontend.
+      - uses: oven-sh/setup-bun@v2
       # These tests clone and fetch `water-rs/waterui` at the revision
       # `Cargo.toml` pins; they are the standalone repository's drift signal.
       - run: cargo nextest run --locked --profile ci --run-ignored ignored-only
