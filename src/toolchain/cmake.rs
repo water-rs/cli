@@ -203,13 +203,35 @@ mod host_tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn install_runs_brew() {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn install_runs_the_package_manager() {
         let machine = TestMachine::new();
+        #[cfg(target_os = "macos")]
         machine.install("brew");
+        #[cfg(target_os = "linux")]
+        machine.install("apt-get");
         let host = machine.host(Vec::<(String, String)>::new());
         smol::block_on(CmakeInstallation.install(&host))
-            .expect("brew install cmake must succeed on a host that provides brew");
+            .expect("installing cmake through the host's package manager must succeed");
+    }
+
+    /// The fake `winget` accepts `install` but never reports the package
+    /// afterwards, so the post-install verification must fail fast instead of
+    /// reporting success.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn install_fails_when_winget_leaves_the_package_missing() {
+        let machine = TestMachine::new();
+        machine.install("winget");
+        let host = machine.host(Vec::<(String, String)>::new());
+        let result = smol::block_on(CmakeInstallation.install(&host));
+        assert!(
+            matches!(
+                result,
+                Err(super::FailToInstallCmake::WingetInstallFailed(_))
+            ),
+            "a package still missing after winget install must be an error: {result:?}"
+        );
     }
 
     #[test]

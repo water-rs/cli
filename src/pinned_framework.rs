@@ -12,33 +12,42 @@ use std::{path::Path, process::Command};
 use zenwave::Client as _;
 
 /// The framework repository URL and the revision the `waterui-*` git
-/// dependencies in this crate's manifest pin — any one of them answers for
-/// all, since the pin is shared.
+/// dependencies in this crate's manifest pin. Every `waterui-*` dependency
+/// must share one `git` and one `rev` — `build.rs` enforces the same rule —
+/// so the pin is read once and answers for all of them.
 pub fn source() -> (String, String) {
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let contents = std::fs::read_to_string(&manifest_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
     let manifest: toml::Value = toml::from_str(&contents)
         .unwrap_or_else(|error| panic!("failed to parse {}: {error}", manifest_path.display()));
+    let mut sources = std::collections::BTreeSet::new();
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
         let Some(table) = manifest.get(section).and_then(toml::Value::as_table) else {
             continue;
         };
-        for dependency in table.values().filter_map(toml::Value::as_table) {
-            let Some(git) = dependency.get("git").and_then(toml::Value::as_str) else {
-                continue;
-            };
-            if !git.trim_end_matches(".git").ends_with("water-rs/waterui") {
+        for (name, dependency) in table {
+            if !name.starts_with("waterui-") {
                 continue;
             }
+            let git = dependency
+                .get("git")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("[{section}] {name} must be a git dependency"));
             let rev = dependency
                 .get("rev")
                 .and_then(toml::Value::as_str)
-                .unwrap_or_else(|| panic!("{section} git dependency on {git} pins no rev"));
-            return (git.to_owned(), rev.to_owned());
+                .unwrap_or_else(|| panic!("[{section}] {name} must pin a rev"));
+            sources.insert((git.to_owned(), rev.to_owned()));
         }
     }
-    panic!("Cargo.toml declares no rev-pinned git dependency on water-rs/waterui");
+    assert!(
+        sources.len() == 1,
+        "Cargo.toml must pin every waterui-* dependency on one git source at one rev, found {sources:?}"
+    );
+    sources
+        .pop_first()
+        .expect("the length check leaves one source")
 }
 
 /// The `<owner>/<repo>` slug of a `https://github.com/…` remote.
