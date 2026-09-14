@@ -140,7 +140,7 @@ core-foundation = "0.10"
 [target.'cfg(unix)'.dependencies]
 # Process-group signalling for the `water run` web dev server (SIGTERM/SIGKILL
 # to the bundler tree the package manager re-execs).
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["process", "signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `.icns` encoding for hand-assembled app bundles. Only the macOS packaging path
@@ -149,7 +149,12 @@ nix = { version = "0.31", features = ["signal"] }
 icns = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
 zenwave = { version = "0.6.1", default-features = false, features = ["hyper-backend", "rustls"] }
