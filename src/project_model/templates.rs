@@ -2069,6 +2069,9 @@ mod tests {
         assert_eq!(managed(), "pins v2");
     }
 
+    /// A `waterui_path` ctx resolves `waterui-preview` through `cargo
+    /// metadata` on the checkout, so the checkout is a minimal fixture
+    /// workspace carrying that one member.
     #[test]
     fn preview_ffi_scaffold_emits_dylib_only_wrapper() {
         let tempdir = tempdir().expect("temporary preview ffi scaffold dir");
@@ -2078,10 +2081,21 @@ mod tests {
             .join("cache")
             .join("managed_backends")
             .join("preview_ffi");
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("CLI crate should be inside the WaterUI workspace")
-            .to_path_buf();
+        let workspace_root = tempdir.path().join("waterui");
+        std::fs::create_dir_all(workspace_root.join("preview/src"))
+            .expect("fixture workspace member dir");
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"preview\"]\n",
+        )
+        .expect("fixture workspace manifest");
+        std::fs::write(
+            workspace_root.join("preview/Cargo.toml"),
+            "[package]\nname = \"waterui-preview\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("fixture member manifest");
+        std::fs::write(workspace_root.join("preview/src/lib.rs"), "")
+            .expect("fixture member source");
         let ctx = ctx(
             Some(workspace_root),
             Some(preview_ffi_dir.clone()),
@@ -5015,15 +5029,16 @@ pub mod inspector {
 
     #[cfg(test)]
     mod tests {
-        /// The scaffolder resolves the Inspector crate by path, so a move that
-        /// nobody updates here breaks `water inspector` silently — which is
-        /// exactly what happened when the crate moved under `devtools/`.
+        /// The scaffolder resolves the Inspector crate by path inside a
+        /// `waterui_path` checkout, so a move that nobody updates here breaks
+        /// `water inspector` silently — which is exactly what happened when the
+        /// crate moved under `devtools/`. The checkout is the pinned framework
+        /// revision, cloned on demand.
         #[test]
+        #[ignore = "clones the pinned framework revision"]
         fn the_inspector_app_crate_path_exists() {
-            let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("the CLI crate lives inside the repository");
-            let crate_path = repository.join(super::INSPECTOR_APP_CRATE);
+            let checkout = crate::pinned_framework::checkout();
+            let crate_path = checkout.path().join(super::INSPECTOR_APP_CRATE);
             assert!(
                 crate_path.join("Cargo.toml").is_file(),
                 "inspector app crate is not at {}",

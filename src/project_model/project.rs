@@ -2229,7 +2229,10 @@ mod channel_tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(&format!("requires waterui-cli >= {minimum}")));
-            assert!(error.contains("cargo install --path cli --locked"));
+            assert!(error.contains(&format!(
+                "cargo install waterui-cli --git {} --locked",
+                env!("CARGO_PKG_REPOSITORY")
+            )));
             assert!(!project_root.exists());
 
             smol::fs::create_dir(&project_root).await.unwrap();
@@ -2287,8 +2290,6 @@ mod channel_tests {
 
 #[cfg(test)]
 mod webview_backend_tests {
-    use std::path::Path;
-
     use super::{
         ResolvedWebViewBackend, TargetBackend, TargetPlatform, resolve_enabled_features,
         resolve_linked_runtime_packages,
@@ -2395,12 +2396,14 @@ mod webview_backend_tests {
 
     /// The engine is read out of the application's own graph, so the examples
     /// are the test: the CEF `WebView` example links `waterui-browser-cef` and
-    /// the shared system-`WebView` example links no engine at all.
+    /// the shared system-`WebView` example links no engine at all. The
+    /// examples live in the framework repository — this crate builds against a
+    /// pinned `water-rs/waterui` revision, and the test clones it on demand.
     #[test]
+    #[ignore = "clones the pinned framework revision"]
     fn runtime_graph_is_scoped_to_the_selected_application() {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("CLI crate must be inside the WaterUI repository");
+        let checkout = crate::pinned_framework::checkout();
+        let repository = checkout.path();
         let chromium = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/chromium"),
         ))
@@ -2482,12 +2485,14 @@ mod webview_backend_tests {
     /// the FFI's `map` feature — is read off the application's own graph, the
     /// same way the browser engine is. `waterui-map` is a component crate an
     /// application depends on directly; no facade feature announces it any
-    /// more, so linking it is what the capability has to see.
+    /// more, so linking it is what the capability has to see. The examples
+    /// live in the framework repository — this crate builds against a pinned
+    /// `water-rs/waterui` revision, and the test clones it on demand.
     #[test]
+    #[ignore = "clones the pinned framework revision"]
     fn the_map_capability_is_read_from_the_application_graph() {
-        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("CLI crate must be inside the WaterUI repository");
+        let checkout = crate::pinned_framework::checkout();
+        let repository = checkout.path();
 
         let map = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/map"),

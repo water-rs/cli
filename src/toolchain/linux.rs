@@ -974,10 +974,17 @@ mod tests {
     }
 
     /// The floors are read out of specific crate versions, so the versions the
-    /// diagnostics name have to be the ones the workspace actually resolves.
+    /// diagnostics name have to be the ones the framework actually resolves.
+    /// The lockfile that pins them lives in `water-rs/waterui`, fetched at the
+    /// revision this crate's manifest pins.
     #[test]
+    #[ignore = "fetches the pinned framework revision's lockfile over the network"]
     fn crate_versions_match_lockfile() {
-        let lockfile = include_str!("../../../Cargo.lock");
+        let (framework, revision) = crate::pinned_framework::source();
+        let lockfile = String::from_utf8(crate::pinned_framework::fetch(
+            &crate::pinned_framework::raw_url(&framework, &revision, "Cargo.lock"),
+        ))
+        .expect("the framework lockfile is UTF-8");
         for library in VERSIONED_NATIVE_LIBRARIES {
             let entry = format!(
                 "name = \"{}\"\nversion = \"{}\"\n",
