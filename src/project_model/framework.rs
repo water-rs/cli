@@ -1074,10 +1074,14 @@ fn minimum_cli_version(metadata: &toml::Table) -> Result<Option<cargo_toml::SemV
         .wrap_err("invalid package.metadata.waterui.minimum-cli-version")
 }
 
-fn local_cli_update(root: &Path) -> String {
+/// The CLI update hint for a framework that is not a registry release — a
+/// local checkout or a git-pinned `dev`/`nightly` source pairs with the
+/// development line of this repository.
+fn checkout_cli_update() -> String {
     format!(
-        "run `cargo install --path cli --locked` from the WaterUI checkout at {}",
-        root.display()
+        "cargo install {} --git {} --locked",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_REPOSITORY")
     )
 }
 
@@ -1112,7 +1116,7 @@ pub(crate) async fn validate_local_cli(root: &Path) -> Result<()> {
     let contents = smol::fs::read_to_string(root.join("Cargo.toml")).await?;
     let manifest = toml::from_str(&contents)?;
     if let Some(minimum) = minimum_cli_version(&framework_metadata(&manifest)?)? {
-        validate_installed_cli(&minimum, &local_cli_update(root))?;
+        validate_installed_cli(&minimum, &checkout_cli_update())?;
     }
     Ok(())
 }
@@ -1370,9 +1374,7 @@ pub(crate) mod test_fixtures {
         ResolvedFramework {
             source: Source::Stable {
                 release: Some(FrameworkRelease {
-                    repository: env!("CARGO_PKG_REPOSITORY")
-                        .trim_end_matches(".git")
-                        .to_owned(),
+                    repository: framework_repository().to_owned(),
                     revision: revision('a'),
                     tag: "v0.4.1".to_owned(),
                 }),
@@ -1788,7 +1790,7 @@ mod tests {
                 )
             })
             .collect();
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let revision = "a".repeat(40);
         let framework = ResolvedFramework {
             source: Source::Nightly {
@@ -1930,13 +1932,8 @@ mod tests {
             ("waterui-dew-version".to_string(), "0.2.1".to_string()),
             ("waterui-gtk-version".to_string(), "0.1.2".to_string()),
         ]);
-        let packages = resolve_packages(
-            &scaffold,
-            &lock,
-            env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git"),
-            &"a".repeat(40),
-        )
-        .unwrap();
+        let packages =
+            resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40)).unwrap();
         assert!(packages["waterui"].git.is_some());
         let dew = &packages["waterui-dew"];
         assert!(dew.git.is_none());
@@ -2249,7 +2246,7 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
 
     #[test]
     fn certification_verification_rejects_uncertified_or_mismatched_manifests() {
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let release = release("v0.4.1", false, false, "2025-11-01T00:00:00Z");
 
         let dev = certification(FrameworkChannel::Dev, "dev");
@@ -2341,7 +2338,7 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             },
         });
         std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let certification = smol::block_on(load_manifest(&path, repository)).unwrap();
         assert_eq!(certification.channel, FrameworkChannel::Stable);
         assert_eq!(certification.tag, "v0.4.1");
@@ -2352,10 +2349,15 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
 
     /// The Rust scaffold derivation and `framework_manifest.py`'s must produce
     /// the same table for the same tree — this asserts the Rust side against
-    /// the repository's own manifest.
+    /// the fixture manifest, which carries the framework root manifest's
+    /// metadata table and the workspace requirements `scaffold-packages`
+    /// names.
     #[test]
     fn framework_scaffold_derives_from_the_framework_manifest() {
-        let root: toml::Value = toml::from_str(include_str!("../../../Cargo.toml")).unwrap();
+        let root: toml::Value = toml::from_str(include_str!(
+            "../../tests/fixtures/framework_checkout_manifest.toml"
+        ))
+        .unwrap();
         let scaffold = framework_scaffold(&root).unwrap();
         let workspace = |name: &str| {
             let dependency = &root["workspace"]["dependencies"][name];

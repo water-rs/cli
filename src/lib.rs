@@ -10,6 +10,8 @@ pub mod esp32;
 pub mod gtk4;
 pub mod hydrolysis;
 pub mod mcp;
+#[cfg(test)]
+pub(crate) mod pinned_framework;
 mod platforming;
 pub mod preview;
 mod project_model;
