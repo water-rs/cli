@@ -4,30 +4,33 @@ name: Release
 #
 # * `workflow_run` on CI: a green `dev` run refreshes the release-plz pull
 #   request; a green `main` run (a merged dev→main release PR) tags the
-#   released version `v<version>` and opens the GitHub release. release-plz
-#   only computes versions, updates the changelog and pushes the tag —
-#   `publish = false` in release-plz.toml; crates.io publishing happens in
-#   this same workflow's tag-triggered jobs below.
-# * `push` on a `v*` tag: cargo-dist builds the six ship targets, the
-#   artifacts attach to the GitHub release, the dist-generated Homebrew
-#   formula is handed to water-rs/homebrew-water, and the crate publishes to
-#   crates.io through OIDC trusted publishing.
+#   released version `v<version>` and creates the GitHub release.
+#   release-plz only computes versions, updates the changelog and pushes
+#   the tag — `publish = false` in release-plz.toml; crates.io publishing
+#   is the `publish` job below.
+# * `workflow_dispatch` with a `tag` input: re-runs the publish, dist and
+#   asset jobs for an existing release tag (recovery after a failed leg).
 #
-# release-plz acts under the org release PAT rather than the workflow's
-# GITHUB_TOKEN because tags pushed under GITHUB_TOKEN do not trigger the
-# `push: tags` jobs — the binary build would never run.
+# release-plz runs under the workflow's own GITHUB_TOKEN, and nothing here
+# depends on a tag push firing another workflow: the tag release-plz just
+# created is read out of its JSON report into a job output, and the
+# publish/dist/asset jobs chain off it with `needs:` in this same run —
+# the shape the framework's release pipeline uses, and the only one that
+# works, because a tag pushed under GITHUB_TOKEN triggers no workflow.
 on:
   workflow_run:
     workflows: ["CI"]
     branches: [dev, main]
     types: [completed]
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to re-run, e.g. v0.2.2"
+        required: true
+        type: string
 
 permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -44,6 +47,12 @@ jobs:
     concurrency:
       group: release-main
       cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      # The `v<version>` tag release-plz created this run, empty when it
+      # released nothing.
+      tag: ${{ steps.cli_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,10 +64,30 @@ jobs:
       # `release-plz release` verify-builds the manifest it tags.
       - uses: ./.github/actions/setup-linux-deps
       - uses: ./.github/actions/release-plz
+        id: release_plz
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Read the tag out of release-plz's own report rather than looking
+      # for one on this job's HEAD — the tag lands on the release branch's
+      # tip, not on the merge commit this job checked out.
+      - name: Detect CLI release tag
+        id: cli_tag
+        shell: bash
+        env:
+          REPORT: ${{ steps.release_plz.outputs.report }}
+        run: |
+          set -euo pipefail
+
+          TAG="$(jq -r '[.releases[]? | select(.package_name == "waterui-cli") | .tag] | last // ""' <<< "$REPORT")"
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${TAG}" ]]; then
+            echo "release-plz released waterui-cli as ${TAG}."
+          else
+            echo "release-plz released no waterui-cli this run."
+          fi
 
   release-pr:
     name: Prepare the next release
@@ -70,6 +99,9 @@ jobs:
     concurrency:
       group: release-plz-dev
       cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,22 +111,26 @@ jobs:
         with:
           cache: "false"
       - uses: ./.github/actions/setup-linux-deps
-      # Under the PAT for the same reason as `release`: the release pull
-      # request's pushes must trigger CI.
       - uses: ./.github/actions/release-plz
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    needs: release
+    if: always() && (needs.release.outputs.tag || inputs.tag)
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ needs.release.outputs.tag || inputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ env.TAG }}
       - uses: ./.github/actions/setup-rust
         with:
           cache: "false"
@@ -105,14 +141,30 @@ jobs:
       # configured per crate on crates.io).
       - uses: rust-lang/crates-io-auth-action@v1
         id: crates-io-auth
-      - run: cargo publish --locked
+      # Idempotent so `workflow_dispatch` can re-run a release whose publish
+      # leg already landed: only the version on crates.io decides.
+      - name: Publish the crate
+        shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if curl -sf -o /dev/null "https://crates.io/api/v1/crates/waterui-cli/${version}"; then
+            echo "waterui-cli ${version} is already published — nothing to do"
+          else
+            cargo publish --locked
+          fi
 
   dist:
     name: dist / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    if: github.event_name == 'push'
+    needs: release
+    if: always() && (needs.release.outputs.tag || inputs.tag)
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ needs.release.outputs.tag || inputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -132,7 +184,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ env.TAG }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -153,7 +205,7 @@ jobs:
         shell: bash
         run: |
           dist build \
-            --tag "${{ github.ref_name }}" \
+            --tag "${{ env.TAG }}" \
             --artifacts=local \
             --target "${{ matrix.target }}"
 
@@ -169,13 +221,19 @@ jobs:
 
   release-assets:
     name: Upload release assets
-    needs: [publish, dist]
-    if: github.event_name == 'push'
+    needs: [release, publish, dist]
+    # `always()` so a skipped `release` on workflow_dispatch still resolves;
+    # the publish/dist results are what actually gate this job.
+    if: always() && needs.publish.result == 'success' && needs.dist.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release.outputs.tag || inputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ env.TAG }}
 
       - name: Install cargo-dist
         uses: taiki-e/install-action@v2
@@ -190,7 +248,7 @@ jobs:
           merge-multiple: true
 
       - name: Build global release artifacts
-        run: dist build --tag "${{ github.ref_name }}" --artifacts=global
+        run: dist build --tag "${{ env.TAG }}" --artifacts=global
 
       # The patterns must not overlap. `*.tar.*` also matched every
       # `…tar.xz.sha256`, which `*.sha256` matched again, so each checksum
@@ -203,7 +261,7 @@ jobs:
       - name: Upload assets to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.TAG }}
           files: |
             target/distrib/*.tar.xz
             target/distrib/*.tar.gz
@@ -234,11 +292,9 @@ jobs:
       # `--force` because a re-run of a release pushes the same branch again.
       - name: Push the Homebrew formula branch
         shell: bash
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          version="${VERSION#v}"
+          version="${TAG#v}"
           cd homebrew-water
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
