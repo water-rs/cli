@@ -1413,10 +1413,10 @@ mod tests {
         let patched_path = |source: &str| {
             manifest["patch"][source]["waterui-core"]["path"]
                 .as_str()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    panic!("no waterui-core path patch under [patch.{source:?}]:\n{manifest}")
-                })
+                .map_or_else(
+                    || panic!("no waterui-core path patch under [patch.{source:?}]:\n{manifest}"),
+                    std::path::PathBuf::from,
+                )
         };
         assert_eq!(patched_path("crates-io"), core_path);
         assert_eq!(
