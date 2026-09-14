@@ -1408,18 +1408,20 @@ mod tests {
         let manifest = super::render_native_backend_bin_cargo_toml(&ctx, "waterui-test-gtk4", &[])
             .expect("generated manifest renders");
 
-        let core_path = checkout.join("core").to_string_lossy().into_owned();
-        assert!(
-            manifest.contains(&format!(
-                "[patch.crates-io.waterui-core]\npath = \"{core_path}\""
-            )),
-            "{manifest}"
-        );
-        assert!(
-            manifest.contains(&format!(
-                "[patch.\"https://github.com/water-rs/waterui\".waterui-core]\npath = \"{core_path}\""
-            )),
-            "{manifest}"
+        let core_path = checkout.join("core");
+        let manifest: toml::Value = toml::from_str(&manifest).expect("generated manifest parses");
+        let patched_path = |source: &str| {
+            manifest["patch"][source]["waterui-core"]["path"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    panic!("no waterui-core path patch under [patch.{source:?}]:\n{manifest}")
+                })
+        };
+        assert_eq!(patched_path("crates-io"), core_path);
+        assert_eq!(
+            patched_path("https://github.com/water-rs/waterui"),
+            core_path
         );
     }
 
