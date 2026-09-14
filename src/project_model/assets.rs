@@ -57,9 +57,8 @@ struct FontRegistry {
 impl FontRegistry {
     /// The registry shipped with this CLI.
     fn builtin() -> eyre::Result<Self> {
-        toml::from_str(include_str!("assets/fonts.toml")).wrap_err(
-            "built-in font registry `cli/src/project_model/assets/fonts.toml` is malformed",
-        )
+        toml::from_str(include_str!("assets/fonts.toml"))
+            .wrap_err("built-in font registry `src/project_model/assets/fonts.toml` is malformed")
     }
 
     /// Where `name` is fetched from, if the registry offers it.

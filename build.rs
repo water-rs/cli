@@ -85,24 +85,42 @@ fn register_git_head_rerun(repo_root: &Path) {
 }
 
 /// The repository the `waterui-*` git dependencies pin — where certified
-/// manifests, releases, and `dev` revisions live. Declared once in
-/// `Cargo.toml`; baked in here so runtime code never guesses it.
-fn framework_repository(manifest: &Value) -> &str {
-    let mut repositories: BTreeSet<&str> = ["dependencies", "dev-dependencies"]
-        .into_iter()
-        .filter_map(|table| manifest[table].as_table())
-        .flat_map(|dependencies| dependencies.values())
-        .filter_map(|dependency| dependency.get("git").and_then(Value::as_str))
-        .filter(|git| git.trim_end_matches(".git").ends_with("water-rs/waterui"))
-        .collect();
-    assert!(
-        repositories.len() == 1,
-        "Cargo.toml must pin its waterui-* dependencies on exactly one \
-         water-rs/waterui repository"
-    );
-    repositories
-        .pop_first()
-        .expect("the length check leaves one repository")
+/// manifests, releases, and `dev` revisions live. Every `waterui-*`
+/// dependency must be a git dependency on the same repository at the same
+/// `rev`: a shared type would otherwise exist twice, and a partially bumped
+/// pin would certify against one revision while linking another.
+fn framework_repository(manifest: &Value) -> String {
+    let mut sources: BTreeSet<(String, String)> = BTreeSet::new();
+    for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(dependencies) = manifest[table].as_table() else {
+            continue;
+        };
+        for (name, dependency) in dependencies {
+            if !name.starts_with("waterui-") {
+                continue;
+            }
+            let git = dependency
+                .get("git")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("Cargo.toml [{table}] {name} must be a git dependency"));
+            let rev = dependency
+                .get("rev")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("Cargo.toml [{table}] {name} must pin a rev"));
+            sources.insert((git.to_owned(), rev.to_owned()));
+        }
+    }
+    let mut sources = sources.into_iter();
+    let (git, _) = sources
+        .next()
+        .expect("Cargo.toml declares no waterui-* dependency");
+    if let Some((other_git, other_rev)) = sources.next() {
+        panic!(
+            "Cargo.toml pins waterui-* dependencies on more than one source: {git} and \
+             {other_git}@{other_rev} — move every waterui-* dependency to one git + rev"
+        );
+    }
+    git
 }
 
 fn manifest_scaffold_string(scaffold_metadata: &Value, key: &str) -> String {
