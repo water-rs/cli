@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, ValueEnum};
-use eyre::{Result, bail};
+use eyre::{Context as _, Result, bail};
 use futures_util::StreamExt;
 
 #[cfg(target_os = "macos")]
@@ -20,11 +20,12 @@ use waterui_cli::{
     },
     apple::{
         device::AppleSimulator,
+        physical::ApplePhysicalDevice,
         platform::{build_rust_lib, package_apple},
         toolchain::AppleSdk,
     },
     backend::reinit_backend,
-    build::BuildOptions,
+    build::{BuildOptions, BuildProfile},
     device::{Artifact, Device, DeviceEvent, Local, LogLevel, RunOptions, Running},
     esp32::{backend::Esp32Backend, platform::run_esp32},
     gtk4::{
@@ -40,6 +41,7 @@ use waterui_cli::{
     },
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
     project::Project,
+    web,
 };
 
 #[cfg(target_os = "macos")]
@@ -177,7 +179,7 @@ pub enum TargetBackend {
     Apple,
     /// Android backend (Android Views).
     Android,
-    /// GTK4 backend (Linux only).
+    /// GTK4 backend (Linux only, experimental).
     Gtk4,
     /// Hydrolysis backend (self-drawn renderer).
     Hydrolysis,
@@ -187,6 +189,9 @@ pub enum TargetBackend {
 
 /// Arguments for the run command.
 #[derive(ClapArgs, Debug)]
+// CLI flag structs collect booleans by nature; each flag is a documented
+// `--flag`, not structural state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Args {
     /// Target platform to run on.
     /// Defaults to the host platform when omitted.
@@ -235,6 +240,27 @@ pub struct Args {
         conflicts_with_all = ["platform", "backend", "device", "logs", "native_logs"]
     )]
     tui: bool,
+
+    /// Build in release mode (optimized). The web dev server never runs in a
+    /// release build: `include_web!` renders the staged bundle instead.
+    #[arg(long)]
+    release: bool,
+
+    /// Build for profiling: full release optimization with debug info and
+    /// symbols kept so a profiler can symbolicate the recording.
+    #[arg(long, conflicts_with = "release")]
+    profiling: bool,
+
+    /// Build fully unoptimized, skipping the light optimization `water run`
+    /// applies by default to backends whose per-frame cost is high.
+    #[arg(long, conflicts_with_all = ["release", "profiling"])]
+    debug: bool,
+
+    /// Do not start the frontend dev server for `include_web!` mounts; the
+    /// debug build renders the staged bundle, packaged as `water package`
+    /// does.
+    #[arg(long)]
+    no_dev_server: bool,
 }
 
 /// Parses one `--env KEY=VALUE` argument into its key and value.
@@ -289,8 +315,9 @@ fn resolve_backend(
     let default_backend = match platform {
         TargetPlatform::Ios | TargetPlatform::Macos => TargetBackend::Apple,
         TargetPlatform::Android => TargetBackend::Android,
-        TargetPlatform::Linux => TargetBackend::Gtk4,
-        TargetPlatform::Windows | TargetPlatform::Web => TargetBackend::Hydrolysis,
+        TargetPlatform::Linux | TargetPlatform::Windows | TargetPlatform::Web => {
+            TargetBackend::Hydrolysis
+        }
         TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4 => {
             TargetBackend::Dew
         }
@@ -347,7 +374,7 @@ const fn default_backend_priority(platform: TargetPlatform) -> &'static [TargetB
         TargetPlatform::Ios => &[TargetBackend::Apple],
         TargetPlatform::Android => &[TargetBackend::Android],
         TargetPlatform::Macos => &[TargetBackend::Apple, TargetBackend::Hydrolysis],
-        TargetPlatform::Linux => &[TargetBackend::Gtk4, TargetBackend::Hydrolysis],
+        TargetPlatform::Linux => &[TargetBackend::Hydrolysis, TargetBackend::Gtk4],
         TargetPlatform::Windows | TargetPlatform::Web => &[TargetBackend::Hydrolysis],
         TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4 => {
             &[TargetBackend::Dew]
@@ -431,7 +458,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.device.as_deref(),
     )
     .await?;
-    let config = build_run_config(shell, &host, &args, &context.project).await;
+    let config = build_run_config(shell, &host, &args, &context.project, context.backend).await;
 
     #[cfg(target_os = "macos")]
     let mut crash_ctx =
@@ -443,7 +470,10 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
             }
         };
 
-    let running = shell
+    // The dev-server guard is held for the app's whole run: dropping it —
+    // on app exit, normal return, or the Ctrl-C future-drop — kills the
+    // bundler child (`kill_on_drop`).
+    let (running, _dev_server) = shell
         .display_output(build_and_run(
             shell,
             &host,
@@ -510,6 +540,13 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<RunContext> {
     let mut project = Project::open(&project_path).await?;
     let platform = resolve_platform(args.platform);
     let backend = resolve_run_backend(&project, platform, args.backend)?;
+
+    if backend == TargetBackend::Gtk4 {
+        warn!(
+            shell,
+            "The GTK4 backend is experimental — hydrolysis is the default"
+        );
+    }
 
     validate_desktop_backend_platform_on_host(platform, backend)?;
     validate_device_arg(platform, backend, args.device.as_deref())?;
@@ -704,8 +741,8 @@ async fn run_web_app(shell: &Shell, project: &Project) -> Result<()> {
 async fn run_esp32_app(shell: &Shell, project: &Project, device: Option<&str>) -> Result<()> {
     let sccache_path = detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await;
     let build_options = sccache_path.map_or_else(
-        || BuildOptions::development(false),
-        |sccache| BuildOptions::development(false).with_sccache(sccache),
+        || BuildOptions::development(BuildProfile::Debug),
+        |sccache| BuildOptions::development(BuildProfile::Debug).with_sccache(sccache),
     );
 
     let _ = shell.status(">", "Building ESP32 firmware...");
@@ -722,11 +759,7 @@ async fn select_run_device(
     project: &Project,
     device_id: Option<&str>,
 ) -> Result<DeviceSelection> {
-    let spinner = shell.spinner("Scanning for devices...");
-    let device = find_device(host, platform, backend, project, device_id).await?;
-    if let Some(pb) = spinner {
-        pb.finish_and_clear();
-    }
+    let device = find_device(shell, host, platform, backend, project, device_id).await?;
 
     let needs_launch = device.needs_launch();
     if needs_launch {
@@ -746,6 +779,7 @@ async fn build_run_config(
     host: &waterui_cli::toolchain::Host,
     args: &Args,
     project: &Project,
+    backend: TargetBackend,
 ) -> BuildRunConfig {
     let sccache_path = detect_sccache_path(shell, host).await;
     let mut run_options = RunOptions::new();
@@ -759,9 +793,33 @@ async fn build_run_config(
         run_options.insert_env_var(key.clone(), value.clone());
     }
 
+    let profile = run_profile(args, backend);
     BuildRunConfig {
         run_options,
         sccache_path,
+        profile,
+        dev_server: !profile.is_release() && !args.no_dev_server,
+    }
+}
+
+/// Resolve the Cargo profile `water run` builds under.
+///
+/// Self-drawn backends (Hydrolysis) spend their per-frame budget in the
+/// rendering stack, so a plain `water run` lifts the dev profile to a light
+/// optimization level rather than paying debug-code frame times. `--debug`
+/// opts back into a fully unoptimized build; `--release` and `--profiling`
+/// select the release profile without and with debug info.
+const fn run_profile(args: &Args, backend: TargetBackend) -> BuildProfile {
+    if args.release {
+        BuildProfile::Release
+    } else if args.profiling {
+        BuildProfile::Profiling
+    } else if args.debug {
+        BuildProfile::Debug
+    } else if matches!(backend, TargetBackend::Hydrolysis) {
+        BuildProfile::Optimized
+    } else {
+        BuildProfile::Debug
     }
 }
 
@@ -855,26 +913,110 @@ async fn build_and_run(
     backend: TargetBackend,
     selection: DeviceSelection,
     config: BuildRunConfig,
-) -> Result<Running> {
+) -> Result<(Running, Option<web::WebDevServer>)> {
     let build_plan = resolve_build_plan(cli_platform, backend, &selection.device)?;
+    let physical_ios = is_physical_ios(&selection.device);
     let launch_task =
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
     let _ = shell.status(">", "Building...");
     build_for_backend(project, backend, &build_plan, build_options(&config)).await?;
 
+    // A declared `include_web!` mount is served by the bundler's own dev
+    // server in debug runs — spawn it after the Rust build (its root comes
+    // from the compiled metadata) and before packaging, so the packaged app
+    // stages no web output.
+    let dev_server = if config.dev_server {
+        start_web_dev_server(shell, project, config.sccache_path.as_deref(), physical_ios).await?
+    } else {
+        None
+    };
+
     let _ = shell.status(">", "Packaging...");
-    let artifact = package_for_backend(project, backend, &build_plan).await?;
+    let artifact = package_for_backend(
+        project,
+        backend,
+        &build_plan,
+        config.profile.is_release(),
+        dev_server.is_some(),
+    )
+    .await?;
 
     if selection.needs_launch {
         let _ = shell.status(">", "Waiting for device...");
     }
     let device = launch_task.await?;
 
-    let _ = shell.status(">", "Running...");
-    let running = run_with_options(host, device, artifact, config.run_options).await?;
+    let mut run_options = config.run_options;
+    if let Some(server) = &dev_server {
+        apply_dev_url_handoff(&device, server.url(), &mut run_options)?;
+    }
 
-    Ok(running)
+    let _ = shell.status(">", "Running...");
+    let running = run_with_options(host, device, artifact, run_options).await?;
+
+    Ok((running, dev_server))
+}
+
+/// Spawn the declared frontend's dev server for a debug run, when the
+/// compiled library mounts one with `include_web!`.
+async fn start_web_dev_server(
+    shell: &Shell,
+    project: &Project,
+    sccache_path: Option<&std::path::Path>,
+    expose_on_lan: bool,
+) -> Result<Option<web::WebDevServer>> {
+    let Some(meta) = web::web_mount(project, sccache_path).await? else {
+        return Ok(None);
+    };
+    let root = meta
+        .project
+        .as_ref()
+        .expect("web_mount only returns a mount that declares a project");
+    let package_manager = project
+        .manifest()
+        .web
+        .as_ref()
+        .map_or_else(web::PackageManager::default, |web| web.package_manager);
+    if !package_manager.is_installed().await {
+        bail!(
+            "`{}` is not installed; run `water doctor`",
+            package_manager.binary()
+        );
+    }
+    let script = web::dev_script(root)?;
+    let _ = shell.status(
+        ">",
+        format!("Starting `{} run {script}`", package_manager.binary()),
+    );
+    let server = web::WebDevServer::spawn(package_manager, root, &script, expose_on_lan).await?;
+    let _ = shell.status(">", format!("Dev server ready at {}", server.url()));
+    Ok(Some(server))
+}
+
+/// Route the dev-server URL into the selected target's launch channel.
+fn apply_dev_url_handoff(
+    device: &SelectedDevice,
+    url: &url::Url,
+    run_options: &mut RunOptions,
+) -> Result<()> {
+    let target = match device {
+        SelectedDevice::Local(_) => web::DevTarget::Desktop,
+        SelectedDevice::AppleSimulator(_) => web::DevTarget::IosSimulator,
+        SelectedDevice::ApplePhysical(_) => web::DevTarget::IosDevice,
+        SelectedDevice::AndroidDevice(_) | SelectedDevice::AndroidEmulator(_) => {
+            web::DevTarget::Android
+        }
+    };
+    // Every launch path forwards `WATERUI_DEV_URL` in the environment —
+    // `cmd.env`/`open --env` on desktop, `SIMCTL_CHILD_*` under `simctl
+    // launch`, `devicectl -e` on a physical device, and the `waterui.env.`
+    // intent extra on Android (where `run_on_android` additionally makes the
+    // port reachable with `adb reverse`). A physical device cannot reach the
+    // Mac's loopback, so its URL is rewritten to the LAN address first.
+    let url = web::device_facing_url(target, url)?;
+    run_options.insert_env_var(web::DEV_URL_ENV.to_string(), url.to_string());
+    Ok(())
 }
 
 fn resolve_build_plan(
@@ -883,7 +1025,15 @@ fn resolve_build_plan(
     device: &SelectedDevice,
 ) -> Result<BuildPlan> {
     let lib_platform = match cli_platform {
-        TargetPlatform::Ios => LibTargetPlatform::IOSSimulator,
+        // The device decides the iOS SDK: a physical device builds
+        // `aarch64-apple-ios` (iphoneos), a simulator `*-apple-ios-sim`.
+        TargetPlatform::Ios => {
+            if is_physical_ios(device) {
+                LibTargetPlatform::IOS
+            } else {
+                LibTargetPlatform::IOSSimulator
+            }
+        }
         TargetPlatform::Macos => LibTargetPlatform::MacOS,
         TargetPlatform::Android => LibTargetPlatform::Android,
         TargetPlatform::Linux => LibTargetPlatform::Linux,
@@ -926,6 +1076,7 @@ fn spawn_device_launch_task(
         if needs_launch {
             match &device {
                 SelectedDevice::AppleSimulator(sim) => sim.launch(&host).await?,
+                SelectedDevice::ApplePhysical(dev) => dev.launch(&host).await?,
                 SelectedDevice::Local(local) => local.launch(&host).await?,
                 SelectedDevice::AndroidDevice(dev) => dev.launch(&host).await?,
                 SelectedDevice::AndroidEmulator(emu) => emu.launch(&host).await?,
@@ -936,10 +1087,14 @@ fn spawn_device_launch_task(
 }
 
 fn build_options(config: &BuildRunConfig) -> BuildOptions {
-    config.sccache_path.as_ref().map_or_else(
-        || BuildOptions::development(false),
-        |sccache| BuildOptions::development(false).with_sccache(sccache.clone()),
-    )
+    config
+        .sccache_path
+        .as_ref()
+        .map_or_else(
+            || BuildOptions::development(config.profile),
+            |sccache| BuildOptions::development(config.profile).with_sccache(sccache.clone()),
+        )
+        .with_dev_server(config.dev_server)
 }
 
 async fn build_for_backend(
@@ -978,8 +1133,12 @@ async fn package_for_backend(
     project: &Project,
     backend: TargetBackend,
     plan: &BuildPlan,
+    release: bool,
+    dev_server: bool,
 ) -> Result<Artifact> {
-    let package_options = PackageOptions::development();
+    let package_options = PackageOptions::development()
+        .with_debug(!release)
+        .with_dev_server(dev_server);
     match backend {
         TargetBackend::Apple => package_apple(project, plan.lib_platform, package_options).await,
         TargetBackend::Android => {
@@ -999,6 +1158,12 @@ async fn package_for_backend(
 struct BuildRunConfig {
     run_options: RunOptions,
     sccache_path: Option<PathBuf>,
+    /// The Cargo profile the run builds under — see `run_profile`.
+    profile: BuildProfile,
+    /// Whether a declared `include_web!` mount may be served by the bundler's
+    /// dev server: non-release profiles only, unless `--no-dev-server` opts
+    /// out.
+    dev_server: bool,
 }
 
 /// Run artifact on device.
@@ -1010,6 +1175,7 @@ async fn run_with_options(
 ) -> Result<Running> {
     let running = match device {
         SelectedDevice::AppleSimulator(sim) => sim.run(host, artifact, run_options).await?,
+        SelectedDevice::ApplePhysical(dev) => dev.run(host, artifact, run_options).await?,
         SelectedDevice::Local(local) => local.run(host, artifact, run_options).await?,
         SelectedDevice::AndroidDevice(dev) => dev.run(host, artifact, run_options).await?,
         SelectedDevice::AndroidEmulator(emu) => emu.run(host, artifact, run_options).await?,
@@ -1021,6 +1187,8 @@ async fn run_with_options(
 /// A device that can be selected for running.
 enum SelectedDevice {
     AppleSimulator(AppleSimulator),
+    /// A paired physical iOS device (USB or "Connect via network").
+    ApplePhysical(ApplePhysicalDevice),
     /// Local machine - used for desktop backends and macOS Apple backend.
     Local(Local),
     AndroidDevice(AndroidDevice),
@@ -1032,10 +1200,348 @@ impl SelectedDevice {
     fn needs_launch(&self) -> bool {
         match self {
             Self::AppleSimulator(sim) => sim.state != "Booted",
-            Self::Local(_) | Self::AndroidDevice(_) => false,
+            Self::ApplePhysical(_) | Self::Local(_) | Self::AndroidDevice(_) => false,
             Self::AndroidEmulator(_) => true,
         }
     }
+}
+
+/// Whether the selected device is a physical iOS device — the one target
+/// whose dev-server URL and launch channel differ from every other.
+const fn is_physical_ios(device: &SelectedDevice) -> bool {
+    matches!(device, SelectedDevice::ApplePhysical(_))
+}
+
+/// One selectable run target, flattened across simulators, physical devices,
+/// and emulators so the remembered-device check and the picker see one list.
+struct DeviceCandidate {
+    device: SelectedDevice,
+    /// Identifier persisted as the last-used device in `~/.water/config.toml`.
+    id: String,
+    /// Label shown in the interactive picker and non-interactive listings.
+    label: String,
+}
+
+/// `~/.water/config.toml` key for the device a `(backend, platform)` last
+/// ran on.
+const fn device_memory_key(backend: TargetBackend, platform: TargetPlatform) -> &'static str {
+    match (backend, platform) {
+        (TargetBackend::Apple, TargetPlatform::Ios) => "apple/ios",
+        (TargetBackend::Android, TargetPlatform::Android) => "android/android",
+        // Device memory only exists for targets with a device dimension.
+        _ => unreachable!(),
+    }
+}
+
+/// The device last used for `key`, if the config records one. A config read
+/// failure is a warning, not a run failure.
+async fn remembered_device(key: &str) -> Option<String> {
+    match waterui_cli::water_dir::ensure_global_config().await {
+        Ok(config) => config.last_used_device.get(key).cloned(),
+        Err(error) => {
+            tracing::warn!("could not read the Water config for device memory: {error:#}");
+            None
+        }
+    }
+}
+
+/// Record `id` as the last-used device for `key`. Best-effort: a config
+/// write failure must not break a run.
+async fn persist_device_choice(key: &str, id: &str) {
+    match waterui_cli::water_dir::ensure_global_config().await {
+        Ok(mut config) => {
+            if config.last_used_device.get(key).map(String::as_str) == Some(id) {
+                return;
+            }
+            config
+                .last_used_device
+                .insert(key.to_owned(), id.to_owned());
+            if let Err(error) = waterui_cli::water_dir::write_global_config(&config).await {
+                tracing::warn!("could not persist the last-used device: {error:#}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!("could not read the Water config for device memory: {error:#}");
+        }
+    }
+}
+
+/// What `device_choice` resolved for a no-`--device` run.
+#[derive(Debug)]
+enum DeviceChoice {
+    /// Run `candidates[index]`; `persist` records it as the last-used device.
+    Use(usize, bool),
+    /// The remembered device is gone — the caller warns and chooses among
+    /// the candidates as if nothing were remembered.
+    Stale(String),
+    /// Multiple candidates and no memory — a human must pick.
+    Prompt,
+}
+
+/// Pure selection rule: a remembered device still present wins; a single
+/// candidate is unambiguous; otherwise the user must be asked.
+fn device_choice(candidates: &[DeviceCandidate], remembered: Option<&str>) -> DeviceChoice {
+    if let Some(id) = remembered {
+        return candidates.iter().position(|c| c.id == id).map_or_else(
+            || DeviceChoice::Stale(id.to_owned()),
+            |index| DeviceChoice::Use(index, false),
+        );
+    }
+    if candidates.len() == 1 {
+        DeviceChoice::Use(0, false)
+    } else {
+        DeviceChoice::Prompt
+    }
+}
+
+/// Ask which device to use. Non-interactive runs cannot pick, so they fail
+/// with the candidate list.
+fn prompt_for_device(
+    shell: &Shell,
+    prompt: &str,
+    candidates: &[DeviceCandidate],
+    spinner: Option<&indicatif::ProgressBar>,
+) -> Result<usize> {
+    use std::fmt::Write as _;
+    if !shell.is_terminal() {
+        let list = candidates.iter().fold(String::new(), |mut out, candidate| {
+            write!(out, "\n  {} — {}", candidate.label, candidate.id)
+                .expect("writing to a String cannot fail");
+            out
+        });
+        bail!("Several devices are available; pass --device to choose one:{list}");
+    }
+    let labels: Vec<&str> = candidates.iter().map(|c| c.label.as_str()).collect();
+    let pick = || {
+        dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+            .with_prompt(prompt)
+            .items(&labels)
+            .default(0)
+            .interact()
+    };
+    // The scan spinner would redraw over the prompt; hide it while the user
+    // answers.
+    Ok(spinner.map_or_else(&pick, |pb| pb.suspend(pick))?)
+}
+
+/// Pick one device out of `candidates`: the remembered last-used device when
+/// it is still present, the single candidate when unambiguous, otherwise an
+/// interactive picker. Choices the user or an explicit query make are
+/// persisted; an unambiguous single candidate only writes when it repairs a
+/// stale memory.
+async fn choose_device_candidate(
+    shell: &Shell,
+    memory_key: &str,
+    prompt: &str,
+    candidates: Vec<DeviceCandidate>,
+    spinner: Option<&indicatif::ProgressBar>,
+) -> Result<SelectedDevice> {
+    debug_assert!(!candidates.is_empty());
+
+    let mut remembered = remembered_device(memory_key).await;
+    let mut stale_memory = false;
+    let (index, persist) = loop {
+        match device_choice(&candidates, remembered.as_deref()) {
+            DeviceChoice::Use(index, persist) => break (index, persist || stale_memory),
+            DeviceChoice::Stale(id) => {
+                warn!(shell, "Last-used device \"{id}\" is not available");
+                remembered = None;
+                stale_memory = true;
+            }
+            DeviceChoice::Prompt => {
+                break (
+                    prompt_for_device(shell, prompt, &candidates, spinner)?,
+                    true,
+                );
+            }
+        }
+    };
+
+    let candidate = candidates
+        .into_iter()
+        .nth(index)
+        .expect("the index came from the candidate list");
+    if persist {
+        persist_device_choice(memory_key, &candidate.id).await;
+    }
+    Ok(candidate.device)
+}
+
+/// Select the iOS target. An explicit `--device` may name a paired physical
+/// device or a simulator (matched by identifier, UDID, or name); without
+/// one, the remembered last-used device wins, then an unambiguous single
+/// candidate, then the picker.
+async fn select_ios_device(
+    shell: &Shell,
+    host: &waterui_cli::toolchain::Host,
+    project: &Project,
+    device_id: Option<&str>,
+    spinner: Option<&indicatif::ProgressBar>,
+) -> Result<SelectedDevice> {
+    let physical = ApplePhysicalDevice::scan(host)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!("devicectl device scan failed: {error:#}");
+            Vec::new()
+        });
+
+    if let Some(query) = device_id {
+        if let Some(device) = select_physical_ios(host, &physical, project, query).await? {
+            persist_device_choice(
+                device_memory_key(TargetBackend::Apple, TargetPlatform::Ios),
+                &device.identifier,
+            )
+            .await;
+            return Ok(SelectedDevice::ApplePhysical(device));
+        }
+        let sim = AppleSimulator::select_ios(host, project, Some(query)).await?;
+        persist_device_choice(
+            device_memory_key(TargetBackend::Apple, TargetPlatform::Ios),
+            &sim.udid,
+        )
+        .await;
+        return Ok(SelectedDevice::AppleSimulator(sim));
+    }
+
+    let candidates = ios_device_candidates(host, project, &physical).await?;
+    if candidates.is_empty() {
+        // Reuse the simulator path's diagnosis — it lists every simulator and
+        // the required runtime.
+        return Ok(SelectedDevice::AppleSimulator(
+            AppleSimulator::select_ios(host, project, None).await?,
+        ));
+    }
+    choose_device_candidate(
+        shell,
+        device_memory_key(TargetBackend::Apple, TargetPlatform::Ios),
+        "Select an iOS device",
+        candidates,
+        spinner,
+    )
+    .await
+}
+
+/// Every device that can run the app on iOS: qualifying simulators (booted
+/// first, the historic preference), then usable paired devices.
+async fn ios_device_candidates(
+    host: &waterui_cli::toolchain::Host,
+    project: &Project,
+    physical: &[ApplePhysicalDevice],
+) -> Result<Vec<DeviceCandidate>> {
+    let ios_version = |version: Option<&semver::Version>| {
+        version.map_or_else(|| String::from("an unknown iOS"), |v| format!("iOS {v}"))
+    };
+    let deployment_target = |target_platform: LibTargetPlatform| async move {
+        let (_, target) =
+            waterui_cli::apple::platform::apple_deployment_target(project, target_platform).await?;
+        waterui_cli::utils::parse_semver_version(&target).wrap_err_with(|| {
+            format!("Failed to parse the project's IPHONEOS_DEPLOYMENT_TARGET `{target}`")
+        })
+    };
+    let sim_target = deployment_target(LibTargetPlatform::IOSSimulator).await?;
+    let device_target = deployment_target(LibTargetPlatform::IOS).await?;
+
+    let mut simulators = AppleSimulator::scan_ios(host).await?;
+    simulators.retain(|sim| sim.supports_deployment_target(&sim_target));
+    simulators.sort_by_key(|sim| usize::from(sim.state != "Booted"));
+    let mut candidates: Vec<DeviceCandidate> = simulators
+        .into_iter()
+        .map(|sim| DeviceCandidate {
+            label: format!(
+                "{} — {} ({})",
+                sim.name,
+                ios_version(sim.runtime_version.as_ref()),
+                sim.state
+            ),
+            id: sim.udid.clone(),
+            device: SelectedDevice::AppleSimulator(sim),
+        })
+        .collect();
+
+    candidates.extend(
+        physical
+            .iter()
+            .filter(|device| {
+                device.usability().is_ok() && device.supports_deployment_target(&device_target)
+            })
+            .map(|device| DeviceCandidate {
+                label: format!(
+                    "{} — {} ({})",
+                    device.name,
+                    ios_version(device.os_version.as_ref()),
+                    match device.transport {
+                        waterui_cli::apple::physical::Transport::Wired => "USB",
+                        waterui_cli::apple::physical::Transport::LocalNetwork => "Wi-Fi",
+                        waterui_cli::apple::physical::Transport::Other => "paired",
+                    }
+                ),
+                id: device.identifier.clone(),
+                device: SelectedDevice::ApplePhysical(device.clone()),
+            }),
+    );
+    Ok(candidates)
+}
+
+/// Match a `--device` query against paired physical devices.
+///
+/// Returns `Ok(None)` when nothing matches — the query may still name a
+/// simulator. A matched device that cannot run the app (unreachable, no
+/// Developer Mode, too-old OS) is an error naming the remedy rather than a
+/// silent miss.
+async fn select_physical_ios(
+    host: &waterui_cli::toolchain::Host,
+    devices: &[ApplePhysicalDevice],
+    project: &Project,
+    query: &str,
+) -> Result<Option<ApplePhysicalDevice>> {
+    let matches: Vec<&ApplePhysicalDevice> = devices
+        .iter()
+        .filter(|device| device.identifier == query || device.udid == query || device.name == query)
+        .collect();
+    let device = match matches.as_slice() {
+        [] => return Ok(None),
+        [device] => *device,
+        candidates => {
+            use std::fmt::Write as _;
+            let list = candidates.iter().fold(String::new(), |mut out, device| {
+                write!(out, "\n  {} ({})", device.name, device.identifier)
+                    .expect("writing to a String cannot fail");
+                out
+            });
+            bail!(
+                "Device \"{query}\" matches {} devices; select one by identifier:{list}",
+                candidates.len()
+            );
+        }
+    };
+
+    if let Err(reason) = device.usability() {
+        bail!("{}", reason.remedy(device));
+    }
+
+    let (_, target) =
+        waterui_cli::apple::platform::apple_deployment_target(project, LibTargetPlatform::IOS)
+            .await?;
+    let deployment_target =
+        waterui_cli::utils::parse_semver_version(&target).wrap_err_with(|| {
+            format!("Failed to parse the project's IPHONEOS_DEPLOYMENT_TARGET `{target}`")
+        })?;
+    if !device.supports_deployment_target(&deployment_target) {
+        bail!(
+            "{} runs {}, but this app requires iOS {deployment_target} (IPHONEOS_DEPLOYMENT_TARGET)",
+            device.name,
+            device.os_version.as_ref().map_or_else(
+                || String::from("an unknown iOS version"),
+                |v| format!("iOS {v}")
+            ),
+        );
+    }
+
+    // A device build must be signed; check the keychain has a development
+    // identity now rather than after a multi-minute build.
+    waterui_cli::apple::toolchain::development_team_id(host).await?;
+
+    Ok(Some(device.clone()))
 }
 
 async fn check_toolchain_for_backend(
@@ -1096,6 +1602,7 @@ async fn check_toolchain_for_backend(
 }
 
 async fn find_device(
+    shell: &Shell,
     host: &waterui_cli::toolchain::Host,
     platform: TargetPlatform,
     backend: TargetBackend,
@@ -1107,50 +1614,20 @@ async fn find_device(
         return Ok(SelectedDevice::Local(Local));
     }
 
-    match platform {
-        TargetPlatform::Ios => Ok(SelectedDevice::AppleSimulator(
-            AppleSimulator::select_ios(host, project, device_id).await?,
-        )),
+    let spinner = shell.spinner("Scanning for devices...");
+    let device = match platform {
+        TargetPlatform::Ios => {
+            select_ios_device(shell, host, project, device_id, spinner.as_ref()).await
+        }
         TargetPlatform::Macos => {
             // macOS with Apple backend uses the local machine
             Ok(SelectedDevice::Local(Local))
         }
         TargetPlatform::Android => {
-            let devices = AndroidDevice::scan(host).await?;
-
-            if let Some(id) = device_id {
-                // Find specific device
-                for dev in devices {
-                    if dev.identifier() == id {
-                        return Ok(SelectedDevice::AndroidDevice(dev));
-                    }
-                }
-                bail!("Device not found: {id}");
-            }
-
-            // If we have a connected device, use it
-            if let Some(dev) = devices.into_iter().next() {
-                return Ok(SelectedDevice::AndroidDevice(dev));
-            }
-
-            // No connected devices - try to find an emulator AVD
-            let avds = AndroidPlatform::list_avds(host).await?;
-            let avd_name = avds.into_iter().next().ok_or_else(|| {
-                eyre::eyre!(
-                    "No Android devices connected and no emulators available. Create an emulator with Android Studio or `avdmanager`, or connect a device."
-                )
-            })?;
-
-            Ok(SelectedDevice::AndroidEmulator(
-                AndroidEmulator::open(host, avd_name).await?,
-            ))
+            select_android_device(shell, host, device_id, spinner.as_ref()).await
         }
-        TargetPlatform::Linux => {
-            // Linux runs on the local machine
-            Ok(SelectedDevice::Local(Local))
-        }
-        TargetPlatform::Windows => {
-            // Windows runs on the local machine
+        TargetPlatform::Linux | TargetPlatform::Windows => {
+            // Linux and Windows run on the local machine
             Ok(SelectedDevice::Local(Local))
         }
         TargetPlatform::Web => {
@@ -1159,12 +1636,70 @@ async fn find_device(
         TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4 => {
             bail!("esp32 platform does not use the device pipeline");
         }
+    };
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
     }
+    device
+}
+
+/// Select the Android target. An explicit `--device` names a connected
+/// device serial or an AVD; without one, the remembered last-used device
+/// wins, then an unambiguous single candidate, then the picker.
+async fn select_android_device(
+    shell: &Shell,
+    host: &waterui_cli::toolchain::Host,
+    device_id: Option<&str>,
+    spinner: Option<&indicatif::ProgressBar>,
+) -> Result<SelectedDevice> {
+    const KEY: &str = device_memory_key(TargetBackend::Android, TargetPlatform::Android);
+    let devices = AndroidDevice::scan(host).await?;
+    let avds = AndroidPlatform::list_avds(host).await?;
+
+    if let Some(query) = device_id {
+        for dev in devices {
+            if dev.identifier() == query {
+                persist_device_choice(KEY, dev.identifier()).await;
+                return Ok(SelectedDevice::AndroidDevice(dev));
+            }
+        }
+        if avds.iter().any(|avd| avd == query) {
+            persist_device_choice(KEY, query).await;
+            return Ok(SelectedDevice::AndroidEmulator(
+                AndroidEmulator::open(host, query.to_string()).await?,
+            ));
+        }
+        bail!("Device not found: {query}");
+    }
+
+    let mut candidates: Vec<DeviceCandidate> = devices
+        .into_iter()
+        .map(|dev| DeviceCandidate {
+            label: format!("{} (connected)", dev.identifier()),
+            id: dev.identifier().to_owned(),
+            device: SelectedDevice::AndroidDevice(dev),
+        })
+        .collect();
+    for avd in avds {
+        candidates.push(DeviceCandidate {
+            label: format!("{avd} (emulator)"),
+            id: avd.clone(),
+            device: SelectedDevice::AndroidEmulator(AndroidEmulator::open(host, avd).await?),
+        });
+    }
+
+    if candidates.is_empty() {
+        bail!(
+            "No Android devices connected and no emulators available. Create an emulator with Android Studio or `avdmanager`, or connect a device."
+        );
+    }
+    choose_device_candidate(shell, KEY, "Select an Android device", candidates, spinner).await
 }
 
 fn device_name(device: &SelectedDevice) -> String {
     match device {
         SelectedDevice::AppleSimulator(sim) => sim.name.clone(),
+        SelectedDevice::ApplePhysical(dev) => dev.name.clone(),
         SelectedDevice::Local(local) => local.name().to_string(),
         SelectedDevice::AndroidDevice(dev) => dev.identifier().to_string(),
         SelectedDevice::AndroidEmulator(emu) => format!("{} (emulator)", emu.avd_name()),
@@ -1173,7 +1708,7 @@ fn device_name(device: &SelectedDevice) -> String {
 
 const fn platform_name(platform: TargetPlatform) -> &'static str {
     match platform {
-        TargetPlatform::Ios => "iOS Simulator",
+        TargetPlatform::Ios => "iOS",
         TargetPlatform::Android => "Android",
         TargetPlatform::Macos => "macOS",
         TargetPlatform::Linux => "Linux",
@@ -1200,17 +1735,21 @@ fn validate_device_arg(
     backend: TargetBackend,
     device: Option<&str>,
 ) -> Result<()> {
-    if platform == TargetPlatform::Web && device.is_some() {
+    if device.is_none() {
+        return Ok(());
+    }
+
+    if platform == TargetPlatform::Web {
         bail!("--device is not supported with the web platform");
     }
 
-    if matches!(backend, TargetBackend::Gtk4 | TargetBackend::Hydrolysis)
-        && platform != TargetPlatform::Web
-        && device.is_some()
-    {
-        bail!(
-            "--device is not supported with desktop backends (gtk4/hydrolysis run on the local machine)"
-        );
+    // Targets without a device dimension always run on this machine; a
+    // `--device` there can only be a mistake, so reject it instead of
+    // silently ignoring it.
+    let local_only = matches!(backend, TargetBackend::Gtk4 | TargetBackend::Hydrolysis)
+        || (platform, backend) == (TargetPlatform::Macos, TargetBackend::Apple);
+    if local_only {
+        bail!("--device is not supported: this target always runs on the local machine");
     }
     Ok(())
 }
@@ -1341,11 +1880,12 @@ fn handle_device_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendAvailability, TargetBackend, TargetPlatform, handle_device_event,
-        parse_env_assignment, resolve_backend, resolve_default_backend_for_project,
-        resolve_platform, validate_desktop_backend_platform_on_host, validate_device_arg,
+        BackendAvailability, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend,
+        TargetPlatform, device_choice, handle_device_event, parse_env_assignment,
+        prompt_for_device, resolve_backend, resolve_default_backend_for_project, resolve_platform,
+        validate_desktop_backend_platform_on_host, validate_device_arg,
     };
-    use waterui_cli::device::{ApplicationExit, DeviceEvent};
+    use waterui_cli::device::{ApplicationExit, DeviceEvent, Local};
 
     #[test]
     fn env_assignment_splits_on_first_equals() {
@@ -1387,6 +1927,77 @@ mod tests {
     }
 
     #[test]
+    fn rejects_device_on_local_only_targets() {
+        // The Apple backend on macOS has exactly one device — this machine —
+        // so --device can only be a mistake.
+        let err = validate_device_arg(TargetPlatform::Macos, TargetBackend::Apple, Some("foo"))
+            .expect_err("apple/macos with --device should fail");
+        assert!(err.to_string().contains("--device is not supported"));
+        let err = validate_device_arg(TargetPlatform::Web, TargetBackend::Hydrolysis, Some("foo"))
+            .expect_err("web with --device should fail");
+        assert!(err.to_string().contains("--device is not supported"));
+    }
+
+    #[test]
+    fn device_choice_prefers_remembered_device() {
+        let candidates = vec![
+            device_candidate("sim-1"),
+            device_candidate("phys-1"),
+            device_candidate("sim-2"),
+        ];
+        match device_choice(&candidates, Some("phys-1")) {
+            DeviceChoice::Use(1, false) => {}
+            other => panic!("expected Use(1, false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_choice_reports_stale_memory() {
+        let candidates = vec![device_candidate("sim-1")];
+        match device_choice(&candidates, Some("gone")) {
+            DeviceChoice::Stale(id) => assert_eq!(id, "gone"),
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_choice_single_candidate_is_unambiguous() {
+        let candidates = vec![device_candidate("sim-1")];
+        match device_choice(&candidates, None) {
+            DeviceChoice::Use(0, false) => {}
+            other => panic!("expected Use(0, false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_choice_multiple_candidates_prompts() {
+        let candidates = vec![device_candidate("a"), device_candidate("b")];
+        assert!(matches!(
+            device_choice(&candidates, None),
+            DeviceChoice::Prompt
+        ));
+    }
+
+    #[test]
+    fn non_interactive_multi_device_error_lists_candidates() {
+        let shell = crate::shell::Shell::new(true);
+        let candidates = vec![device_candidate("serial-a"), device_candidate("avd-b")];
+        let err = prompt_for_device(&shell, "Pick", &candidates, None)
+            .expect_err("non-interactive runs cannot pick");
+        let message = err.to_string();
+        assert!(message.contains("--device"));
+        assert!(message.contains("serial-a") && message.contains("avd-b"));
+    }
+
+    fn device_candidate(id: &str) -> DeviceCandidate {
+        DeviceCandidate {
+            device: SelectedDevice::Local(Local),
+            id: id.to_owned(),
+            label: id.to_owned(),
+        }
+    }
+
+    #[test]
     fn clean_device_exit_stops_without_error() {
         let shell = crate::shell::Shell::new(false);
         let should_stop = handle_device_event(
@@ -1418,7 +2029,7 @@ mod tests {
         );
         assert_eq!(
             resolve_backend(TargetPlatform::Linux, None).expect("linux backend"),
-            TargetBackend::Gtk4
+            TargetBackend::Hydrolysis
         );
         assert_eq!(
             resolve_backend(TargetPlatform::Windows, None).expect("windows backend"),
@@ -1448,12 +2059,25 @@ mod tests {
             ),
             TargetBackend::Hydrolysis
         );
+        // Hydrolysis is the Linux default even with no backend configured;
+        // GTK4 stays selectable but experimental.
         assert_eq!(
             resolve_default_backend_for_project(
                 TargetPlatform::Linux,
                 false,
                 BackendAvailability {
                     available: [false, false, false, false, false],
+                }
+            ),
+            TargetBackend::Hydrolysis
+        );
+        // GTK4 remains selectable when it is the only configured backend.
+        assert_eq!(
+            resolve_default_backend_for_project(
+                TargetPlatform::Linux,
+                false,
+                BackendAvailability {
+                    available: [false, false, true, false, false],
                 }
             ),
             TargetBackend::Gtk4
@@ -1480,7 +2104,7 @@ mod tests {
                     available: [false, false, false, true, false],
                 }
             ),
-            TargetBackend::Gtk4
+            TargetBackend::Hydrolysis
         );
     }
 

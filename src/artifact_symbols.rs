@@ -257,4 +257,160 @@ mod tests {
             );
         });
     }
+
+    /// `#[used]` is linker-retained (`no_dead_strip` on Mach-O), so every
+    /// `waterui_meta_*` static is `#[cfg(debug_assertions)]`: a release rlib
+    /// must carry none. Discovery never reads the target build anyway — the
+    /// CLI builds a dev-profile host rlib.
+    #[test]
+    fn release_rlib_carries_no_meta_statics() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/meta_static");
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--lib", "--release"])
+            .current_dir(&fixture)
+            .status()
+            .expect("cargo build --release runs");
+        assert!(status.success(), "the release fixture build must succeed");
+        let symbols = ArtifactSymbols::read(&fixture.join("target/release/libmeta_static.rlib"))
+            .expect("release rlib should parse");
+        assert!(
+            symbols.leaves_with_prefix("waterui_meta_").is_empty(),
+            "a release rlib must not carry waterui_meta_* statics"
+        );
+    }
+
+    /// The `web_meta` fixture staged against the pinned framework: its sources
+    /// copied beside a manifest whose `waterui` dependency is the git pin this
+    /// crate's own manifest carries, so the revision lives in one place.
+    fn web_meta_fixture() -> tempfile::TempDir {
+        #[derive(serde::Serialize)]
+        struct Manifest {
+            package: Package,
+            workspace: toml::Table,
+            dependencies: std::collections::BTreeMap<&'static str, Dependency>,
+            patch: Patch,
+        }
+        #[derive(serde::Serialize)]
+        struct Patch {
+            #[serde(rename = "crates-io")]
+            crates_io: std::collections::BTreeMap<&'static str, GitSource>,
+        }
+        #[derive(serde::Serialize)]
+        struct GitSource {
+            git: String,
+            rev: String,
+        }
+        #[derive(serde::Serialize)]
+        struct Package {
+            name: &'static str,
+            version: &'static str,
+            edition: &'static str,
+        }
+        #[derive(serde::Serialize)]
+        struct Dependency {
+            git: String,
+            rev: String,
+            #[serde(rename = "default-features")]
+            default_features: bool,
+            features: Vec<&'static str>,
+        }
+
+        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
+        let fixture = tempfile::tempdir().expect("fixture directory");
+        fs_extra::dir::copy(
+            &sources,
+            fixture.path(),
+            &fs_extra::dir::CopyOptions::new().content_only(true),
+        )
+        .expect("the fixture sources copy");
+        let (git, rev) = crate::pinned_framework::source();
+        // The lean facade: `include_web!` expands against `waterui::webview`
+        // and `waterui::Bundle`, nothing else of the framework is needed.
+        let manifest = Manifest {
+            package: Package {
+                name: "web-meta",
+                version: "0.0.0",
+                edition: "2024",
+            },
+            workspace: toml::Table::new(),
+            dependencies: std::iter::once((
+                "waterui",
+                Dependency {
+                    git: git.clone(),
+                    rev: rev.clone(),
+                    default_features: false,
+                    features: vec!["webview", "assets"],
+                },
+            ))
+            .collect(),
+            // The extracted `waterui-image` the facade links from crates.io
+            // depends on the registry copies of these crates; without the
+            // redirect the graph carries two of each and every `View` is a
+            // different type on either side.
+            patch: Patch {
+                crates_io: [
+                    "waterui-core",
+                    "waterui-graphics",
+                    "waterui-layout",
+                    "waterui-macros",
+                ]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name,
+                        GitSource {
+                            git: git.clone(),
+                            rev: rev.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            },
+        };
+        std::fs::write(
+            fixture.path().join("Cargo.toml"),
+            toml::to_string(&manifest).expect("the manifest serializes"),
+        )
+        .expect("the manifest is written");
+        fixture
+    }
+
+    /// `include_web!` is the one web mount an application declares; its
+    /// metadata must reach the CLI through the same `waterui_meta_bundle_*`
+    /// channel a plain `include_bundle!` uses, carrying the frontend project
+    /// root so `water run` knows what to build (#587). The macro expands
+    /// against the `waterui` facade, which this crate does not link, so cargo
+    /// fetches the pinned framework revision to build the fixture — network
+    /// work that belongs to the nightly job.
+    #[test]
+    #[ignore = "fetches the pinned framework revision"]
+    fn reads_include_web_mount_meta_from_built_rlib() {
+        futures_lite::future::block_on(async {
+            let fixture = web_meta_fixture();
+            let rlib = build_host_rlib(fixture.path(), None)
+                .await
+                .expect("fixture crate should build");
+            let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
+            let meta = waterui_assets_planner::BundleMountMeta::from_payload(
+                &symbols
+                    .static_bytes("waterui_meta_bundle_web")
+                    .expect("the web mount static should be present"),
+            )
+            .expect("payload should decode as BundleMountMeta");
+            assert_eq!(meta.mount, "web");
+            assert!(
+                meta.path.ends_with("dist"),
+                "the default out dir is dist: {}",
+                meta.path.display()
+            );
+            assert_eq!(
+                meta.project.as_deref(),
+                Some(
+                    dunce::canonicalize(fixture.path().join("web"))
+                        .as_deref()
+                        .expect("web root")
+                )
+            );
+        });
+    }
 }

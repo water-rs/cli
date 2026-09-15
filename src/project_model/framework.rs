@@ -14,15 +14,17 @@ use eyre::{Result, WrapErr, bail, eyre};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smol::process::Command;
-use zenwave::{Client as _, Method};
+use zenwave::{Client as _, Method, StatusCode};
 
 /// A framework distribution channel, independent of the Rust toolchain.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameworkChannel {
-    /// The integration branch, resolved to an exact compilation-checked commit.
+    /// The integration branch, resolved to an exact compilation-checked
+    /// commit; the Apple backend's `dev` HEAD resolves the same way.
     Dev,
-    /// An immutable revision certified by the complete nightly suite.
+    /// An immutable revision certified by the complete nightly suite,
+    /// including the backend pin the suite's certification records.
     Nightly,
     /// Published packages and the compatible native backends bundled with the CLI.
     #[default]
@@ -114,7 +116,7 @@ pub struct ResolvedFramework {
     patches: PatchSet,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LockedPackage {
     name: String,
     version: String,
@@ -288,7 +290,7 @@ impl ResolvedFramework {
         let metadata = framework_metadata(&manifest)?;
         let minimum_cli_version = minimum_cli_version(&metadata)?;
         if let Some(minimum) = &minimum_cli_version {
-            validate_installed_cli(minimum, &local_cli_update(root))?;
+            validate_installed_cli(minimum, &checkout_cli_update())?;
         }
         let mut scaffold = framework_scaffold(&manifest)?;
         let lock: Lockfile = smol::fs::read_to_string(root.join("Cargo.lock"))
@@ -301,7 +303,13 @@ impl ResolvedFramework {
             })?
             .parse()?;
         let mut submodules = BTreeMap::new();
+        // A checkout from before a backend's revision was declared in the
+        // manifest still carries its gitlink; a manifest declaring
+        // `{name}-backend-revision` has none to read.
         for path in BACKEND_SUBMODULES {
+            if declares_backend_revision(&scaffold, path) {
+                continue;
+            }
             submodules.insert(
                 (*path).to_owned(),
                 local_submodule_revision(root, path).await?,
@@ -348,7 +356,7 @@ impl ResolvedFramework {
     /// Returns an error when the file cannot be read or parsed, fails
     /// verification, or the revision it certifies cannot be fetched.
     pub(crate) async fn resolve_manifest(path: &Path) -> Result<(Self, Option<Vec<u8>>)> {
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let slug = repository_slug(repository)?;
         let certification = load_manifest(path, repository).await?;
         let revision = certification.revision.clone();
@@ -359,17 +367,9 @@ impl ResolvedFramework {
         if let Some(minimum) = &self.minimum_cli_version {
             let update = match &self.source {
                 Source::Stable { .. } => registry_cli_update(minimum),
-                Source::Dev {
-                    repository,
-                    revision,
-                    ..
+                Source::Dev { .. } | Source::Nightly { .. } | Source::Local { .. } => {
+                    checkout_cli_update()
                 }
-                | Source::Nightly {
-                    repository,
-                    revision,
-                    ..
-                } => git_cli_update(repository, revision),
-                Source::Local { root } => local_cli_update(root),
             };
             validate_installed_cli(minimum, &update)?;
         }
@@ -388,6 +388,16 @@ impl ResolvedFramework {
     pub(crate) fn apple_backend_version(&self) -> Option<&str> {
         self.scaffold
             .get("apple-backend-version")
+            .map(String::as_str)
+    }
+
+    /// The Apple backend commit a `dev` or `nightly` selection pins — the
+    /// backend's `dev` HEAD `dev` resolved at selection time, or the
+    /// revision a certification records — and the gitlink pin a framework
+    /// from before the backend's extraction carries on every channel.
+    pub(crate) fn apple_backend_revision(&self) -> Option<&str> {
+        self.scaffold
+            .get("apple-backend-revision")
             .map(String::as_str)
     }
 
@@ -537,7 +547,7 @@ impl ResolvedFramework {
             } => format!("git+{repository}?rev={revision}#{revision}"),
         };
         let locked = self.cargo_lock(contents)?;
-        let allowed: BTreeSet<_> = locked.packages.iter().map(LockedPackage::from).collect();
+        let allowed = self.allowed_packages(&locked.packages);
         let packages: BTreeMap<_, _> = metadata
             .packages
             .iter()
@@ -648,7 +658,7 @@ impl ResolvedFramework {
                 .iter()
                 .map(|package| (LockedDependency::from(package), package.clone())),
         );
-        let allowed: BTreeSet<_> = packages.values().map(LockedPackage::from).collect();
+        let allowed = self.allowed_packages(packages.values());
         let mut seed = project_lock;
         seed.packages = packages.into_values().collect();
         smol::fs::write(&lock_path, seed.to_string()).await?;
@@ -758,6 +768,57 @@ impl ResolvedFramework {
         }
     }
 
+    /// The locked identities a generated project's resolution may produce
+    /// for each recorded package: the recorded one, plus — for a crate the
+    /// patch tables pin to a repository of its own — the same package at the
+    /// pin and at the framework's own source. Cargo vendors a git
+    /// dependency's submodules, so a submodule crate's path edges resolve
+    /// inside the framework's source while its `[patch]` edge resolves at
+    /// the submodule repository — the same commit either way (#807).
+    fn allowed_packages<'p>(
+        &self,
+        packages: impl IntoIterator<Item = &'p cargo_lock::Package>,
+    ) -> BTreeSet<LockedPackage> {
+        let mut allowed = BTreeSet::new();
+        let Some((repository, revision)) = self.git_source() else {
+            return packages.into_iter().map(LockedPackage::from).collect();
+        };
+        let framework_source = format!("git+{repository}?rev={revision}#{revision}");
+        // Crate name → the `git+<repo>?rev=<rev>` source its patch pins it to.
+        let pinned: BTreeMap<&str, String> = self
+            .patches
+            .values()
+            .flatten()
+            .filter_map(|(name, dependency)| {
+                let Dependency::Detailed(detail) = dependency else {
+                    return None;
+                };
+                let (git, rev) = detail.git.as_deref().zip(detail.rev.as_deref())?;
+                Some((name.as_str(), format!("git+{git}?rev={rev}#{rev}")))
+            })
+            .collect();
+        for package in packages {
+            let identity = LockedPackage::from(package);
+            if let Some(source) = &identity.source
+                && let Some(pin) = pinned.get(identity.name.as_str())
+            {
+                if source == &framework_source {
+                    allowed.insert(LockedPackage {
+                        source: Some(pin.clone()),
+                        ..identity.clone()
+                    });
+                } else if source == pin {
+                    allowed.insert(LockedPackage {
+                        source: Some(framework_source.clone()),
+                        ..identity.clone()
+                    });
+                }
+            }
+            allowed.insert(identity);
+        }
+        allowed
+    }
+
     pub(crate) fn dependency(&self, name: &str) -> DependencyDetail {
         match &self.source {
             Source::Stable { .. } => DependencyDetail {
@@ -787,7 +848,7 @@ impl ResolvedFramework {
     /// Returns an error when the channel has no eligible release, the manifest
     /// fails verification, or the certified revision cannot be fetched.
     pub(crate) async fn resolve(channel: FrameworkChannel) -> Result<(Self, Option<Vec<u8>>)> {
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let slug = repository_slug(repository)?;
         match channel {
             FrameworkChannel::Stable | FrameworkChannel::Nightly => {
@@ -835,12 +896,25 @@ impl ResolvedFramework {
         if let Some(minimum) = &minimum_cli_version {
             let update = match channel {
                 FrameworkChannel::Stable => registry_cli_update(minimum),
-                FrameworkChannel::Dev | FrameworkChannel::Nightly => {
-                    git_cli_update(repository, revision)
-                }
+                FrameworkChannel::Dev | FrameworkChannel::Nightly => checkout_cli_update(),
             };
             validate_installed_cli(minimum, &update)?;
         }
+
+        // `.gitmodules` names each submodule path's repository at the
+        // revision; the pin's commit half comes from the tree's gitlinks
+        // (`dev`) or the certification (a certified channel). `stable`
+        // resolves from the registry and carries neither.
+        let submodule_repositories = match channel {
+            FrameworkChannel::Stable => BTreeMap::new(),
+            FrameworkChannel::Dev | FrameworkChannel::Nightly => {
+                match fetch_optional(&format!("{base}/.gitmodules")).await? {
+                    Some(bytes) => parse_gitmodules(std::str::from_utf8(&bytes)?),
+                    // Every submodule was extracted; the revision records none.
+                    None => BTreeMap::new(),
+                }
+            }
+        };
 
         let (source, submodules) = if let Some(certification) = &certification {
             (
@@ -855,34 +929,17 @@ impl ResolvedFramework {
                 certification.submodules.clone(),
             )
         } else {
-            // `dev` has no certification; the repository tree's own gitlinks
-            // record which backend revisions the revision was built against.
-            let mut submodules = BTreeMap::new();
-            for path in BACKEND_SUBMODULES {
-                submodules.insert(
-                    (*path).to_owned(),
-                    submodule_revision(slug, revision, path).await?,
-                );
-            }
-            // Revisions from before the Apple backend left the tree still
-            // carry its `backends/apple` gitlink; a manifest declaring
-            // `apple-backend-version` has none to read.
-            if !scaffold.contains_key("apple-backend-version") {
-                submodules.insert(
-                    "backends/apple".to_owned(),
-                    submodule_revision(slug, revision, "backends/apple").await?,
-                );
-            }
             (
                 Source::Dev {
                     repository: repository.to_owned(),
                     revision: revision.to_owned(),
                     lock_sha256,
                 },
-                submodules,
+                dev_submodules(slug, revision, &scaffold, &submodule_repositories).await?,
             )
         };
         complete_scaffold(&mut scaffold, &submodules, &lock)?;
+        channel_apple_backend_pin(channel, &mut scaffold, certification.as_ref()).await?;
 
         let (packages, patches, lockfile) = match channel {
             // A stable project resolves its graph from the registry; nothing is
@@ -896,7 +953,11 @@ impl ResolvedFramework {
                     .map(toml::Value::try_into)
                     .transpose()?
                     .unwrap_or_default();
-                let patches = rebase_patches_onto_source(patches, repository, revision);
+                // A path under a submodule belongs to the submodule's
+                // repository at the pinned commit, not the superproject's —
+                // whose tree holds a gitlink there, not the crate.
+                let pins = submodule_pins(submodule_repositories, &submodules);
+                let patches = rebase_patches_onto_source(patches, repository, revision, &pins);
                 let packages = resolve_packages(&scaffold, &lock, repository, revision)?;
                 (packages, patches, Some(lock_bytes))
             }
@@ -914,6 +975,106 @@ impl ResolvedFramework {
             lockfile,
         ))
     }
+}
+
+/// The Apple backend follows the framework's channel. `dev` resolves the
+/// backend's own `dev` HEAD — the compilation-gated revision the channel
+/// promises — because the `backends/apple` gitlink that used to record the
+/// pairing is gone and `apple-backend-version` is a stable pin. A
+/// certification may likewise name the backend revision its suite ran.
+/// Either lands as `apple-backend-revision`, the pin a non-stable channel's
+/// requirement prefers; a framework from before the backend's extraction
+/// instead keeps the gitlink pin `complete_scaffold` recorded.
+async fn channel_apple_backend_pin(
+    channel: FrameworkChannel,
+    scaffold: &mut BTreeMap<String, String>,
+    certification: Option<&Certification>,
+) -> Result<()> {
+    match channel {
+        FrameworkChannel::Dev if scaffold.contains_key("apple-backend-version") => {
+            let url = scaffold.get("apple-backend-url").ok_or_else(|| {
+                eyre!("framework manifest declares apple-backend-version without apple-backend-url")
+            })?;
+            let revision = backend_dev_revision(url).await?;
+            scaffold.insert("apple-backend-revision".to_owned(), revision);
+        }
+        FrameworkChannel::Nightly => {
+            if let Some(revision) = certification
+                .and_then(|certification| certification.scaffold.get("apple-backend-revision"))
+            {
+                validate_revision(revision)
+                    .wrap_err("nightly certification scaffold `apple-backend-revision`")?;
+                scaffold.insert("apple-backend-revision".to_owned(), revision.clone());
+            }
+        }
+        FrameworkChannel::Stable | FrameworkChannel::Dev => {}
+    }
+    Ok(())
+}
+
+/// `dev` has no certification; the repository tree's own gitlinks record which
+/// submodule revisions the revision was built against — every submodule
+/// `.gitmodules` names plus `backends/apple`, whose manifest declaration
+/// predates its extraction from the tree.
+async fn dev_submodules(
+    slug: &str,
+    revision: &str,
+    scaffold: &BTreeMap<String, String>,
+    submodule_repositories: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut submodules = BTreeMap::new();
+    for path in BACKEND_SUBMODULES {
+        if declares_backend_revision(scaffold, path) {
+            continue;
+        }
+        submodules.insert(
+            (*path).to_owned(),
+            submodule_revision(slug, revision, path).await?,
+        );
+    }
+    // Revisions from before the Apple backend left the tree still carry its
+    // `backends/apple` gitlink; a manifest declaring `apple-backend-version`
+    // has none to read.
+    if !scaffold.contains_key("apple-backend-version") {
+        submodules.insert(
+            "backends/apple".to_owned(),
+            submodule_revision(slug, revision, "backends/apple").await?,
+        );
+    }
+    // The remaining `.gitmodules` entries (`kit`, `utils/nami`, …) pin no
+    // scaffold fact, but a `[patch]` path under one rebases onto the
+    // submodule's repository at the gitlink's commit — the same record the
+    // certification supplies for `nightly`.
+    for path in submodule_repositories.keys() {
+        if !submodules.contains_key(path)
+            && let Some(commit) = submodule_pin(slug, revision, path).await?
+        {
+            submodules.insert(path.clone(), commit);
+        }
+    }
+    Ok(submodules)
+}
+
+/// Marry each `.gitmodules` path's repository URL to its recorded commit, the
+/// pin a `[patch]` path under it rebases onto.
+fn submodule_pins(
+    repositories: BTreeMap<String, String>,
+    submodules: &BTreeMap<String, String>,
+) -> BTreeMap<String, SubmodulePin> {
+    repositories
+        .into_iter()
+        .filter_map(|(path, url)| {
+            submodules.get(&path).map(|commit| {
+                (
+                    path,
+                    SubmodulePin {
+                        repository: canonical_git_url(&url).to_owned(),
+                        commit: commit.clone(),
+                    },
+                )
+            })
+        })
+        .collect()
 }
 
 /// The persisted source a certification proves, checked against the tree it
@@ -963,11 +1124,22 @@ fn certified_source(
     })
 }
 
-/// The submodule each native backend repository is pinned through; the
-/// directory's basename keys the scaffold's `{name}-backend-revision` entry.
-/// Backends released on their own cadence — Apple, since #839 — carry a
-/// `{name}-backend-version` literal in `[package.metadata.waterui]` instead.
+/// The submodule each native backend repository used to be pinned through;
+/// the directory's basename keys the scaffold's `{name}-backend-revision`
+/// entry. A framework that declares `{name}-backend-revision` in
+/// `[package.metadata.waterui]` (Android, since water-rs/waterui#940) or
+/// `{name}-backend-version` (Apple, since #839) carries no gitlink, and the
+/// gitlink is read only for a revision from before that declaration.
 const BACKEND_SUBMODULES: &[&str] = &["backends/android"];
+
+/// Whether the scaffold already names `submodule_path`'s backend pin — a
+/// declared `{name}-backend-revision` — so no gitlink has to be read for it.
+fn declares_backend_revision(scaffold: &BTreeMap<String, String>, submodule_path: &str) -> bool {
+    scaffold.contains_key(&format!(
+        "{}-backend-revision",
+        backend_name(submodule_path)
+    ))
+}
 
 /// The workspace crates a scaffolded project pins; each `{name}-version`
 /// scaffold entry comes from the framework's own lockfile at the selected
@@ -991,11 +1163,19 @@ fn backend_name(submodule_path: &str) -> &str {
         .expect("a submodule path has a basename")
 }
 
-/// The framework repository's `owner/name` slug, from its GitHub URL.
+/// The repository the CLI's pinned `waterui-*` dependencies resolve from —
+/// where certified manifests, releases, and `dev` revisions live. `build.rs`
+/// bakes it in from the git source in `Cargo.toml` so the pin is declared
+/// exactly once.
+fn framework_repository() -> &'static str {
+    env!("WATERUI_FRAMEWORK_REPOSITORY").trim_end_matches(".git")
+}
+
+/// A repository's `owner/name` slug, from its GitHub URL.
 fn repository_slug(repository: &str) -> Result<&str> {
     repository
         .strip_prefix("https://github.com/")
-        .ok_or_else(|| eyre!("framework repository must identify its GitHub source"))
+        .ok_or_else(|| eyre!("{repository} must identify its GitHub source"))
 }
 
 /// The framework's own metadata table — `[package.metadata.waterui]` of the
@@ -1020,7 +1200,8 @@ fn framework_metadata(manifest: &toml::Value) -> Result<toml::Table> {
 /// The scaffold facts the framework manifest itself declares: each
 /// `scaffold-packages` entry's requirement from `[workspace.dependencies]`,
 /// and every backend coordinate — `{name}-backend-url`, plus the
-/// `{name}-backend-version` of a backend pinned by release rather than
+/// `{name}-backend-version` of a backend pinned by release or the
+/// `{name}-backend-revision` of one pinned by commit, rather than by
 /// gitlink — from `[package.metadata.waterui]`.
 ///
 /// `framework_manifest.py` emits exactly this table into every `framework.json`
@@ -1053,12 +1234,18 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
         scaffold.insert(format!("{name}-version"), requirement.to_owned());
     }
     for (key, value) in &metadata {
-        if !(key.ends_with("-backend-url") || key.ends_with("-backend-version")) {
+        if !(key.ends_with("-backend-url")
+            || key.ends_with("-backend-version")
+            || key.ends_with("-backend-revision"))
+        {
             continue;
         }
         let value = value
             .as_str()
             .ok_or_else(|| eyre!("package.metadata.waterui.{key} must be a string"))?;
+        if key.ends_with("-backend-revision") {
+            validate_revision(value).wrap_err_with(|| format!("package.metadata.waterui.{key}"))?;
+        }
         scaffold.insert(key.clone(), value.to_owned());
     }
     Ok(scaffold)
@@ -1076,23 +1263,20 @@ fn minimum_cli_version(metadata: &toml::Table) -> Result<Option<cargo_toml::SemV
         .wrap_err("invalid package.metadata.waterui.minimum-cli-version")
 }
 
-fn local_cli_update(root: &Path) -> String {
+/// The CLI update hint for a framework that is not a registry release — a
+/// local checkout or a git-pinned `dev`/`nightly` source pairs with the
+/// development line of this repository.
+fn checkout_cli_update() -> String {
     format!(
-        "run `cargo install --path cli --locked` from the WaterUI checkout at {}",
-        root.display()
+        "cargo install {} --git {} --locked",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_REPOSITORY")
     )
 }
 
 fn registry_cli_update(minimum: &cargo_toml::SemVer) -> String {
     format!(
         "cargo install {} --version '>={minimum}' --locked",
-        env!("CARGO_PKG_NAME")
-    )
-}
-
-fn git_cli_update(repository: &str, revision: &str) -> String {
-    format!(
-        "cargo install {} --git {repository} --rev {revision} --locked",
         env!("CARGO_PKG_NAME")
     )
 }
@@ -1121,7 +1305,7 @@ pub(crate) async fn validate_local_cli(root: &Path) -> Result<()> {
     let contents = smol::fs::read_to_string(root.join("Cargo.toml")).await?;
     let manifest = toml::from_str(&contents)?;
     if let Some(minimum) = minimum_cli_version(&framework_metadata(&manifest)?)? {
-        validate_installed_cli(&minimum, &local_cli_update(root))?;
+        validate_installed_cli(&minimum, &checkout_cli_update())?;
     }
     Ok(())
 }
@@ -1147,20 +1331,8 @@ pub(crate) fn validate_resolved_cli(metadata: &cargo_metadata::Metadata) -> Resu
             .map(|source| source.repr.parse::<cargo_lock::SourceId>())
             .transpose()?;
         let update = match source {
-            Some(source) if source.is_git() => git_cli_update(
-                source.url().as_str(),
-                source
-                    .precise()
-                    .ok_or_else(|| eyre!("resolved framework has no Git revision"))?,
-            ),
-            Some(_) => registry_cli_update(&minimum),
-            None => local_cli_update(
-                package
-                    .manifest_path
-                    .parent()
-                    .expect("package manifest has a parent")
-                    .as_std_path(),
-            ),
+            Some(source) if !source.is_git() => registry_cli_update(&minimum),
+            Some(_) | None => checkout_cli_update(),
         };
         validate_installed_cli(&minimum, &update)?;
     }
@@ -1256,7 +1428,13 @@ fn complete_scaffold(
     submodules: &BTreeMap<String, String>,
     lock: &Lockfile,
 ) -> Result<()> {
+    // A declared `{name}-backend-revision` is already in the scaffold
+    // (`framework_scaffold` copied and validated it); the gitlink is the pin
+    // record only for a framework from before the declaration.
     for &submodule in BACKEND_SUBMODULES {
+        if declares_backend_revision(scaffold, submodule) {
+            continue;
+        }
         let commit = submodules
             .get(submodule)
             .ok_or_else(|| eyre!("framework records no {submodule} submodule pin"))?;
@@ -1335,6 +1513,58 @@ async fn submodule_revision(slug: &str, revision: &str, path: &str) -> Result<St
     Ok(entry.sha)
 }
 
+/// The commit `path`'s gitlink records at `revision`, or `None` when `path`
+/// is not a submodule there — a `.gitmodules` entry can outlive the gitlink
+/// it once named, and the patch paths under it then belong in the tree.
+async fn submodule_pin(slug: &str, revision: &str, path: &str) -> Result<Option<String>> {
+    let Some(bytes) = fetch_optional(&format!(
+        "https://api.github.com/repos/{slug}/contents/{path}?ref={revision}"
+    ))
+    .await?
+    else {
+        return Ok(None);
+    };
+    // A present-but-ordinary path lists as a directory array or carries a
+    // non-submodule type; neither is a pin.
+    let Ok(entry) = serde_json::from_slice::<SubmoduleEntry>(&bytes) else {
+        return Ok(None);
+    };
+    Ok((entry.kind == "submodule").then_some(entry.sha))
+}
+
+/// The `path → url` pairs `.gitmodules` records — git-config syntax rather
+/// than TOML (values go unquoted), so a line scan keyed on `[submodule]`
+/// sections.
+fn parse_gitmodules(contents: &str) -> BTreeMap<String, String> {
+    let mut submodules = BTreeMap::new();
+    let mut submodule = false;
+    let mut path = None::<String>;
+    let mut url = None::<String>;
+    for line in contents.lines().map(str::trim) {
+        if line.starts_with('[') {
+            if submodule && let (Some(path), Some(url)) = (path.take(), url.take()) {
+                submodules.insert(path, url);
+            }
+            submodule = line.starts_with("[submodule");
+            continue;
+        }
+        if !submodule {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "path" => path = Some(value.trim().trim_matches('"').to_owned()),
+                "url" => url = Some(value.trim().trim_matches('"').to_owned()),
+                _ => {}
+            }
+        }
+    }
+    if submodule && let (Some(path), Some(url)) = (path, url) {
+        submodules.insert(path, url);
+    }
+    submodules
+}
+
 fn validate_revision(revision: &str) -> Result<()> {
     if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("framework revision must be a full Git commit hash");
@@ -1343,18 +1573,29 @@ fn validate_revision(revision: &str) -> Result<()> {
 }
 
 async fn fetch(url: &str) -> Result<Vec<u8>> {
+    fetch_optional(url)
+        .await?
+        .ok_or_else(|| eyre!("framework resolution returned HTTP 404 from {url}"))
+}
+
+/// [`fetch`] that answers `None` when the resource does not exist —
+/// `.gitmodules` is absent on a revision whose submodules were all
+/// extracted. zenwave surfaces a non-success status as `Err`, so the 404
+/// arrives as an [`Error::Http`], never as a response to inspect.
+async fn fetch_optional(url: &str) -> Result<Option<Vec<u8>>> {
     let mut client = zenwave::client();
-    let response = client
+    let response = match client
         .method(Method::GET, url)?
         .header("User-Agent", env!("CARGO_PKG_NAME"))?
-        .await?;
-    if !response.status().is_success() {
-        bail!(
-            "framework resolution returned HTTP {} from {url}",
-            response.status()
-        );
-    }
-    Ok(response.into_body().into_bytes().await?.to_vec())
+        .await
+    {
+        Ok(response) => response,
+        Err(zenwave::Error::Http { status, .. }) if status == StatusCode::NOT_FOUND => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(response.into_body().into_bytes().await?.to_vec()))
 }
 
 #[cfg(test)]
@@ -1380,7 +1621,7 @@ pub(crate) mod test_fixtures {
                     "apple-backend-url".to_owned(),
                     "https://github.com/water-rs/apple-backend.git".to_owned(),
                 ),
-                ("apple-backend-version".to_owned(), "0.2.0".to_owned()),
+                ("apple-backend-version".to_owned(), "0.3.0-dev.2".to_owned()),
                 (
                     "android-backend-url".to_owned(),
                     "https://github.com/water-rs/android-backend.git".to_owned(),
@@ -1391,9 +1632,7 @@ pub(crate) mod test_fixtures {
         ResolvedFramework {
             source: Source::Stable {
                 release: Some(FrameworkRelease {
-                    repository: env!("CARGO_PKG_REPOSITORY")
-                        .trim_end_matches(".git")
-                        .to_owned(),
+                    repository: framework_repository().to_owned(),
                     revision: revision('a'),
                     tag: "v0.4.1".to_owned(),
                 }),
@@ -1408,9 +1647,46 @@ pub(crate) mod test_fixtures {
         }
     }
 
+    /// A `dev`-channel resolution: the manifest's scaffold facts plus the
+    /// `apple-backend-revision` `construct` resolves for the channel — the
+    /// backend's `dev` HEAD at selection time — beside the declared
+    /// `apple-backend-version` the channel must not follow.
+    pub fn dev_framework() -> ResolvedFramework {
+        let mut framework = stable_framework();
+        framework.source = Source::Dev {
+            repository: framework_repository().to_owned(),
+            revision: 'a'.to_string().repeat(40),
+            lock_sha256: 'f'.to_string().repeat(64),
+        };
+        framework.scaffold.insert(
+            "apple-backend-revision".to_owned(),
+            'd'.to_string().repeat(40),
+        );
+        framework
+    }
+
+    /// A `nightly`-channel resolution; `backend_revision` carries the
+    /// `apple-backend-revision` a certification records when its suite names
+    /// the backend it ran — absent, the declared `apple-backend-version` is
+    /// what the certification certified.
+    pub fn nightly_framework(backend_revision: bool) -> ResolvedFramework {
+        let mut framework = dev_framework();
+        if !backend_revision {
+            framework.scaffold.remove("apple-backend-revision");
+        }
+        framework.source = Source::Nightly {
+            repository: framework_repository().to_owned(),
+            revision: 'a'.to_string().repeat(40),
+            tag: "nightly-2026.09.15".to_owned(),
+            lock_sha256: 'f'.to_string().repeat(64),
+        };
+        framework
+    }
+
     /// A local framework checkout fixture: the repository's own root manifest
-    /// and a lock naming the workspace crates, inside a git worktree whose
-    /// `HEAD` records both backend submodule pins.
+    /// and a lock naming the workspace crates, inside a git worktree. Like the
+    /// repository today it carries no backend gitlink: both backend pins are
+    /// literals in the manifest.
     pub fn write_local_checkout(root: &Path) {
         std::fs::create_dir_all(root).expect("checkout dir");
         std::fs::write(root.join("Cargo.toml"), local_checkout_manifest()).expect("manifest");
@@ -1431,7 +1707,6 @@ pub(crate) mod test_fixtures {
             "Cargo.toml".to_owned(),
             "Cargo.lock".to_owned(),
         ]);
-        write_submodule_pin(root, "backends/android", 'c');
         git(&[
             "-c".to_owned(),
             "user.name=waterui-test".to_owned(),
@@ -1443,15 +1718,25 @@ pub(crate) mod test_fixtures {
         ]);
     }
 
-    /// The same fixture as it existed while `backends/apple` still rode a
-    /// gitlink: no `apple-backend-version` in the manifest, the submodule pin
-    /// recorded in the index.
+    /// The same fixture as it existed while both backends still rode
+    /// gitlinks: no `apple-backend-version` and no `android-backend-revision`
+    /// in the manifest, the submodule pins recorded in the index.
     pub fn write_pre_decoupling_checkout(root: &Path) {
         write_local_checkout(root);
         write_submodule_pin(root, "backends/apple", 'b');
-        let manifest = local_checkout_manifest().replace("apple-backend-version = \"0.2.0\"\n", "");
+        write_submodule_pin(root, "backends/android", 'c');
+        let manifest = local_checkout_manifest()
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                !(line.starts_with("apple-backend-version")
+                    || line.starts_with("android-backend-revision"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            !manifest.contains("apple-backend-version"),
+            !manifest.contains("apple-backend-version")
+                && !manifest.contains("android-backend-revision"),
             "the fixture manifest moved; the pre-decoupling rewrite must be revisited"
         );
         std::fs::write(root.join("Cargo.toml"), manifest).expect("manifest");
@@ -1526,23 +1811,45 @@ pub(crate) mod test_fixtures {
 }
 
 async fn resolve_dev(repository: &str, slug: &str) -> Result<String> {
+    gated_dev_head(repository, slug, "dev.yml", "framework").await
+}
+
+/// The Apple backend's `dev` HEAD for a `dev` framework selection. The
+/// backend moved out of the framework tree, so nothing records the backend
+/// revision a `dev` framework was built against — `apple-backend-version`
+/// is the stable pin and must not serve `dev`. The backend's `dev` is held
+/// to the same promise the framework's makes: `ci.yml` gates the branch.
+async fn backend_dev_revision(url: &str) -> Result<String> {
+    gated_dev_head(
+        url,
+        repository_slug(url.trim_end_matches(".git"))?,
+        "ci.yml",
+        "Apple backend",
+    )
+    .await
+}
+
+/// The `dev` HEAD of `repository`, held to the channel's promise that the
+/// resolved commit passed `gate` — the workflow file gating `dev` in that
+/// repository: `dev.yml` for the framework, `ci.yml` for a backend.
+async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["ls-remote", repository, "refs/heads/dev"])
         .output()
         .await?;
     if !output.status.success() {
         bail!(
-            "could not resolve framework dev: {}",
+            "could not resolve {what} dev: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
     let revision = std::str::from_utf8(&output.stdout)?
         .split_whitespace()
         .next()
-        .ok_or_else(|| eyre!("framework repository has no dev branch"))?
+        .ok_or_else(|| eyre!("{what} repository has no dev branch"))?
         .to_owned();
     validate_revision(&revision)?;
-    let response = fetch(&format!("https://api.github.com/repos/{slug}/actions/workflows/dev.yml/runs?branch=dev&head_sha={revision}&status=success&event=push&per_page=1")).await?;
+    let response = fetch(&format!("https://api.github.com/repos/{slug}/actions/workflows/{gate}/runs?branch=dev&head_sha={revision}&status=success&event=push&per_page=1")).await?;
     let runs: serde_json::Value = serde_json::from_slice(&response)?;
     let checked = runs["workflow_runs"].as_array().is_some_and(|runs| {
         runs.iter().any(|run| {
@@ -1550,7 +1857,7 @@ async fn resolve_dev(repository: &str, slug: &str) -> Result<String> {
         })
     });
     if !checked {
-        bail!("framework dev revision {revision} has not passed its compilation gate");
+        bail!("{what} dev revision {revision} has not passed its compilation gate");
     }
     Ok(revision)
 }
@@ -1740,57 +2047,87 @@ fn verify_certification(
     if let Some(minimum) = &minimum_cli_version(&certification.metadata)? {
         let update = match channel {
             FrameworkChannel::Stable => registry_cli_update(minimum),
-            FrameworkChannel::Dev | FrameworkChannel::Nightly => {
-                git_cli_update(repository, &certification.revision)
-            }
+            FrameworkChannel::Dev | FrameworkChannel::Nightly => checkout_cli_update(),
         };
         validate_installed_cli(minimum, &update)?;
     }
     Ok(())
 }
 
+/// A submodule the resolved revision pins: the repository `.gitmodules`
+/// names for the path and the commit the revision's gitlink — or a certified
+/// channel's certification — records.
+struct SubmodulePin {
+    /// The submodule's repository, canonicalized like [`framework_repository`].
+    repository: String,
+    /// The pinned commit.
+    commit: String,
+}
+
 /// Rebase a fetched root manifest's `[patch]` tables onto the channel's own
-/// source: path entries become `git + rev` at the resolved revision.
+/// sources: a path entry under one of the revision's submodules becomes
+/// `git + rev` on the submodule's repository at the recorded commit, and any
+/// other path entry becomes `git + rev` on the framework repository at the
+/// resolved revision.
 ///
-/// Every name a path entry carried is additionally patched on the repository
-/// source itself. Extracted crates (`waterui-gtk`, …) declare their
-/// `waterui-*` dependencies as `git = "<repo>"`, which a `[patch.crates-io]`
-/// table cannot redirect — Cargo only patches the source a dependency
-/// actually names — so without the repository-source table the graph carries
-/// a second framework beside the channel's and `View` splits across the two
-/// (#758).
-fn rebase_patches_onto_source(mut patches: PatchSet, repository: &str, revision: &str) -> PatchSet {
-    patches.retain(|source, _| source.trim_end_matches(".git") != repository);
-    let mut path_patched_names = Vec::new();
+/// A fetched table keyed on the framework repository itself is dropped in
+/// any spelling — Cargo canonicalizes a source's query, fragment, `.git`
+/// suffix and trailing slash away, so every one names the patched source
+/// itself, and a patch may not point at the source it patches. No
+/// repository-source mirror is synthesized for the path entries either:
+/// mirroring them at the channel's revision was the same-source patch Cargo
+/// rejects (#807), and the extracted crates that once named framework
+/// crates by `git` (#758) are consumed from the registry, where
+/// `[patch.crates-io]` already applies.
+fn rebase_patches_onto_source(
+    mut patches: PatchSet,
+    repository: &str,
+    revision: &str,
+    submodules: &BTreeMap<String, SubmodulePin>,
+) -> PatchSet {
+    patches.retain(|source, _| !same_git_source(source, repository));
     for dependencies in patches.values_mut() {
-        for (name, dependency) in dependencies.iter_mut() {
-            if let Dependency::Detailed(detail) = dependency
-                && detail.path.take().is_some()
-            {
-                detail.git = Some(repository.to_owned());
-                detail.rev = Some(revision.to_owned());
-                path_patched_names.push(name.clone());
-            }
+        for dependency in dependencies.values_mut() {
+            let Dependency::Detailed(detail) = dependency else {
+                continue;
+            };
+            let Some(path) = detail.path.take() else {
+                continue;
+            };
+            let path = path.trim_start_matches("./");
+            let pin = submodules.iter().find_map(|(root, pin)| {
+                (path == root.as_str() || path.starts_with(&format!("{root}/"))).then_some(pin)
+            });
+            let (git, rev) = pin.map_or((repository, revision), |pin| {
+                (pin.repository.as_str(), pin.commit.as_str())
+            });
+            detail.git = Some(git.to_owned());
+            detail.rev = Some(rev.to_owned());
         }
     }
-    let repository_source = patches.entry(repository.to_owned()).or_default();
-    for name in path_patched_names {
-        repository_source.insert(
-            name,
-            Dependency::Detailed(Box::new(DependencyDetail {
-                git: Some(repository.to_owned()),
-                rev: Some(revision.to_owned()),
-                ..DependencyDetail::default()
-            })),
-        );
-    }
     patches
+}
+
+/// A git URL in the spelling Cargo canonicalizes sources to: the query,
+/// fragment, `.git` suffix and trailing slash carry no meaning.
+fn canonical_git_url(url: &str) -> &str {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    url.trim_end_matches('/')
+        .trim_end_matches(".git")
+        .trim_end_matches('/')
+}
+
+/// Whether two URLs name the same git source — `repo?branch=dev`, `repo.git`
+/// and `repo` canonicalize to one source, so a `[patch]` table keyed on any
+/// of them patches the framework repository itself.
+fn same_git_source(source: &str, repository: &str) -> bool {
+    canonical_git_url(source) == canonical_git_url(repository)
 }
 
 #[cfg(test)]
 mod tests {
     use test_fixtures::{
-        package, stable_framework, write_local_checkout, write_pre_decoupling_checkout,
+        package, stable_framework, test_lock, write_local_checkout, write_pre_decoupling_checkout,
     };
 
     use super::*;
@@ -1807,7 +2144,7 @@ mod tests {
                 )
             })
             .collect();
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let revision = "a".repeat(40);
         let framework = ResolvedFramework {
             source: Source::Nightly {
@@ -1949,13 +2286,8 @@ mod tests {
             ("waterui-dew-version".to_string(), "0.2.1".to_string()),
             ("waterui-gtk-version".to_string(), "0.1.2".to_string()),
         ]);
-        let packages = resolve_packages(
-            &scaffold,
-            &lock,
-            env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git"),
-            &"a".repeat(40),
-        )
-        .unwrap();
+        let packages =
+            resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40)).unwrap();
         assert!(packages["waterui"].git.is_some());
         let dew = &packages["waterui-dew"];
         assert!(dew.git.is_none());
@@ -2128,6 +2460,13 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             })),
         );
         crates_io.insert(
+            "waterkit-audio".to_string(),
+            Dependency::Detailed(Box::new(DependencyDetail {
+                path: Some("kit/multimedia/audio".to_string()),
+                ..DependencyDetail::default()
+            })),
+        );
+        crates_io.insert(
             "vello".to_string(),
             Dependency::Detailed(Box::new(DependencyDetail {
                 git: Some("https://github.com/lexoliu/vello".to_string()),
@@ -2136,15 +2475,30 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             })),
         );
         patches.insert("crates-io".to_string(), crates_io);
+        // A fetched table keyed on the framework repository itself — in any
+        // spelling Cargo canonicalizes to it — must not survive: a patch may
+        // not point at the source it patches.
         patches.insert(
             "https://github.com/water-rs/waterui".to_string(),
             std::collections::BTreeMap::new(),
         );
+        patches.insert(
+            "https://github.com/water-rs/waterui.git?branch=dev".to_string(),
+            std::collections::BTreeMap::new(),
+        );
 
+        let submodules = BTreeMap::from([(
+            "kit".to_string(),
+            SubmodulePin {
+                repository: "https://github.com/water-rs/waterkit".to_string(),
+                commit: "98c89ee702c5629094030023fb8d55464592d35d".to_string(),
+            },
+        )]);
         let rebased = rebase_patches_onto_source(
             patches,
             "https://github.com/water-rs/waterui",
             "475b4bb884a5f4e2b1156f1af74c40feaf71fdc1",
+            &submodules,
         );
 
         // The crates-io path entry became a git pin at the channel revision.
@@ -2161,20 +2515,23 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             Some("475b4bb884a5f4e2b1156f1af74c40feaf71fdc1")
         );
 
-        // The repository source gained the same names so extracted crates'
-        // git-source dependencies resolve to the channel revision.
-        let Dependency::Detailed(core) =
-            &rebased["https://github.com/water-rs/waterui"]["waterui-core"]
-        else {
-            panic!("the repository-source patch keeps a detailed dependency");
+        // A path under a submodule rebases onto the submodule's repository at
+        // the pinned commit — the superproject holds a gitlink, not the crate.
+        let Dependency::Detailed(audio) = &rebased["crates-io"]["waterkit-audio"] else {
+            panic!("a submodule path patch stays a detailed dependency");
         };
         assert_eq!(
-            core.rev.as_deref(),
-            Some("475b4bb884a5f4e2b1156f1af74c40feaf71fdc1")
+            audio.git.as_deref(),
+            Some("https://github.com/water-rs/waterkit")
+        );
+        assert_eq!(
+            audio.rev.as_deref(),
+            Some("98c89ee702c5629094030023fb8d55464592d35d")
         );
 
-        // Dependencies patched to another source stay untouched and are not
-        // mirrored onto the repository source.
+        // Dependencies patched to another source stay untouched, and no
+        // repository-source table is synthesized — it would patch a source
+        // onto itself.
         let Dependency::Detailed(vello) = &rebased["crates-io"]["vello"] else {
             panic!("a git patch stays a detailed dependency");
         };
@@ -2182,7 +2539,97 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             vello.git.as_deref(),
             Some("https://github.com/lexoliu/vello")
         );
-        assert!(!rebased["https://github.com/water-rs/waterui"].contains_key("vello"));
+        assert!(!rebased.contains_key("https://github.com/water-rs/waterui"));
+        assert!(!rebased.contains_key("https://github.com/water-rs/waterui.git?branch=dev"));
+    }
+
+    #[test]
+    fn coherence_admits_a_submodule_crate_at_either_source() {
+        let revision = "a".repeat(40);
+        let pin = "98c89ee702c5629094030023fb8d55464592d35d";
+        let framework_source = format!("git+{}?rev={revision}#{revision}", framework_repository());
+        let pin_source = format!("git+https://github.com/water-rs/waterkit?rev={pin}#{pin}");
+        let (mut framework, _) = snapshot(&test_lock());
+        framework
+            .patches
+            .entry("crates-io".into())
+            .or_default()
+            .insert(
+                "waterkit-codec".into(),
+                Dependency::Detailed(Box::new(DependencyDetail {
+                    git: Some("https://github.com/water-rs/waterkit".into()),
+                    rev: Some(pin.into()),
+                    ..DependencyDetail::default()
+                })),
+            );
+        framework
+            .patches
+            .entry("crates-io".into())
+            .or_default()
+            .insert(
+                "waterkit-fs".into(),
+                Dependency::Detailed(Box::new(DependencyDetail {
+                    git: Some("https://github.com/water-rs/waterkit".into()),
+                    rev: Some(pin.into()),
+                    ..DependencyDetail::default()
+                })),
+            );
+        let packages = vec![
+            // Recorded at the framework's own source — a submodule path dep
+            // cargo vendors in-source.
+            package("waterkit-codec", "0.1.1", Some(&framework_source)),
+            // Recorded at the submodule repository the patch pins it to.
+            package("waterkit-fs", "0.1.1", Some(&pin_source)),
+            package(
+                "serde",
+                "1.0.0",
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+            ),
+        ];
+        let allowed = framework.allowed_packages(&packages);
+        let identity = |name: &str, source: &str| LockedPackage {
+            name: name.to_owned(),
+            version: "0.1.1".to_owned(),
+            source: Some(source.to_owned()),
+        };
+        assert!(allowed.contains(&identity("waterkit-codec", &framework_source)));
+        assert!(allowed.contains(&identity("waterkit-codec", &pin_source)));
+        assert!(allowed.contains(&identity("waterkit-fs", &pin_source)));
+        assert!(allowed.contains(&identity("waterkit-fs", &framework_source)));
+        // A registry package gains no variants.
+        assert_eq!(
+            allowed
+                .iter()
+                .filter(|package| package.name == "serde")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn parse_gitmodules_reads_submodule_paths_and_urls() {
+        let submodules = parse_gitmodules(
+            "[submodule \"backends/android\"]\n\
+             \tpath = backends/android\n\
+             \turl = https://github.com/water-rs/android-backend.git\n\
+             \tbranch = dev\n\
+             [submodule \"kit\"]\n\
+             \tpath = kit\n\
+             \turl = \"https://github.com/water-rs/waterkit.git\"\n",
+        );
+        assert_eq!(
+            submodules,
+            BTreeMap::from([
+                (
+                    "backends/android".to_string(),
+                    "https://github.com/water-rs/android-backend.git".to_string(),
+                ),
+                (
+                    "kit".to_string(),
+                    "https://github.com/water-rs/waterkit.git".to_string(),
+                ),
+            ])
+        );
     }
 
     fn release(tag: &str, draft: bool, prerelease: bool, published_at: &str) -> Release {
@@ -2268,7 +2715,7 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
 
     #[test]
     fn certification_verification_rejects_uncertified_or_mismatched_manifests() {
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let release = release("v0.4.1", false, false, "2025-11-01T00:00:00Z");
 
         let dev = certification(FrameworkChannel::Dev, "dev");
@@ -2360,7 +2807,7 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             },
         });
         std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        let repository = env!("CARGO_PKG_REPOSITORY").trim_end_matches(".git");
+        let repository = framework_repository();
         let certification = smol::block_on(load_manifest(&path, repository)).unwrap();
         assert_eq!(certification.channel, FrameworkChannel::Stable);
         assert_eq!(certification.tag, "v0.4.1");
@@ -2371,10 +2818,15 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
 
     /// The Rust scaffold derivation and `framework_manifest.py`'s must produce
     /// the same table for the same tree — this asserts the Rust side against
-    /// the repository's own manifest.
+    /// the fixture manifest, which carries the framework root manifest's
+    /// metadata table and the workspace requirements `scaffold-packages`
+    /// names.
     #[test]
     fn framework_scaffold_derives_from_the_framework_manifest() {
-        let root: toml::Value = toml::from_str(include_str!("../../../Cargo.toml")).unwrap();
+        let root: toml::Value = toml::from_str(include_str!(
+            "../../tests/fixtures/framework_checkout_manifest.toml"
+        ))
+        .unwrap();
         let scaffold = framework_scaffold(&root).unwrap();
         let workspace = |name: &str| {
             let dependency = &root["workspace"]["dependencies"][name];
@@ -2398,12 +2850,28 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                     "apple-backend-url".to_owned(),
                     "https://github.com/water-rs/apple-backend.git".to_owned()
                 ),
-                ("apple-backend-version".to_owned(), "0.2.0".to_owned()),
+                ("apple-backend-version".to_owned(), "0.3.0-dev.2".to_owned()),
                 (
                     "android-backend-url".to_owned(),
                     "https://github.com/water-rs/android-backend.git".to_owned()
                 ),
+                ("android-backend-revision".to_owned(), "c".repeat(40)),
             ])
+        );
+    }
+
+    #[test]
+    fn framework_scaffold_rejects_a_backend_revision_that_is_not_a_commit() {
+        let mut root: toml::Value = toml::from_str(include_str!(
+            "../../tests/fixtures/framework_checkout_manifest.toml"
+        ))
+        .unwrap();
+        root["package"]["metadata"]["waterui"]["android-backend-revision"] =
+            toml::Value::String("dev".to_owned());
+        let error = framework_scaffold(&root).unwrap_err();
+        assert!(
+            error.to_string().contains("android-backend-revision"),
+            "{error:?}"
         );
     }
 
@@ -2415,7 +2883,10 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
         let framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
         assert_eq!(framework.channel(), None);
         assert_eq!(framework.scaffold_value("hydrolysis-version"), "0.2.1");
-        assert_eq!(framework.scaffold_value("apple-backend-version"), "0.2.0");
+        assert_eq!(
+            framework.scaffold_value("apple-backend-version"),
+            "0.3.0-dev.2"
+        );
         assert_eq!(
             framework.scaffold_value("android-backend-revision"),
             "c".repeat(40)
@@ -2424,10 +2895,11 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
         assert!(framework.git_source().is_none());
     }
 
-    /// A checkout from before `backends/apple` left the tree: its manifest
-    /// declares no `apple-backend-version`, so the gitlink supplies the pin.
+    /// A checkout from before the backends left the tree: its manifest
+    /// declares neither `apple-backend-version` nor
+    /// `android-backend-revision`, so the gitlinks supply the pins.
     #[test]
-    fn local_checkout_predating_the_apple_gitlink_removal_uses_its_pin() {
+    fn local_checkout_predating_the_gitlink_removals_uses_its_pins() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("waterui");
         write_pre_decoupling_checkout(&root);
@@ -2436,6 +2908,10 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
         assert_eq!(
             framework.scaffold_value("apple-backend-revision"),
             "b".repeat(40)
+        );
+        assert_eq!(
+            framework.scaffold_value("android-backend-revision"),
+            "c".repeat(40)
         );
     }
 }

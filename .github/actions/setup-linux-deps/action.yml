@@ -1,0 +1,19 @@
+name: Setup Linux native dependencies
+description: >
+  Installs the native libraries a Linux build of the CLI needs: `libudev`
+  for `serialport` (the default `esp32` feature) and `pkg-config` to find
+  it. The framework action this is trimmed from carried the GUI stack —
+  GTK4, fonts, VA-API, PipeWire — which no crate in this repository's graph
+  links.
+
+runs:
+  using: composite
+  steps:
+    - name: Install native dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The runner image's baked apt index can name .debs that have left
+        # the pool; refresh before installing.
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq libudev-dev pkg-config

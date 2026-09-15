@@ -21,7 +21,7 @@ use tracing::{debug as trace_debug, info, warn};
 use std::path::Path;
 
 use crate::{
-    apple::platform::apple_deployment_target,
+    apple::{physical::ApplePhysicalDevice, platform::apple_deployment_target},
     debug,
     device::{
         ApplicationExit, Artifact, Device, DeviceEvent, FailToRun, Local, LogLevel, Running,
@@ -198,8 +198,13 @@ fn spawn_simulator_exit_monitor(
             return;
         }
 
-        if let Some(panic_msg) =
-            fetch_recent_panic_logs(&host, context.start_instant, Some(context.pid)).await
+        if let Some(panic_msg) = fetch_recent_panic_logs(
+            &host,
+            &context.device_identifier,
+            context.start_instant,
+            Some(context.pid),
+        )
+        .await
         {
             let _ = sender.try_send(DeviceEvent::Crashed(panic_msg));
             return;
@@ -226,6 +231,7 @@ fn start_log_stream(
     log_level: Option<LogLevel>,
     pid: u32,
     native_logs: bool,
+    udid: &str,
 ) -> eyre::Result<(Receiver<PanicInfo>, smol::process::Child)> {
     // Bounded channel with capacity 1 acts as oneshot - only first panic is captured
     let (panic_tx, panic_rx) = smol::channel::bounded::<PanicInfo>(1);
@@ -240,9 +246,12 @@ fn start_log_stream(
         format!("processID == {pid} AND subsystem == \"dev.waterui\"")
     };
 
-    let mut log_cmd = host.command("log");
+    // The stream runs inside the simulator: the host logd records nothing for
+    // sim processes on these systems, so a host-side `log stream` sees zero
+    // entries while `simctl spawn <udid> log stream` sees them all.
+    let mut log_cmd = host.command("xcrun");
     log_cmd
-        .arg("stream")
+        .args(["simctl", "spawn", udid, "log", "stream"])
         .arg("--predicate")
         .arg(&predicate)
         .arg("--level")
@@ -260,6 +269,22 @@ fn start_log_stream(
         .stdout
         .take()
         .expect("stdout is piped for the simulator log stream");
+
+    // `log stream` only forwards entries written after it attaches to logd, and
+    // a fast first paint routinely beats the attach — the launch marker (and a
+    // fast crash's panic payload) would be permanently lost. `log show` reads
+    // the persisted store, so replay the recent window once shortly after the
+    // stream starts; consumers take the first matching marker, so a line that
+    // also arrives through the stream is harmless.
+    replay_log_history(
+        host.clone(),
+        udid.to_string(),
+        predicate,
+        sender.clone(),
+        panic_tx.clone(),
+        log_level,
+    );
+
     spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Some(Ok(line)) = lines.next().await {
@@ -276,35 +301,79 @@ fn start_log_stream(
             }
 
             // Only send log events to display if user requested logs
-            if log_level.is_some() {
-                // Parse log level from compact format: "timestamp Ty Process..."
-                // Ty is: F (fault), E (error), W (warning), I (info), D (debug)
-                // Fault is Apple's highest severity - used by panic handler
-                let level = if line.contains(" F ") || line.contains(" E ") {
-                    tracing::Level::ERROR
-                } else if line.contains(" W ") {
-                    tracing::Level::WARN
-                } else if line.contains(" D ") {
-                    tracing::Level::DEBUG
-                } else {
-                    tracing::Level::INFO
-                };
-
-                if sender
+            if log_level.is_some()
+                && sender
                     .try_send(DeviceEvent::Log {
-                        level,
+                        level: compact_log_level(&line),
                         message: line,
                     })
                     .is_err()
-                {
-                    break;
-                }
+            {
+                break;
             }
         }
     })
     .detach();
 
     Ok((panic_rx, log_child))
+}
+
+/// Parse log level from `log`'s compact format: "timestamp Ty Process..." where
+/// Ty is F (fault), E (error), W (warning), I (info), or D (debug). Fault is
+/// Apple's highest severity - used by the panic handler.
+fn compact_log_level(line: &str) -> tracing::Level {
+    if line.contains(" F ") || line.contains(" E ") {
+        tracing::Level::ERROR
+    } else if line.contains(" W ") {
+        tracing::Level::WARN
+    } else if line.contains(" D ") {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::INFO
+    }
+}
+
+/// Forward `log show` output for the recent window into the same event path as
+/// the live stream, a few seconds after the stream starts. Reads the persisted
+/// store, so it recovers entries emitted before the stream attached to logd.
+fn replay_log_history(
+    host: Host,
+    udid: String,
+    predicate: String,
+    sender: Sender<DeviceEvent>,
+    panic_tx: Sender<PanicInfo>,
+    log_level: Option<LogLevel>,
+) {
+    spawn(async move {
+        Timer::after(Duration::from_secs(4)).await;
+        let Ok(output) = host
+            .command("xcrun")
+            .args(["simctl", "spawn", &udid, "log", "show"])
+            .args(["--last", "2m", "--predicate", &predicate])
+            .args(["--style", "compact"])
+            .output()
+            .await
+        else {
+            return;
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.starts_with("Filtering") || line.starts_with("Timestamp") {
+                continue;
+            }
+            if line.contains("panic.payload=")
+                && let Some(info) = extract_panic_info_from_log(line)
+            {
+                let _ = panic_tx.try_send(info);
+            }
+            if log_level.is_some() {
+                let _ = sender.try_send(DeviceEvent::Log {
+                    level: compact_log_level(line),
+                    message: line.to_string(),
+                });
+            }
+        }
+    })
+    .detach();
 }
 
 /// Extract panic information from a log line containing panic.payload and panic.location fields.
@@ -340,6 +409,7 @@ fn extract_panic_info_from_log(line: &str) -> Option<PanicInfo> {
 /// Returns the panic message if found, along with location and payload.
 async fn fetch_recent_panic_logs(
     host: &Host,
+    udid: &str,
     started_at: Instant,
     pid: Option<u32>,
 ) -> Option<String> {
@@ -350,10 +420,16 @@ async fn fetch_recent_panic_logs(
             "processID == {pid} AND subsystem == \"dev.waterui\" AND eventMessage CONTAINS \"panic\""
         ));
 
+    // Same simulator-side domain as the live stream: the host logd does not
+    // record sim app entries, so `log show` must run inside the device.
     let output = host
         .output(
-            "log",
+            "xcrun",
             [
+                "simctl",
+                "spawn",
+                udid,
+                "log",
                 "show",
                 "--predicate",
                 predicate.as_str(),
@@ -501,6 +577,9 @@ pub enum AppleDevice {
     /// An Apple Simulator device
     Simulator(Box<AppleSimulator>),
 
+    /// A paired physical iOS device reachable over USB or the LAN.
+    Physical(ApplePhysicalDevice),
+
     /// The current physical `macOS` device
     ///
     /// Apple do not provide macOS simulator, so this represents the current physical machine.
@@ -512,6 +591,7 @@ impl Device for AppleDevice {
     fn name(&self) -> &str {
         match self {
             Self::Simulator(simulator) => simulator.name(),
+            Self::Physical(device) => device.name(),
             Self::Current(mac_os) => mac_os.name(),
         }
     }
@@ -519,6 +599,7 @@ impl Device for AppleDevice {
     async fn launch(&self, host: &Host) -> eyre::Result<()> {
         match self {
             Self::Simulator(simulator) => simulator.launch(host).await,
+            Self::Physical(device) => device.launch(host).await,
             Self::Current(_) => {
                 // No need to launch anything for MacOS physical device
                 // This is the current machine
@@ -535,18 +616,26 @@ impl Device for AppleDevice {
     ) -> Result<crate::device::Running, crate::device::FailToRun> {
         match self {
             Self::Simulator(simulator) => simulator.run(host, artifact, options).await,
+            Self::Physical(device) => device.run(host, artifact, options).await,
             Self::Current(mac_os) => mac_os.run(host, artifact, options).await,
         }
     }
 
     async fn scan(host: &Host) -> eyre::Result<Vec<Self>> {
-        // Aggregate all available Apple devices: simulators + local
+        // Aggregate all available Apple devices: simulators + physical + local
         let mut devices = Vec::new();
 
         // Add available simulators
         let simulators = AppleSimulator::scan(host).await?;
         for sim in simulators {
             devices.push(Self::Simulator(Box::new(sim)));
+        }
+
+        // Add paired physical devices; a devicectl failure is non-fatal —
+        // the simulator list is still useful on its own.
+        match ApplePhysicalDevice::scan(host).await {
+            Ok(physical) => devices.extend(physical.into_iter().map(Self::Physical)),
+            Err(error) => warn!("devicectl device scan failed: {error:#}"),
         }
 
         // Add local machine
@@ -664,9 +753,15 @@ impl Device for AppleSimulator {
 
         // Start log streaming and get panic info receiver
         // Uses WaterUI subsystem predicate by default, or processID if native_logs is enabled
-        let (panic_rx, log_child) =
-            start_log_stream(host, sender.clone(), log_level, pid, native_logs)
-                .map_err(FailToRun::Launch)?;
+        let (panic_rx, log_child) = start_log_stream(
+            host,
+            sender.clone(),
+            log_level,
+            pid,
+            native_logs,
+            &self.udid,
+        )
+        .map_err(FailToRun::Launch)?;
         running.retain(log_child);
 
         // Monitor the actual app process and classify crash vs normal exit.

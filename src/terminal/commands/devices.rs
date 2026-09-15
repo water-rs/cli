@@ -14,10 +14,10 @@ use waterui_cli::esp32::platform::{SerialPortSummary, scan_serial_ports};
 use waterui_cli::{
     android::{
         AndroidSdk,
+        adb::Adb,
         device::{AndroidDevice, emulator_avd_name_with_adb},
     },
-    apple::device::AppleSimulator,
-    device::Device,
+    apple::{device::AppleSimulator, physical::ApplePhysicalDevice},
     toolchain::Host,
 };
 
@@ -53,13 +53,13 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     let host = Host::current();
     match args.platform {
         TargetPlatform::Ios => {
-            let ios_devices = scan_ios_devices(&host).await?;
-            display_ios_devices(shell, &ios_devices);
+            let (physical, sims) = scan_ios_devices(&host).await?;
+            display_ios_devices(shell, &physical, &sims);
         }
         TargetPlatform::Android => {
-            let adb_path = resolve_android_adb(&host)?;
+            let adb = Adb::locate(&host).await?;
             let (avds, devices, running_avds) =
-                scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb_path).await?;
+                scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb).await?;
             display_android_devices(shell, &avds, &devices, &running_avds);
         }
         TargetPlatform::Macos => {
@@ -76,14 +76,14 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         }
         TargetPlatform::All => {
             // Fast-fail only when adb is unavailable.
-            let adb_path = resolve_android_adb(&host)?;
+            let adb = Adb::locate(&host).await?;
             let spinner = shell.spinner("Scanning devices...");
 
             // Scan iOS, Android, and serial ports in parallel
             let ((ios_devices, android_result), serial_ports) = zip(
                 zip(
                     scan_ios_devices(&host),
-                    scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb_path),
+                    scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb),
                 ),
                 scan_esp32_ports(),
             )
@@ -94,7 +94,8 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
             }
 
             // Display results in order
-            display_ios_devices(shell, &ios_devices?);
+            let (physical, sims) = ios_devices?;
+            display_ios_devices(shell, &physical, &sims);
             {
                 let (avds, devices, running_avds) = android_result?;
                 display_android_devices(shell, &avds, &devices, &running_avds);
@@ -114,20 +115,20 @@ async fn run_json(shell: &Shell, args: Args) -> Result<()> {
     let host = Host::current();
     let output = match args.platform {
         TargetPlatform::Ios => {
-            let ios_devices = scan_ios_devices(&host).await?;
+            let (physical, sims) = scan_ios_devices(&host).await?;
             DevicesJsonOutput {
                 ty: "devices",
                 platform: "ios",
-                ios: Some(json_ios_devices(&ios_devices)),
+                ios: Some(json_ios_devices(&physical, &sims)),
                 android: None,
                 macos: None,
                 esp32: None,
             }
         }
         TargetPlatform::Android => {
-            let adb_path = resolve_android_adb(&host)?;
+            let adb = Adb::locate(&host).await?;
             let (avds, devices, running_avds) =
-                scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb_path).await?;
+                scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb).await?;
             DevicesJsonOutput {
                 ty: "devices",
                 platform: "android",
@@ -166,16 +167,16 @@ async fn run_json(shell: &Shell, args: Args) -> Result<()> {
         }
         TargetPlatform::All => {
             // Fast-fail only when adb is unavailable.
-            let adb_path = resolve_android_adb(&host)?;
+            let adb = Adb::locate(&host).await?;
             let ((ios_devices, android_result), serial_ports) = zip(
                 zip(
                     scan_ios_devices(&host),
-                    scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb_path),
+                    scan_android_devices(&host, AndroidSdk::emulator_path(&host), adb),
                 ),
                 scan_esp32_ports(),
             )
             .await;
-            let ios_devices = ios_devices?;
+            let (physical, sims) = ios_devices?;
             let (avds, devices, running_avds) = android_result?;
             #[cfg(feature = "esp32")]
             let esp32 = Some(json_esp32_devices(&serial_ports?));
@@ -188,7 +189,7 @@ async fn run_json(shell: &Shell, args: Args) -> Result<()> {
             DevicesJsonOutput {
                 ty: "devices",
                 platform: "all",
-                ios: Some(json_ios_devices(&ios_devices)),
+                ios: Some(json_ios_devices(&physical, &sims)),
                 android: Some(json_android_section(&avds, &devices, &running_avds)),
                 macos: Some(vec![JsonMacosDevice {
                     id: "local".to_string(),
@@ -203,20 +204,28 @@ async fn run_json(shell: &Shell, args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Scan iOS simulators on `host`.
-async fn scan_ios_devices(host: &Host) -> Result<Vec<AppleSimulator>> {
-    AppleSimulator::scan_ios(host).await
-}
-
-fn resolve_android_adb(host: &Host) -> Result<PathBuf> {
-    AndroidSdk::adb_path(host).ok_or_else(|| eyre::eyre!("Android adb not found"))
+/// Scan iOS devices and simulators on `host`.
+///
+/// The `devicectl` scan is non-fatal — a machine without paired devices (or
+/// without `CoreDevice`) still has its simulators to list.
+async fn scan_ios_devices(host: &Host) -> Result<(Vec<ApplePhysicalDevice>, Vec<AppleSimulator>)> {
+    let (physical, simulators) = zip(
+        ApplePhysicalDevice::scan(host),
+        AppleSimulator::scan_ios(host),
+    )
+    .await;
+    let physical = physical.unwrap_or_else(|error| {
+        tracing::warn!("devicectl device scan failed: {error:#}");
+        Vec::new()
+    });
+    Ok((physical, simulators?))
 }
 
 /// Scan Android devices and emulators on `host`.
 async fn scan_android_devices(
     host: &Host,
     emulator_path: Option<PathBuf>,
-    adb_path: PathBuf,
+    adb: Adb,
 ) -> Result<(Vec<String>, Vec<AndroidDevice>, HashSet<String>)> {
     // List available AVDs (emulators) and connected devices in parallel
     let avds_future = async move {
@@ -241,7 +250,7 @@ async fn scan_android_devices(
             })
     };
 
-    let devices_future = AndroidDevice::scan(host);
+    let devices_future = AndroidDevice::scan_with_adb(host, &adb);
 
     let (avds, connected_devices) = zip(avds_future, devices_future).await;
     let avds = avds?;
@@ -254,15 +263,41 @@ async fn scan_android_devices(
         if !id.starts_with("emulator-") {
             continue;
         }
-        let name = emulator_avd_name_with_adb(host, &adb_path, id).await?;
+        let name = emulator_avd_name_with_adb(host, &adb, id).await?;
         running_avds.insert(name);
     }
 
     Ok((avds, connected_devices, running_avds))
 }
 
-/// Display iOS devices.
-fn display_ios_devices(shell: &Shell, devs: &[AppleSimulator]) {
+/// Display iOS devices: paired physical devices first, then simulators.
+fn display_ios_devices(shell: &Shell, physical: &[ApplePhysicalDevice], devs: &[AppleSimulator]) {
+    if !physical.is_empty() {
+        header!(shell, "iOS Devices");
+        for device in physical {
+            let reachable = device.usability().is_ok();
+            let state_icon = if reachable { "●" } else { "○" };
+            let transport = match device.transport {
+                waterui_cli::apple::physical::Transport::Wired => "USB",
+                waterui_cli::apple::physical::Transport::LocalNetwork => "Wi-Fi",
+                waterui_cli::apple::physical::Transport::Other => "?",
+            };
+            let os = device
+                .os_version
+                .as_ref()
+                .map_or_else(String::new, |v| format!(" — iOS {v}"));
+            line!(
+                shell,
+                "  {} {} [{}]{} ({})",
+                state_icon,
+                device.name,
+                transport,
+                os,
+                device.identifier
+            );
+        }
+    }
+
     if !devs.is_empty() {
         header!(shell, "iOS Simulators");
     }
@@ -272,8 +307,8 @@ fn display_ios_devices(shell: &Shell, devs: &[AppleSimulator]) {
         line!(shell, "  {} {} ({})", state_icon, sim.name, sim.udid);
     }
 
-    if devs.is_empty() {
-        line!(shell, "  No iOS simulators available");
+    if devs.is_empty() && physical.is_empty() {
+        line!(shell, "  No iOS simulators or devices available");
     }
 }
 
@@ -381,6 +416,8 @@ struct JsonIosDevice {
     udid: String,
     state: String,
     available: bool,
+    /// `"device"` for a paired physical device, `"simulator"` otherwise.
+    kind: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -419,15 +456,26 @@ struct JsonEsp32Device {
     likely_esp: bool,
 }
 
-fn json_ios_devices(devices: &[AppleSimulator]) -> Vec<JsonIosDevice> {
-    devices
+fn json_ios_devices(
+    physical: &[ApplePhysicalDevice],
+    devices: &[AppleSimulator],
+) -> Vec<JsonIosDevice> {
+    physical
         .iter()
-        .map(|sim| JsonIosDevice {
+        .map(|device| JsonIosDevice {
+            name: device.name.clone(),
+            udid: device.udid.clone(),
+            state: format!("{:?}", device.tunnel_state),
+            available: device.usability().is_ok(),
+            kind: "device",
+        })
+        .chain(devices.iter().map(|sim| JsonIosDevice {
             name: sim.name.clone(),
             udid: sim.udid.clone(),
             state: sim.state.clone(),
             available: sim.is_available,
-        })
+            kind: "simulator",
+        }))
         .collect()
 }
 
@@ -483,6 +531,7 @@ mod tests {
             udid: "UDID".to_string(),
             state: "Booted".to_string(),
             available: true,
+            kind: "simulator",
         };
         let android = JsonAndroidSection {
             emulators: vec![JsonAndroidEmulator {

@@ -10,7 +10,7 @@ use std::{
 
 use askama::Template;
 
-use crate::framework::ResolvedFramework;
+use crate::framework::{FrameworkChannel, ResolvedFramework};
 use crate::project::ResolvedWebViewBackend;
 
 use include_dir::{Dir, include_dir};
@@ -83,7 +83,7 @@ pub fn scaffold_template_digest() -> String {
     })
 }
 
-mod embedded {
+pub mod embedded {
     use super::{Dir, include_dir};
 
     pub static APPLE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/apple");
@@ -121,6 +121,16 @@ impl IosPermissionTemplateEntry {
 pub struct FontRegistrationTemplateEntry {
     pub family_name: String,
     pub file_name: String,
+}
+
+/// What the launch screen staged into the Apple asset catalog contains, so
+/// the generated Xcode project names only the assets that exist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchTemplateEntry {
+    /// A `LaunchBackground` color set was staged (a background is configured).
+    pub has_background: bool,
+    /// A `LaunchImage` image set was staged (`Launch.*` exists).
+    pub has_image: bool,
 }
 
 /// ESP32 harness parameters substituted into the generated firmware crate.
@@ -252,8 +262,6 @@ pub struct TemplateContext {
     pub apple_backend_branch: Option<String>,
     /// `[backend.apple] revision` — pin the remote package to a revision.
     pub apple_backend_revision: Option<String>,
-    /// Whether to use remote dev backend (`JitPack`) instead of local
-    pub use_remote_dev_backend: bool,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
     /// Persisted framework source and native backend revisions.
@@ -280,11 +288,24 @@ pub struct TemplateContext {
     pub preview_app_dependency: Option<(CrateName, PathBuf)>,
     /// Package type of the project being scaffolded.
     pub package_type: crate::project::PackageType,
+    /// The `include_web!` argument when the root view is a web frontend:
+    /// `"web"` for the conventional layout, a path relative to the project
+    /// root for a frontend referenced in place. `None` renders the demo
+    /// `lib.rs` instead.
+    pub web_frontend_arg: Option<String>,
     /// ESP32 harness parameters used by the esp32 templates.
     pub esp32: Esp32TemplateEntry,
+    /// The launch screen assets the Apple templates refer to.
+    pub launch: LaunchTemplateEntry,
 }
 
 impl TemplateContext {
+    /// The `include_web!` argument rendered into `web_lib.rs.tpl`.
+    #[must_use]
+    pub fn web_arg(&self) -> &str {
+        self.web_frontend_arg.as_deref().unwrap_or("web")
+    }
+
     /// Build a template context for a new root project scaffold.
     #[must_use]
     pub fn for_create_options(
@@ -299,13 +320,10 @@ impl TemplateContext {
             crate_name,
             bundle_identifier: options.bundle_identifier.clone(),
             author: options.author.clone(),
-            android_backend_path: waterui_path
-                .as_ref()
-                .map(|path| path.join("backends/android")),
+            android_backend_path: None,
             apple_backend_path: None,
             apple_backend_branch: None,
             apple_backend_revision: None,
-            use_remote_dev_backend: waterui_path.is_none(),
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -318,7 +336,9 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type: options.package_type,
+            web_frontend_arg: options.web.as_ref().map(|web| web.include_arg.clone()),
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
@@ -343,7 +363,6 @@ impl TemplateContext {
                 .map(PathBuf::from),
             apple_backend_branch: apple.and_then(|backend| backend.branch.clone()),
             apple_backend_revision: apple.and_then(|backend| backend.revision.clone()),
-            use_remote_dev_backend: manifest.waterui_path.is_none(),
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -356,7 +375,9 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type: manifest.package.package_type,
+            web_frontend_arg: manifest.web.as_ref().map(|_| "web".to_string()),
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
@@ -371,9 +392,6 @@ impl TemplateContext {
         accessory: bool,
         preview_runtime_fingerprint: Option<String>,
     ) -> Self {
-        let android_backend_path = waterui_path
-            .as_ref()
-            .map(|waterui_path| waterui_path.join("backends/android"));
         // A support app exists to host one specific WaterUI runtime, so it has
         // to resolve dependencies exactly the way that runtime's own workspace
         // does — `[patch]` included. Cargo only honours `[patch]` from the root
@@ -390,11 +408,10 @@ impl TemplateContext {
             crate_name,
             bundle_identifier,
             author: String::new(),
-            android_backend_path,
+            android_backend_path: None,
             apple_backend_path: None,
             apple_backend_branch: None,
             apple_backend_revision: None,
-            use_remote_dev_backend: waterui_path.is_none(),
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -407,7 +424,9 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type: crate::project::PackageType::Playground,
+            web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
@@ -504,6 +523,13 @@ impl TemplateContext {
         self
     }
 
+    /// Name the launch screen assets staged into the Apple asset catalog.
+    #[must_use]
+    pub const fn with_launch(mut self, launch: LaunchTemplateEntry) -> Self {
+        self.launch = launch;
+        self
+    }
+
     /// Set ESP32 harness parameters for template rendering.
     #[must_use]
     pub fn with_esp32(mut self, esp32: Esp32TemplateEntry) -> Self {
@@ -530,18 +556,20 @@ impl TemplateContext {
             .unwrap_or_else(|error| panic!("{error:#}"))
     }
 
+    /// Whether the Android project consumes the runtime as the remote
+    /// coordinate `android_remote_backend_dependency` names rather than a
+    /// local checkout: true unless `[backend.android] backend_path` names one
+    /// or `waterui_path/backends/android` is a Gradle project.
+    #[must_use]
+    pub fn use_remote_dev_backend(&self) -> bool {
+        self.compute_android_backend_path().is_none()
+    }
+
+    /// The local runtime the Android project includes as a composite build;
+    /// empty in remote mode, where the templates never read it.
     #[must_use]
     pub fn android_backend_path(&self) -> String {
-        if self.use_remote_dev_backend {
-            return String::new();
-        }
-
-        self.compute_android_backend_path().unwrap_or_else(|| {
-            panic!(
-                "TemplateContext missing local Android backend path: \
-use_remote_dev_backend=false requires waterui_path or android_backend_path"
-            )
-        })
+        self.compute_android_backend_path().unwrap_or_default()
     }
 
     #[must_use]
@@ -631,27 +659,50 @@ use_remote_dev_backend=false requires waterui_path or android_backend_path"
         normalize_path_for_config(&backend_path)
     }
 
-    /// Compute the relative path from the backend project to a `WaterUI` backend.
-    fn compute_relative_backend_path(&self, backend_subdir: &str) -> Option<String> {
-        let waterui_path = self.waterui_path.as_ref()?;
-        Some(self.backend_relative_path(&waterui_path.join("backends").join(backend_subdir)))
-    }
-
     /// The path to the local Apple backend checkout `[backend.apple]`
     /// `backend_path` names, resolved from the Xcode project's directory.
     /// `None` consumes the remote Swift package instead.
+    ///
+    /// Without a manifest override, `waterui_path/backends/apple` is used when
+    /// it is a real Swift package: playground manifests cannot declare
+    /// `[backends.*]`, and dropping this fallback silently retargeted every
+    /// playground build — including the backend's own e2e suite — onto the
+    /// pinned remote release.
     fn compute_apple_backend_path(&self) -> Option<String> {
         self.apple_backend_path
             .as_ref()
             .map(|path| self.backend_relative_path(path))
+            .or_else(|| {
+                let local = self.waterui_workspace_root()?.join("backends/apple");
+                local
+                    .join("Package.swift")
+                    .is_file()
+                    .then(|| self.backend_relative_path(&local))
+            })
     }
 
-    /// Compute the relative path from the Android project to the `WaterUI` Android backend.
+    /// The path to the local Android backend checkout `[backend.android]`
+    /// `backend_path` names, resolved from the Android project's directory.
+    /// `None` consumes the remote runtime coordinate instead.
+    ///
+    /// Without a manifest override, `waterui_path/backends/android` is used
+    /// when it is a real Gradle project: the framework tree carries no
+    /// `backends/android` gitlink any more (water-rs/waterui#940), so a local
+    /// checkout without one builds against the runtime the framework
+    /// declares through `android-backend-revision`, while a checkout that
+    /// does carry a runtime there — a backend e2e overlay, an older
+    /// revision — keeps building against it.
     fn compute_android_backend_path(&self) -> Option<String> {
         self.android_backend_path
             .as_ref()
             .map(|path| normalize_path_for_config(path))
-            .or_else(|| self.compute_relative_backend_path("android"))
+            .or_else(|| {
+                let local = self.waterui_workspace_root()?.join("backends/android");
+                local
+                    .join("settings.gradle.kts")
+                    .is_file()
+                    .then(|| self.backend_relative_path(&local))
+            })
     }
 
     /// Absolute path of the `WaterUI` workspace root when building against a
@@ -725,30 +776,37 @@ use_remote_dev_backend=false requires waterui_path or android_backend_path"
 
     /// The `SwiftPM` requirement the generated `XCRemoteSwiftPackageReference`
     /// pins the Apple backend at: a `[backend.apple]` override first —
-    /// `branch`, then `revision` — the framework's declared
-    /// `apple-backend-version` next, and the `apple-backend-revision` gitlink
-    /// pin a framework older than the submodule's removal carries last.
+    /// `branch`, then `revision` — then the pin the framework's channel
+    /// carries. `dev` and `nightly` pin `apple-backend-revision`, the
+    /// backend commit the channel resolved or certified, before the stable
+    /// `apple-backend-version` tag; `stable` and a local checkout do the
+    /// reverse, falling to the `apple-backend-revision` gitlink pin a
+    /// framework older than the submodule's removal records.
     fn apple_backend_requirement(&self) -> String {
         if let (Some(_), Some(_)) = (&self.apple_backend_branch, &self.apple_backend_revision) {
             panic!("`[backend.apple]` sets both `branch` and `revision`; pick one");
         }
+        let revision =
+            |revision: &str| format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";");
+        let version =
+            |version: &str| format!("kind = exactVersion;\n\t\t\t\tversion = \"{version}\";");
         self.apple_backend_branch
-            .as_ref()
+            .as_deref()
             .map(|branch| format!("kind = branch;\n\t\t\t\tbranch = \"{branch}\";"))
-            .or_else(|| {
-                self.apple_backend_revision
-                    .as_ref()
-                    .map(|revision| format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";"))
+            .or_else(|| self.apple_backend_revision.as_deref().map(revision))
+            .or_else(|| match self.framework.channel() {
+                Some(FrameworkChannel::Dev | FrameworkChannel::Nightly) => self
+                    .framework
+                    .apple_backend_revision()
+                    .map(revision)
+                    .or_else(|| self.framework.apple_backend_version().map(version)),
+                Some(FrameworkChannel::Stable) | None => self
+                    .framework
+                    .apple_backend_version()
+                    .map(version)
+                    .or_else(|| self.framework.apple_backend_revision().map(revision)),
             })
-            .or_else(|| {
-                self.framework.apple_backend_version().map(|version| {
-                    format!("kind = exactVersion;\n\t\t\t\tversion = \"{version}\";")
-                })
-            })
-            .unwrap_or_else(|| {
-                let revision = self.framework.scaffold_value("apple-backend-revision");
-                format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";")
-            })
+            .unwrap_or_else(|| panic!("resolved framework carries no Apple backend pin"))
     }
 
     /// Generate the `XCode` package reference section for the project file.
@@ -1017,6 +1075,7 @@ define_scaffold_templates! {
     AssetsReadmeTemplate => (Root, "src/templates/assets_readme.md.tpl"),
     AppleProjectTemplate => (Apple, "src/templates/apple/AppName.xcodeproj/project.pbxproj.tpl"),
     AppleAppTemplate => (Apple, "src/templates/apple/AppName/AppNameApp.swift.tpl"),
+    AppleInfoPlistTemplate => (Apple, "src/templates/apple/AppName/Info.plist.tpl"),
     AppleBuildScriptTemplate => (Apple, "src/templates/apple/build-rust.sh.tpl"),
     AndroidGradleAppTemplate => (Android, "src/templates/android/app/build.gradle.kts.tpl"),
     AndroidManifestTemplate => (Android, "src/templates/android/app/src/main/AndroidManifest.xml.tpl"),
@@ -1029,6 +1088,7 @@ define_scaffold_templates! {
     Gtk4BuildScriptTemplate => (Gtk4, "src/templates/gtk4/build.rs.tpl"),
     Gtk4MainTemplate => (Gtk4, "src/templates/gtk4/src/main.rs.tpl"),
     HydrolysisBuildScriptTemplate => (Hydrolysis, "src/templates/hydrolysis/build.rs.tpl"),
+    RootWebLibTemplate => (Root, "src/templates/web_lib.rs.tpl"),
     HydrolysisLibTemplate => (Hydrolysis, "src/templates/hydrolysis/src/lib.rs.tpl"),
     HydrolysisMainTemplate => (Hydrolysis, "src/templates/hydrolysis/src/main.rs.tpl"),
     HydrolysisPreviewRuntimeTemplate => (Hydrolysis, "src/templates/hydrolysis/src/preview_runtime.rs.tpl"),
@@ -1048,11 +1108,12 @@ define_scaffold_templates! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserTemplateContext, Esp32TemplateEntry, ResolvedWebViewBackend, TemplateContext,
-        TemplateNamespace, embedded, gtk4, jitpack_dependency_coordinate,
-        normalize_path_for_config, preview_ffi, render_scaffold_template,
+        BrowserTemplateContext, Esp32TemplateEntry, LaunchTemplateEntry, ResolvedFramework,
+        ResolvedWebViewBackend, TemplateContext, TemplateNamespace, embedded, gtk4,
+        jitpack_dependency_coordinate, normalize_path_for_config, preview_ffi,
+        render_scaffold_template,
     };
-    use crate::framework::test_fixtures::stable_framework;
+    use crate::framework::test_fixtures::{dev_framework, nightly_framework, stable_framework};
     use crate::project_types::{BundleIdentifier, CrateName};
     use include_dir::Dir;
     use std::path::PathBuf;
@@ -1075,7 +1136,6 @@ mod tests {
             apple_backend_path: None,
             apple_backend_branch: None,
             apple_backend_revision: None,
-            use_remote_dev_backend: waterui_path.is_none(),
             waterui_path,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
@@ -1088,12 +1148,57 @@ mod tests {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             package_type,
+            web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
+            launch: LaunchTemplateEntry::default(),
         }
     }
 
     fn app_ctx() -> TemplateContext {
         ctx(None, None, None, crate::project::PackageType::App)
+    }
+
+    /// A local checkout without a `backends/android` Gradle project — the
+    /// framework tree since water-rs/waterui#940 — consumes the remote
+    /// runtime the framework declares; one that carries the runtime (a
+    /// backend e2e overlay, an older revision) is included as a composite
+    /// build.
+    #[test]
+    fn android_uses_the_local_runtime_only_when_the_checkout_carries_one() {
+        let workspace = tempdir().expect("tempdir");
+        let waterui = workspace.path().join("waterui");
+        let project = workspace.path().join("app");
+        std::fs::create_dir_all(&waterui).expect("checkout");
+        std::fs::create_dir_all(project.join("android")).expect("project");
+        let context = || {
+            ctx(
+                Some(waterui.clone()),
+                Some(project.join("android")),
+                Some(project.clone()),
+                crate::project::PackageType::App,
+            )
+        };
+
+        let bare = context();
+        assert!(bare.use_remote_dev_backend());
+        assert_eq!(bare.android_backend_path(), "");
+        assert!(
+            bare.android_remote_backend_dependency()
+                .contains(&"c".repeat(40)),
+            "the remote coordinate names the declared android-backend-revision"
+        );
+
+        std::fs::create_dir_all(waterui.join("backends/android")).expect("runtime");
+        std::fs::write(waterui.join("backends/android/settings.gradle.kts"), "").expect("gradle");
+        let overlaid = context();
+        assert!(!overlaid.use_remote_dev_backend());
+        assert!(
+            overlaid
+                .android_backend_path()
+                .ends_with("backends/android"),
+            "{}",
+            overlaid.android_backend_path()
+        );
     }
 
     fn playground_ctx() -> TemplateContext {
@@ -1355,18 +1460,20 @@ mod tests {
         let manifest = super::render_native_backend_bin_cargo_toml(&ctx, "waterui-test-gtk4", &[])
             .expect("generated manifest renders");
 
-        let core_path = checkout.join("core").to_string_lossy().into_owned();
-        assert!(
-            manifest.contains(&format!(
-                "[patch.crates-io.waterui-core]\npath = \"{core_path}\""
-            )),
-            "{manifest}"
-        );
-        assert!(
-            manifest.contains(&format!(
-                "[patch.\"https://github.com/water-rs/waterui\".waterui-core]\npath = \"{core_path}\""
-            )),
-            "{manifest}"
+        let core_path = checkout.join("core");
+        let manifest: toml::Value = toml::from_str(&manifest).expect("generated manifest parses");
+        let patched_path = |source: &str| {
+            manifest["patch"][source]["waterui-core"]["path"]
+                .as_str()
+                .map_or_else(
+                    || panic!("no waterui-core path patch under [patch.{source:?}]:\n{manifest}"),
+                    std::path::PathBuf::from,
+                )
+        };
+        assert_eq!(patched_path("crates-io"), core_path);
+        assert_eq!(
+            patched_path("https://github.com/water-rs/waterui"),
+            core_path
         );
     }
 
@@ -1413,6 +1520,49 @@ mod tests {
             "/waterui/backends/apple"
         };
         assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn waterui_path_backends_apple_is_used_when_no_manifest_override() {
+        let waterui_root = tempdir().expect("tempdir");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Package.swift"),
+            "// swift-tools-version:5.9\n",
+        )
+        .expect("Package.swift");
+        let project_root = tempdir().expect("tempdir");
+
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(project_root.path().join("managed_backends/apple")),
+            Some(project_root.path().to_path_buf()),
+            crate::project::PackageType::Playground,
+        );
+
+        let path = ctx
+            .compute_apple_backend_path()
+            .expect("waterui_path/backends/apple must resolve");
+        assert!(
+            path.ends_with("backends/apple"),
+            "expected the staged backend path, got {path}"
+        );
+    }
+
+    #[test]
+    fn missing_local_apple_backend_falls_back_to_remote_package() {
+        let waterui_root = tempdir().expect("tempdir");
+        std::fs::create_dir_all(waterui_root.path().join("backends")).expect("backends dir");
+
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(PathBuf::from("managed_backends/apple")),
+            None,
+            crate::project::PackageType::Playground,
+        );
+
+        assert!(ctx.compute_apple_backend_path().is_none());
     }
 
     #[test]
@@ -1513,6 +1663,123 @@ mod tests {
         assert!(rendered.contains(ctx.framework.scaffold_value("apple-backend-url")));
         assert!(rendered.contains(ctx.framework.apple_backend_version().unwrap()));
         assert!(rendered.contains("kind = exactVersion;"));
+    }
+
+    /// The Apple backend follows the framework's channel: `dev` and
+    /// `nightly` pin the `apple-backend-revision` the channel resolved or
+    /// certified, never the stable `apple-backend-version` tag — and a
+    /// `[backends.apple]` override still outranks either.
+    #[test]
+    fn apple_project_pins_the_channel_backend_on_dev_and_nightly() {
+        let project = |framework: ResolvedFramework| {
+            let mut context = app_ctx();
+            context.framework = framework;
+            let template = embedded::APPLE
+                .get_file("AppName.xcodeproj/project.pbxproj.tpl")
+                .expect("apple project template must exist")
+                .contents_utf8()
+                .expect("apple project template must be utf-8");
+            render_scaffold_template(
+                TemplateNamespace::Apple,
+                std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
+                template,
+                &context,
+            )
+            .expect("apple project render")
+        };
+        let revision = 'd'.to_string().repeat(40);
+        for (channel, rendered) in [
+            ("dev", project(dev_framework())),
+            ("nightly", project(nightly_framework(true))),
+        ] {
+            assert!(
+                rendered.contains(&format!("revision = \"{revision}\";")),
+                "{channel} must pin the backend revision:\n{rendered}"
+            );
+            assert!(!rendered.contains("kind = exactVersion;"), "{channel}");
+        }
+        // A nightly certification that names no backend revision certifies
+        // the manifest's declared tag.
+        let rendered = project(nightly_framework(false));
+        assert!(rendered.contains("kind = exactVersion;"));
+        assert!(rendered.contains("version = \"0.3.0-dev.2\";"));
+        // An explicit `[backends.apple]` override outranks the channel pin.
+        let mut context = app_ctx();
+        context.framework = dev_framework();
+        context.apple_backend_branch = Some("dev".to_owned());
+        let template = embedded::APPLE
+            .get_file("AppName.xcodeproj/project.pbxproj.tpl")
+            .expect("apple project template must exist")
+            .contents_utf8()
+            .expect("apple project template must be utf-8");
+        let rendered = render_scaffold_template(
+            TemplateNamespace::Apple,
+            std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
+            template,
+            &context,
+        )
+        .expect("apple project render");
+        assert!(rendered.contains("kind = branch;\n\t\t\t\tbranch = \"dev\";"));
+    }
+
+    #[test]
+    fn apple_project_names_only_the_launch_assets_that_were_staged() {
+        let render = |ctx: &TemplateContext, file: &str| {
+            let template = embedded::APPLE
+                .get_file(file)
+                .expect("apple template must exist")
+                .contents_utf8()
+                .expect("apple template must be utf-8");
+            render_scaffold_template(
+                TemplateNamespace::Apple,
+                std::path::Path::new(file),
+                template,
+                ctx,
+            )
+            .expect("apple template render")
+        };
+        let project = "AppName.xcodeproj/project.pbxproj.tpl";
+        let info_plist = "AppName/Info.plist.tpl";
+
+        let bare = app_ctx();
+        let rendered = render(&bare, project);
+        assert!(rendered.contains(&format!(
+            "INFOPLIST_FILE = \"{}/Info.plist\";",
+            bare.app_name
+        )));
+        assert!(rendered.contains("GENERATE_INFOPLIST_FILE = YES;"));
+        // UILaunchScreen has no INFOPLIST_KEY_ build setting for its sub-keys;
+        // Xcode silently drops such keys, so the project must not carry them.
+        assert!(!rendered.contains("INFOPLIST_KEY_UILaunchScreen"));
+        // Info.plist lives in the synchronized app folder; without this
+        // exception Xcode also copies it as a bundle resource and the build
+        // fails with two producers of the app's Info.plist.
+        assert!(
+            rendered.contains("membershipExceptions = (\n\t\t\t\tInfo.plist,\n\t\t\t);"),
+            "{rendered}"
+        );
+        let plist = render(&bare, info_plist);
+        assert!(
+            plist.contains("<key>UILaunchScreen</key>\n\t<dict>\n\t</dict>"),
+            "{plist}"
+        );
+
+        let configured = app_ctx().with_launch(LaunchTemplateEntry {
+            has_background: true,
+            has_image: true,
+        });
+        let plist = render(&configured, info_plist);
+        assert!(plist.contains("<key>UIColorName</key>\n\t\t<string>LaunchBackground</string>"));
+        assert!(plist.contains("<key>UIImageName</key>\n\t\t<string>LaunchImage</string>"));
+        assert!(plist.contains("<key>UIImageRespectsSafeAreaInsets</key>\n\t\t<true/>"));
+
+        let color_only = app_ctx().with_launch(LaunchTemplateEntry {
+            has_background: true,
+            has_image: false,
+        });
+        let plist = render(&color_only, info_plist);
+        assert!(plist.contains("LaunchBackground"));
+        assert!(!plist.contains("LaunchImage"));
     }
 
     #[test]
@@ -1644,6 +1911,8 @@ mod tests {
         .expect("android MainActivity render");
 
         assert!(activity.contains("enableEdgeToEdge()"));
+        // The dev-server URL is forwarded only on debuggable builds.
+        assert!(activity.contains(r#"envVar == "WATERUI_DEV_URL" && !BuildConfig.DEBUG"#));
         assert!(activity.contains("waterUiApplication.acquireRuntime(this)"));
         assert!(activity.contains("androidRuntimeLease.close()"));
         assert!(activity.contains("val reportActivityFinished = !isChangingConfigurations"));
@@ -2069,6 +2338,9 @@ mod tests {
         assert_eq!(managed(), "pins v2");
     }
 
+    /// A `waterui_path` ctx resolves `waterui-preview` through `cargo
+    /// metadata` on the checkout, so the checkout is a minimal fixture
+    /// workspace carrying that one member.
     #[test]
     fn preview_ffi_scaffold_emits_dylib_only_wrapper() {
         let tempdir = tempdir().expect("temporary preview ffi scaffold dir");
@@ -2078,10 +2350,21 @@ mod tests {
             .join("cache")
             .join("managed_backends")
             .join("preview_ffi");
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("CLI crate should be inside the WaterUI workspace")
-            .to_path_buf();
+        let workspace_root = tempdir.path().join("waterui");
+        std::fs::create_dir_all(workspace_root.join("preview/src"))
+            .expect("fixture workspace member dir");
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"preview\"]\n",
+        )
+        .expect("fixture workspace manifest");
+        std::fs::write(
+            workspace_root.join("preview/Cargo.toml"),
+            "[package]\nname = \"waterui-preview\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("fixture member manifest");
+        std::fs::write(workspace_root.join("preview/src/lib.rs"), "")
+            .expect("fixture member source");
         let ctx = ctx(
             Some(workspace_root),
             Some(preview_ffi_dir.clone()),
@@ -3961,7 +4244,7 @@ fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::Patc
 /// `waterui-*` dependencies against — the source a `[patch]` table must name
 /// to redirect those dependencies.
 fn framework_git_source() -> String {
-    env!("CARGO_PKG_REPOSITORY")
+    env!("WATERUI_FRAMEWORK_REPOSITORY")
         .trim_end_matches(".git")
         .to_string()
 }
@@ -4442,10 +4725,7 @@ pub mod root {
     /// workflow work out of the box: the planner walks the assets root
     /// recursively, so the directory has to exist before the first `assets!`
     /// call, and a tracked file is what keeps it present in git.
-    static ROOT_TEMPLATES: &[(&str, &str)] = &[
-        ("lib.rs.tpl", "src/lib.rs"),
-        (".gitignore.tpl", ".gitignore"),
-    ];
+    static ROOT_TEMPLATES: &[(&str, &str)] = &[(".gitignore.tpl", ".gitignore")];
 
     /// Write root templates to the given directory.
     ///
@@ -4464,11 +4744,22 @@ pub mod root {
         generate_cargo_toml(base_dir, ctx).await?;
 
         let assets_readme = format!("{assets_dir}/README.md");
-        let templates: Vec<(&str, String)> = ROOT_TEMPLATES
-            .iter()
-            .map(|(template, dest)| (*template, (*dest).to_string()))
-            .chain(core::iter::once(("assets_readme.md.tpl", assets_readme)))
-            .collect();
+        // A web-frontend project gets the `include_web!` root view
+        // instead of the demo form.
+        let lib_template = if ctx.web_frontend_arg.is_some() {
+            "web_lib.rs.tpl"
+        } else {
+            "lib.rs.tpl"
+        };
+        let templates: Vec<(&str, String)> =
+            core::iter::once((lib_template, "src/lib.rs".to_string()))
+                .chain(
+                    ROOT_TEMPLATES
+                        .iter()
+                        .map(|(template, dest)| (*template, (*dest).to_string())),
+                )
+                .chain(core::iter::once(("assets_readme.md.tpl", assets_readme)))
+                .collect();
         // The WaterUI logo is the starting app icon; the planner picks up any
         // root-level `Icon.*` asset, so replacing the file rebrands the app.
         // Builds without SVG support scaffold a rendered PNG instead.
@@ -4534,7 +4825,7 @@ pub mod root {
             )]),
             dependencies: BTreeMap::from([("waterui".to_string(), waterui_dependency.clone())]),
             build_dependencies: BTreeMap::new(),
-            target: native_target_section(waterui_dependency),
+            target: native_target_section(waterui_dependency, ctx.web_frontend_arg.is_some()),
             workspace: GeneratedWorkspaceSection {},
             patch: match &ctx.waterui_path {
                 Some(waterui_path) => {
@@ -4564,17 +4855,24 @@ pub mod root {
 
     fn native_target_section(
         waterui_dependency: GeneratedDependencyDetail,
+        web_frontend: bool,
     ) -> BTreeMap<String, GeneratedTargetSection<GeneratedDependencyDetail>> {
         // Desktop conveniences only: `media` pulls the GPU stack, which does
         // not exist on espidf targets, so firmware builds must fall through
         // to the bare default-features-off dependency for the scaffolded app
         // to cross-compile for ESP32 chips at all.
+        // `include_web!` expands against both the assets bundle API and the
+        // webview surface, so a web-frontend project enables both.
+        let mut waterui_features = vec!["assets", "media", "flow-markdown"];
+        if web_frontend {
+            waterui_features.push("webview");
+        }
         BTreeMap::from([(
             "cfg(not(any(target_arch = \"wasm32\", target_os = \"espidf\")))".to_string(),
             GeneratedTargetSection {
                 dependencies: BTreeMap::from([(
                     "waterui".to_string(),
-                    waterui_dependency.with_features(&["assets", "media", "flow-markdown"]),
+                    waterui_dependency.with_features(&waterui_features),
                 )]),
             },
         )])
@@ -5015,15 +5313,16 @@ pub mod inspector {
 
     #[cfg(test)]
     mod tests {
-        /// The scaffolder resolves the Inspector crate by path, so a move that
-        /// nobody updates here breaks `water inspector` silently — which is
-        /// exactly what happened when the crate moved under `devtools/`.
+        /// The scaffolder resolves the Inspector crate by path inside a
+        /// `waterui_path` checkout, so a move that nobody updates here breaks
+        /// `water inspector` silently — which is exactly what happened when the
+        /// crate moved under `devtools/`. The checkout is the pinned framework
+        /// revision, cloned on demand.
         #[test]
+        #[ignore = "clones the pinned framework revision"]
         fn the_inspector_app_crate_path_exists() {
-            let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .expect("the CLI crate lives inside the repository");
-            let crate_path = repository.join(super::INSPECTOR_APP_CRATE);
+            let checkout = crate::pinned_framework::checkout();
+            let crate_path = checkout.path().join(super::INSPECTOR_APP_CRATE);
             assert!(
                 crate_path.join("Cargo.toml").is_file(),
                 "inspector app crate is not at {}",

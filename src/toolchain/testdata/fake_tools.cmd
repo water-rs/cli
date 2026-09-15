@@ -111,10 +111,7 @@ goto :exit_ok
 exit /b 0
 
 :rustup
-if "%*"=="show active-toolchain" (
-    if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN (echo error: no active toolchain 1>&2 & exit /b 1)
-    call :respond RUSTUP_ACTIVE_TOOLCHAIN & exit /b !errorlevel!
-)
+if "%*"=="show active-toolchain" goto :rustup_active_toolchain
 if "%*"=="target list --installed" (call :respond_or_empty RUSTUP_INSTALLED_TARGETS & exit /b 0)
 set "args=%*"
 if "!args:~0,17!"=="toolchain install" exit /b 0
@@ -123,6 +120,14 @@ if "!args:~0,10!"=="target add" exit /b 0
 if "%1"=="--version" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 if "%1"=="-V" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 exit /b 2
+
+rem `exit /b` inside a nested parenthesized block does not reach the process
+rem exit code through `cmd /c`, so the no-toolchain branch lives at top level.
+:rustup_active_toolchain
+if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN echo error: no active toolchain 1>&2
+if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN exit /b 1
+call :respond RUSTUP_ACTIVE_TOOLCHAIN
+exit /b %errorlevel%
 
 :rustc
 if "%1"=="--version" (echo rustc %WATERUI_FAKE_RUSTC_VERSION% (waterui-test 2026-01-01) & exit /b 0)
@@ -175,6 +180,7 @@ exit /b 0
 :adb
 if "%*"=="version" (echo Android Debug Bridge version 1.0.41 & echo Version %WATERUI_FAKE_ADB_VERSION% & exit /b 0)
 if "%*"=="devices -l" (echo List of devices attached & call :respond_or_empty ADB_DEVICES & exit /b 0)
+if "%*"=="start-server" (if defined WATERUI_FAKE_ADB_START_SERVER_STATUS (exit /b %WATERUI_FAKE_ADB_START_SERVER_STATUS%) else (exit /b 0))
 set "args=%*"
 call :contains args "emu avd name" && (call :respond_or_empty ADB_EMU_AVD_NAME & exit /b 0)
 call :contains args getprop && (call :respond_or_empty ADB_GETPROP & exit /b 0)

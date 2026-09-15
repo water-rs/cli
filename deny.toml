@@ -1,0 +1,72 @@
+[graph]
+all-features = true
+# The CLI runs on the developer's host — the six targets `dist` ships.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # MathCAT's build script unpacks its speech-rule bundle with `zip`, which
+    # brings `libbz2-rs-sys`. The bzip2 licence is BSD-style and permissive —
+    # redistribution in source and binary form, keep the notice, do not
+    # misrepresent the origin — so it sits in the same class as `Zlib` and
+    # `0BSD` above. It reaches no shipped artifact either way: the crate is a
+    # build dependency and its code never enters an application binary.
+    "bzip2-1.0.6",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "IJG",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "WTFPL",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+ignore = true
+
+# The `bans` check itself is the point of this section: CI previously ran only
+# `cargo deny check licenses`, so a known-malicious package could enter the
+# graph without any check objecting.
+#
+# The entries are the crates.io supply-chain attack of 2026-08-20
+# (https://blog.rust-lang.org/2026/08/20/supply-chain-attack-on-arrayref/): a
+# compromised maintainer account published `arrayref@0.3.10`,
+# `internment@0.8.7` and `append-only-vec@0.1.9`, each depending on a
+# typosquatted dropper whose build script fetched and executed a remote
+# payload, with the legitimate releases yanked to force resolvers onto them.
+# crates.io has since deleted every malicious version and unyanked the
+# legitimate ones, so these bans are belt-and-braces rather than load-bearing —
+# they cost nothing and turn a re-publication under any of these names into a
+# hard CI failure instead of a silent pickup.
+[bans]
+multiple-versions = "allow"
+deny = [
+    { crate = "arrayref@0.3.10", reason = "compromised release: depends on the proc-macro1 dropper" },
+    { crate = "internment@0.8.7", reason = "compromised release from the same account takeover" },
+    { crate = "append-only-vec@0.1.9", reason = "compromised release from the same account takeover" },
+    { crate = "proc-macro1", reason = "malware: proc-macro2 typosquat with a payload-downloading build script" },
+    { crate = "proc-macro-en", reason = "malware: dropper republished under a second name during the incident" },
+    { crate = "aovine", reason = "malware: dropper from the same incident" },
+    { crate = "arone", reason = "malware: dropper from the same incident" },
+    { crate = "aronenao", reason = "malware: dropper from the same incident" },
+    { crate = "tinymember", reason = "malware: dropper from the same incident" },
+]

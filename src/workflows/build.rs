@@ -122,15 +122,21 @@ impl RustDynamicLibraries {
     /// # Errors
     /// Returns an error when either required dynamic library is absent or ambiguous.
     pub async fn resolve(lib_dir: &Path, triple: &Triple) -> eyre::Result<Self> {
-        let waterui = lib_dir
-            .join("deps")
-            .join(dynamic_library_file_name("waterui_dylib", triple));
-        if !waterui.is_file() {
-            bail!(
+        let file_name = dynamic_library_file_name("waterui_dylib", triple);
+        // Cargo emits a dependency's final dylib artifact in `deps/` on stable
+        // and at the profile directory root on current nightlies; accept both.
+        let waterui = [
+            lib_dir.join(&file_name),
+            lib_dir.join("deps").join(&file_name),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            eyre::eyre!(
                 "Shared WaterUI runtime was not built at {}",
-                waterui.display()
-            );
-        }
+                lib_dir.join("deps").join(&file_name).display()
+            )
+        })?;
 
         let target_libdir = rust_target_libdir(triple).await?;
         let resolution_triple = triple.clone();
@@ -300,10 +306,78 @@ pub struct RustBuild {
     envs: Vec<(String, OsString)>,
 }
 
+/// The optimization/debug-info trade-off a Cargo build selects.
+///
+/// The variants are realized on top of the workspace's declared `dev` and
+/// `release` profiles through `CARGO_PROFILE_*` overrides, so they work on
+/// user projects and generated crates alike without manifest changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildProfile {
+    /// The `dev` profile as declared: unoptimized, with debug info.
+    #[default]
+    Debug,
+    /// The `dev` profile lifted to a light optimization level with full debug
+    /// info — the `water run` default for self-drawn backends, whose
+    /// per-frame cost sits in rendering dependencies rather than in app code.
+    Optimized,
+    /// The `release` profile at full speed optimization, without debug info.
+    Release,
+    /// The `release` profile at full speed optimization, with debug info and
+    /// symbols kept so a profiler can symbolicate the recording.
+    Profiling,
+}
+
+impl BuildProfile {
+    /// Whether the build uses Cargo's `release` profile — artifacts land in
+    /// the `release/` profile directory and `cargo` gets `--release`.
+    #[must_use]
+    pub const fn is_release(self) -> bool {
+        matches!(self, Self::Release | Self::Profiling)
+    }
+
+    /// Whether the profile keeps the development-run shape: the `include_web!`
+    /// dev server may serve mounts and the artifact packages as debuggable.
+    #[must_use]
+    pub const fn is_development(self) -> bool {
+        !self.is_release()
+    }
+
+    /// `CARGO_PROFILE_*` overrides realizing this profile on the workspace's
+    /// declared `dev`/`release` profiles.
+    ///
+    /// These compose with `profile.*.package."*"` overrides a manifest may
+    /// declare: the env sets the profile's base value, so generated crates —
+    /// whose `dev` profile already lifts dependencies to `opt-level 2` — keep
+    /// that dependency optimization while the base rises to cover the root
+    /// crate and the per-unit debug-assertion switches the override table
+    /// does not mention.
+    fn development_envs(self) -> Vec<(String, OsString)> {
+        let entries: &[(&str, &str)] = match self {
+            Self::Debug => &[],
+            Self::Optimized => &[
+                ("CARGO_PROFILE_DEV_OPT_LEVEL", "1"),
+                ("CARGO_PROFILE_DEV_DEBUG", "true"),
+                ("CARGO_PROFILE_DEV_DEBUG_ASSERTIONS", "false"),
+                ("CARGO_PROFILE_DEV_OVERFLOW_CHECKS", "false"),
+            ],
+            Self::Release => &[("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3")],
+            Self::Profiling => &[
+                ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3"),
+                ("CARGO_PROFILE_RELEASE_DEBUG", "true"),
+                ("CARGO_PROFILE_RELEASE_STRIP", "none"),
+            ],
+        };
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), OsString::from(*value)))
+            .collect()
+    }
+}
+
 /// Options for building Rust libraries.
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
-    release: bool,
+    profile: BuildProfile,
     output_dir: Option<std::path::PathBuf>,
     /// Optional path to sccache for compilation caching.
     sccache_path: Option<std::path::PathBuf>,
@@ -311,18 +385,30 @@ pub struct BuildOptions {
     target_triple: Option<Triple>,
     /// Rust runtime linkage used by the final native application.
     linkage: RustLinkage,
+    /// Whether `include_web!` mounts are dev-server-served and skipped when
+    /// the build stages assets (Hydrolysis stages at build time).
+    dev_server: bool,
+    /// `CARGO_PROFILE_*` overrides applied to the cargo invocation.
+    cargo_envs: Vec<(String, OsString)>,
 }
 
 impl BuildOptions {
     /// Create options for a development build that uses the shared Rust runtime.
+    ///
+    /// Development runs want wall-clock speed: `Release` and `Profiling` force
+    /// `opt-level 3` rather than the size-optimized `opt-level "z"` the
+    /// packaging profile declares, and `Optimized`/`Profiling`/`Release` all
+    /// carry `CARGO_PROFILE_*` overrides the cargo invocation applies.
     #[must_use]
-    pub const fn development(release: bool) -> Self {
+    pub fn development(profile: BuildProfile) -> Self {
         Self {
-            release,
+            profile,
             output_dir: None,
             sccache_path: None,
             target_triple: None,
             linkage: RustLinkage::SharedRuntime,
+            dev_server: false,
+            cargo_envs: profile.development_envs(),
         }
     }
 
@@ -338,21 +424,52 @@ impl BuildOptions {
     }
 
     /// Create options for a self-contained package build.
+    ///
+    /// A packaged artifact builds under the profile the workspace declares —
+    /// no `CARGO_PROFILE_*` overrides: the release profile's size tuning
+    /// (`opt-level "z"`, symbol stripping) is the shipped configuration.
     #[must_use]
-    pub const fn packaging(release: bool) -> Self {
+    pub const fn packaging(profile: BuildProfile) -> Self {
         Self {
-            release,
+            profile,
             output_dir: None,
             sccache_path: None,
             target_triple: None,
             linkage: RustLinkage::Static,
+            dev_server: false,
+            cargo_envs: Vec::new(),
         }
     }
 
-    /// Whether to build in release mode
+    /// Whether the build uses Cargo's `release` profile.
     #[must_use]
     pub const fn is_release(&self) -> bool {
-        self.release
+        self.profile.is_release()
+    }
+
+    /// The selected build profile.
+    #[must_use]
+    pub const fn profile(&self) -> BuildProfile {
+        self.profile
+    }
+
+    /// `CARGO_PROFILE_*` overrides the cargo invocation applies.
+    #[must_use]
+    pub fn cargo_envs(&self) -> &[(String, OsString)] {
+        &self.cargo_envs
+    }
+
+    /// Mark web mounts as dev-server-served for asset staging this build does.
+    #[must_use]
+    pub const fn with_dev_server(mut self, dev_server: bool) -> Self {
+        self.dev_server = dev_server;
+        self
+    }
+
+    /// Whether web mounts are dev-server-served and skipped during staging.
+    #[must_use]
+    pub const fn uses_dev_server(&self) -> bool {
+        self.dev_server
     }
 
     /// Get the output directory, if specified
@@ -998,9 +1115,11 @@ mod tests {
     use target_lexicon::Triple;
     use tempfile::tempdir;
 
+    use std::ffi::OsString;
+
     use super::{
-        BuildOptions, CargoTarget, RustDynamicLibraries, RustLinkage, dynamic_library_file_name,
-        lib_extension_for_triple, resolve_rust_standard_library_in,
+        BuildOptions, BuildProfile, CargoTarget, RustDynamicLibraries, RustLinkage,
+        dynamic_library_file_name, lib_extension_for_triple, resolve_rust_standard_library_in,
     };
 
     fn triple(value: &str) -> Triple {
@@ -1053,15 +1172,85 @@ mod tests {
     #[test]
     fn development_and_packaging_have_distinct_linkage() {
         assert_eq!(
-            BuildOptions::development(false).linkage(),
+            BuildOptions::development(BuildProfile::Debug).linkage(),
             RustLinkage::SharedRuntime
         );
         assert_eq!(
-            BuildOptions::packaging(false).linkage(),
+            BuildOptions::packaging(BuildProfile::Debug).linkage(),
             RustLinkage::Static
         );
-        assert!(BuildOptions::development(true).is_release());
-        assert!(BuildOptions::packaging(true).is_release());
+        assert!(BuildOptions::development(BuildProfile::Release).is_release());
+        assert!(BuildOptions::packaging(BuildProfile::Release).is_release());
+    }
+
+    #[test]
+    fn build_profile_release_variants_select_the_release_profile() {
+        assert!(BuildProfile::Release.is_release());
+        assert!(BuildProfile::Profiling.is_release());
+        assert!(!BuildProfile::Debug.is_release());
+        assert!(!BuildProfile::Optimized.is_release());
+    }
+
+    #[test]
+    fn development_profile_envs_realize_the_selected_trade_off() {
+        let optimized = BuildOptions::development(BuildProfile::Optimized);
+        let envs = optimized.cargo_envs();
+        assert!(
+            envs.contains(&(
+                "CARGO_PROFILE_DEV_OPT_LEVEL".to_string(),
+                OsString::from("1")
+            )),
+            "optimized development lifts the dev opt-level: {envs:?}"
+        );
+        assert!(
+            envs.contains(&(
+                "CARGO_PROFILE_DEV_DEBUG_ASSERTIONS".to_string(),
+                OsString::from("false")
+            )),
+            "optimized development drops dep debug assertions: {envs:?}"
+        );
+        assert!(
+            envs.contains(&(
+                "CARGO_PROFILE_DEV_DEBUG".to_string(),
+                OsString::from("true")
+            )),
+            "optimized development keeps full debug info: {envs:?}"
+        );
+
+        let profiling = BuildOptions::development(BuildProfile::Profiling);
+        let envs = profiling.cargo_envs();
+        for key in [
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+            "CARGO_PROFILE_RELEASE_DEBUG",
+            "CARGO_PROFILE_RELEASE_STRIP",
+        ] {
+            assert!(
+                envs.iter().any(|(env_key, _)| env_key == key),
+                "profiling keeps debug info and symbols: missing {key} in {envs:?}"
+            );
+        }
+
+        assert!(
+            BuildOptions::development(BuildProfile::Debug)
+                .cargo_envs()
+                .is_empty(),
+            "plain debug runs the declared dev profile"
+        );
+    }
+
+    #[test]
+    fn packaging_never_overrides_the_declared_profile() {
+        for profile in [
+            BuildProfile::Debug,
+            BuildProfile::Optimized,
+            BuildProfile::Release,
+            BuildProfile::Profiling,
+        ] {
+            assert!(
+                BuildOptions::packaging(profile).cargo_envs().is_empty(),
+                "packaging {profile:?} must ship the declared profile"
+            );
+        }
     }
 
     #[test]

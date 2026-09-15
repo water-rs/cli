@@ -2,10 +2,11 @@
 //!
 //! Embeds the git commit and the CLI-owned scaffold metadata the binary reads
 //! at runtime. Framework-owned scaffold facts are not embedded in the CLI at
-//! all: they live in the root manifest's `[package.metadata.waterui]` and reach
-//! a scaffolded project through the published `framework.json`.
+//! all: they live in the framework root manifest's `[package.metadata.waterui]`
+//! and reach a scaffolded project through the published `framework.json`.
 
 use std::{
+    collections::BTreeSet,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -13,14 +14,23 @@ use std::{
 
 use toml::Value;
 
-#[path = "src/android/ndk_version.rs"]
-mod ndk_version;
-
 fn main() {
     let cli_manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should always be set"),
     );
-    let manifest = manifest_value(&cli_manifest_dir.join("Cargo.toml"));
+    // `cargo package` normalizes the manifest inside the tarball — git/path
+    // dependencies are rewritten to their registry `version`, which is the
+    // only shape crates.io accepts — and keeps the authored file verbatim at
+    // `Cargo.toml.orig`. The checks below (git + rev pin, waterui-scaffold
+    // keys) are about what the author wrote, so the packaged build must read
+    // the original manifest or it panics on the normalized one.
+    let authored_manifest = cli_manifest_dir.join("Cargo.toml.orig");
+    let manifest_path = if authored_manifest.exists() {
+        authored_manifest
+    } else {
+        cli_manifest_dir.join("Cargo.toml")
+    };
+    let manifest = manifest_value(&manifest_path);
     let scaffold_metadata = &manifest["package"]["metadata"]["waterui-scaffold"];
 
     // `android-kotlin-version` is the table's only legitimate key. A
@@ -31,46 +41,25 @@ fn main() {
         for key in table.keys() {
             assert!(
                 key == "android-kotlin-version",
-                "cli/Cargo.toml [package.metadata.waterui-scaffold].{key} is \
-                 framework-owned: declare it in the root manifest's \
-                 [package.metadata.waterui] table instead"
+                "Cargo.toml [package.metadata.waterui-scaffold].{key} is \
+                 framework-owned: declare it in the water-rs/waterui root \
+                 manifest's [package.metadata.waterui] table instead"
             );
         }
     }
     let kotlin_version = manifest_scaffold_string(scaffold_metadata, "android-kotlin-version");
     println!("cargo:rustc-env=WATERUI_CLI_ANDROID_KOTLIN_VERSION={kotlin_version}");
 
-    // `ANDROID_NDK_VERSION` is a source literal in `android::ndk_version` so it
-    // survives `cargo publish` — a packaged CLI still knows which NDK
-    // `sdkmanager` package to install. When this build runs inside a WaterUI
-    // checkout, pin the literal to the runtime Gradle declaration so the two
-    // can never drift.
-    let runtime_gradle = cli_manifest_dir
-        .join("..")
-        .join(ndk_version::RUNTIME_BUILD_GRADLE_RELATIVE_PATH);
-    println!("cargo:rerun-if-changed={}", runtime_gradle.display());
-    if let Ok(contents) = fs::read_to_string(&runtime_gradle) {
-        let declared = ndk_version::parse_android_ndk_version_from_runtime_build_gradle(&contents)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no `ndkVersion` declaration in {}",
-                    runtime_gradle.display()
-                )
-            });
-        assert_eq!(
-            declared,
-            ndk_version::ANDROID_NDK_VERSION,
-            "cli/src/android/ndk_version.rs ANDROID_NDK_VERSION drifted from \
-             {} — update the literal with the runtime Gradle `ndkVersion`",
-            runtime_gradle.display()
-        );
-    }
+    println!(
+        "cargo:rustc-env=WATERUI_FRAMEWORK_REPOSITORY={}",
+        framework_repository(&manifest)
+    );
 
     let cli_commit =
         git(&cli_manifest_dir, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=WATERUI_CLI_COMMIT={cli_commit}");
 
-    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
     register_git_head_rerun(&cli_manifest_dir);
 }
 
@@ -105,6 +94,45 @@ fn register_git_head_rerun(repo_root: &Path) {
         "cargo:rerun-if-changed={}",
         git_dir_path.join("refs").display()
     );
+}
+
+/// The repository the `waterui-*` git dependencies pin — where certified
+/// manifests, releases, and `dev` revisions live. Every `waterui-*`
+/// dependency must be a git dependency on the same repository at the same
+/// `rev`: a shared type would otherwise exist twice, and a partially bumped
+/// pin would certify against one revision while linking another.
+fn framework_repository(manifest: &Value) -> String {
+    let mut sources: BTreeSet<(String, String)> = BTreeSet::new();
+    for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(dependencies) = manifest[table].as_table() else {
+            continue;
+        };
+        for (name, dependency) in dependencies {
+            if !name.starts_with("waterui-") {
+                continue;
+            }
+            let git = dependency
+                .get("git")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("Cargo.toml [{table}] {name} must be a git dependency"));
+            let rev = dependency
+                .get("rev")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("Cargo.toml [{table}] {name} must pin a rev"));
+            sources.insert((git.to_owned(), rev.to_owned()));
+        }
+    }
+    let mut sources = sources.into_iter();
+    let (git, _) = sources
+        .next()
+        .expect("Cargo.toml declares no waterui-* dependency");
+    if let Some((other_git, other_rev)) = sources.next() {
+        panic!(
+            "Cargo.toml pins waterui-* dependencies on more than one source: {git} and \
+             {other_git}@{other_rev} — move every waterui-* dependency to one git + rev"
+        );
+    }
+    git
 }
 
 fn manifest_scaffold_string(scaffold_metadata: &Value, key: &str) -> String {

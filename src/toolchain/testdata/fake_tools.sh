@@ -197,6 +197,9 @@ adb)
             printf 'List of devices attached\n'
             respond_or_empty ADB_DEVICES
             ;;
+        start-server)
+            exit "${WATERUI_FAKE_ADB_START_SERVER_STATUS:-0}"
+            ;;
         *"emu avd name")
             respond_or_empty ADB_EMU_AVD_NAME
             ;;

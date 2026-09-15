@@ -368,6 +368,7 @@ impl AndroidPlatform {
             resolve_android_build_context(&host, abi, &triple, min_api_level).await?;
         let build = configure_android_rust_build(&host, project, &triple, &build_context, &options)
             .await?
+            .with_envs(options.cargo_envs().iter().cloned())
             .with_target_dir(project.water_target_dir(options.linkage()).await?);
 
         let lib_dir = build.build_lib(options.is_release()).await?;
@@ -406,7 +407,7 @@ impl AndroidPlatform {
         let backend_path = project.backend_path::<AndroidBackend>();
 
         // Copy project assets and dependency fonts
-        copy_assets_and_fonts(project, &backend_path).await?;
+        copy_assets_and_fonts(project, &backend_path, None, options.uses_dev_server()).await?;
 
         let gradlew = backend_path.join(if cfg!(windows) {
             "gradlew.bat"
@@ -872,16 +873,23 @@ pub const fn is_android_platform(platform: TargetPlatform) -> bool {
 // ============================================================================
 
 /// Copy project assets and dependency fonts to the Android assets directory.
-async fn copy_assets_and_fonts(project: &Project, backend_path: &Path) -> eyre::Result<()> {
+async fn copy_assets_and_fonts(
+    project: &Project,
+    backend_path: &Path,
+    sccache_path: Option<&Path>,
+    dev_server: bool,
+) -> eyre::Result<()> {
     let assets_dir = backend_path.join("app/src/main/assets");
 
     // Stage project assets using platform-native conventions.
-    assets::stage_project_assets_for_android(project, backend_path).await?;
+    let manifest =
+        assets::stage_project_assets_for_android(project, backend_path, sccache_path, dev_server)
+            .await?;
 
     // Scan and resolve dependency fonts
     let font_declarations = assets::scan_fonts(project).await?;
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
-    resolved_fonts.extend(assets::scan_project_font_assets(project)?);
+    resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
 
     if !resolved_fonts.is_empty() {
         // Copy fonts to assets/fonts/

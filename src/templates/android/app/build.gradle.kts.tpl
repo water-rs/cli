@@ -136,6 +136,8 @@ android {
     }
     buildFeatures {
         compose = false
+        // `BuildConfig.DEBUG` gates the dev-server URL intent extra.
+        buildConfig = true
     }
     compileOptions {
         isCoreLibraryDesugaringEnabled = true
@@ -156,13 +158,15 @@ android {
 
 dependencies {
     // Use the backend revision embedded into the CLI build in remote mode, local backend otherwise
-    if ({{ ctx.use_remote_dev_backend }}) {
+    if ({{ ctx.use_remote_dev_backend() }}) {
         implementation("{{ ctx.android_remote_backend_dependency() }}")
     } else {
         implementation("dev.waterui.android:runtime")
     }
 
     implementation("androidx.core:core-ktx:1.19.0")
+    // The launch screen: the platform SplashScreen API on 31+, backported below.
+    implementation("androidx.core:core-splashscreen:1.2.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.13.0")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")

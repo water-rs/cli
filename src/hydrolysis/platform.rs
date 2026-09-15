@@ -118,7 +118,13 @@ pub async fn build_hydrolysis_with_envs_and_features(
 
     // Stage assets and the Windows icon resource before the backend is built.
     // The generated `build.rs` expects `app-icon.ico` to exist when targeting Windows.
-    copy_assets_and_fonts(project, &backend_path).await?;
+    copy_assets_and_fonts(
+        project,
+        &backend_path,
+        options.sccache_path(),
+        options.uses_dev_server(),
+    )
+    .await?;
 
     let llvm_envs = WindowsArm64LlvmToolchain
         .cargo_envs(&crate::toolchain::Host::current())
@@ -142,6 +148,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
             hydrolysis_loader_search_path(platform),
         )
         .with_envs(llvm_envs)
+        .with_envs(options.cargo_envs().iter().cloned())
         .with_envs(extra_envs.iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
@@ -296,7 +303,7 @@ pub async fn package_hydrolysis(
         "release"
     };
     let backend_path = project.backend_path::<HydrolysisBackend>();
-    copy_assets_and_fonts(project, &backend_path).await?;
+    copy_assets_and_fonts(project, &backend_path, None, options.uses_dev_server()).await?;
 
     let linkage = if options.uses_shared_rust_runtime() {
         RustLinkage::SharedRuntime
@@ -481,10 +488,17 @@ const fn is_hydrolysis_native_platform(platform: TargetPlatform) -> bool {
     )
 }
 
-async fn copy_assets_and_fonts(project: &Project, backend_path: &Path) -> eyre::Result<()> {
+async fn copy_assets_and_fonts(
+    project: &Project,
+    backend_path: &Path,
+    sccache_path: Option<&Path>,
+    dev_server: bool,
+) -> eyre::Result<()> {
     let resources_dir = backend_path.join("resources");
     fs::create_dir_all(&resources_dir).await?;
-    assets::stage_project_assets_for_gtk(project, &resources_dir).await?;
+    let manifest =
+        assets::stage_project_assets_for_gtk(project, &resources_dir, sccache_path, dev_server)
+            .await?;
 
     // The generated crate's build script embeds this into the executable's
     // resources when targeting Windows.
@@ -497,7 +511,7 @@ async fn copy_assets_and_fonts(project: &Project, backend_path: &Path) -> eyre::
     let mut font_declarations = assets::scan_fonts(project).await?;
     font_declarations.extend(assets::hydrolysis_default_font_declarations());
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
-    resolved_fonts.extend(assets::scan_project_font_assets(project)?);
+    resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
     if !resolved_fonts.is_empty() {
         let fonts_dest = resources_dir.join("fonts");
         assets::copy_fonts(&resolved_fonts, &fonts_dest).await?;
