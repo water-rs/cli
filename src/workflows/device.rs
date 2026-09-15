@@ -545,7 +545,7 @@ fn start_log_stream(
     // consumer takes the first matching marker.
     replay_log_history(
         host.clone(),
-        predicate.clone(),
+        predicate,
         sender.clone(),
         panic_tx.clone(),
         log_level,
