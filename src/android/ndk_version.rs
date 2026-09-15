@@ -48,16 +48,17 @@ android {
     }
 
     /// `ANDROID_NDK_VERSION` must not drift from the runtime Gradle
-    /// declaration. The runtime is the `backends/android` gitlink of the
-    /// pinned framework revision, so the comparison resolves the gitlink
-    /// through the GitHub API and fetches `runtime/build.gradle.kts` at that
-    /// commit — network-bound, hence nightly-only.
+    /// declaration. The runtime is the `android-backend-revision` the pinned
+    /// framework revision declares (or its `backends/android` gitlink before
+    /// that declaration existed), so the comparison resolves that commit and
+    /// fetches `runtime/build.gradle.kts` there — network-bound, hence
+    /// nightly-only.
     #[test]
     #[ignore = "fetches the pinned water-rs/android-backend revision over the network"]
     fn embedded_ndk_version_matches_the_pinned_android_backend() {
         let (framework, revision) = crate::pinned_framework::source();
         let (backend_commit, backend) =
-            crate::pinned_framework::gitlink(&framework, "backends/android", &revision);
+            crate::pinned_framework::android_backend(&framework, &revision);
         let contents = String::from_utf8(crate::pinned_framework::fetch(
             &crate::pinned_framework::raw_url(
                 &backend,
