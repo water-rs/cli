@@ -185,3 +185,10 @@ fontcull-skrifa = "0.39.2"
 
 [package.metadata.cargo-machete]
 ignored = ["roxmltree", "waterui-inspector-protocol"]
+
+# cargo-dist builds release binaries with `--profile=dist`; the profile must
+# exist in the manifest or every `dist build` leg fails. This is the profile
+# `dist init` generates.
+[profile.dist]
+inherits = "release"
+lto = "thin"
