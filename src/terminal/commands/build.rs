@@ -16,7 +16,7 @@ use waterui_cli::{
     apple::platform::build_rust_lib,
     apple::toolchain::AppleSdk,
     backend::reinit_backend,
-    build::BuildOptions,
+    build::{BuildOptions, BuildProfile},
     esp32::{backend::Esp32Backend, platform::build_esp32},
     gtk4::{backend::Gtk4Backend, platform::build_gtk4},
     hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
@@ -264,9 +264,14 @@ where
 }
 
 async fn build_options(shell: &Shell, args: &Args, backend: TargetBackend) -> BuildOptions {
+    let profile = if args.release {
+        BuildProfile::Release
+    } else {
+        BuildProfile::Debug
+    };
     let mut build_options = args.output_dir.as_ref().map_or_else(
-        || BuildOptions::development(args.release),
-        |output_dir| BuildOptions::development(args.release).with_output_dir(output_dir),
+        || BuildOptions::development(profile),
+        |output_dir| BuildOptions::development(profile).with_output_dir(output_dir),
     );
 
     if let Some(sccache_path) =

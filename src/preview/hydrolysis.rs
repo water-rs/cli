@@ -4,7 +4,7 @@ use askama::Template;
 use eyre::{Context as _, Result, bail};
 
 use crate::backend::reinit_backend;
-use crate::build::{BuildOptions, RustLinkage};
+use crate::build::{BuildOptions, BuildProfile, RustLinkage};
 use crate::hydrolysis::backend::HydrolysisBackend;
 use crate::hydrolysis::platform::{
     build_hydrolysis_with_envs_and_features, built_hydrolysis_binary_path,
@@ -125,7 +125,7 @@ pub async fn render_preview_with_hydrolysis(
     write_preview_bindings(&project, source, theme, None).await?;
     stage_hydrolysis_resources(&project, theme, sccache_path.as_deref()).await?;
 
-    let mut build_options = BuildOptions::development(false);
+    let mut build_options = BuildOptions::development(BuildProfile::Debug);
     if let Some(sccache_path) = sccache_path {
         build_options = build_options.with_sccache(sccache_path);
     }
@@ -169,7 +169,7 @@ pub async fn test_preview_with_hydrolysis(
     write_preview_bindings(&project, source, theme, Some(automation_body)).await?;
     stage_hydrolysis_resources(&project, theme, sccache_path.as_deref()).await?;
 
-    let mut build_options = BuildOptions::development(false);
+    let mut build_options = BuildOptions::development(BuildProfile::Debug);
     if let Some(sccache_path) = sccache_path {
         build_options = build_options.with_sccache(sccache_path);
     }

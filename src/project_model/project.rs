@@ -162,7 +162,11 @@ impl Project {
     ) -> Result<Running, FailToRun> {
         // Build rust library for the target platform
         backend
-            .build(self, platform, BuildOptions::development(false))
+            .build(
+                self,
+                platform,
+                BuildOptions::development(BuildProfile::Debug),
+            )
             .await
             .map_err(FailToRun::Build)?;
 
@@ -199,7 +203,7 @@ impl Project {
             .map_err(FailToRun::Build)?;
 
         AndroidPlatform::new(abi)
-            .build(self, BuildOptions::development(false))
+            .build(self, BuildOptions::development(BuildProfile::Debug))
             .await
             .map_err(FailToRun::Build)?;
 
@@ -1900,7 +1904,7 @@ use crate::{
     android::{backend::AndroidBackend, device::AndroidAbiProvider, platform::AndroidPlatform},
     apple::backend::AppleBackend,
     backend::{Backend, Backends},
-    build::BuildOptions,
+    build::{BuildOptions, BuildProfile},
     device::{Artifact, Device, FailToRun, RunOptions, Running},
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project_types::{BundleIdentifier, CrateName, PermissionKey},

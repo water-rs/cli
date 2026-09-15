@@ -368,6 +368,7 @@ impl AndroidPlatform {
             resolve_android_build_context(&host, abi, &triple, min_api_level).await?;
         let build = configure_android_rust_build(&host, project, &triple, &build_context, &options)
             .await?
+            .with_envs(options.cargo_envs().iter().cloned())
             .with_target_dir(project.water_target_dir(options.linkage()).await?);
 
         let lib_dir = build.build_lib(options.is_release()).await?;

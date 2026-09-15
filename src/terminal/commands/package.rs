@@ -13,7 +13,7 @@ use waterui_cli::{
     apple::platform::{build_rust_lib, package_apple},
     apple::toolchain::AppleSdk,
     backend::reinit_backend,
-    build::BuildOptions,
+    build::{BuildOptions, BuildProfile},
     device::Artifact,
     gtk4::{
         backend::Gtk4Backend,
@@ -151,7 +151,11 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Packagi
     let project =
         ensure_packaging_backend_generated(shell, &project_path, project, backend).await?;
 
-    let mut build_options = BuildOptions::packaging(args.release);
+    let mut build_options = BuildOptions::packaging(if args.release {
+        BuildProfile::Release
+    } else {
+        BuildProfile::Debug
+    });
     if let Some(sccache_path) =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await
     {
