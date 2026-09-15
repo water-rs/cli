@@ -8,8 +8,14 @@ name: Release
 #   release-plz only computes versions, updates the changelog and pushes
 #   the tag — `publish = false` in release-plz.toml; crates.io publishing
 #   is the `publish` job below.
-# * `workflow_dispatch` with a `tag` input: re-runs the publish, dist and
-#   asset jobs for an existing release tag (recovery after a failed leg).
+# * `workflow_dispatch` with a `tag` input: runs the publish, dist and
+#   asset jobs for an existing release tag. This is the release's second
+#   half, not just recovery: crates.io trusted publishing refuses OIDC
+#   tokens minted under `workflow_run`, so crates.io publishing can only
+#   ever happen on `workflow_dispatch`/`push`/`release` events. The flow
+#   for a release is therefore: merge the release PR → the tag and GitHub
+#   release appear automatically → dispatch this workflow with the tag to
+#   publish, build binaries, and hand the Homebrew formula to the tap.
 #
 # release-plz runs under the workflow's own GITHUB_TOKEN, and nothing here
 # depends on a tag push firing another workflow: the tag release-plz just
@@ -121,7 +127,9 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     needs: release
-    if: always() && (needs.release.outputs.tag || inputs.tag)
+    # crates.io trusted publishing rejects OIDC tokens issued under
+    # `workflow_run`, so the publish leg only ever runs on dispatch.
+    if: github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       id-token: write
@@ -160,7 +168,10 @@ jobs:
     name: dist / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: release
-    if: always() && (needs.release.outputs.tag || inputs.tag)
+    # Binaries belong to the same dispatch as the publish leg: building
+    # them on `workflow_run` would only produce artifacts that
+    # `release-assets` cannot attach while publish is skipped.
+    if: github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
     env:

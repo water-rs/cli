@@ -1,6 +1,6 @@
 [package]
 name = "waterui-cli"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["Lexo Liu"]
 rust-version = "1.95"
@@ -185,3 +185,10 @@ fontcull-skrifa = "0.39.2"
 
 [package.metadata.cargo-machete]
 ignored = ["roxmltree", "waterui-inspector-protocol"]
+
+# cargo-dist builds release binaries with `--profile=dist`; the profile must
+# exist in the manifest or every `dist build` leg fails. This is the profile
+# `dist init` generates.
+[profile.dist]
+inherits = "release"
+lto = "thin"
