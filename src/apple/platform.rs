@@ -191,7 +191,8 @@ pub async fn build_rust_lib(
         .with_features(
             apple_ffi_build_features(project, browser_runtime_plan, options.linkage()).await?,
         )
-        .with_crate_type_override(host_library.crate_type());
+        .with_crate_type_override(host_library.crate_type())
+        .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
     }

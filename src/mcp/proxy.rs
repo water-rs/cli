@@ -34,7 +34,7 @@ use waterui_mcp_protocol::{
 };
 use waterui_preview_protocol::hydrolysis::{MCP_RUN_CONFIG_ENV, McpRunConfig};
 
-use crate::build::{BuildOptions, RustLinkage};
+use crate::build::{BuildOptions, BuildProfile, RustLinkage};
 use crate::hydrolysis::backend::HydrolysisBackend;
 use crate::hydrolysis::platform::{
     build_hydrolysis_with_envs_and_features, built_hydrolysis_binary_path,
@@ -302,7 +302,7 @@ async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)
     )
     .await?;
 
-    let mut build_options = BuildOptions::development(false);
+    let mut build_options = BuildOptions::development(BuildProfile::Debug);
     if let Some(sccache_path) = &config.sccache_path {
         build_options = build_options.with_sccache(sccache_path.clone());
     }

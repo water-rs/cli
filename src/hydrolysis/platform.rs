@@ -148,6 +148,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
             hydrolysis_loader_search_path(platform),
         )
         .with_envs(llvm_envs)
+        .with_envs(options.cargo_envs().iter().cloned())
         .with_envs(extra_envs.iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());

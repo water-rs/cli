@@ -25,7 +25,7 @@ use waterui_cli::{
         toolchain::AppleSdk,
     },
     backend::reinit_backend,
-    build::BuildOptions,
+    build::{BuildOptions, BuildProfile},
     device::{Artifact, Device, DeviceEvent, Local, LogLevel, RunOptions, Running},
     esp32::{backend::Esp32Backend, platform::run_esp32},
     gtk4::{
@@ -246,6 +246,16 @@ pub struct Args {
     #[arg(long)]
     release: bool,
 
+    /// Build for profiling: full release optimization with debug info and
+    /// symbols kept so a profiler can symbolicate the recording.
+    #[arg(long, conflicts_with = "release")]
+    profiling: bool,
+
+    /// Build fully unoptimized, skipping the light optimization `water run`
+    /// applies by default to backends whose per-frame cost is high.
+    #[arg(long, conflicts_with_all = ["release", "profiling"])]
+    debug: bool,
+
     /// Do not start the frontend dev server for `include_web!` mounts; the
     /// debug build renders the staged bundle, packaged as `water package`
     /// does.
@@ -448,7 +458,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.device.as_deref(),
     )
     .await?;
-    let config = build_run_config(shell, &host, &args, &context.project).await;
+    let config = build_run_config(shell, &host, &args, &context.project, context.backend).await;
 
     #[cfg(target_os = "macos")]
     let mut crash_ctx =
@@ -731,8 +741,8 @@ async fn run_web_app(shell: &Shell, project: &Project) -> Result<()> {
 async fn run_esp32_app(shell: &Shell, project: &Project, device: Option<&str>) -> Result<()> {
     let sccache_path = detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await;
     let build_options = sccache_path.map_or_else(
-        || BuildOptions::development(false),
-        |sccache| BuildOptions::development(false).with_sccache(sccache),
+        || BuildOptions::development(BuildProfile::Debug),
+        |sccache| BuildOptions::development(BuildProfile::Debug).with_sccache(sccache),
     );
 
     let _ = shell.status(">", "Building ESP32 firmware...");
@@ -769,6 +779,7 @@ async fn build_run_config(
     host: &waterui_cli::toolchain::Host,
     args: &Args,
     project: &Project,
+    backend: TargetBackend,
 ) -> BuildRunConfig {
     let sccache_path = detect_sccache_path(shell, host).await;
     let mut run_options = RunOptions::new();
@@ -782,11 +793,33 @@ async fn build_run_config(
         run_options.insert_env_var(key.clone(), value.clone());
     }
 
+    let profile = run_profile(args, backend);
     BuildRunConfig {
         run_options,
         sccache_path,
-        release: args.release,
-        dev_server: !args.release && !args.no_dev_server,
+        profile,
+        dev_server: !profile.is_release() && !args.no_dev_server,
+    }
+}
+
+/// Resolve the Cargo profile `water run` builds under.
+///
+/// Self-drawn backends (Hydrolysis) spend their per-frame budget in the
+/// rendering stack, so a plain `water run` lifts the dev profile to a light
+/// optimization level rather than paying debug-code frame times. `--debug`
+/// opts back into a fully unoptimized build; `--release` and `--profiling`
+/// select the release profile without and with debug info.
+const fn run_profile(args: &Args, backend: TargetBackend) -> BuildProfile {
+    if args.release {
+        BuildProfile::Release
+    } else if args.profiling {
+        BuildProfile::Profiling
+    } else if args.debug {
+        BuildProfile::Debug
+    } else if matches!(backend, TargetBackend::Hydrolysis) {
+        BuildProfile::Optimized
+    } else {
+        BuildProfile::Debug
     }
 }
 
@@ -904,7 +937,7 @@ async fn build_and_run(
         project,
         backend,
         &build_plan,
-        config.release,
+        config.profile.is_release(),
         dev_server.is_some(),
     )
     .await?;
@@ -1058,8 +1091,8 @@ fn build_options(config: &BuildRunConfig) -> BuildOptions {
         .sccache_path
         .as_ref()
         .map_or_else(
-            || BuildOptions::development(config.release),
-            |sccache| BuildOptions::development(config.release).with_sccache(sccache.clone()),
+            || BuildOptions::development(config.profile),
+            |sccache| BuildOptions::development(config.profile).with_sccache(sccache.clone()),
         )
         .with_dev_server(config.dev_server)
 }
@@ -1125,9 +1158,11 @@ async fn package_for_backend(
 struct BuildRunConfig {
     run_options: RunOptions,
     sccache_path: Option<PathBuf>,
-    release: bool,
+    /// The Cargo profile the run builds under — see `run_profile`.
+    profile: BuildProfile,
     /// Whether a declared `include_web!` mount may be served by the bundler's
-    /// dev server: debug builds only, unless `--no-dev-server` opts out.
+    /// dev server: non-release profiles only, unless `--no-dev-server` opts
+    /// out.
     dev_server: bool,
 }
 
