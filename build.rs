@@ -18,7 +18,19 @@ fn main() {
     let cli_manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should always be set"),
     );
-    let manifest = manifest_value(&cli_manifest_dir.join("Cargo.toml"));
+    // `cargo package` normalizes the manifest inside the tarball — git/path
+    // dependencies are rewritten to their registry `version`, which is the
+    // only shape crates.io accepts — and keeps the authored file verbatim at
+    // `Cargo.toml.orig`. The checks below (git + rev pin, waterui-scaffold
+    // keys) are about what the author wrote, so the packaged build must read
+    // the original manifest or it panics on the normalized one.
+    let authored_manifest = cli_manifest_dir.join("Cargo.toml.orig");
+    let manifest_path = if authored_manifest.exists() {
+        authored_manifest
+    } else {
+        cli_manifest_dir.join("Cargo.toml")
+    };
+    let manifest = manifest_value(&manifest_path);
     let scaffold_metadata = &manifest["package"]["metadata"]["waterui-scaffold"];
 
     // `android-kotlin-version` is the table's only legitimate key. A
@@ -47,7 +59,7 @@ fn main() {
         git(&cli_manifest_dir, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=WATERUI_CLI_COMMIT={cli_commit}");
 
-    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed={}", manifest_path.display());
     register_git_head_rerun(&cli_manifest_dir);
 }
 
