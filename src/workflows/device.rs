@@ -537,6 +537,20 @@ fn start_log_stream(
         .stdout
         .take()
         .expect("stdout is piped for the macOS log stream");
+
+    // The stream only forwards entries written after it attaches to logd, and
+    // a fast first paint can beat the attach — replay the persisted store once
+    // shortly after so pre-attach entries (the launch marker, a fast crash's
+    // panic payload) still reach the consumer. Duplicates are harmless: the
+    // consumer takes the first matching marker.
+    replay_log_history(
+        host.clone(),
+        predicate.clone(),
+        sender.clone(),
+        panic_tx.clone(),
+        log_level,
+    );
+
     let task = spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Some(Ok(line)) = lines.next().await {
@@ -578,6 +592,60 @@ fn start_log_stream(
     });
 
     Ok((MacosLogStream { task, panic_rx }, log_child))
+}
+
+/// Forward `log show` output for the recent window into the same event path as
+/// the live stream, a few seconds after the stream starts. Reads the persisted
+/// store, so it recovers entries emitted before the stream attached to logd.
+#[cfg(target_os = "macos")]
+fn replay_log_history(
+    host: Host,
+    predicate: String,
+    sender: Sender<DeviceEvent>,
+    panic_tx: Sender<String>,
+    log_level: Option<LogLevel>,
+) {
+    spawn(async move {
+        Timer::after(Duration::from_secs(4)).await;
+        let Ok(output) = host
+            .command("log")
+            .args(["show", "--last", "2m", "--predicate", &predicate])
+            .args(["--style", "compact"])
+            .output()
+            .await
+        else {
+            return;
+        };
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.starts_with("Filtering") || line.starts_with("Timestamp") {
+                continue;
+            }
+            if line.contains("panic.payload=")
+                && let Some(info) = extract_panic_info_from_log(line)
+            {
+                let _ = panic_tx.try_send(format_panic_message(
+                    &info.payload,
+                    info.location.as_deref(),
+                ));
+            }
+            if log_level.is_some() {
+                let level = if line.contains(" F ") || line.contains(" E ") {
+                    tracing::Level::ERROR
+                } else if line.contains(" W ") {
+                    tracing::Level::WARN
+                } else if line.contains(" D ") {
+                    tracing::Level::DEBUG
+                } else {
+                    tracing::Level::INFO
+                };
+                let _ = sender.try_send(DeviceEvent::Log {
+                    level,
+                    message: line.to_string(),
+                });
+            }
+        }
+    })
+    .detach();
 }
 
 /// Extract panic information from a log line containing panic.payload and panic.location fields.
