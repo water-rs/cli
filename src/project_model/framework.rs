@@ -20,9 +20,11 @@ use zenwave::{Client as _, Method, StatusCode};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FrameworkChannel {
-    /// The integration branch, resolved to an exact compilation-checked commit.
+    /// The integration branch, resolved to an exact compilation-checked
+    /// commit; the Apple backend's `dev` HEAD resolves the same way.
     Dev,
-    /// An immutable revision certified by the complete nightly suite.
+    /// An immutable revision certified by the complete nightly suite,
+    /// including the backend pin the suite's certification records.
     Nightly,
     /// Published packages and the compatible native backends bundled with the CLI.
     #[default]
@@ -386,6 +388,16 @@ impl ResolvedFramework {
     pub(crate) fn apple_backend_version(&self) -> Option<&str> {
         self.scaffold
             .get("apple-backend-version")
+            .map(String::as_str)
+    }
+
+    /// The Apple backend commit a `dev` or `nightly` selection pins — the
+    /// backend's `dev` HEAD `dev` resolved at selection time, or the
+    /// revision a certification records — and the gitlink pin a framework
+    /// from before the backend's extraction carries on every channel.
+    pub(crate) fn apple_backend_revision(&self) -> Option<&str> {
+        self.scaffold
+            .get("apple-backend-revision")
             .map(String::as_str)
     }
 
@@ -927,6 +939,7 @@ impl ResolvedFramework {
             )
         };
         complete_scaffold(&mut scaffold, &submodules, &lock)?;
+        channel_apple_backend_pin(channel, &mut scaffold, certification.as_ref()).await?;
 
         let (packages, patches, lockfile) = match channel {
             // A stable project resolves its graph from the registry; nothing is
@@ -962,6 +975,41 @@ impl ResolvedFramework {
             lockfile,
         ))
     }
+}
+
+/// The Apple backend follows the framework's channel. `dev` resolves the
+/// backend's own `dev` HEAD — the compilation-gated revision the channel
+/// promises — because the `backends/apple` gitlink that used to record the
+/// pairing is gone and `apple-backend-version` is a stable pin. A
+/// certification may likewise name the backend revision its suite ran.
+/// Either lands as `apple-backend-revision`, the pin a non-stable channel's
+/// requirement prefers; a framework from before the backend's extraction
+/// instead keeps the gitlink pin `complete_scaffold` recorded.
+async fn channel_apple_backend_pin(
+    channel: FrameworkChannel,
+    scaffold: &mut BTreeMap<String, String>,
+    certification: Option<&Certification>,
+) -> Result<()> {
+    match channel {
+        FrameworkChannel::Dev if scaffold.contains_key("apple-backend-version") => {
+            let url = scaffold.get("apple-backend-url").ok_or_else(|| {
+                eyre!("framework manifest declares apple-backend-version without apple-backend-url")
+            })?;
+            let revision = backend_dev_revision(url).await?;
+            scaffold.insert("apple-backend-revision".to_owned(), revision);
+        }
+        FrameworkChannel::Nightly => {
+            if let Some(revision) = certification
+                .and_then(|certification| certification.scaffold.get("apple-backend-revision"))
+            {
+                validate_revision(revision)
+                    .wrap_err("nightly certification scaffold `apple-backend-revision`")?;
+                scaffold.insert("apple-backend-revision".to_owned(), revision.clone());
+            }
+        }
+        FrameworkChannel::Stable | FrameworkChannel::Dev => {}
+    }
+    Ok(())
 }
 
 /// `dev` has no certification; the repository tree's own gitlinks record which
@@ -1123,11 +1171,11 @@ fn framework_repository() -> &'static str {
     env!("WATERUI_FRAMEWORK_REPOSITORY").trim_end_matches(".git")
 }
 
-/// The framework repository's `owner/name` slug, from its GitHub URL.
+/// A repository's `owner/name` slug, from its GitHub URL.
 fn repository_slug(repository: &str) -> Result<&str> {
     repository
         .strip_prefix("https://github.com/")
-        .ok_or_else(|| eyre!("framework repository must identify its GitHub source"))
+        .ok_or_else(|| eyre!("{repository} must identify its GitHub source"))
 }
 
 /// The framework's own metadata table — `[package.metadata.waterui]` of the
@@ -1599,6 +1647,42 @@ pub(crate) mod test_fixtures {
         }
     }
 
+    /// A `dev`-channel resolution: the manifest's scaffold facts plus the
+    /// `apple-backend-revision` `construct` resolves for the channel — the
+    /// backend's `dev` HEAD at selection time — beside the declared
+    /// `apple-backend-version` the channel must not follow.
+    pub fn dev_framework() -> ResolvedFramework {
+        let mut framework = stable_framework();
+        framework.source = Source::Dev {
+            repository: framework_repository().to_owned(),
+            revision: 'a'.to_string().repeat(40),
+            lock_sha256: 'f'.to_string().repeat(64),
+        };
+        framework.scaffold.insert(
+            "apple-backend-revision".to_owned(),
+            'd'.to_string().repeat(40),
+        );
+        framework
+    }
+
+    /// A `nightly`-channel resolution; `backend_revision` carries the
+    /// `apple-backend-revision` a certification records when its suite names
+    /// the backend it ran — absent, the declared `apple-backend-version` is
+    /// what the certification certified.
+    pub fn nightly_framework(backend_revision: bool) -> ResolvedFramework {
+        let mut framework = dev_framework();
+        if !backend_revision {
+            framework.scaffold.remove("apple-backend-revision");
+        }
+        framework.source = Source::Nightly {
+            repository: framework_repository().to_owned(),
+            revision: 'a'.to_string().repeat(40),
+            tag: "nightly-2026.09.15".to_owned(),
+            lock_sha256: 'f'.to_string().repeat(64),
+        };
+        framework
+    }
+
     /// A local framework checkout fixture: the repository's own root manifest
     /// and a lock naming the workspace crates, inside a git worktree. Like the
     /// repository today it carries no backend gitlink: both backend pins are
@@ -1727,23 +1811,45 @@ pub(crate) mod test_fixtures {
 }
 
 async fn resolve_dev(repository: &str, slug: &str) -> Result<String> {
+    gated_dev_head(repository, slug, "dev.yml", "framework").await
+}
+
+/// The Apple backend's `dev` HEAD for a `dev` framework selection. The
+/// backend moved out of the framework tree, so nothing records the backend
+/// revision a `dev` framework was built against — `apple-backend-version`
+/// is the stable pin and must not serve `dev`. The backend's `dev` is held
+/// to the same promise the framework's makes: `ci.yml` gates the branch.
+async fn backend_dev_revision(url: &str) -> Result<String> {
+    gated_dev_head(
+        url,
+        repository_slug(url.trim_end_matches(".git"))?,
+        "ci.yml",
+        "Apple backend",
+    )
+    .await
+}
+
+/// The `dev` HEAD of `repository`, held to the channel's promise that the
+/// resolved commit passed `gate` — the workflow file gating `dev` in that
+/// repository: `dev.yml` for the framework, `ci.yml` for a backend.
+async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["ls-remote", repository, "refs/heads/dev"])
         .output()
         .await?;
     if !output.status.success() {
         bail!(
-            "could not resolve framework dev: {}",
+            "could not resolve {what} dev: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
     let revision = std::str::from_utf8(&output.stdout)?
         .split_whitespace()
         .next()
-        .ok_or_else(|| eyre!("framework repository has no dev branch"))?
+        .ok_or_else(|| eyre!("{what} repository has no dev branch"))?
         .to_owned();
     validate_revision(&revision)?;
-    let response = fetch(&format!("https://api.github.com/repos/{slug}/actions/workflows/dev.yml/runs?branch=dev&head_sha={revision}&status=success&event=push&per_page=1")).await?;
+    let response = fetch(&format!("https://api.github.com/repos/{slug}/actions/workflows/{gate}/runs?branch=dev&head_sha={revision}&status=success&event=push&per_page=1")).await?;
     let runs: serde_json::Value = serde_json::from_slice(&response)?;
     let checked = runs["workflow_runs"].as_array().is_some_and(|runs| {
         runs.iter().any(|run| {
@@ -1751,7 +1857,7 @@ async fn resolve_dev(repository: &str, slug: &str) -> Result<String> {
         })
     });
     if !checked {
-        bail!("framework dev revision {revision} has not passed its compilation gate");
+        bail!("{what} dev revision {revision} has not passed its compilation gate");
     }
     Ok(revision)
 }

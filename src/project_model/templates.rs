@@ -10,7 +10,7 @@ use std::{
 
 use askama::Template;
 
-use crate::framework::ResolvedFramework;
+use crate::framework::{FrameworkChannel, ResolvedFramework};
 use crate::project::ResolvedWebViewBackend;
 
 use include_dir::{Dir, include_dir};
@@ -776,30 +776,37 @@ impl TemplateContext {
 
     /// The `SwiftPM` requirement the generated `XCRemoteSwiftPackageReference`
     /// pins the Apple backend at: a `[backend.apple]` override first —
-    /// `branch`, then `revision` — the framework's declared
-    /// `apple-backend-version` next, and the `apple-backend-revision` gitlink
-    /// pin a framework older than the submodule's removal carries last.
+    /// `branch`, then `revision` — then the pin the framework's channel
+    /// carries. `dev` and `nightly` pin `apple-backend-revision`, the
+    /// backend commit the channel resolved or certified, before the stable
+    /// `apple-backend-version` tag; `stable` and a local checkout do the
+    /// reverse, falling to the `apple-backend-revision` gitlink pin a
+    /// framework older than the submodule's removal records.
     fn apple_backend_requirement(&self) -> String {
         if let (Some(_), Some(_)) = (&self.apple_backend_branch, &self.apple_backend_revision) {
             panic!("`[backend.apple]` sets both `branch` and `revision`; pick one");
         }
+        let revision =
+            |revision: &str| format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";");
+        let version =
+            |version: &str| format!("kind = exactVersion;\n\t\t\t\tversion = \"{version}\";");
         self.apple_backend_branch
-            .as_ref()
+            .as_deref()
             .map(|branch| format!("kind = branch;\n\t\t\t\tbranch = \"{branch}\";"))
-            .or_else(|| {
-                self.apple_backend_revision
-                    .as_ref()
-                    .map(|revision| format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";"))
+            .or_else(|| self.apple_backend_revision.as_deref().map(revision))
+            .or_else(|| match self.framework.channel() {
+                Some(FrameworkChannel::Dev | FrameworkChannel::Nightly) => self
+                    .framework
+                    .apple_backend_revision()
+                    .map(revision)
+                    .or_else(|| self.framework.apple_backend_version().map(version)),
+                Some(FrameworkChannel::Stable) | None => self
+                    .framework
+                    .apple_backend_version()
+                    .map(version)
+                    .or_else(|| self.framework.apple_backend_revision().map(revision)),
             })
-            .or_else(|| {
-                self.framework.apple_backend_version().map(|version| {
-                    format!("kind = exactVersion;\n\t\t\t\tversion = \"{version}\";")
-                })
-            })
-            .unwrap_or_else(|| {
-                let revision = self.framework.scaffold_value("apple-backend-revision");
-                format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";")
-            })
+            .unwrap_or_else(|| panic!("resolved framework carries no Apple backend pin"))
     }
 
     /// Generate the `XCode` package reference section for the project file.
@@ -1101,11 +1108,12 @@ define_scaffold_templates! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserTemplateContext, Esp32TemplateEntry, LaunchTemplateEntry, ResolvedWebViewBackend,
-        TemplateContext, TemplateNamespace, embedded, gtk4, jitpack_dependency_coordinate,
-        normalize_path_for_config, preview_ffi, render_scaffold_template,
+        BrowserTemplateContext, Esp32TemplateEntry, LaunchTemplateEntry, ResolvedFramework,
+        ResolvedWebViewBackend, TemplateContext, TemplateNamespace, embedded, gtk4,
+        jitpack_dependency_coordinate, normalize_path_for_config, preview_ffi,
+        render_scaffold_template,
     };
-    use crate::framework::test_fixtures::stable_framework;
+    use crate::framework::test_fixtures::{dev_framework, nightly_framework, stable_framework};
     use crate::project_types::{BundleIdentifier, CrateName};
     use include_dir::Dir;
     use std::path::PathBuf;
@@ -1655,6 +1663,63 @@ mod tests {
         assert!(rendered.contains(ctx.framework.scaffold_value("apple-backend-url")));
         assert!(rendered.contains(ctx.framework.apple_backend_version().unwrap()));
         assert!(rendered.contains("kind = exactVersion;"));
+    }
+
+    /// The Apple backend follows the framework's channel: `dev` and
+    /// `nightly` pin the `apple-backend-revision` the channel resolved or
+    /// certified, never the stable `apple-backend-version` tag — and a
+    /// `[backends.apple]` override still outranks either.
+    #[test]
+    fn apple_project_pins_the_channel_backend_on_dev_and_nightly() {
+        let project = |framework: ResolvedFramework| {
+            let mut context = app_ctx();
+            context.framework = framework;
+            let template = embedded::APPLE
+                .get_file("AppName.xcodeproj/project.pbxproj.tpl")
+                .expect("apple project template must exist")
+                .contents_utf8()
+                .expect("apple project template must be utf-8");
+            render_scaffold_template(
+                TemplateNamespace::Apple,
+                std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
+                template,
+                &context,
+            )
+            .expect("apple project render")
+        };
+        let revision = 'd'.to_string().repeat(40);
+        for (channel, rendered) in [
+            ("dev", project(dev_framework())),
+            ("nightly", project(nightly_framework(true))),
+        ] {
+            assert!(
+                rendered.contains(&format!("revision = \"{revision}\";")),
+                "{channel} must pin the backend revision:\n{rendered}"
+            );
+            assert!(!rendered.contains("kind = exactVersion;"), "{channel}");
+        }
+        // A nightly certification that names no backend revision certifies
+        // the manifest's declared tag.
+        let rendered = project(nightly_framework(false));
+        assert!(rendered.contains("kind = exactVersion;"));
+        assert!(rendered.contains("version = \"0.3.0-dev.2\";"));
+        // An explicit `[backends.apple]` override outranks the channel pin.
+        let mut context = app_ctx();
+        context.framework = dev_framework();
+        context.apple_backend_branch = Some("dev".to_owned());
+        let template = embedded::APPLE
+            .get_file("AppName.xcodeproj/project.pbxproj.tpl")
+            .expect("apple project template must exist")
+            .contents_utf8()
+            .expect("apple project template must be utf-8");
+        let rendered = render_scaffold_template(
+            TemplateNamespace::Apple,
+            std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
+            template,
+            &context,
+        )
+        .expect("apple project render");
+        assert!(rendered.contains("kind = branch;\n\t\t\t\tbranch = \"dev\";"));
     }
 
     #[test]
