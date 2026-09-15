@@ -262,8 +262,6 @@ pub struct TemplateContext {
     pub apple_backend_branch: Option<String>,
     /// `[backend.apple] revision` — pin the remote package to a revision.
     pub apple_backend_revision: Option<String>,
-    /// Whether to use remote dev backend (`JitPack`) instead of local
-    pub use_remote_dev_backend: bool,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
     /// Persisted framework source and native backend revisions.
@@ -322,13 +320,10 @@ impl TemplateContext {
             crate_name,
             bundle_identifier: options.bundle_identifier.clone(),
             author: options.author.clone(),
-            android_backend_path: waterui_path
-                .as_ref()
-                .map(|path| path.join("backends/android")),
+            android_backend_path: None,
             apple_backend_path: None,
             apple_backend_branch: None,
             apple_backend_revision: None,
-            use_remote_dev_backend: waterui_path.is_none(),
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -368,7 +363,6 @@ impl TemplateContext {
                 .map(PathBuf::from),
             apple_backend_branch: apple.and_then(|backend| backend.branch.clone()),
             apple_backend_revision: apple.and_then(|backend| backend.revision.clone()),
-            use_remote_dev_backend: manifest.waterui_path.is_none(),
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -398,9 +392,6 @@ impl TemplateContext {
         accessory: bool,
         preview_runtime_fingerprint: Option<String>,
     ) -> Self {
-        let android_backend_path = waterui_path
-            .as_ref()
-            .map(|waterui_path| waterui_path.join("backends/android"));
         // A support app exists to host one specific WaterUI runtime, so it has
         // to resolve dependencies exactly the way that runtime's own workspace
         // does — `[patch]` included. Cargo only honours `[patch]` from the root
@@ -417,11 +408,10 @@ impl TemplateContext {
             crate_name,
             bundle_identifier,
             author: String::new(),
-            android_backend_path,
+            android_backend_path: None,
             apple_backend_path: None,
             apple_backend_branch: None,
             apple_backend_revision: None,
-            use_remote_dev_backend: waterui_path.is_none(),
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -566,18 +556,20 @@ impl TemplateContext {
             .unwrap_or_else(|error| panic!("{error:#}"))
     }
 
+    /// Whether the Android project consumes the runtime as the remote
+    /// coordinate `android_remote_backend_dependency` names rather than a
+    /// local checkout: true unless `[backend.android] backend_path` names one
+    /// or `waterui_path/backends/android` is a Gradle project.
+    #[must_use]
+    pub fn use_remote_dev_backend(&self) -> bool {
+        self.compute_android_backend_path().is_none()
+    }
+
+    /// The local runtime the Android project includes as a composite build;
+    /// empty in remote mode, where the templates never read it.
     #[must_use]
     pub fn android_backend_path(&self) -> String {
-        if self.use_remote_dev_backend {
-            return String::new();
-        }
-
-        self.compute_android_backend_path().unwrap_or_else(|| {
-            panic!(
-                "TemplateContext missing local Android backend path: \
-use_remote_dev_backend=false requires waterui_path or android_backend_path"
-            )
-        })
+        self.compute_android_backend_path().unwrap_or_default()
     }
 
     #[must_use]
@@ -667,12 +659,6 @@ use_remote_dev_backend=false requires waterui_path or android_backend_path"
         normalize_path_for_config(&backend_path)
     }
 
-    /// Compute the relative path from the backend project to a `WaterUI` backend.
-    fn compute_relative_backend_path(&self, backend_subdir: &str) -> Option<String> {
-        let waterui_path = self.waterui_path.as_ref()?;
-        Some(self.backend_relative_path(&waterui_path.join("backends").join(backend_subdir)))
-    }
-
     /// The path to the local Apple backend checkout `[backend.apple]`
     /// `backend_path` names, resolved from the Xcode project's directory.
     /// `None` consumes the remote Swift package instead.
@@ -695,12 +681,28 @@ use_remote_dev_backend=false requires waterui_path or android_backend_path"
             })
     }
 
-    /// Compute the relative path from the Android project to the `WaterUI` Android backend.
+    /// The path to the local Android backend checkout `[backend.android]`
+    /// `backend_path` names, resolved from the Android project's directory.
+    /// `None` consumes the remote runtime coordinate instead.
+    ///
+    /// Without a manifest override, `waterui_path/backends/android` is used
+    /// when it is a real Gradle project: the framework tree carries no
+    /// `backends/android` gitlink any more (water-rs/waterui#940), so a local
+    /// checkout without one builds against the runtime the framework
+    /// declares through `android-backend-revision`, while a checkout that
+    /// does carry a runtime there — a backend e2e overlay, an older
+    /// revision — keeps building against it.
     fn compute_android_backend_path(&self) -> Option<String> {
         self.android_backend_path
             .as_ref()
             .map(|path| normalize_path_for_config(path))
-            .or_else(|| self.compute_relative_backend_path("android"))
+            .or_else(|| {
+                let local = self.waterui_workspace_root()?.join("backends/android");
+                local
+                    .join("settings.gradle.kts")
+                    .is_file()
+                    .then(|| self.backend_relative_path(&local))
+            })
     }
 
     /// Absolute path of the `WaterUI` workspace root when building against a
@@ -1126,7 +1128,6 @@ mod tests {
             apple_backend_path: None,
             apple_backend_branch: None,
             apple_backend_revision: None,
-            use_remote_dev_backend: waterui_path.is_none(),
             waterui_path,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
@@ -1147,6 +1148,49 @@ mod tests {
 
     fn app_ctx() -> TemplateContext {
         ctx(None, None, None, crate::project::PackageType::App)
+    }
+
+    /// A local checkout without a `backends/android` Gradle project — the
+    /// framework tree since water-rs/waterui#940 — consumes the remote
+    /// runtime the framework declares; one that carries the runtime (a
+    /// backend e2e overlay, an older revision) is included as a composite
+    /// build.
+    #[test]
+    fn android_uses_the_local_runtime_only_when_the_checkout_carries_one() {
+        let workspace = tempdir().expect("tempdir");
+        let waterui = workspace.path().join("waterui");
+        let project = workspace.path().join("app");
+        std::fs::create_dir_all(&waterui).expect("checkout");
+        std::fs::create_dir_all(project.join("android")).expect("project");
+        let context = || {
+            ctx(
+                Some(waterui.clone()),
+                Some(project.join("android")),
+                Some(project.clone()),
+                crate::project::PackageType::App,
+            )
+        };
+
+        let bare = context();
+        assert!(bare.use_remote_dev_backend());
+        assert_eq!(bare.android_backend_path(), "");
+        assert!(
+            bare.android_remote_backend_dependency()
+                .contains(&"c".repeat(40)),
+            "the remote coordinate names the declared android-backend-revision"
+        );
+
+        std::fs::create_dir_all(waterui.join("backends/android")).expect("runtime");
+        std::fs::write(waterui.join("backends/android/settings.gradle.kts"), "").expect("gradle");
+        let overlaid = context();
+        assert!(!overlaid.use_remote_dev_backend());
+        assert!(
+            overlaid
+                .android_backend_path()
+                .ends_with("backends/android"),
+            "{}",
+            overlaid.android_backend_path()
+        );
     }
 
     fn playground_ctx() -> TemplateContext {

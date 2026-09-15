@@ -70,3 +70,31 @@ pub fn raw_url(git: &str, rev: &str, path: &str) -> String {
         github_slug(git)
     )
 }
+
+/// The `(commit, repository)` of the Android runtime the framework at `rev`
+/// builds against: the `android-backend-revision` / `android-backend-url`
+/// literals its root manifest declares, or — for a revision from before
+/// water-rs/waterui#940 declared them — the `backends/android` gitlink.
+pub fn android_backend(git: &str, rev: &str) -> (String, String) {
+    let manifest = fetch(&raw_url(git, rev, "Cargo.toml"));
+    let manifest: toml::Value =
+        toml::from_str(std::str::from_utf8(&manifest).unwrap_or_else(|error| {
+            panic!("the framework manifest at {rev} is not UTF-8: {error}")
+        }))
+        .unwrap_or_else(|error| panic!("the framework manifest at {rev} is not TOML: {error}"));
+    let metadata = &manifest["package"]["metadata"]["waterui"];
+    match (
+        metadata
+            .get("android-backend-revision")
+            .and_then(toml::Value::as_str),
+        metadata
+            .get("android-backend-url")
+            .and_then(toml::Value::as_str),
+    ) {
+        (Some(revision), Some(url)) => (revision.to_owned(), url.to_owned()),
+        (None, _) => gitlink(git, "backends/android", rev),
+        (Some(_), None) => panic!(
+            "the framework manifest at {rev} declares android-backend-revision without android-backend-url"
+        ),
+    }
+}
