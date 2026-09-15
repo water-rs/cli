@@ -198,8 +198,13 @@ fn spawn_simulator_exit_monitor(
             return;
         }
 
-        if let Some(panic_msg) =
-            fetch_recent_panic_logs(&host, context.start_instant, Some(context.pid)).await
+        if let Some(panic_msg) = fetch_recent_panic_logs(
+            &host,
+            &context.device_identifier,
+            context.start_instant,
+            Some(context.pid),
+        )
+        .await
         {
             let _ = sender.try_send(DeviceEvent::Crashed(panic_msg));
             return;
@@ -226,6 +231,7 @@ fn start_log_stream(
     log_level: Option<LogLevel>,
     pid: u32,
     native_logs: bool,
+    udid: &str,
 ) -> eyre::Result<(Receiver<PanicInfo>, smol::process::Child)> {
     // Bounded channel with capacity 1 acts as oneshot - only first panic is captured
     let (panic_tx, panic_rx) = smol::channel::bounded::<PanicInfo>(1);
@@ -240,9 +246,12 @@ fn start_log_stream(
         format!("processID == {pid} AND subsystem == \"dev.waterui\"")
     };
 
-    let mut log_cmd = host.command("log");
+    // The stream runs inside the simulator: the host logd records nothing for
+    // sim processes on these systems, so a host-side `log stream` sees zero
+    // entries while `simctl spawn <udid> log stream` sees them all.
+    let mut log_cmd = host.command("xcrun");
     log_cmd
-        .arg("stream")
+        .args(["simctl", "spawn", udid, "log", "stream"])
         .arg("--predicate")
         .arg(&predicate)
         .arg("--level")
@@ -269,6 +278,7 @@ fn start_log_stream(
     // also arrives through the stream is harmless.
     replay_log_history(
         host.clone(),
+        udid.to_string(),
         predicate,
         sender.clone(),
         panic_tx.clone(),
@@ -328,6 +338,7 @@ fn compact_log_level(line: &str) -> tracing::Level {
 /// store, so it recovers entries emitted before the stream attached to logd.
 fn replay_log_history(
     host: Host,
+    udid: String,
     predicate: String,
     sender: Sender<DeviceEvent>,
     panic_tx: Sender<PanicInfo>,
@@ -336,8 +347,9 @@ fn replay_log_history(
     spawn(async move {
         Timer::after(Duration::from_secs(4)).await;
         let Ok(output) = host
-            .command("log")
-            .args(["show", "--last", "2m", "--predicate", &predicate])
+            .command("xcrun")
+            .args(["simctl", "spawn", &udid, "log", "show"])
+            .args(["--last", "2m", "--predicate", &predicate])
             .args(["--style", "compact"])
             .output()
             .await
@@ -397,6 +409,7 @@ fn extract_panic_info_from_log(line: &str) -> Option<PanicInfo> {
 /// Returns the panic message if found, along with location and payload.
 async fn fetch_recent_panic_logs(
     host: &Host,
+    udid: &str,
     started_at: Instant,
     pid: Option<u32>,
 ) -> Option<String> {
@@ -407,10 +420,16 @@ async fn fetch_recent_panic_logs(
             "processID == {pid} AND subsystem == \"dev.waterui\" AND eventMessage CONTAINS \"panic\""
         ));
 
+    // Same simulator-side domain as the live stream: the host logd does not
+    // record sim app entries, so `log show` must run inside the device.
     let output = host
         .output(
-            "log",
+            "xcrun",
             [
+                "simctl",
+                "spawn",
+                udid,
+                "log",
                 "show",
                 "--predicate",
                 predicate.as_str(),
@@ -734,9 +753,15 @@ impl Device for AppleSimulator {
 
         // Start log streaming and get panic info receiver
         // Uses WaterUI subsystem predicate by default, or processID if native_logs is enabled
-        let (panic_rx, log_child) =
-            start_log_stream(host, sender.clone(), log_level, pid, native_logs)
-                .map_err(FailToRun::Launch)?;
+        let (panic_rx, log_child) = start_log_stream(
+            host,
+            sender.clone(),
+            log_level,
+            pid,
+            native_logs,
+            &self.udid,
+        )
+        .map_err(FailToRun::Launch)?;
         running.retain(log_child);
 
         // Monitor the actual app process and classify crash vs normal exit.
