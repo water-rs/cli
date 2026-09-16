@@ -950,7 +950,12 @@ impl CreateOptions {
             );
         }
         if let Some(path) = &self.waterui_path {
-            let root = smol::fs::canonicalize(path).await?;
+            // `dunce`, not `std`'s canonicalize: on Windows the standard one
+            // returns an extended-length path (`\\?\C:\…`), and a scaffolded
+            // manifest that carries it as a dependency `path` is one Cargo
+            // refuses to parse ("invalid path url").
+            let path = path.clone();
+            let root = unblock(move || dunce::canonicalize(path)).await?;
             self.waterui_path = Some(root.clone());
             return Ok((ResolvedFramework::for_local_checkout(&root).await?, None));
         }
