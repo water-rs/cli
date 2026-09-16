@@ -8,12 +8,13 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use cargo_metadata::{Message, TargetKind};
 use color_eyre::eyre::{Context as _, Result, bail};
 use object::read::archive::ArchiveFile;
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
+
+use crate::build::{BuildProgress, command_output_with_progress};
 
 /// Symbols of one compiled Rust artifact: an rlib/staticlib archive (every
 /// member parsed) or a single object/dylib.
@@ -175,26 +176,30 @@ fn leaf_of(name: &str) -> Option<&str> {
 /// Runs `cargo build --lib --message-format=json-render-diagnostics` with
 /// `project_path` as the working directory. `sccache_path`, when given, is
 /// installed as `RUSTC_WRAPPER` through the same helper every other CLI build
-/// uses.
+/// uses. `progress`, when given, receives cargo's compile events — the same
+/// streaming a [`crate::build::RustBuild`] reports — because this compile is
+/// often the first thing `water run` does and a cold one takes minutes.
 ///
 /// # Errors
 /// Returns an error when cargo fails or the project produces no rlib.
-pub async fn build_host_rlib(project_path: &Path, sccache_path: Option<&Path>) -> Result<PathBuf> {
+pub async fn build_host_rlib(
+    project_path: &Path,
+    sccache_path: Option<&Path>,
+    progress: Option<&BuildProgress>,
+) -> Result<PathBuf> {
     let manifest_path = dunce::canonicalize(project_path.join("Cargo.toml"))
         .wrap_err_with(|| format!("no Cargo.toml under {}", project_path.display()))?;
 
     let mut cargo = smol::process::Command::new("cargo");
     cargo
         .args(["build", "--lib", "--message-format=json-render-diagnostics"])
-        .current_dir(project_path)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .current_dir(project_path);
     if let Some(sccache_path) = sccache_path {
         crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path);
     }
-    let output = cargo
-        .output()
+    // Stdout stays collected-only: it carries the JSON message stream parsed
+    // below, so a progress sink must never mirror it to the terminal.
+    let output = command_output_with_progress(&mut cargo, progress.cloned())
         .await
         .wrap_err("failed to execute `cargo build --lib`")?;
     if !output.status.success() {
@@ -243,7 +248,7 @@ mod tests {
     fn reads_meta_statics_and_exports_from_built_rlib() {
         futures_lite::future::block_on(async {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/meta_static");
-            let rlib = build_host_rlib(&fixture, None)
+            let rlib = build_host_rlib(&fixture, None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
@@ -387,7 +392,7 @@ mod tests {
     fn reads_include_web_mount_meta_from_built_rlib() {
         futures_lite::future::block_on(async {
             let fixture = web_meta_fixture();
-            let rlib = build_host_rlib(fixture.path(), None)
+            let rlib = build_host_rlib(fixture.path(), None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");

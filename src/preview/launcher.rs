@@ -23,6 +23,7 @@ use super::protocol::DylibId;
 use super::protocol::PreviewPlatform;
 use super::protocol::PreviewRuntimePlatform;
 use super::protocol::PreviewTcpConfig;
+use crate::build::BuildProgress;
 
 use crate::apple::dynamic_runtime;
 use crate::build::{RustBuild, RustLinkage};
@@ -537,6 +538,7 @@ pub async fn launch_preview_session(
     project_path: &Path,
     platform: PreviewPlatform,
     sccache_path: Option<PathBuf>,
+    progress: Option<BuildProgress>,
 ) -> Result<PreviewSession> {
     let requirements_start = Instant::now();
     let requirements = resolve_preview_requirements(project_path, platform).await?;
@@ -567,7 +569,7 @@ pub async fn launch_preview_session(
     }
 
     let project = open_preview_support_project(&requirements).await?;
-    let running = launch_preview_app_for_platform(&project, platform).await?;
+    let running = launch_preview_app_for_platform(&project, platform, progress.as_ref()).await?;
     build_preview_session_from_launch(
         running,
         platform,
@@ -656,18 +658,22 @@ async fn open_preview_support_project(requirements: &PreviewRequirements) -> Res
 async fn launch_preview_app_for_platform(
     project: &Project,
     platform: PreviewPlatform,
+    progress: Option<&BuildProgress>,
 ) -> Result<Running> {
     match platform {
-        PreviewPlatform::Macos => launch_preview_on_macos(project).await,
-        PreviewPlatform::IosSimulator => launch_preview_on_ios_simulator(project).await,
+        PreviewPlatform::Macos => launch_preview_on_macos(project, progress).await,
+        PreviewPlatform::IosSimulator => launch_preview_on_ios_simulator(project, progress).await,
         PreviewPlatform::Ios => {
             bail!("Physical iOS devices are not yet supported for preview");
         }
-        PreviewPlatform::Android => launch_preview_on_android(project).await,
+        PreviewPlatform::Android => launch_preview_on_android(project, progress).await,
     }
 }
 
-async fn launch_preview_on_macos(project: &Project) -> Result<Running> {
+async fn launch_preview_on_macos(
+    project: &Project,
+    progress: Option<&BuildProgress>,
+) -> Result<Running> {
     let backend = project
         .apple_backend()
         .ok_or_else(|| eyre::eyre!("Apple backend not configured"))?;
@@ -681,12 +687,16 @@ async fn launch_preview_on_macos(project: &Project) -> Result<Running> {
             TargetPlatform::MacOS,
             device,
             preview_run_options(),
+            progress.cloned(),
         )
         .await
         .map_err(|e| eyre::eyre!("Failed to run preview app: {e}"))
 }
 
-async fn launch_preview_on_ios_simulator(project: &Project) -> Result<Running> {
+async fn launch_preview_on_ios_simulator(
+    project: &Project,
+    progress: Option<&BuildProgress>,
+) -> Result<Running> {
     let backend = project
         .apple_backend()
         .ok_or_else(|| eyre::eyre!("Apple backend not configured"))?;
@@ -700,12 +710,16 @@ async fn launch_preview_on_ios_simulator(project: &Project) -> Result<Running> {
             TargetPlatform::IOSSimulator,
             simulator,
             preview_run_options(),
+            progress.cloned(),
         )
         .await
         .map_err(|e| eyre::eyre!("Failed to run preview app: {e}"))
 }
 
-async fn launch_preview_on_android(project: &Project) -> Result<Running> {
+async fn launch_preview_on_android(
+    project: &Project,
+    progress: Option<&BuildProgress>,
+) -> Result<Running> {
     let backend = project
         .android_backend()
         .ok_or_else(|| eyre::eyre!("Android backend not configured"))?;
@@ -719,7 +733,7 @@ async fn launch_preview_on_android(project: &Project) -> Result<Running> {
         device.launch(&host).await?;
         info!("Building and running preview app on Android device...");
         return project
-            .run_android_with_options(backend, device, preview_run_options())
+            .run_android_with_options(backend, device, preview_run_options(), progress.cloned())
             .await
             .map_err(|e| eyre::eyre!("Failed to run preview app: {e}"));
     }
@@ -733,7 +747,7 @@ async fn launch_preview_on_android(project: &Project) -> Result<Running> {
     emulator.launch(&host).await?;
     info!("Building and running preview app on Android emulator...");
     project
-        .run_android_with_options(backend, emulator, preview_run_options())
+        .run_android_with_options(backend, emulator, preview_run_options(), progress.cloned())
         .await
         .map_err(|e| eyre::eyre!("Failed to run preview app: {e}"))
 }

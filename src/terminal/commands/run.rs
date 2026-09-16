@@ -25,7 +25,7 @@ use waterui_cli::{
         toolchain::AppleSdk,
     },
     backend::reinit_backend,
-    build::{BuildOptions, BuildProfile},
+    build::{BuildOptions, BuildProfile, BuildProgress},
     device::{Artifact, Device, DeviceEvent, Local, LogLevel, RunOptions, Running},
     esp32::{backend::Esp32Backend, platform::run_esp32},
     gtk4::{
@@ -991,6 +991,7 @@ async fn build_and_run(
         &build_plan,
         config.profile.is_release(),
         dev_server.is_some(),
+        Some(shell.build_progress()),
     )
     .await?;
 
@@ -1018,7 +1019,8 @@ async fn start_web_dev_server(
     sccache_path: Option<&std::path::Path>,
     expose_on_lan: bool,
 ) -> Result<Option<web::WebDevServer>> {
-    let Some(meta) = web::web_mount(project, sccache_path).await? else {
+    let Some(meta) = web::web_mount(project, sccache_path, Some(&shell.build_progress())).await?
+    else {
         return Ok(None);
     };
     let root = meta
@@ -1190,10 +1192,14 @@ async fn package_for_backend(
     plan: &BuildPlan,
     release: bool,
     dev_server: bool,
+    progress: Option<BuildProgress>,
 ) -> Result<Artifact> {
-    let package_options = PackageOptions::development()
+    let mut package_options = PackageOptions::development()
         .with_debug(!release)
         .with_dev_server(dev_server);
+    if let Some(progress) = progress {
+        package_options = package_options.with_progress(progress);
+    }
     match backend {
         TargetBackend::Apple => package_apple(project, plan.lib_platform, package_options).await,
         TargetBackend::Android => {

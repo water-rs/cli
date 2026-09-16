@@ -16,7 +16,7 @@ use smol::unblock;
 use tracing::info;
 
 use crate::{
-    build::BuildOptions,
+    build::{BuildOptions, BuildProgress},
     device::Artifact,
     esp32::{backend::Esp32Backend, chip::Esp32Chip},
     platform::{PackageOptions, TargetPlatform},
@@ -274,10 +274,20 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
     let output =
         crate::build::command_output_with_progress(&mut cargo, options.progress().cloned()).await?;
     if !output.status.success() {
+        let details = command_failure_details(&output);
+        // A live-rendered stream is tailed rather than re-dumped in full.
+        let details = if options
+            .progress()
+            .is_some_and(BuildProgress::shows_all_lines)
+        {
+            crate::build::output_tail(&details)
+        } else {
+            details
+        };
         bail!(
             "Failed to build ESP32 firmware with cargo (status {}):\n{}",
             output.status,
-            command_failure_details(&output)
+            details
         );
     }
 

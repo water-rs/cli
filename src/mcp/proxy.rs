@@ -299,6 +299,7 @@ async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)
         &project,
         HydrolysisPreviewTheme::Material3,
         config.sccache_path.as_deref(),
+        None,
     )
     .await?;
 

@@ -326,7 +326,15 @@ impl Shell {
         };
         let bars = self.multi_progress.clone();
         let units = Arc::new(AtomicUsize::new(0));
-        BuildProgress::new(move |event| render_compile_event(mode, &bars, &units, &event))
+        let progress =
+            BuildProgress::new(move |event| render_compile_event(mode, &bars, &units, &event));
+        // An interactive terminal renders every line live, so a failure report
+        // tails the captured output instead of dumping it a second time.
+        if matches!(mode, CompileRender::Interactive) {
+            progress.showing_all_lines()
+        } else {
+            progress
+        }
     }
 
     /// Display a panic report from a platform crash message.
@@ -669,8 +677,11 @@ fn render_compile_event(
             if matches!(event, CompileEvent::Line(_)) {
                 return;
             }
+            // Events carry cargo's raw line, which a user-forced color
+            // setting leaves ANSI-wrapped; plain piped output strips it.
+            let text = compile_event_text(units, event);
             let mut stderr = anstream::stderr().lock();
-            let _ = writeln!(stderr, "{}", compile_event_text(units, event));
+            let _ = writeln!(stderr, "{}", console::strip_ansi_codes(&text));
             let _ = stderr.flush();
         }
         CompileRender::Json => {
@@ -716,7 +727,7 @@ struct BuildProgressRecord<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<&'a str>,
+    message: Option<String>,
 }
 
 fn compile_event_record<'a>(
@@ -742,7 +753,7 @@ fn compile_event_record<'a>(
             name: None,
             version: None,
             count: None,
-            message: Some(text),
+            message: Some(console::strip_ansi_codes(text).into_owned()),
         },
         CompileEvent::Line(text) => BuildProgressRecord {
             ty: "build-progress",
@@ -750,7 +761,7 @@ fn compile_event_record<'a>(
             name: None,
             version: None,
             count: None,
-            message: Some(text),
+            message: Some(console::strip_ansi_codes(text).into_owned()),
         },
     }
 }

@@ -587,7 +587,13 @@ pub enum CompileEvent {
 /// The terminal attaches one per build; events arrive on the task draining
 /// cargo's stderr, so a sink must stay cheap.
 #[derive(Clone)]
-pub struct BuildProgress(std::sync::Arc<dyn Fn(CompileEvent) + Send + Sync>);
+pub struct BuildProgress {
+    report: std::sync::Arc<dyn Fn(CompileEvent) + Send + Sync>,
+    /// Whether the sink renders every line live. When it does, a build
+    /// failure report can tail the captured output instead of re-dumping what
+    /// the user already watched scroll by.
+    shows_all_lines: bool,
+}
 
 impl std::fmt::Debug for BuildProgress {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -599,11 +605,28 @@ impl BuildProgress {
     /// A sink that renders each event through `report`.
     #[must_use]
     pub fn new(report: impl Fn(CompileEvent) + Send + Sync + 'static) -> Self {
-        Self(std::sync::Arc::new(report))
+        Self {
+            report: std::sync::Arc::new(report),
+            shows_all_lines: false,
+        }
+    }
+
+    /// Mark the sink as rendering every line live, including
+    /// [`CompileEvent::Line`] diagnostics.
+    #[must_use]
+    pub const fn showing_all_lines(mut self) -> Self {
+        self.shows_all_lines = true;
+        self
+    }
+
+    /// Whether the sink renders every line live.
+    #[must_use]
+    pub const fn shows_all_lines(&self) -> bool {
+        self.shows_all_lines
     }
 
     fn report(&self, event: CompileEvent) {
-        (self.0)(event);
+        (self.report)(event);
     }
 }
 
@@ -618,8 +641,16 @@ const CARGO_UNIT_PHASES: &[&str] = &[
 ];
 
 /// Classify one line of cargo's stderr into a [`CompileEvent`].
+///
+/// Cargo emits ANSI-colored status lines whenever color is forced — by the
+/// `CARGO_TERM_COLOR` this module sets for terminal output, or by the user's
+/// own `[term] color` configuration — so the line is classified on its
+/// stripped text. Text-carrying events keep the raw line: an interactive sink
+/// renders cargo's colors, and the piped and JSON renderers strip on emit.
 fn classify_compile_line(line: &str) -> CompileEvent {
-    let text = line.trim();
+    let raw = line.trim();
+    let stripped = console::strip_ansi_codes(raw);
+    let text = stripped.trim();
     for phase in CARGO_UNIT_PHASES {
         let Some(rest) = text
             .strip_prefix(phase)
@@ -630,7 +661,7 @@ fn classify_compile_line(line: &str) -> CompileEvent {
         // A unit line names `name vversion`; `Downloaded 12 crates` and
         // `Doc-tests foo` are status text, not a unit.
         let Some((name, version)) = rest.split_once(" v") else {
-            return CompileEvent::Line(text.to_owned());
+            return CompileEvent::Line(raw.to_owned());
         };
         let version = version.split([' ', '(']).next().unwrap_or_default();
         return CompileEvent::Unit {
@@ -640,9 +671,9 @@ fn classify_compile_line(line: &str) -> CompileEvent {
         };
     }
     if text.starts_with("Finished ") {
-        return CompileEvent::Finished(text.to_owned());
+        return CompileEvent::Finished(raw.to_owned());
     }
-    CompileEvent::Line(text.to_owned())
+    CompileEvent::Line(raw.to_owned())
 }
 
 /// Spawn a configured command with piped stdio, drain both streams to their
@@ -652,8 +683,10 @@ fn classify_compile_line(line: &str) -> CompileEvent {
 /// pipes are always drained and collected in full, so failure reporting and
 /// retry detection see the same captured text whether or not a sink is
 /// attached. When no sink is attached and the CLI's output passthrough is
-/// enabled, raw chunks echo to the terminal as they arrive — the historical
-/// `Stdio::inherit` behavior.
+/// enabled, raw stderr chunks echo to the terminal as they arrive — the
+/// historical `Stdio::inherit` behavior. Stdout is collected silently: a
+/// `--message-format=json` caller parses it as a protocol stream, so it is
+/// never mirrored.
 pub(crate) async fn command_output_with_progress(
     command: &mut Command,
     progress: Option<BuildProgress>,
@@ -672,7 +705,7 @@ pub(crate) async fn command_output_with_progress(
     let echo = progress.is_none() && std_output_enabled();
     // The drains run as their own tasks: inlined into this future their read
     // buffers alone would push it past clippy's `large_futures` threshold.
-    let stdout_task = smol::spawn(drain_pipe(stdout_pipe, io::stdout(), echo));
+    let stdout_task = smol::spawn(drain_pipe(stdout_pipe));
     let stderr_task = smol::spawn(drain_cargo_stderr(stderr_pipe, progress, echo));
     let status = child.status().await?;
     let stdout = stdout_task.await?;
@@ -684,24 +717,14 @@ pub(crate) async fn command_output_with_progress(
     })
 }
 
-/// Drain a piped child stream to EOF, collecting every byte. When `echo` is
-/// set each chunk is also mirrored to `sink`, reproducing the incremental
-/// passthrough `Stdio::inherit` produced.
-async fn drain_pipe(
-    mut reader: impl smol::io::AsyncRead + Unpin,
-    mut sink: impl io::Write,
-    echo: bool,
-) -> io::Result<Vec<u8>> {
+/// Drain a piped child stream to EOF, collecting every byte.
+async fn drain_pipe(mut reader: impl smol::io::AsyncRead + Unpin) -> io::Result<Vec<u8>> {
     let mut collected = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
             break;
-        }
-        if echo {
-            let _ = sink.write_all(&chunk[..read]);
-            let _ = sink.flush();
         }
         collected.extend_from_slice(&chunk[..read]);
     }
@@ -717,7 +740,7 @@ async fn drain_cargo_stderr(
     echo: bool,
 ) -> io::Result<Vec<u8>> {
     let mut collected = Vec::new();
-    let mut pending = String::new();
+    let mut pending: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
         let read = reader.read(&mut chunk).await?;
@@ -730,9 +753,13 @@ async fn drain_cargo_stderr(
             let _ = io::stderr().flush();
         }
         if let Some(sink) = &progress {
-            pending.push_str(&String::from_utf8_lossy(&chunk[..read]));
-            while let Some(newline) = pending.find('\n') {
-                let line: String = pending.drain(..=newline).collect();
+            pending.extend_from_slice(&chunk[..read]);
+            // A line feed is never a UTF-8 continuation byte, so scanning raw
+            // bytes for line boundaries and decoding only complete lines
+            // cannot corrupt a multibyte character straddling a chunk.
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let line: Vec<u8> = pending.drain(..=newline).collect();
+                let line = String::from_utf8_lossy(&line);
                 let line = line.trim_end();
                 if !line.trim().is_empty() {
                     sink.report(classify_compile_line(line));
@@ -741,7 +768,8 @@ async fn drain_cargo_stderr(
         }
     }
     if let Some(sink) = &progress {
-        let tail = pending.trim_end();
+        let tail = String::from_utf8_lossy(&pending);
+        let tail = tail.trim_end();
         if !tail.trim().is_empty() {
             sink.report(classify_compile_line(tail));
         }
@@ -1044,7 +1072,8 @@ impl RustBuild {
                         return Err(RustBuildError::FailToBuildRustLibrary(
                             std::io::Error::other(format!(
                                 "Cargo build failed and meson appears missing.\n\
-Automatic meson installation failed: {install_err}\n\n{combined}"
+Automatic meson installation failed: {install_err}\n\n{}",
+                                self.failure_report(&combined)
                             )),
                         ));
                     }
@@ -1055,11 +1084,28 @@ Automatic meson installation failed: {install_err}\n\n{combined}"
         if !output.status.success() {
             let combined = combined_build_output(&output);
             return Err(RustBuildError::FailToBuildRustLibrary(
-                std::io::Error::other(format!("Cargo build failed:\n{combined}")),
+                std::io::Error::other(format!(
+                    "Cargo build failed:\n{}",
+                    self.failure_report(&combined)
+                )),
             ));
         }
 
         self.lib_output_dir(release).await
+    }
+
+    /// The text a build failure report embeds: the whole captured output, or
+    /// only its tail when the attached sink already rendered every line live.
+    fn failure_report(&self, combined: &str) -> String {
+        if self
+            .progress
+            .as_ref()
+            .is_some_and(BuildProgress::shows_all_lines)
+        {
+            output_tail(combined)
+        } else {
+            combined.to_owned()
+        }
     }
 
     async fn clean_stale_cmake_build_dirs(&self) -> Result<bool, RustBuildError> {
@@ -1285,6 +1331,24 @@ fn combined_build_output(output: &std::process::Output) -> String {
     } else {
         stderr.to_string()
     }
+}
+
+/// Lines a failure report keeps when the terminal already streamed the whole
+/// build live — the dump is truncated to this tail.
+const FAILURE_TAIL_LINES: usize = 40;
+
+/// The last [`FAILURE_TAIL_LINES`] lines of `text` — what a failure report
+/// needs when the terminal already rendered the full stream.
+pub(crate) fn output_tail(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= FAILURE_TAIL_LINES {
+        return text.to_owned();
+    }
+    format!(
+        "… {} earlier lines already streamed above …\n{}",
+        lines.len() - FAILURE_TAIL_LINES,
+        lines[lines.len() - FAILURE_TAIL_LINES..].join("\n")
+    )
 }
 
 fn should_auto_install_meson(build_output: &str) -> bool {
@@ -1562,6 +1626,27 @@ mod tests {
         assert_eq!(
             classify_compile_line("warning: unused import"),
             CompileEvent::Line("warning: unused import".to_string())
+        );
+    }
+
+    #[test]
+    fn compile_progress_classifies_through_ansi_color() {
+        // A user-forced `[term] color = "always"` or the CARGO_TERM_COLOR the
+        // CLI sets for terminals wraps cargo's status words in escapes.
+        let colored = "\u{1b}[0m\u{1b}[1m\u{1b}[32m   Compiling\u{1b}[0m serde v1.0.228";
+        assert_eq!(
+            classify_compile_line(colored),
+            CompileEvent::Unit {
+                phase: "Compiling",
+                name: "serde".to_string(),
+                version: Some("1.0.228".to_string()),
+            }
+        );
+        let colored_finished =
+            "\u{1b}[0m\u{1b}[1m\u{1b}[32m    Finished\u{1b}[0m `dev` profile in 1.23s";
+        assert_eq!(
+            classify_compile_line(colored_finished),
+            CompileEvent::Finished(colored_finished.trim().to_string())
         );
     }
 
