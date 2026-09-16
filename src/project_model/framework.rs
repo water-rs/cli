@@ -548,6 +548,16 @@ impl ResolvedFramework {
         };
         let locked = self.cargo_lock(contents)?;
         let allowed = self.allowed_packages(&locked.packages);
+        // The names the framework contract knows: `Water.lock`'s packages and
+        // the scaffold's extracted crates. Anything else — an extracted
+        // crate's private dependencies, which can never enter `Water.lock` —
+        // is foreign to the check.
+        let ecosystem: BTreeSet<&str> = locked
+            .packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .chain(self.packages.keys().map(String::as_str))
+            .collect();
         let packages: BTreeMap<_, _> = metadata
             .packages
             .iter()
@@ -590,7 +600,10 @@ impl ResolvedFramework {
                 version: package.version.to_string(),
                 source: package.source.as_ref().map(|source| source.repr.clone()),
             };
-            if !allowed.contains(&identity) {
+            if !allowed.contains(&identity)
+                && ecosystem.contains(identity.name.as_str())
+                && !self.sanctioned_source(&identity)
+            {
                 bail!(
                     "framework dependency {} {} differs from Water.lock; select a compatible channel explicitly",
                     identity.name,
@@ -819,16 +832,54 @@ impl ResolvedFramework {
         allowed
     }
 
+    /// Whether `identity` resolves a scaffold package at the source its
+    /// declared requirement sanctions — the declared `git + rev`, or the
+    /// registry at the pinned `=version`. An extracted crate never enters
+    /// `Water.lock`; the declared pin is the certification of what it must
+    /// resolve to.
+    fn sanctioned_source(&self, identity: &LockedPackage) -> bool {
+        let Some(detail) = self.packages.get(identity.name.as_str()) else {
+            return false;
+        };
+        let Some(source) = &identity.source else {
+            return false;
+        };
+        if let (Some(git), Some(rev)) = (&detail.git, &detail.rev) {
+            let Ok(source) = source.parse::<cargo_lock::SourceId>() else {
+                return false;
+            };
+            let declared = cargo_lock::package::GitReference::Rev(rev.clone());
+            return source.is_git()
+                && source.git_reference() == Some(&declared)
+                && canonical_git_url(source.url().as_str()) == canonical_git_url(git);
+        }
+        source.as_str() == "registry+https://github.com/rust-lang/crates.io-index"
+            && detail.version.as_ref().is_some_and(|requirement| {
+                identity
+                    .version
+                    .parse::<cargo_toml::SemVer>()
+                    .is_ok_and(|version| requirement.matches(&version))
+            })
+    }
+
     pub(crate) fn dependency(&self, name: &str) -> DependencyDetail {
         match &self.source {
-            Source::Stable { .. } => DependencyDetail {
-                version: Some(
-                    format!("={}", self.scaffold_value(&format!("{name}-version")))
-                        .parse()
-                        .expect("resolved package version is valid"),
-                ),
-                ..Default::default()
-            },
+            Source::Stable { .. } => {
+                let requirement = self.scaffold_value(&format!("{name}-version"));
+                // The registry substitutes for a declared git pin only once
+                // the workspace names the crate by version alone.
+                let git = self.scaffold.get(&format!("{name}-git"));
+                DependencyDetail {
+                    version: Some(
+                        git.map_or_else(|| format!("={requirement}"), |_| requirement.to_owned())
+                            .parse()
+                            .expect("resolved package version is valid"),
+                    ),
+                    git: git.cloned(),
+                    rev: git.map(|_| self.scaffold_value(&format!("{name}-rev")).to_owned()),
+                    ..Default::default()
+                }
+            }
             Source::Dev { .. } | Source::Nightly { .. } => self.packages[name].clone(),
             Source::Local { .. } => {
                 unreachable!("a local checkout resolves framework crates by path")
@@ -1202,9 +1253,10 @@ fn framework_metadata(manifest: &toml::Value) -> Result<toml::Table> {
 }
 
 /// The scaffold facts the framework manifest itself declares: each
-/// `scaffold-packages` entry's requirement from `[workspace.dependencies]`,
-/// and every backend coordinate — `{name}-backend-url`, plus the
-/// `{name}-backend-version` of a backend pinned by release or the
+/// `scaffold-packages` entry's requirement from `[workspace.dependencies]` —
+/// `{name}-version`, plus `{name}-git` and `{name}-rev` when the requirement
+/// pins a repository — and every backend coordinate — `{name}-backend-url`,
+/// plus the `{name}-backend-version` of a backend pinned by release or the
 /// `{name}-backend-revision` of one pinned by commit, rather than by
 /// gitlink — from `[package.metadata.waterui]`.
 ///
@@ -1236,6 +1288,21 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
             .or_else(|| dependency.get("version").and_then(toml::Value::as_str))
             .ok_or_else(|| eyre!("workspace.dependencies.{name} declares no version"))?;
         scaffold.insert(format!("{name}-version"), requirement.to_owned());
+        // A scaffold package pinned from git keeps that source: a bare
+        // `{name}-version` cannot express the commit the framework builds
+        // against, and the registry may not carry it at all.
+        if let Some(git) = dependency.get("git").and_then(toml::Value::as_str) {
+            let revision = dependency
+                .get("rev")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    eyre!("workspace.dependencies.{name} must pin an immutable Git revision")
+                })?;
+            validate_revision(revision)
+                .wrap_err_with(|| format!("workspace.dependencies.{name}.rev"))?;
+            scaffold.insert(format!("{name}-git"), git.to_owned());
+            scaffold.insert(format!("{name}-rev"), revision.to_owned());
+        }
     }
     for (key, value) in &metadata {
         if !(key.ends_with("-backend-url")
@@ -1366,14 +1433,37 @@ fn resolve_packages(
                 package.name.as_str() == name && package.version.to_string() == *version
             })
             .collect();
+        // A scaffold package the workspace pins from git resolves from that
+        // pin on every channel: an extracted crate never enters the framework
+        // lock, and for one built in-tree the lock only witnesses that the
+        // framework resolves the same commit.
+        if let Some(git) = scaffold.get(&format!("{name}-git")) {
+            let pinned = scaffold.get(&format!("{name}-rev")).ok_or_else(|| {
+                eyre!("framework scaffold declares {name}-git without {name}-rev")
+            })?;
+            match candidates.as_slice() {
+                [] => {}
+                [package] => assert_declared_git_source(name, package, git, pinned)?,
+                _ => bail!("framework lock has multiple sources for {name} {version}"),
+            }
+            packages.insert(
+                name.to_owned(),
+                DependencyDetail {
+                    version: Some(version.parse()?),
+                    git: Some(git.clone()),
+                    rev: Some(pinned.clone()),
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
         let package = match candidates.as_slice() {
             [package] => *package,
             // An extracted crate the framework no longer builds never enters
-            // its lock — `waterui-dew` releases from water-rs/dew (#614) and
-            // `waterui-gtk` from water-rs/gtk-backend (#612), so the scaffold's
-            // declared requirement is the resolution, the same `=<version>` the
-            // registry-source arm below produces for a crate the framework
-            // still carries.
+            // its lock — `waterui-dew` releases from water-rs/dew (#614) — so
+            // the scaffold's declared requirement is the resolution, the same
+            // `=<version>` the registry-source arm below produces for a crate
+            // the framework still carries.
             [] => {
                 packages.insert(
                     name.to_owned(),
@@ -1414,6 +1504,29 @@ fn resolve_packages(
         packages.insert(name.to_owned(), dependency);
     }
     Ok(packages)
+}
+
+/// Assert `package`'s lock source is the git repository a declared
+/// `{name}-git`/`{name}-rev` scaffold pair names — the witness that the
+/// framework builds the same commit a scaffolded project receives.
+fn assert_declared_git_source(
+    name: &str,
+    package: &cargo_lock::Package,
+    git: &str,
+    revision: &str,
+) -> Result<()> {
+    let Some(source) = &package.source else {
+        bail!("framework package {name} is a workspace member, not the declared {git}");
+    };
+    let declared = cargo_lock::package::GitReference::Rev(revision.to_owned());
+    if !(source.is_git()
+        && source.git_reference() == Some(&declared)
+        && source.precise() == Some(revision)
+        && canonical_git_url(source.url().as_str()) == canonical_git_url(git))
+    {
+        bail!("framework package {name} resolves {source}, not the declared {git}@{revision}");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -2292,7 +2405,8 @@ mod tests {
     fn extracted_crate_absent_from_the_lock_resolves_to_its_declared_requirement() {
         // A crate released from its own repository and not consumed by the
         // framework never enters the framework lock — the scaffold's declared
-        // requirement is the requirement a dev/nightly resolution pins.
+        // requirement is the requirement a dev/nightly resolution pins,
+        // whether the workspace names a version or a git revision.
         let lock = Lockfile {
             packages: vec![package("waterui", "0.3.0", None)],
             version: cargo_lock::ResolveVersion::V4,
@@ -2300,10 +2414,16 @@ mod tests {
             metadata: BTreeMap::default(),
             patch: cargo_lock::Patch::default(),
         };
+        let gtk_revision = "b".repeat(40);
         let scaffold = BTreeMap::from([
             ("waterui-version".to_string(), "0.3.0".to_string()),
             ("waterui-dew-version".to_string(), "0.2.1".to_string()),
-            ("waterui-gtk-version".to_string(), "0.1.2".to_string()),
+            ("waterui-gtk-version".to_string(), "0.2.0".to_string()),
+            (
+                "waterui-gtk-git".to_string(),
+                "https://github.com/water-rs/gtk-backend".to_string(),
+            ),
+            ("waterui-gtk-rev".to_string(), gtk_revision.clone()),
         ]);
         let packages =
             resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40)).unwrap();
@@ -2312,8 +2432,132 @@ mod tests {
         assert!(dew.git.is_none());
         assert_eq!(dew.version.as_ref().unwrap().to_string(), "=0.2.1");
         let gtk = &packages["waterui-gtk"];
-        assert!(gtk.git.is_none());
-        assert_eq!(gtk.version.as_ref().unwrap().to_string(), "=0.1.2");
+        assert_eq!(
+            gtk.git.as_deref(),
+            Some("https://github.com/water-rs/gtk-backend")
+        );
+        assert_eq!(gtk.rev.as_deref(), Some(gtk_revision.as_str()));
+        assert_eq!(gtk.version.as_ref().unwrap().to_string(), "^0.2.0");
+    }
+
+    #[test]
+    fn declared_git_source_must_agree_with_the_lock() {
+        // The declared pin is authoritative, but a framework that also builds
+        // the crate in-tree must not lock a different commit than it declares.
+        let locked_revision = "b".repeat(40);
+        let drifted_revision = "c".repeat(40);
+        for (lock_revision, expected) in [
+            (locked_revision.as_str(), true),
+            (drifted_revision.as_str(), false),
+        ] {
+            let source = format!(
+                "git+https://github.com/water-rs/gtk-backend?rev={lock_revision}#{lock_revision}"
+            );
+            let lock = Lockfile {
+                packages: vec![package("waterui-gtk", "0.2.0", Some(&source))],
+                version: cargo_lock::ResolveVersion::V4,
+                root: None,
+                metadata: BTreeMap::default(),
+                patch: cargo_lock::Patch::default(),
+            };
+            let scaffold = BTreeMap::from([
+                ("waterui-gtk-version".to_string(), "0.2.0".to_string()),
+                (
+                    "waterui-gtk-git".to_string(),
+                    "https://github.com/water-rs/gtk-backend".to_string(),
+                ),
+                ("waterui-gtk-rev".to_string(), locked_revision.clone()),
+            ]);
+            let result =
+                resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40));
+            assert_eq!(result.is_ok(), expected, "lock revision {lock_revision}");
+            if expected {
+                assert_eq!(
+                    result.unwrap()["waterui-gtk"].rev.as_deref(),
+                    Some(locked_revision.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stable_dependency_honors_a_declared_git_source() {
+        let mut framework = stable_framework();
+        let revision = "b".repeat(40);
+        framework.scaffold.insert(
+            "waterui-gtk-git".to_owned(),
+            "https://github.com/water-rs/gtk-backend".to_owned(),
+        );
+        framework
+            .scaffold
+            .insert("waterui-gtk-rev".to_owned(), revision.clone());
+        let gtk = framework.dependency("waterui-gtk");
+        assert_eq!(
+            gtk.git.as_deref(),
+            Some("https://github.com/water-rs/gtk-backend")
+        );
+        assert_eq!(gtk.rev.as_deref(), Some(revision.as_str()));
+        assert_eq!(gtk.version.as_ref().unwrap().to_string(), "^0.1.2");
+        // A scaffold package declared by version alone still resolves the
+        // registry pin.
+        let dew = framework.dependency("waterui-dew");
+        assert!(dew.git.is_none());
+        assert_eq!(dew.version.as_ref().unwrap().to_string(), "=0.2.1");
+    }
+
+    #[test]
+    fn extracted_crate_validation_accepts_only_the_sanctioned_source() {
+        // `Water.lock` cannot record an extracted crate, so
+        // `validate_dependencies` holds it to its declared pin instead: the
+        // exact commit for a git source, the exact version for the registry.
+        let gtk_revision = "b".repeat(40);
+        let mut framework = stable_framework();
+        framework.packages.insert(
+            "waterui-gtk".to_owned(),
+            DependencyDetail {
+                version: Some("0.2.0".parse().unwrap()),
+                git: Some("https://github.com/water-rs/gtk-backend".to_owned()),
+                rev: Some(gtk_revision.clone()),
+                ..Default::default()
+            },
+        );
+        framework.packages.insert(
+            "waterui-dew".to_owned(),
+            DependencyDetail {
+                version: Some("=0.2.1".parse().unwrap()),
+                ..Default::default()
+            },
+        );
+        let identity = |name: &str, version: &str, source: String| LockedPackage {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source: Some(source),
+        };
+        let gtk_source = |revision: &str| {
+            format!("git+https://github.com/water-rs/gtk-backend?rev={revision}#{revision}")
+        };
+        assert!(framework.sanctioned_source(&identity(
+            "waterui-gtk",
+            "0.2.0",
+            gtk_source(&gtk_revision)
+        )));
+        // The pinned commit carries whatever version its manifest declares.
+        assert!(framework.sanctioned_source(&identity(
+            "waterui-gtk",
+            "0.2.1",
+            gtk_source(&gtk_revision)
+        )));
+        // A different commit is a different pin.
+        let drifted = "c".repeat(40);
+        assert!(!framework.sanctioned_source(&identity(
+            "waterui-gtk",
+            "0.2.0",
+            gtk_source(&drifted)
+        )));
+        // The registry pin holds only its exact version.
+        let registry = || "registry+https://github.com/rust-lang/crates.io-index".to_owned();
+        assert!(framework.sanctioned_source(&identity("waterui-dew", "0.2.1", registry())));
+        assert!(!framework.sanctioned_source(&identity("waterui-dew", "0.2.2", registry())));
     }
 
     /// The exact requirement a stable channel writes for one scaffold entry.
@@ -2866,6 +3110,14 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                 ("waterui-dew-version".to_owned(), workspace("waterui-dew")),
                 ("waterui-gtk-version".to_owned(), workspace("waterui-gtk")),
                 (
+                    "waterui-gtk-git".to_owned(),
+                    "https://github.com/water-rs/gtk-backend".to_owned()
+                ),
+                (
+                    "waterui-gtk-rev".to_owned(),
+                    "3162043e618e759bea6d6e52ec75c6ee1273c080".to_owned()
+                ),
+                (
                     "apple-backend-url".to_owned(),
                     "https://github.com/water-rs/apple-backend.git".to_owned()
                 ),
@@ -2877,6 +3129,21 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                 ("android-backend-revision".to_owned(), "c".repeat(40)),
             ])
         );
+    }
+
+    #[test]
+    fn framework_scaffold_rejects_a_git_package_without_a_revision() {
+        let mut root: toml::Value = toml::from_str(include_str!(
+            "../../tests/fixtures/framework_checkout_manifest.toml"
+        ))
+        .unwrap();
+        let gtk = &mut root["workspace"]["dependencies"]["waterui-gtk"];
+        gtk.as_table_mut()
+            .unwrap()
+            .insert("branch".to_owned(), toml::Value::String("dev".to_owned()));
+        gtk.as_table_mut().unwrap().remove("rev");
+        let error = framework_scaffold(&root).unwrap_err();
+        assert!(error.to_string().contains("waterui-gtk"), "{error:?}");
     }
 
     #[test]
