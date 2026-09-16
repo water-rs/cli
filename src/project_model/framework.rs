@@ -1426,11 +1426,22 @@ fn resolve_packages(
         if name.ends_with("-backend") {
             continue;
         }
+        // The scaffold value is a requirement, not the resolved version: a
+        // declaration that names an older but still-satisfied version
+        // (`"0.2.0"` where the lock carries 0.2.1) must still find the lock
+        // candidate and inherit its source. String equality would take the
+        // lock-absent arm and pin `=<requirement>` — a release the framework
+        // never certified. `sanctioned_source` matches the same way.
+        let requirement: cargo_toml::VersionReq = version.parse().wrap_err_with(|| {
+            eyre!(
+                "framework scaffold requirement {name} = {version:?} is not a version requirement"
+            )
+        })?;
         let candidates: Vec<_> = lock
             .packages
             .iter()
             .filter(|package| {
-                package.name.as_str() == name && package.version.to_string() == *version
+                package.name.as_str() == name && requirement.matches(&package.version)
             })
             .collect();
         // A scaffold package the workspace pins from git resolves from that
@@ -2481,6 +2492,41 @@ mod tests {
     }
 
     #[test]
+    fn resolve_packages_matches_the_requirement_against_the_lock() {
+        // The scaffold value is a requirement: a declaration satisfied by a
+        // newer locked version — `hydrolysis-m3 = "0.2.0"` where the lock
+        // carries the pinned 0.2.1 — still resolves the lock candidate's git
+        // source instead of pinning `=0.2.0`, a registry release the patch
+        // table cannot rescue and the framework never certified.
+        let m3_revision = "14a35e3ef69ced36557a3c7ab11d52e0afb53ad5";
+        let m3_source = format!(
+            "git+https://github.com/water-rs/hydrolysis-m3?rev={m3_revision}#{m3_revision}"
+        );
+        let lock = Lockfile {
+            packages: vec![
+                package("waterui", "0.3.0", None),
+                package("hydrolysis-m3", "0.2.1", Some(&m3_source)),
+            ],
+            version: cargo_lock::ResolveVersion::V4,
+            root: None,
+            metadata: BTreeMap::default(),
+            patch: cargo_lock::Patch::default(),
+        };
+        let scaffold = BTreeMap::from([
+            ("waterui-version".to_string(), "0.3.0".to_string()),
+            ("hydrolysis-m3-version".to_string(), "0.2.0".to_string()),
+        ]);
+        let packages =
+            resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40)).unwrap();
+        let m3 = &packages["hydrolysis-m3"];
+        assert_eq!(
+            m3.git.as_deref(),
+            Some("https://github.com/water-rs/hydrolysis-m3")
+        );
+        assert_eq!(m3.rev.as_deref(), Some(m3_revision));
+    }
+
+    #[test]
     fn stable_dependency_honors_a_declared_git_source() {
         let mut framework = stable_framework();
         let revision = "b".repeat(40);
@@ -3108,6 +3154,14 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                     workspace("hydrolysis-m3")
                 ),
                 ("waterui-dew-version".to_owned(), workspace("waterui-dew")),
+                (
+                    "waterui-dew-git".to_owned(),
+                    "https://github.com/water-rs/dew".to_owned()
+                ),
+                (
+                    "waterui-dew-rev".to_owned(),
+                    "b64f6759a3ebe7ac621bad84be00fe431f978119".to_owned()
+                ),
                 ("waterui-gtk-version".to_owned(), workspace("waterui-gtk")),
                 (
                     "waterui-gtk-git".to_owned(),
