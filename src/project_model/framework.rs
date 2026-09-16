@@ -2130,6 +2130,26 @@ fn newest_release(releases: Vec<Release>, channel: FrameworkChannel) -> Result<R
         })
 }
 
+/// The first stable framework release whose GitHub release publishes a
+/// `framework.json`. Manifest publishing began here; every earlier tag
+/// resolves nothing on the stable channel.
+const FIRST_STABLE_MANIFEST_RELEASE: &str = "0.5.0";
+
+/// The stable channel selected a release that predates manifest publishing:
+/// it has no `framework.json` to resolve. The diagnostic names the first
+/// manifest-carrying release and the channels that resolve today.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "stable release {tag} carries no framework.json — it predates manifest publishing. \
+     The first stable release carrying a manifest is {FIRST_STABLE_MANIFEST_RELEASE}; \
+     until it is published, use `water create <name> --channel dev` or, once a certified \
+     nightly exists, `--channel nightly`."
+)]
+struct StableReleaseWithoutManifest {
+    /// The tag of the release the stable channel resolved to.
+    tag: String,
+}
+
 /// The `framework.json` asset of the selected release.
 fn certification_asset(release: &Release, channel: FrameworkChannel) -> Result<&ReleaseAsset> {
     release
@@ -2140,10 +2160,10 @@ fn certification_asset(release: &Release, channel: FrameworkChannel) -> Result<&
             FrameworkChannel::Nightly => {
                 eyre!("nightly {} has no certification manifest", release.tag_name)
             }
-            FrameworkChannel::Stable => eyre!(
-                "stable release {} carries no framework.json — it predates manifest publishing",
-                release.tag_name
-            ),
+            FrameworkChannel::Stable => StableReleaseWithoutManifest {
+                tag: release.tag_name.clone(),
+            }
+            .into(),
             FrameworkChannel::Dev => unreachable!("dev releases are not certified"),
         })
 }
@@ -3010,6 +3030,14 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             .to_string();
         assert!(error.contains("v0.4.1"), "{error}");
         assert!(error.contains("predates manifest publishing"), "{error}");
+        assert!(
+            error.contains(FIRST_STABLE_MANIFEST_RELEASE),
+            "{error} must name the first manifest-carrying stable release"
+        );
+        assert!(
+            error.contains("--channel dev") && error.contains("--channel nightly"),
+            "{error} must name the channels that resolve today"
+        );
     }
 
     fn certification(channel: FrameworkChannel, tag: &str) -> Certification {
