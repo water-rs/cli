@@ -97,11 +97,11 @@ remove_dir_all = "1.0"
 # shared types across two sources. The `version` fields are what
 # `cargo publish` keeps after stripping `git`; a release therefore cannot ship
 # until versions carrying those APIs publish.
-waterui-assets-core = { git = "https://github.com/water-rs/waterui", rev = "c68e4340a5b07328a27fbd961531fb743aecd884", version = "0.1.0" }
-waterui-assets-planner = { git = "https://github.com/water-rs/waterui", rev = "c68e4340a5b07328a27fbd961531fb743aecd884", version = "0.2.0" }
-waterui-preview-protocol = { git = "https://github.com/water-rs/waterui", rev = "c68e4340a5b07328a27fbd961531fb743aecd884", version = "0.1.2" }
-waterui-inspector-protocol = { git = "https://github.com/water-rs/waterui", rev = "c68e4340a5b07328a27fbd961531fb743aecd884", version = "0.1.2" }
-waterui-mcp-protocol = { git = "https://github.com/water-rs/waterui", rev = "c68e4340a5b07328a27fbd961531fb743aecd884", version = "0.1.0" }
+waterui-assets-core = { git = "https://github.com/water-rs/waterui", rev = "b8ae00f4d44fb85f707a684ab42a63e4cb55b355", version = "0.1.0" }
+waterui-assets-planner = { git = "https://github.com/water-rs/waterui", rev = "b8ae00f4d44fb85f707a684ab42a63e4cb55b355", version = "0.2.0" }
+waterui-preview-protocol = { git = "https://github.com/water-rs/waterui", rev = "b8ae00f4d44fb85f707a684ab42a63e4cb55b355", version = "0.1.2" }
+waterui-inspector-protocol = { git = "https://github.com/water-rs/waterui", rev = "b8ae00f4d44fb85f707a684ab42a63e4cb55b355", version = "0.1.2" }
+waterui-mcp-protocol = { git = "https://github.com/water-rs/waterui", rev = "b8ae00f4d44fb85f707a684ab42a63e4cb55b355", version = "0.1.0" }
 aither-core = "0.4"
 aither-mcp = { version = "0.4", default-features = false, features = ["server"] }
 # Decodes the base64 image payloads a `tools/call` response carries back from

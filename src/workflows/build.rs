@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
 };
 
-use eyre::bail;
+use eyre::{Context as _, bail};
 use futures_util::StreamExt as _;
 use smol::{io::AsyncReadExt as _, process::Command, unblock};
 use target_lexicon::{Environment, OperatingSystem, Triple};
@@ -127,9 +127,11 @@ impl RustDynamicLibraries {
         let file_name = dynamic_library_file_name("waterui_dylib", triple);
         // Cargo emits a dependency's final dylib artifact in `deps/` on stable
         // and at the profile directory root on current nightlies; accept both.
+        // `deps/` wins: a copy an earlier `stage` left at the profile root must
+        // never mask the artifact the current build produced.
         let waterui = [
-            lib_dir.join(&file_name),
             lib_dir.join("deps").join(&file_name),
+            lib_dir.join(&file_name),
         ]
         .into_iter()
         .find(|path| path.is_file())
@@ -182,15 +184,32 @@ impl RustDynamicLibraries {
     /// Returns an error when the destination cannot be created or a library cannot be copied.
     pub async fn stage(&self, destination: &Path) -> eyre::Result<()> {
         smol::fs::create_dir_all(destination).await?;
-        Self::remove_staged(destination, &self.triple).await?;
-        for source in self.iter() {
+        // A resolved source can already live inside the destination — the
+        // profile-root dylib a nightly emits — so the staged-copy cleanup must
+        // leave sources alone and the copy must not rewrite a library over
+        // itself.
+        let sources: Vec<PathBuf> = self.iter().map(|path| (*path).to_path_buf()).collect();
+        Self::remove_staged_except(destination, &self.triple, &sources).await?;
+        for source in &sources {
             let file_name = source.file_name().ok_or_else(|| {
                 eyre::eyre!(
                     "Dynamic library path has no file name: {}",
                     source.display()
                 )
             })?;
-            crate::utils::copy_file(source, destination.join(file_name)).await?;
+            let staged = destination.join(file_name);
+            if *source == staged {
+                continue;
+            }
+            crate::utils::copy_file(source, &staged)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "Failed to stage {} to {}",
+                        source.display(),
+                        staged.display()
+                    )
+                })?;
         }
         Ok(())
     }
@@ -200,6 +219,17 @@ impl RustDynamicLibraries {
     /// # Errors
     /// Returns an error when the destination cannot be read or a matching library cannot be removed.
     pub async fn remove_staged(destination: &Path, triple: &Triple) -> eyre::Result<()> {
+        Self::remove_staged_except(destination, triple, &[]).await
+    }
+
+    /// `keep` holds library paths that must survive: when a resolved source
+    /// already lives in `destination`, deleting it would remove the very
+    /// library being staged.
+    async fn remove_staged_except(
+        destination: &Path,
+        triple: &Triple,
+        keep: &[PathBuf],
+    ) -> eyre::Result<()> {
         if !destination.is_dir() {
             return Ok(());
         }
@@ -214,6 +244,9 @@ impl RustDynamicLibraries {
         let mut entries = smol::fs::read_dir(destination).await?;
         while let Some(entry) = entries.next().await {
             let entry = entry?;
+            if keep.contains(&entry.path()) {
+                continue;
+            }
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
             if file_name == waterui
