@@ -59,6 +59,11 @@ pub struct Args {
     /// `create vite`'s interactive framework picker.
     #[arg(long)]
     vite_template: Option<String>,
+
+    /// Skip the confirmation prompt required by experimental backends
+    /// (needed in non-interactive environments).
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 struct CreatePlan {
@@ -132,6 +137,22 @@ impl Backend {
         }
     }
 
+    const fn cli_name(self) -> &'static str {
+        match self {
+            Self::Apple => "Apple",
+            Self::Android => "Android",
+            Self::Gtk4 => "GTK4",
+            Self::Hydrolysis => "Hydrolysis",
+            Self::Esp32 => "ESP32",
+        }
+    }
+
+    /// Whether the backend is experimental — shipped without full testing
+    /// ahead of milestone releases — so scaffolding it asks for confirmation.
+    const fn is_experimental(self) -> bool {
+        matches!(self, Self::Gtk4)
+    }
+
     fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "apple" | "ios" | "macos" => Some(Self::Apple),
@@ -147,6 +168,13 @@ impl Backend {
 /// Run the create command.
 pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     let plan = resolve_create_plan(shell, &args)?;
+    for backend in &plan.backends {
+        if backend.is_experimental()
+            && !super::confirm_experimental_backend(shell, backend.cli_name(), args.yes)?
+        {
+            return Ok(());
+        }
+    }
     if plan.template == CreateTemplate::Web {
         // The declared manager must exist before anything touches disk.
         super::web::ensure_installed(plan.package_manager).await?;
@@ -498,6 +526,17 @@ mod tests {
     // Only the non-Linux host test exercises this.
     #[cfg(not(target_os = "linux"))]
     use super::validate_backends_on_host;
+
+    #[test]
+    fn only_gtk4_is_experimental() {
+        for backend in Backend::ALL {
+            assert_eq!(
+                backend.is_experimental(),
+                matches!(backend, Backend::Gtk4),
+                "{backend:?} experimental flag drifted"
+            );
+        }
+    }
 
     /// Scaffolds a `WaterUI` project plus a `create vite` frontend into `root`
     /// against the framework checkout at `waterui_checkout`, applies the brand
