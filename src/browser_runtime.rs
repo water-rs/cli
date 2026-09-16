@@ -757,11 +757,13 @@ async fn write_cef_sbom(path: &Path, version: &str, created: &str) -> eyre::Resu
     .await
 }
 
+/// The WPE runtime is built and published by the framework repository's
+/// `WPE Runtime` workflow on a `wpe-runtime-v<version>` tag, so the manifest
+/// is bound to the WPE version this CLI expects, not to the CLI release.
 fn runtime_manifest_url(configuration: &SourceConfiguration) -> String {
     format!(
-        "{}/v{}/browser-runtime-manifest.json",
-        configuration.release_base_url,
-        env!("CARGO_PKG_VERSION")
+        "{}/wpe-runtime-v{}/browser-runtime-manifest.json",
+        configuration.release_base_url, configuration.wpe_version
     )
 }
 
@@ -841,14 +843,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_manifest_is_bound_to_the_cli_release() {
+    fn runtime_manifest_is_bound_to_the_wpe_runtime_release() {
         let configuration: SourceConfiguration =
             toml::from_str(super::SOURCE_CONFIG).expect("source configuration must parse");
         assert_eq!(
             runtime_manifest_url(&configuration),
             format!(
-                "https://github.com/water-rs/cli/releases/download/v{}/browser-runtime-manifest.json",
-                env!("CARGO_PKG_VERSION")
+                "https://github.com/water-rs/waterui/releases/download/wpe-runtime-v{}/browser-runtime-manifest.json",
+                configuration.wpe_version
             )
         );
     }
