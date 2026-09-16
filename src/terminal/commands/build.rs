@@ -307,10 +307,14 @@ async fn build_options(shell: &Shell, args: &Args, backend: TargetBackend) -> Bu
     } else {
         BuildProfile::Debug
     };
-    let mut build_options = args.output_dir.as_ref().map_or_else(
-        || BuildOptions::development(profile),
-        |output_dir| BuildOptions::development(profile).with_output_dir(output_dir),
-    );
+    let mut build_options = args
+        .output_dir
+        .as_ref()
+        .map_or_else(
+            || BuildOptions::development(profile),
+            |output_dir| BuildOptions::development(profile).with_output_dir(output_dir),
+        )
+        .with_progress(shell.build_progress());
 
     if let Some(sccache_path) =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await

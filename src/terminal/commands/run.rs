@@ -552,6 +552,7 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
             &project,
             &launcher_dir,
             sccache_path,
+            Some(shell.build_progress()),
         ))
         .await?;
 
@@ -783,10 +784,12 @@ async fn run_web_app(shell: &Shell, project: &Project) -> Result<()> {
 
 async fn run_esp32_app(shell: &Shell, project: &Project, device: Option<&str>) -> Result<()> {
     let sccache_path = detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await;
-    let build_options = sccache_path.map_or_else(
-        || BuildOptions::development(BuildProfile::Debug),
-        |sccache| BuildOptions::development(BuildProfile::Debug).with_sccache(sccache),
-    );
+    let build_options = sccache_path
+        .map_or_else(
+            || BuildOptions::development(BuildProfile::Debug),
+            |sccache| BuildOptions::development(BuildProfile::Debug).with_sccache(sccache),
+        )
+        .with_progress(shell.build_progress());
 
     let _ = shell.status(">", "Building ESP32 firmware...");
     shell
@@ -963,7 +966,13 @@ async fn build_and_run(
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
     let _ = shell.status(">", "Building...");
-    build_for_backend(project, backend, &build_plan, build_options(&config)).await?;
+    build_for_backend(
+        project,
+        backend,
+        &build_plan,
+        build_options(&config).with_progress(shell.build_progress()),
+    )
+    .await?;
 
     // A declared `include_web!` mount is served by the bundler's own dev
     // server in debug runs — spawn it after the Rust build (its root comes

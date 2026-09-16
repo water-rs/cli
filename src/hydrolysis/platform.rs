@@ -153,6 +153,9 @@ pub async fn build_hydrolysis_with_envs_and_features(
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
     }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
+    }
     build
         .build_binary(
             project.hydrolysis_backend_crate_name().as_str(),

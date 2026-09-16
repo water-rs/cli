@@ -385,6 +385,7 @@ jobs:
           $p = Start-Process -FilePath water -ArgumentList 'run' -PassThru `
             -WorkingDirectory "$env:USERPROFILE\e2eplay" `
             -RedirectStandardOutput "$logs\run-play.out" -RedirectStandardError "$logs\run-play.err"
+          $runStart = Get-Date
           $started = $false
           $deadline = (Get-Date).AddMinutes(20)
           while ((Get-Date) -lt $deadline) {
@@ -397,7 +398,12 @@ jobs:
           }
           # A process that reports Started but crashes immediately is not a
           # passing launch; give it a short grace window before teardown.
-          if ($started) { Start-Sleep -Seconds 10 }
+          if ($started) {
+            $runElapsed = [int]((Get-Date) - $runStart).TotalSeconds
+            Write-Output "::notice::cold water run reached 'Application started' in ${runElapsed}s"
+            Set-Content "$logs\run-play-time.log" "cold water run to 'Application started': ${runElapsed}s"
+            Start-Sleep -Seconds 10
+          }
           taskkill /T /F /PID $p.Id 2>$null | Out-Null
           Get-Process e2eplay -ErrorAction SilentlyContinue | Stop-Process -Force
           if (-not $started) { Fail "water run never reported 'Application started'" }
@@ -437,6 +443,7 @@ jobs:
           cd "/Users/$E2E_USER/e2eplay" || exit 1
           water run > "$RUNNER_TEMP/run-play.log" 2>&1 &
           run_pid=$!
+          run_start=$SECONDS
           started=1
           for _ in $(seq 1 300); do
             if grep -q 'Application started' "$RUNNER_TEMP/run-play.log" 2>/dev/null; then
@@ -446,6 +453,10 @@ jobs:
             sleep 4
           done
           if [ "$started" -eq 0 ]; then
+            run_elapsed=$((SECONDS - run_start))
+            echo "::notice::cold water run reached 'Application started' in ${run_elapsed}s"
+            echo "cold water run to 'Application started': ${run_elapsed}s" \
+              > "$RUNNER_TEMP/run-play-time.log"
             sleep 10
             grep -q 'Application crashed\|Application exited' "$RUNNER_TEMP/run-play.log" \
               && { echo "::error::water run launched but the app died within the grace window"; started=2; }
@@ -456,6 +467,8 @@ jobs:
           kill "$run_pid" 2>/dev/null || true; sleep 2; kill -9 "$run_pid" 2>/dev/null || true
           pkill -f 'e2eplay' 2>/dev/null || true
           cp "$RUNNER_TEMP/run-play.log" "/Users/$E2E_USER/e2e-logs/run-play.log" || true
+          cp "$RUNNER_TEMP/run-play-time.log" "/Users/$E2E_USER/e2e-logs/run-play-time.log" \
+            2>/dev/null || true
           if [ "$started" -ne 0 ]; then
             tail -30 "$RUNNER_TEMP/run-play.log" 2>/dev/null || true
           fi
@@ -476,6 +489,7 @@ jobs:
           # `--yes` answers the GTK4 experimental-backend confirmation.
           LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a water run --yes > "$HOME/e2e-logs/run-play.log" 2>&1 &
           run_pid=$!
+          run_start=$SECONDS
           started=1
           for _ in $(seq 1 300); do
             if grep -q 'Application started' "$HOME/e2e-logs/run-play.log" 2>/dev/null; then
@@ -485,6 +499,10 @@ jobs:
             sleep 4
           done
           if [ "$started" -eq 0 ]; then
+            run_elapsed=$((SECONDS - run_start))
+            echo "::notice::cold water run reached 'Application started' in ${run_elapsed}s"
+            echo "cold water run to 'Application started': ${run_elapsed}s" \
+              > "$HOME/e2e-logs/run-play-time.log"
             sleep 10
             grep -q 'Application crashed\|Application exited' "$HOME/e2e-logs/run-play.log" \
               && { echo "::error::water run launched but the app died within the grace window"; started=2; }

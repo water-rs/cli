@@ -252,13 +252,12 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
     let chip = esp32_chip(project)?;
 
     let mut cargo = smol::process::Command::new("cargo");
-    let cargo = command(&mut cargo);
     cargo.current_dir(&backend_path);
     cargo.arg("build");
     cargo.arg("--target-dir").arg(&backend_target_dir);
-    crate::build::configure_generated_crate_compilation(cargo);
+    crate::build::configure_generated_crate_compilation(&mut cargo);
     if let Some(sccache_path) = options.sccache_path() {
-        crate::toolchain::sccache::configure_compilation_cache(cargo, sccache_path);
+        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path);
     }
     for (key, value) in esp_toolchain_envs(chip)? {
         cargo.env(key, value);
@@ -266,8 +265,14 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
     if options.is_release() {
         cargo.arg("--release");
     }
+    // Piped stdio strips rustc diagnostics of their colors; restore cargo's
+    // coloring while the terminal renders the output.
+    if crate::utils::std_output_enabled() && std::env::var_os("CARGO_TERM_COLOR").is_none() {
+        cargo.env("CARGO_TERM_COLOR", "always");
+    }
 
-    let output = cargo.output().await?;
+    let output =
+        crate::build::command_output_with_progress(&mut cargo, options.progress().cloned()).await?;
     if !output.status.success() {
         bail!(
             "Failed to build ESP32 firmware with cargo (status {}):\n{}",

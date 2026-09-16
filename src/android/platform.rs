@@ -638,6 +638,9 @@ async fn configure_android_rust_build(
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
     }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
+    }
     for (key, value) in &context.llvm_envs {
         build = build.with_env(key.clone(), value.clone());
     }

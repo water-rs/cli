@@ -8,6 +8,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
 use std::fmt::Display;
 use std::io::{self, IsTerminal, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use waterui_cli::build::{BuildProgress, CompileEvent};
 use waterui_cli::utils::set_std_output;
 
 /// ANSI styles for output.
@@ -303,6 +306,27 @@ impl Shell {
         pb.set_message(message.into());
         pb.enable_steady_tick(std::time::Duration::from_millis(80));
         Some(pb)
+    }
+
+    /// The sink a cargo build reports its compile progress into.
+    ///
+    /// Attach it through `BuildOptions::with_progress`. An interactive
+    /// terminal sees every status line cargo prints, rendered above the
+    /// progress area; a piped terminal gets one phase line per crate unit
+    /// cargo reports; JSON mode gets a structured `build-progress` record per
+    /// event.
+    #[must_use]
+    pub fn build_progress(&self) -> BuildProgress {
+        let mode = if self.is_json() {
+            CompileRender::Json
+        } else if self.is_terminal() {
+            CompileRender::Interactive
+        } else {
+            CompileRender::Piped
+        };
+        let bars = self.multi_progress.clone();
+        let units = Arc::new(AtomicUsize::new(0));
+        BuildProgress::new(move |event| render_compile_event(mode, &bars, &units, &event))
     }
 
     /// Display a panic report from a platform crash message.
@@ -617,6 +641,117 @@ impl Shell {
         })?;
         writeln!(io::stdout(), "{json}")?;
         io::stdout().flush()
+    }
+}
+
+/// How [`Shell::build_progress`] renders a compile event.
+#[derive(Clone, Copy)]
+enum CompileRender {
+    /// Every line, above the multi-progress area.
+    Interactive,
+    /// One phase line per crate unit, on stderr.
+    Piped,
+    /// A `build-progress` JSON record per event, on stdout.
+    Json,
+}
+
+fn render_compile_event(
+    mode: CompileRender,
+    bars: &MultiProgress,
+    units: &AtomicUsize,
+    event: &CompileEvent,
+) {
+    match mode {
+        CompileRender::Interactive => {
+            let _ = bars.println(compile_event_text(units, event));
+        }
+        CompileRender::Piped => {
+            if matches!(event, CompileEvent::Line(_)) {
+                return;
+            }
+            let mut stderr = anstream::stderr().lock();
+            let _ = writeln!(stderr, "{}", compile_event_text(units, event));
+            let _ = stderr.flush();
+        }
+        CompileRender::Json => {
+            let record = compile_event_record(units, event);
+            if let Ok(json) = serde_json::to_string(&record) {
+                let mut stdout = io::stdout().lock();
+                let _ = writeln!(stdout, "{json}");
+                let _ = stdout.flush();
+            }
+        }
+    }
+}
+
+/// One cargo status line rendered the way cargo itself renders it, with the
+/// running unit count appended.
+fn compile_event_text(units: &AtomicUsize, event: &CompileEvent) -> String {
+    match event {
+        CompileEvent::Unit {
+            phase,
+            name,
+            version,
+        } => {
+            let count = units.fetch_add(1, Ordering::Relaxed) + 1;
+            version.as_ref().map_or_else(
+                || format!("{phase:>12} {name} ({count})"),
+                |version| format!("{phase:>12} {name} v{version} ({count})"),
+            )
+        }
+        CompileEvent::Finished(text) | CompileEvent::Line(text) => text.clone(),
+    }
+}
+
+/// The JSON record one event becomes: `{ "type": "build-progress", ... }`.
+#[derive(Serialize)]
+struct BuildProgressRecord<'a> {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    phase: String,
+    #[serde(rename = "crate", skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
+}
+
+fn compile_event_record<'a>(
+    units: &AtomicUsize,
+    event: &'a CompileEvent,
+) -> BuildProgressRecord<'a> {
+    match event {
+        CompileEvent::Unit {
+            phase,
+            name,
+            version,
+        } => BuildProgressRecord {
+            ty: "build-progress",
+            phase: phase.to_ascii_lowercase(),
+            name: Some(name),
+            version: version.as_deref(),
+            count: Some(units.fetch_add(1, Ordering::Relaxed) + 1),
+            message: None,
+        },
+        CompileEvent::Finished(text) => BuildProgressRecord {
+            ty: "build-progress",
+            phase: "finished".to_string(),
+            name: None,
+            version: None,
+            count: None,
+            message: Some(text),
+        },
+        CompileEvent::Line(text) => BuildProgressRecord {
+            ty: "build-progress",
+            phase: "output".to_string(),
+            name: None,
+            version: None,
+            count: None,
+            message: Some(text),
+        },
     }
 }
 

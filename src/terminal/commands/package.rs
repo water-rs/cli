@@ -183,7 +183,8 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
         BuildProfile::Release
     } else {
         BuildProfile::Debug
-    });
+    })
+    .with_progress(shell.build_progress());
     if let Some(sccache_path) =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await
     {

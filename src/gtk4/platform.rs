@@ -73,6 +73,9 @@ pub async fn build_gtk4(project: &Project, options: BuildOptions) -> eyre::Resul
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
     }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
+    }
     build
         .build_binary(
             project.gtk_backend_crate_name().as_str(),
