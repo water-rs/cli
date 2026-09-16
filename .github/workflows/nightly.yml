@@ -65,8 +65,16 @@ jobs:
           shared-key: ignored-${{ runner.os }}
           # One writer per OS cache key: the schedule.
           save-if: ${{ github.event_name == 'schedule' }}
-      - uses: ./.github/actions/setup-linux-deps
+      # The ignored tests compile the pinned framework's own crates — the
+      # scaffolded web app links the GTK/VA-API/PipeWire stack — so they need
+      # the framework's native dependency set, not the trimmed list the CLI's
+      # own graph builds against.
+      - uses: water-rs/waterui/.github/actions/setup-linux-deps@dev
         if: runner.os == 'Linux'
+      # `filtrate`'s `shaderloom` build script needs `dxc` to compile WGSL to
+      # DXIL; the Windows image does not ship it.
+      - uses: ./.github/actions/install-dxc
+        if: runner.os == 'Windows'
       - uses: taiki-e/install-action@nextest
       # The `create --template web` tests scaffold and build a Vite frontend.
       - uses: oven-sh/setup-bun@v2
@@ -128,23 +136,28 @@ jobs:
 
       # The fresh user scaffolds against the framework revision this crate's
       # git dependencies pin — the nightly signal is this pin, not a released
-      # framework or a moving branch. The revision is read out of
-      # `Cargo.toml` so the pin stays declared exactly once. The clone lands
-      # inside the workspace so the provisioning steps' `chmod -R a+rX`
-      # reaches it; `waterui/` is gitignored.
+      # framework or a moving branch. The revision is read out of the resolved
+      # dependency graph — a `waterui-*` package's `source` is
+      # `git+https://github.com/water-rs/waterui?rev=<sha>#<sha>`, where the
+      # fragment is the commit Cargo resolved regardless of how the manifest
+      # spells the pin — so the pin stays declared exactly once. The clone
+      # lands inside the workspace so the provisioning steps' `chmod -R a+rX`
+      # reaches it; `waterui/` is gitignored. The pinned tree carries no
+      # gitlinks, so there is nothing to recurse into.
       - name: Check out the pinned framework revision
         shell: bash
         run: |
           set -euo pipefail
-          rev="$(sed -n 's/.*water-rs\/waterui[^"]*",[[:space:]]*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n1)"
-          if [ -z "$rev" ]; then
-            echo "::error::no water-rs/waterui rev pin found in Cargo.toml"
+          src="$(cargo metadata --format-version 1 --locked \
+            | jq -r '[.packages[].source | strings | select(startswith("git+https://github.com/water-rs/waterui"))] | first // empty')"
+          rev="${src##*#}"
+          if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::no water-rs/waterui rev pin found in the dependency graph"
             exit 1
           fi
           echo "Pinned framework revision: $rev"
           git clone --filter=blob:none https://github.com/water-rs/waterui waterui
           git -C waterui -c advice.detachedHead=false checkout "$rev"
-          git -C waterui submodule update --init --recursive
 
       # `shaderloom` — reached through the scaffolded hydrolysis app's normal
       # dependency graph — compiles WGSL to DXIL through `dxc`, which the
@@ -283,16 +296,18 @@ jobs:
           # or git refuses to read the submodule pins `water create`
           # resolves through.
           git config --global --add safe.directory '*'
-          water create e2eapp --mode app --backends "$E2E_BACKEND" --waterui-path "$WATERUI_SRC" \
+          # `--yes` answers the experimental-backend confirmation (GTK4 on the
+          # Ubuntu leg); non-interactive runs cannot be prompted.
+          water create e2eapp --mode app --backends "$E2E_BACKEND" --waterui-path "$WATERUI_SRC" --yes \
             2>&1 | tee e2e-logs/create-app.log || fail "water create app failed"
           [ -f e2eapp/Water.toml ] || fail "e2eapp scaffold has no Water.toml"
           water create e2eplay --mode playground --waterui-path "$WATERUI_SRC" \
             2>&1 | tee e2e-logs/create-play.log || fail "water create playground failed"
           [ -f e2eplay/Water.toml ] || fail "e2eplay scaffold has no Water.toml"
 
-          (cd e2eapp && water build --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+          (cd e2eapp && water build --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" --yes \
             2>&1 | tee ../e2e-logs/build-app.log) || fail "water build failed"
-          (cd e2eapp && water package --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+          (cd e2eapp && water package --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" --yes \
             2>&1 | tee ../e2e-logs/package-app.log) || fail "water package failed"
           grep -q 'Packaged at' e2e-logs/package-app.log \
             || fail "water package produced no artifact line"
@@ -435,7 +450,10 @@ jobs:
             grep -q 'Application crashed\|Application exited' "$RUNNER_TEMP/run-play.log" \
               && { echo "::error::water run launched but the app died within the grace window"; started=2; }
           fi
-          kill "$run_pid" 2>/dev/null; sleep 2; kill -9 "$run_pid" 2>/dev/null
+          # `kill` on an already-exited `water run` fails, and the step's shell
+          # runs with `-e`: unguarded, that aborted the leg before the log was
+          # collected and the failure annotated.
+          kill "$run_pid" 2>/dev/null || true; sleep 2; kill -9 "$run_pid" 2>/dev/null || true
           pkill -f 'e2eplay' 2>/dev/null || true
           cp "$RUNNER_TEMP/run-play.log" "/Users/$E2E_USER/e2e-logs/run-play.log" || true
           if [ "$started" -ne 0 ]; then
@@ -455,7 +473,8 @@ jobs:
           set -uo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
           cd "$HOME/e2eplay"
-          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a water run > "$HOME/e2e-logs/run-play.log" 2>&1 &
+          # `--yes` answers the GTK4 experimental-backend confirmation.
+          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a water run --yes > "$HOME/e2e-logs/run-play.log" 2>&1 &
           run_pid=$!
           started=1
           for _ in $(seq 1 300); do
