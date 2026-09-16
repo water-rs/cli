@@ -220,12 +220,16 @@ impl Esp32Backend {
         // tables lets `waterui-dew`'s own `waterui-*` requirements resolve
         // beside the project's copies — the recorded framework selection
         // produces the patch set the manifest must already carry.
+        // The emitter (`generated_crate_patches`) prefers the checkout
+        // whenever `waterui_path` resolves, so the comparison must name the
+        // arms in the same order — a manifest carrying both fields emits the
+        // checkout's set, and expecting the channel's would regenerate
+        // forever.
         let expected_patches = match (
-            &project.manifest().framework,
             &project.manifest().waterui_path,
+            &project.manifest().framework,
         ) {
-            (Some(framework), _) => Some(framework.patches()),
-            (None, Some(waterui_path)) => {
+            (Some(waterui_path), _) => {
                 let path = Path::new(waterui_path);
                 let root = if path.is_absolute() {
                     path.to_path_buf()
@@ -243,6 +247,7 @@ impl Esp32Backend {
                     )?,
                 )
             }
+            (None, Some(framework)) => Some(framework.patches()),
             (None, None) => None,
         };
 
