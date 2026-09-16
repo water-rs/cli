@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::{
     assets, browser_runtime,
-    build::{BuildOptions, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     hydrolysis::backend::HydrolysisBackend,
     platform::{PackageOptions, TargetPlatform},
@@ -123,6 +123,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
         &backend_path,
         options.sccache_path(),
         options.uses_dev_server(),
+        options.progress(),
     )
     .await?;
 
@@ -152,6 +153,9 @@ pub async fn build_hydrolysis_with_envs_and_features(
         .with_envs(extra_envs.iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
+    }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
     }
     build
         .build_binary(
@@ -303,7 +307,14 @@ pub async fn package_hydrolysis(
         "release"
     };
     let backend_path = project.backend_path::<HydrolysisBackend>();
-    copy_assets_and_fonts(project, &backend_path, None, options.uses_dev_server()).await?;
+    copy_assets_and_fonts(
+        project,
+        &backend_path,
+        None,
+        options.uses_dev_server(),
+        options.progress(),
+    )
+    .await?;
 
     let linkage = if options.uses_shared_rust_runtime() {
         RustLinkage::SharedRuntime
@@ -493,12 +504,18 @@ async fn copy_assets_and_fonts(
     backend_path: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     let resources_dir = backend_path.join("resources");
     fs::create_dir_all(&resources_dir).await?;
-    let manifest =
-        assets::stage_project_assets_for_gtk(project, &resources_dir, sccache_path, dev_server)
-            .await?;
+    let manifest = assets::stage_project_assets_for_gtk(
+        project,
+        &resources_dir,
+        sccache_path,
+        dev_server,
+        progress,
+    )
+    .await?;
 
     // The generated crate's build script embeds this into the executable's
     // resources when targeting Windows.

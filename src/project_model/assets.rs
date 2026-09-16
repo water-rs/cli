@@ -18,6 +18,7 @@ use walkdir::WalkDir;
 use waterui_assets_core::{AtomicWriteOutcome, download_remote_bytes, write_bytes_atomically};
 use waterui_assets_planner::BundleManifest;
 
+use crate::build::BuildProgress;
 use crate::project::Project;
 use crate::project_model::project_types::PermissionKey;
 
@@ -811,8 +812,9 @@ pub async fn stage_project_assets_for_apple(
     dest_dir: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    unified::stage_for_apple(project, dest_dir, sccache_path, dev_server).await
+    unified::stage_for_apple(project, dest_dir, sccache_path, dev_server, progress).await
 }
 
 /// Stage project assets for Android packaging (res + assets/raw).
@@ -821,8 +823,9 @@ pub async fn stage_project_assets_for_android(
     backend_path: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    unified::stage_for_android(project, backend_path, sccache_path, dev_server).await
+    unified::stage_for_android(project, backend_path, sccache_path, dev_server, progress).await
 }
 
 /// Render the project's macOS `.icns` app icon for hand-assembled bundles.
@@ -850,8 +853,9 @@ pub async fn stage_project_assets_for_gtk(
     resources_dir: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    unified::stage_for_gtk(project, resources_dir, sccache_path, dev_server).await
+    unified::stage_for_gtk(project, resources_dir, sccache_path, dev_server, progress).await
 }
 
 /// Resolves the fonts declared inside an already-staged bundle manifest.

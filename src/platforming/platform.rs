@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 
+use crate::build::BuildProgress;
 use target_lexicon::{
     Aarch64Architecture, Architecture, DefaultToHost, Environment, OperatingSystem,
     Riscv32Architecture, Triple, Vendor,
@@ -307,6 +308,10 @@ pub struct PackageOptions {
 
     /// How `include_web!` mounts reach the packaged app.
     web_frontend: WebFrontendMode,
+
+    /// Sink compile progress is reported to while packaging runs cargo —
+    /// asset-manifest planning compiles the project rlib for its symbol table.
+    progress: Option<BuildProgress>,
 }
 
 /// Whether an `include_web!` mount is staged from a frontend build or served
@@ -334,6 +339,7 @@ impl PackageOptions {
             debug: true,
             shared_rust_runtime: true,
             web_frontend: WebFrontendMode::Stage,
+            progress: None,
         }
     }
 
@@ -345,6 +351,7 @@ impl PackageOptions {
             debug,
             shared_rust_runtime: false,
             web_frontend: WebFrontendMode::Stage,
+            progress: None,
         }
     }
 
@@ -388,6 +395,20 @@ impl PackageOptions {
     #[must_use]
     pub const fn uses_dev_server(&self) -> bool {
         matches!(self.web_frontend, WebFrontendMode::DevServer)
+    }
+
+    /// Attach a compile-progress sink the cargo invocations this packaging
+    /// pass performs report to.
+    #[must_use]
+    pub fn with_progress(mut self, progress: BuildProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// The compile-progress sink, when one is attached.
+    #[must_use]
+    pub const fn progress(&self) -> Option<&BuildProgress> {
+        self.progress.as_ref()
     }
 }
 

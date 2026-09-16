@@ -85,6 +85,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
             target_addr: target.to_string(),
             token: token.clone(),
         },
+        Some(shell.build_progress()),
     )
     .await?;
 

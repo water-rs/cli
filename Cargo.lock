@@ -4050,6 +4050,7 @@ dependencies = [
  "cargo_toml",
  "clap",
  "color-eyre",
+ "console",
  "core-foundation 0.10.1",
  "core-graphics",
  "ctrlc",

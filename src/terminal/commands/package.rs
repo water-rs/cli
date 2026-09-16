@@ -183,7 +183,8 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
         BuildProfile::Release
     } else {
         BuildProfile::Debug
-    });
+    })
+    .with_progress(shell.build_progress());
     if let Some(sccache_path) =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await
     {
@@ -482,7 +483,7 @@ async fn build_hydrolysis_packaging_artifacts(
 async fn package_artifact(shell: &Shell, args: &Args, context: &PackagingContext) -> Result<()> {
     let spinner = shell.spinner("Packaging application...");
     let artifact = shell
-        .display_output(package_artifact_inner(args, context))
+        .display_output(package_artifact_inner(shell, args, context))
         .await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
@@ -491,8 +492,13 @@ async fn package_artifact(shell: &Shell, args: &Args, context: &PackagingContext
     Ok(())
 }
 
-async fn package_artifact_inner(args: &Args, context: &PackagingContext) -> Result<Artifact> {
-    let package_options = PackageOptions::packaging(args.distribution, !args.release);
+async fn package_artifact_inner(
+    shell: &Shell,
+    args: &Args,
+    context: &PackagingContext,
+) -> Result<Artifact> {
+    let package_options = PackageOptions::packaging(args.distribution, !args.release)
+        .with_progress(shell.build_progress());
     match context.backend {
         TargetBackend::Android => {
             let abis: Vec<AndroidAbi> = args.arch.iter().map(|arch| arch.to_abi()).collect();

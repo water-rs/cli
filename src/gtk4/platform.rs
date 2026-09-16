@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::{
     assets, browser_runtime,
-    build::{BuildOptions, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     gtk4::backend::Gtk4Backend,
     platform::{PackageOptions, TargetPlatform},
@@ -72,6 +72,9 @@ pub async fn build_gtk4(project: &Project, options: BuildOptions) -> eyre::Resul
         .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
+    }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
     }
     build
         .build_binary(
@@ -148,7 +151,14 @@ pub async fn package_gtk4(project: &Project, options: PackageOptions) -> eyre::R
     let backend_path = project.backend_path::<Gtk4Backend>();
 
     // Copy project assets and dependency fonts
-    copy_assets_and_fonts(project, &backend_path, None, options.uses_dev_server()).await?;
+    copy_assets_and_fonts(
+        project,
+        &backend_path,
+        None,
+        options.uses_dev_server(),
+        options.progress(),
+    )
+    .await?;
 
     let linkage = if options.uses_shared_rust_runtime() {
         RustLinkage::SharedRuntime
@@ -240,14 +250,20 @@ async fn copy_assets_and_fonts(
     backend_path: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     let resources_dir = backend_path.join("resources");
     fs::create_dir_all(&resources_dir).await?;
 
     // Stage project assets using platform-native conventions.
-    let manifest =
-        assets::stage_project_assets_for_gtk(project, &resources_dir, sccache_path, dev_server)
-            .await?;
+    let manifest = assets::stage_project_assets_for_gtk(
+        project,
+        &resources_dir,
+        sccache_path,
+        dev_server,
+        progress,
+    )
+    .await?;
     assets::stage_hicolor_icons(project, &resources_dir.join("icons")).await?;
 
     // Scan and resolve dependency fonts

@@ -5,7 +5,7 @@ use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Shared};
 use tracing::info;
 
-use crate::build::RustLinkage;
+use crate::build::{BuildProgress, RustLinkage};
 use crate::framework::{
     FrameworkChannel, ResolvedFramework, validate_local_cli, validate_resolved_cli,
 };
@@ -143,13 +143,15 @@ impl Project {
         platform: TargetPlatform,
         device: D,
     ) -> Result<Running, FailToRun> {
-        self.run_with_options(backend, platform, device, RunOptions::new())
+        self.run_with_options(backend, platform, device, RunOptions::new(), None)
             .await
     }
 
     /// Run the `WaterUI` project with explicit run options.
     ///
     /// This allows callers (like preview) to inject extra environment variables.
+    /// `progress`, when given, receives cargo compile events from both the
+    /// library build and the packaging pass's asset-manifest compile.
     ///
     /// # Errors
     /// Returns an error if building, packaging, or launching the app fails.
@@ -159,20 +161,25 @@ impl Project {
         platform: TargetPlatform,
         device: D,
         run_options: RunOptions,
+        progress: Option<BuildProgress>,
     ) -> Result<Running, FailToRun> {
+        let mut build_options = BuildOptions::development(BuildProfile::Debug);
+        if let Some(progress) = &progress {
+            build_options = build_options.with_progress(progress.clone());
+        }
         // Build rust library for the target platform
         backend
-            .build(
-                self,
-                platform,
-                BuildOptions::development(BuildProfile::Debug),
-            )
+            .build(self, platform, build_options)
             .await
             .map_err(FailToRun::Build)?;
 
+        let mut package_options = PackageOptions::development();
+        if let Some(progress) = progress {
+            package_options = package_options.with_progress(progress);
+        }
         // Package the build artifacts for the target platform
         let artifact = backend
-            .package(self, platform, PackageOptions::development())
+            .package(self, platform, package_options)
             .await
             .map_err(FailToRun::Package)?;
 
@@ -191,6 +198,7 @@ impl Project {
         _backend: &AndroidBackend,
         device: D,
         run_options: RunOptions,
+        progress: Option<BuildProgress>,
     ) -> Result<Running, FailToRun> {
         let abi = device.android_abi();
 
@@ -202,15 +210,22 @@ impl Project {
             .await
             .map_err(FailToRun::Build)?;
 
+        let mut build_options = BuildOptions::development(BuildProfile::Debug);
+        if let Some(progress) = &progress {
+            build_options = build_options.with_progress(progress.clone());
+        }
         AndroidPlatform::new(abi)
-            .build(self, BuildOptions::development(BuildProfile::Debug))
+            .build(self, build_options)
             .await
             .map_err(FailToRun::Build)?;
 
-        let artifact =
-            AndroidPlatform::package_with_abis(self, PackageOptions::development(), &[abi])
-                .await
-                .map_err(FailToRun::Package)?;
+        let mut package_options = PackageOptions::development();
+        if let Some(progress) = progress {
+            package_options = package_options.with_progress(progress);
+        }
+        let artifact = AndroidPlatform::package_with_abis(self, package_options, &[abi])
+            .await
+            .map_err(FailToRun::Package)?;
 
         Self::run_packaged(device, artifact, run_options).await
     }
