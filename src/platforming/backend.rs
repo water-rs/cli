@@ -30,6 +30,7 @@ pub struct Backends {
     apple: Option<AppleBackend>,
     gtk4: Option<Gtk4Backend>,
     hydrolysis: Option<HydrolysisBackend>,
+    winui: Option<crate::winui::backend::WinUiBackend>,
     esp32: Option<Esp32Backend>,
 }
 
@@ -41,6 +42,7 @@ impl Backends {
             && self.apple.is_none()
             && self.gtk4.is_none()
             && self.hydrolysis.is_none()
+            && self.winui.is_none()
             && self.esp32.is_none()
     }
 
@@ -61,6 +63,7 @@ impl Backends {
             || self.apple.is_some()
             || self.gtk4.is_some()
             || self.hydrolysis.is_some()
+            || self.winui.is_some()
     }
 
     /// Get the base path for backends, relative to project root.
@@ -136,6 +139,22 @@ impl Backends {
     /// Remove hydrolysis backend configuration.
     pub fn clear_hydrolysis(&mut self) {
         self.hydrolysis = None;
+    }
+
+    /// Get the `WinUI` backend configuration, if any.
+    #[must_use]
+    pub const fn winui(&self) -> Option<&crate::winui::backend::WinUiBackend> {
+        self.winui.as_ref()
+    }
+
+    /// Set the `WinUI` backend configuration.
+    pub fn set_winui(&mut self, backend: crate::winui::backend::WinUiBackend) {
+        self.winui = Some(backend);
+    }
+
+    /// Remove `WinUI` backend configuration.
+    pub fn clear_winui(&mut self) {
+        self.winui = None;
     }
 
     /// Get the ESP32 backend configuration, if any.

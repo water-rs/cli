@@ -42,6 +42,10 @@ use waterui_cli::{
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
     project::Project,
     web,
+    winui::{
+        backend::WinUiBackend,
+        platform::{build_winui, package_winui},
+    },
 };
 
 #[cfg(target_os = "macos")]
@@ -105,7 +109,7 @@ async fn find_latest_ips_report(
 
 #[derive(Debug, Clone, Copy)]
 struct BackendAvailability {
-    available: [bool; 5],
+    available: [bool; 6],
 }
 
 impl BackendAvailability {
@@ -115,7 +119,8 @@ impl BackendAvailability {
             TargetBackend::Android => 1,
             TargetBackend::Gtk4 => 2,
             TargetBackend::Hydrolysis => 3,
-            TargetBackend::Dew => 4,
+            TargetBackend::WinUi => 4,
+            TargetBackend::Dew => 5,
         }]
     }
 }
@@ -183,6 +188,9 @@ pub enum TargetBackend {
     Gtk4,
     /// Hydrolysis backend (self-drawn renderer).
     Hydrolysis,
+    /// `WinUI` backend (Windows only, experimental).
+    #[value(name = "winui")]
+    WinUi,
     /// Dew backend (ESP32 firmware).
     Dew,
 }
@@ -191,7 +199,7 @@ impl TargetBackend {
     /// Whether the backend is experimental — shipped without full testing
     /// ahead of milestone releases — so selecting it asks for confirmation.
     const fn is_experimental(self) -> bool {
-        matches!(self, Self::Gtk4)
+        matches!(self, Self::Gtk4 | Self::WinUi)
     }
 }
 
@@ -352,9 +360,10 @@ fn resolve_backend(
                 TargetBackend::Gtk4 | TargetBackend::Hydrolysis
             )
             | (
-                TargetPlatform::Windows | TargetPlatform::Web,
-                TargetBackend::Hydrolysis
+                TargetPlatform::Windows,
+                TargetBackend::Hydrolysis | TargetBackend::WinUi
             )
+            | (TargetPlatform::Web, TargetBackend::Hydrolysis)
             | (
                 TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4,
                 TargetBackend::Dew
@@ -369,7 +378,7 @@ fn resolve_backend(
              - macOS: apple, hydrolysis\n  \
              - Android: android\n  \
              - Linux: gtk4, hydrolysis\n  \
-             - Windows: hydrolysis\n  \
+             - Windows: hydrolysis, winui\n  \
              - Web: hydrolysis\n  \
              - ESP32-S3: dew\n  \
              - ESP32-C3: dew\n  \
@@ -388,7 +397,8 @@ const fn default_backend_priority(platform: TargetPlatform) -> &'static [TargetB
         TargetPlatform::Android => &[TargetBackend::Android],
         TargetPlatform::Macos => &[TargetBackend::Apple, TargetBackend::Hydrolysis],
         TargetPlatform::Linux => &[TargetBackend::Hydrolysis, TargetBackend::Gtk4],
-        TargetPlatform::Windows | TargetPlatform::Web => &[TargetBackend::Hydrolysis],
+        TargetPlatform::Windows => &[TargetBackend::Hydrolysis, TargetBackend::WinUi],
+        TargetPlatform::Web => &[TargetBackend::Hydrolysis],
         TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4 => {
             &[TargetBackend::Dew]
         }
@@ -610,6 +620,7 @@ const fn backend_availability(project: &Project) -> BackendAvailability {
             project.android_backend().is_some(),
             project.gtk4_backend().is_some(),
             project.hydrolysis_backend().is_some(),
+            project.winui_backend().is_some(),
             project.esp32_backend().is_some(),
         ],
     }
@@ -632,6 +643,9 @@ fn ensure_run_backend_ready(project: &Project, backend: TargetBackend) -> Result
         }
         TargetBackend::Hydrolysis if project.hydrolysis_backend().is_none() => {
             bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
+        }
+        TargetBackend::WinUi if project.winui_backend().is_none() => {
+            bail!("WinUI backend is not configured. Run `water backend add winui`.");
         }
         TargetBackend::Dew if project.esp32_backend().is_none() => {
             bail!("ESP32 backend is not configured. Run `water backend add esp32`.");
@@ -668,6 +682,18 @@ async fn ensure_generated_run_backend(
                 needs_reinit,
                 "Initializing hydrolysis backend...",
                 "Hydrolysis backend initialized",
+            )
+            .await
+        }
+        TargetBackend::WinUi if project.is_playground() => {
+            let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
+            ensure_generated_run_backend_impl::<WinUiBackend>(
+                shell,
+                project_path,
+                project,
+                needs_reinit,
+                "Initializing WinUI backend...",
+                "WinUI backend initialized",
             )
             .await
         }
@@ -1139,6 +1165,9 @@ async fn build_for_backend(
         TargetBackend::Hydrolysis => {
             build_hydrolysis(project, plan.lib_platform, build_options).await?;
         }
+        TargetBackend::WinUi => {
+            build_winui(project, build_options).await?;
+        }
         TargetBackend::Dew => {
             panic!("esp32 run should not enter build_and_run")
         }
@@ -1168,6 +1197,7 @@ async fn package_for_backend(
         TargetBackend::Hydrolysis => {
             package_hydrolysis(project, plan.lib_platform, package_options).await
         }
+        TargetBackend::WinUi => package_winui(project, package_options).await,
         TargetBackend::Dew => panic!("esp32 run should not enter build_and_run"),
     }
 }
@@ -1609,6 +1639,12 @@ async fn check_toolchain_for_backend(
                 toolchain_checks::check_hydrolysis(host).await?;
             }
         }
+        TargetBackend::WinUi => {
+            if platform != TargetPlatform::Windows {
+                bail!("Internal error: WinUI backend is not supported on {platform:?}");
+            }
+            toolchain_checks::check_winui(host).await?;
+        }
         TargetBackend::Dew => {
             if platform.esp32_chip().is_none() {
                 bail!("Internal error: dew backend is not supported on {platform:?}");
@@ -1627,7 +1663,10 @@ async fn find_device(
     device_id: Option<&str>,
 ) -> Result<SelectedDevice> {
     // For native desktop Rust backends, always use Local device regardless of platform.
-    if backend == TargetBackend::Gtk4 || backend == TargetBackend::Hydrolysis {
+    if backend == TargetBackend::Gtk4
+        || backend == TargetBackend::Hydrolysis
+        || backend == TargetBackend::WinUi
+    {
         return Ok(SelectedDevice::Local(Local));
     }
 
@@ -1743,6 +1782,7 @@ const fn backend_name(backend: TargetBackend) -> &'static str {
         TargetBackend::Android => "Android",
         TargetBackend::Gtk4 => "GTK4",
         TargetBackend::Hydrolysis => "Hydrolysis",
+        TargetBackend::WinUi => "WinUI",
         TargetBackend::Dew => "Dew",
     }
 }
@@ -1837,6 +1877,15 @@ fn validate_desktop_backend_platform_on_host(
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
         }
+        TargetBackend::WinUi => {
+            #[cfg(target_os = "windows")]
+            if platform != TargetPlatform::Windows {
+                bail!("WinUI backend on Windows host requires --platform windows");
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            bail!("WinUI backend is only supported on Windows hosts");
+        }
         TargetBackend::Apple => {
             #[cfg(not(target_os = "macos"))]
             bail!("Apple backend requires a macOS host");
@@ -1905,12 +1954,12 @@ mod tests {
     use waterui_cli::device::{ApplicationExit, DeviceEvent, Local};
 
     #[test]
-    fn only_gtk4_is_experimental() {
+    fn only_gtk4_and_winui_are_experimental() {
         use clap::ValueEnum;
         for backend in TargetBackend::value_variants() {
             assert_eq!(
                 backend.is_experimental(),
-                matches!(backend, TargetBackend::Gtk4),
+                matches!(backend, TargetBackend::Gtk4 | TargetBackend::WinUi),
                 "{backend:?} experimental flag drifted"
             );
         }
@@ -2073,7 +2122,7 @@ mod tests {
                 TargetPlatform::Linux,
                 false,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Hydrolysis
@@ -2083,7 +2132,7 @@ mod tests {
                 TargetPlatform::Macos,
                 false,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Hydrolysis
@@ -2095,7 +2144,7 @@ mod tests {
                 TargetPlatform::Linux,
                 false,
                 BackendAvailability {
-                    available: [false, false, false, false, false],
+                    available: [false, false, false, false, false, false],
                 }
             ),
             TargetBackend::Hydrolysis
@@ -2106,7 +2155,7 @@ mod tests {
                 TargetPlatform::Linux,
                 false,
                 BackendAvailability {
-                    available: [false, false, true, false, false],
+                    available: [false, false, true, false, false, false],
                 }
             ),
             TargetBackend::Gtk4
@@ -2120,7 +2169,7 @@ mod tests {
                 TargetPlatform::Macos,
                 true,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Apple
@@ -2130,7 +2179,7 @@ mod tests {
                 TargetPlatform::Linux,
                 true,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Hydrolysis

@@ -65,6 +65,8 @@ pub enum TargetBackend {
     Gtk4,
     /// Hydrolysis backend (self-drawn renderer)
     Hydrolysis,
+    /// `WinUI` backend (Windows App SDK / `WinUI` 3, pure Rust binary)
+    WinUi,
     /// Dew backend (embedded-first CPU renderer for ESP32-class chips)
     Dew,
 }
@@ -181,7 +183,8 @@ impl TargetPlatform {
             | Self::VisionOSSimulator => &[TargetBackend::Apple],
             Self::Android => &[TargetBackend::Android],
             Self::Linux => &[TargetBackend::Gtk4, TargetBackend::Hydrolysis],
-            Self::Windows | Self::Web => &[TargetBackend::Hydrolysis],
+            Self::Windows => &[TargetBackend::Hydrolysis, TargetBackend::WinUi],
+            Self::Web => &[TargetBackend::Hydrolysis],
             Self::Esp32S3 | Self::Esp32C3 | Self::Esp32P4 => &[TargetBackend::Dew],
         }
     }

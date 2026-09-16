@@ -19,6 +19,7 @@ mod runtime;
 pub mod toolchain;
 pub mod toolchain_checks;
 pub mod tui;
+pub mod winui;
 mod workflows;
 
 pub use dependencies::brew;

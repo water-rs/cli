@@ -22,6 +22,7 @@ use waterui_cli::{
     hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
     platform::TargetPlatform as LibTargetPlatform,
     project::{PackageType, Project},
+    winui::{backend::WinUiBackend, platform::build_winui},
 };
 
 /// Target platform for building.
@@ -71,6 +72,9 @@ pub enum TargetBackend {
     Gtk4,
     /// Hydrolysis backend.
     Hydrolysis,
+    /// `WinUI` backend.
+    #[value(name = "winui")]
+    WinUi,
     /// Dew backend (ESP32 firmware).
     Dew,
 }
@@ -79,7 +83,7 @@ impl TargetBackend {
     /// Whether the backend is experimental — shipped without full testing
     /// ahead of milestone releases — so selecting it asks for confirmation.
     const fn is_experimental(self) -> bool {
-        matches!(self, Self::Gtk4)
+        matches!(self, Self::Gtk4 | Self::WinUi)
     }
 }
 
@@ -216,6 +220,9 @@ fn ensure_backend_configured(project: &Project, backend: TargetBackend) -> Resul
         TargetBackend::Hydrolysis if project.hydrolysis_backend().is_none() => {
             bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
         }
+        TargetBackend::WinUi if project.winui_backend().is_none() => {
+            bail!("WinUI backend is not configured. Run `water backend add winui`.");
+        }
         TargetBackend::Dew if project.esp32_backend().is_none() => {
             bail!("ESP32 backend is not configured. Run `water backend add esp32`.");
         }
@@ -247,6 +254,16 @@ async fn ensure_generated_backend_ready(
                 &project,
                 "Re-initializing hydrolysis backend...",
                 "Hydrolysis backend re-initialized",
+            )
+            .await
+        }
+        TargetBackend::WinUi if WinUiBackend::requires_regeneration(&project).await? => {
+            reinitialize_generated_backend::<WinUiBackend>(
+                shell,
+                project_path,
+                &project,
+                "Re-initializing WinUI backend...",
+                "WinUI backend re-initialized",
             )
             .await
         }
@@ -378,6 +395,9 @@ async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Re
                     )
                     .await
                 }
+                TargetBackend::WinUi => {
+                    build_winui(&context.project, context.build_options.clone()).await
+                }
                 TargetBackend::Dew => {
                     build_esp32(&context.project, context.build_options.clone()).await
                 }
@@ -442,7 +462,10 @@ fn resolve_backend(
                 TargetPlatform::Linux,
                 TargetBackend::Gtk4 | TargetBackend::Hydrolysis
             )
-            | (TargetPlatform::Windows, TargetBackend::Hydrolysis)
+            | (
+                TargetPlatform::Windows,
+                TargetBackend::Hydrolysis | TargetBackend::WinUi
+            )
             | (
                 TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4,
                 TargetBackend::Dew
@@ -456,7 +479,7 @@ fn resolve_backend(
              - Android: android\n  \
              - macOS: apple, hydrolysis\n  \
              - Linux: gtk4, hydrolysis\n  \
-             - Windows: hydrolysis\n  \
+             - Windows: hydrolysis, winui\n  \
              - ESP32-S3: dew\n  \
              - ESP32-C3: dew\n  \
              - ESP32-P4: dew",
@@ -470,10 +493,10 @@ fn resolve_backend(
 fn validate_arch_args(backend: TargetBackend, arch: Option<TargetArch>) -> Result<()> {
     if matches!(
         backend,
-        TargetBackend::Gtk4 | TargetBackend::Hydrolysis | TargetBackend::Dew
+        TargetBackend::Gtk4 | TargetBackend::Hydrolysis | TargetBackend::WinUi | TargetBackend::Dew
     ) && arch.is_some()
     {
-        bail!("--arch is not supported for gtk4/hydrolysis/dew backends");
+        bail!("--arch is not supported for gtk4/hydrolysis/winui/dew backends");
     }
     Ok(())
 }
@@ -482,7 +505,10 @@ fn validate_output_dir_args(backend: TargetBackend, output_dir: Option<&PathBuf>
     if output_dir.is_some()
         && matches!(
             backend,
-            TargetBackend::Gtk4 | TargetBackend::Hydrolysis | TargetBackend::Dew
+            TargetBackend::Gtk4
+                | TargetBackend::Hydrolysis
+                | TargetBackend::WinUi
+                | TargetBackend::Dew
         )
     {
         bail!("--output-dir is only supported for Apple/Android backends");
@@ -534,6 +560,12 @@ async fn check_toolchain_for_backend(
             {
                 bail!("Internal error: hydrolysis backend is not supported on {platform:?}");
             }
+        }
+        TargetBackend::WinUi => {
+            if platform != TargetPlatform::Windows {
+                bail!("Internal error: WinUI backend is not supported on {platform:?}");
+            }
+            toolchain_checks::check_winui(host).await?;
         }
         TargetBackend::Dew => {
             if platform.esp32_chip().is_none() {
@@ -638,6 +670,15 @@ fn validate_desktop_backend_platform_on_host(
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
         }
+        TargetBackend::WinUi => {
+            #[cfg(target_os = "windows")]
+            if platform != TargetPlatform::Windows {
+                bail!("WinUI backend on Windows host requires --platform windows");
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            bail!("WinUI backend is only supported on Windows hosts");
+        }
         TargetBackend::Apple => {
             #[cfg(not(target_os = "macos"))]
             bail!("Apple backend requires a macOS host");
@@ -692,6 +733,7 @@ const fn backend_name(backend: TargetBackend) -> &'static str {
         TargetBackend::Android => "Android",
         TargetBackend::Gtk4 => "GTK4",
         TargetBackend::Hydrolysis => "Hydrolysis",
+        TargetBackend::WinUi => "WinUI",
         TargetBackend::Dew => "Dew",
     }
 }
@@ -738,12 +780,12 @@ mod tests {
     use super::{TargetBackend, TargetPlatform, resolve_backend, validate_output_dir_args};
 
     #[test]
-    fn only_gtk4_is_experimental() {
+    fn only_gtk4_and_winui_are_experimental() {
         use clap::ValueEnum;
         for backend in TargetBackend::value_variants() {
             assert_eq!(
                 backend.is_experimental(),
-                matches!(backend, TargetBackend::Gtk4),
+                matches!(backend, TargetBackend::Gtk4 | TargetBackend::WinUi),
                 "{backend:?} experimental flag drifted"
             );
         }

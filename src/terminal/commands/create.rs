@@ -88,6 +88,7 @@ enum Backend {
     Android,
     Gtk4,
     Hydrolysis,
+    WinUi,
     Esp32,
 }
 
@@ -119,11 +120,12 @@ impl ProjectMode {
 }
 
 impl Backend {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Apple,
         Self::Android,
         Self::Gtk4,
         Self::Hydrolysis,
+        Self::WinUi,
         Self::Esp32,
     ];
 
@@ -131,8 +133,9 @@ impl Backend {
         match self {
             Self::Apple => "Apple (iOS/macOS)",
             Self::Android => "Android",
-            Self::Gtk4 => "GTK4 (Linux)",
+            Self::Gtk4 => "GTK4 (Linux, experimental)",
             Self::Hydrolysis => "Hydrolysis (Linux/macOS/Windows)",
+            Self::WinUi => "WinUI (Windows, experimental)",
             Self::Esp32 => "ESP32 (Dew firmware)",
         }
     }
@@ -143,6 +146,7 @@ impl Backend {
             Self::Android => "Android",
             Self::Gtk4 => "GTK4",
             Self::Hydrolysis => "Hydrolysis",
+            Self::WinUi => "WinUI",
             Self::Esp32 => "ESP32",
         }
     }
@@ -150,7 +154,7 @@ impl Backend {
     /// Whether the backend is experimental — shipped without full testing
     /// ahead of milestone releases — so scaffolding it asks for confirmation.
     const fn is_experimental(self) -> bool {
-        matches!(self, Self::Gtk4)
+        matches!(self, Self::Gtk4 | Self::WinUi)
     }
 
     fn from_str(s: &str) -> Option<Self> {
@@ -159,6 +163,7 @@ impl Backend {
             "android" => Some(Self::Android),
             "gtk" | "gtk4" | "linux" => Some(Self::Gtk4),
             "hydrolysis" => Some(Self::Hydrolysis),
+            "winui" => Some(Self::WinUi),
             "esp32" | "esp32s3" | "dew" => Some(Self::Esp32),
             _ => None,
         }
@@ -335,6 +340,7 @@ async fn initialize_requested_backends(
     initialize_backend_if_requested(shell, project, &plan.backends, Backend::Android).await?;
     initialize_backend_if_requested(shell, project, &plan.backends, Backend::Gtk4).await?;
     initialize_backend_if_requested(shell, project, &plan.backends, Backend::Hydrolysis).await?;
+    initialize_backend_if_requested(shell, project, &plan.backends, Backend::WinUi).await?;
     initialize_backend_if_requested(shell, project, &plan.backends, Backend::Esp32).await
 }
 
@@ -356,6 +362,7 @@ async fn initialize_backend_if_requested(
             "Scaffolding hydrolysis backend...",
             "Created hydrolysis backend",
         ),
+        Backend::WinUi => ("Scaffolding WinUI backend...", "Created WinUI backend"),
         Backend::Esp32 => ("Scaffolding ESP32 backend...", "Created ESP32 backend"),
     };
 
@@ -365,6 +372,7 @@ async fn initialize_backend_if_requested(
         Backend::Android => project.init_android_backend().await?,
         Backend::Gtk4 => project.init_gtk4_backend().await?,
         Backend::Hydrolysis => project.init_hydrolysis_backend().await?,
+        Backend::WinUi => project.init_winui_backend().await?,
         Backend::Esp32 => project.init_esp32_backend().await?,
     }
     if let Some(pb) = spinner {
@@ -419,7 +427,7 @@ fn parse_backends(backends: &[String]) -> Result<Vec<Backend>> {
         Ok(parsed)
     } else {
         bail!(
-            "Unknown backend(s): {}. Valid values: apple, android, gtk4, hydrolysis, esp32",
+            "Unknown backend(s): {}. Valid values: apple, android, gtk4, hydrolysis, winui, esp32",
             invalid.join(", ")
         );
     }
@@ -470,6 +478,14 @@ fn next_run_command(package_type: PackageType, backends: &[Backend]) -> Option<&
         return None;
     }
 
+    if backends.iter().any(|b| matches!(b, Backend::WinUi)) {
+        #[cfg(target_os = "windows")]
+        return Some("water run --platform windows --backend winui");
+
+        #[cfg(not(target_os = "windows"))]
+        return None;
+    }
+
     if backends.iter().any(|b| matches!(b, Backend::Esp32)) {
         return Some("water run --platform esp32s3");
     }
@@ -479,7 +495,7 @@ fn next_run_command(package_type: PackageType, backends: &[Backend]) -> Option<&
 
 fn prompt_backends() -> Result<Vec<Backend>> {
     let items: Vec<&str> = Backend::ALL.iter().map(|b| b.label()).collect();
-    let defaults = vec![true, true, false, false, false]; // Apple and Android selected by default
+    let defaults = vec![true, true, false, false, false, false]; // Apple and Android selected by default
 
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Select backends")
@@ -511,6 +527,13 @@ fn validate_backends_on_host(backends: &[Backend]) -> Result<()> {
         bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
     }
 
+    let wants_winui = backends
+        .iter()
+        .any(|backend| matches!(backend, Backend::WinUi));
+    if wants_winui && !cfg!(target_os = "windows") {
+        bail!("WinUI backend is only supported on Windows hosts");
+    }
+
     Ok(())
 }
 
@@ -528,11 +551,11 @@ mod tests {
     use super::validate_backends_on_host;
 
     #[test]
-    fn only_gtk4_is_experimental() {
+    fn only_gtk4_and_winui_are_experimental() {
         for backend in Backend::ALL {
             assert_eq!(
                 backend.is_experimental(),
-                matches!(backend, Backend::Gtk4),
+                matches!(backend, Backend::Gtk4 | Backend::WinUi),
                 "{backend:?} experimental flag drifted"
             );
         }

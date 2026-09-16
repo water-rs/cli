@@ -22,6 +22,7 @@ use waterui_cli::{
     hydrolysis::platform::clean_hydrolysis,
     project::{Manifest, PackageType, Project},
     water_dir,
+    winui::platform::clean_winui,
 };
 
 /// Target backend for cleaning.
@@ -35,6 +36,9 @@ pub enum TargetBackend {
     Gtk4,
     /// Hydrolysis backend (self-drawn renderer).
     Hydrolysis,
+    /// `WinUI` backend (Windows).
+    #[value(name = "winui")]
+    WinUi,
     /// All backends.
     All,
 }
@@ -144,6 +148,14 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
                 pb.finish_and_clear();
             }
             success!(shell, "Cleaned hydrolysis build artifacts");
+        }
+        TargetBackend::WinUi => {
+            let spinner = shell.spinner("Cleaning WinUI build artifacts...");
+            clean_winui(&project).await?;
+            if let Some(pb) = spinner {
+                pb.finish_and_clear();
+            }
+            success!(shell, "Cleaned WinUI build artifacts");
         }
     }
 
