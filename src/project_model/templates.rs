@@ -973,6 +973,25 @@ macro_rules! define_scaffold_templates {
                                 format!("Failed to render template {display_path}: {error}"),
                             )
                         })
+                    })
+                    .and_then(|rendered| {
+                        // The esp32 manifest renders through askama to carry
+                        // the Xtensa profile note, so it bypasses the
+                        // serialized-manifest path that assigns
+                        // `manifest.patch`; without the same tables the
+                        // generated workspace resolves `waterui-dew`'s
+                        // registry `waterui-*` requirements beside the path
+                        // copies and `View` splits across the two.
+                        let mut document = rendered
+                            .parse::<toml_edit::DocumentMut>()
+                            .map_err(io::Error::other)?;
+                        crate::framework::rewrite_patch_tables(
+                            &mut document,
+                            &cargo_toml::PatchSet::default(),
+                            &generated_crate_patches(ctx)?,
+                        )
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                        Ok(document.to_string())
                     }),
                 $(
                     $path => $name { ctx }
@@ -1464,6 +1483,45 @@ mod tests {
 
         let core_path = checkout.join("core");
         let manifest: toml::Value = toml::from_str(&manifest).expect("generated manifest parses");
+        let patched_path = |source: &str| {
+            manifest["patch"][source]["waterui-core"]["path"]
+                .as_str()
+                .map_or_else(
+                    || panic!("no waterui-core path patch under [patch.{source:?}]:\n{manifest}"),
+                    std::path::PathBuf::from,
+                )
+        };
+        assert_eq!(patched_path("crates-io"), core_path);
+        assert_eq!(
+            patched_path("https://github.com/water-rs/waterui"),
+            core_path
+        );
+    }
+
+    #[test]
+    fn esp32_manifest_carries_the_checkout_patch_tables() {
+        let tempdir = tempdir().expect("temporary checkout dir");
+        let checkout = tempdir.path().join("waterui");
+        std::fs::create_dir_all(&checkout).expect("checkout dir");
+        std::fs::write(
+            checkout.join("Cargo.toml"),
+            include_str!("../../tests/fixtures/local_checkout_patches.toml"),
+        )
+        .expect("checkout manifest");
+
+        let ctx = ctx(
+            Some(checkout.clone()),
+            None,
+            Some(tempdir.path().join("app")),
+            crate::project::PackageType::App,
+        );
+        let manifest = render_esp32("Cargo.toml.tpl", &ctx);
+        let manifest: toml::Value = toml::from_str(&manifest).expect("esp32 manifest parses");
+
+        // The askama-rendered manifest must carry the same patch tables the
+        // serialized native manifests get — `waterui-dew`'s registry
+        // `waterui-*` requirements resolve to the checkout, not a second copy.
+        let core_path = checkout.join("core");
         let patched_path = |source: &str| {
             manifest["patch"][source]["waterui-core"]["path"]
                 .as_str()
