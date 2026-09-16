@@ -1113,7 +1113,9 @@ mod tests {
         jitpack_dependency_coordinate, normalize_path_for_config, preview_ffi,
         render_scaffold_template,
     };
-    use crate::framework::test_fixtures::{dev_framework, nightly_framework, stable_framework};
+    use crate::framework::test_fixtures::{
+        dev_framework, nightly_framework, stable_framework, write_apple_revision_checkout,
+    };
     use crate::project_types::{BundleIdentifier, CrateName};
     use include_dir::Dir;
     use std::path::PathBuf;
@@ -1720,6 +1722,21 @@ mod tests {
         )
         .expect("apple project render");
         assert!(rendered.contains("kind = branch;\n\t\t\t\tbranch = \"dev\";"));
+    }
+
+    #[test]
+    fn declared_apple_revision_becomes_an_exact_package_requirement() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("waterui");
+        let revision = "dddddddddddddddddddddddddddddddddddddddd";
+        write_apple_revision_checkout(&root, revision);
+        let mut context = app_ctx();
+        context.framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
+
+        assert_eq!(
+            context.apple_backend_requirement(),
+            "kind = revision;\n\t\t\t\trevision = \"dddddddddddddddddddddddddddddddddddddddd\";"
+        );
     }
 
     #[test]
