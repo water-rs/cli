@@ -216,10 +216,41 @@ impl Esp32Backend {
                 cargo_config.contains(&format!("target = \"{}\"", config.resolved_target_triple()))
             });
 
+        // A manifest rendered before the backend carried the framework patch
+        // tables lets `waterui-dew`'s own `waterui-*` requirements resolve
+        // beside the project's copies — the recorded framework selection
+        // produces the patch set the manifest must already carry.
+        let expected_patches = match (
+            &project.manifest().framework,
+            &project.manifest().waterui_path,
+        ) {
+            (Some(framework), _) => Some(framework.patches()),
+            (None, Some(waterui_path)) => {
+                let path = Path::new(waterui_path);
+                let root = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    project.root().join(path)
+                };
+                Some(
+                    crate::project_model::templates::collect_workspace_patches(&root).map_err(
+                        |error| {
+                            eyre::eyre!(
+                                "failed to read the WaterUI checkout's patch tables at {}: {error}",
+                                root.display()
+                            )
+                        },
+                    )?,
+                )
+            }
+            (None, None) => None,
+        };
+
         Ok(!manifest.dependencies.contains_key("waterui-dew")
             || !main_matches_panel
             || !main_matches_fonts
             || !cargo_target_matches
+            || expected_patches.is_some_and(|expected| manifest.patch != expected)
             || !backend_path.join("rust-toolchain.toml").exists()
             || !backend_path.join(".cargo/config.toml").exists()
             || !backend_path.join("sdkconfig.defaults").exists()
