@@ -75,6 +75,14 @@ pub enum TargetBackend {
     Dew,
 }
 
+impl TargetBackend {
+    /// Whether the backend is experimental — shipped without full testing
+    /// ahead of milestone releases — so selecting it asks for confirmation.
+    const fn is_experimental(self) -> bool {
+        matches!(self, Self::Gtk4)
+    }
+}
+
 /// Target architecture for building.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum TargetArch {
@@ -115,6 +123,11 @@ pub struct Args {
     /// Only valid for Apple/Android backends.
     #[arg(long)]
     output_dir: Option<PathBuf>,
+
+    /// Skip the confirmation prompt required by experimental backends
+    /// (needed in non-interactive environments).
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 struct BuildContext {
@@ -125,7 +138,9 @@ struct BuildContext {
 
 /// Run the build command.
 pub async fn run(shell: &Shell, args: Args) -> Result<()> {
-    let context = prepare_build_context(shell, &args).await?;
+    let Some(context) = prepare_build_context(shell, &args).await? else {
+        return Ok(());
+    };
     print_build_header(
         shell,
         &context.project,
@@ -139,13 +154,19 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     handle_build_result(shell, result, args.output_dir)
 }
 
-async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<BuildContext> {
+async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<BuildContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let mut project = Project::open(&project_path).await?;
     ensure_app_project(&project)?;
 
     let backend = resolve_and_validate_backend(args)?;
     ensure_backend_configured(&project, backend)?;
+
+    if backend.is_experimental()
+        && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
+    {
+        return Ok(None);
+    }
 
     // Selecting an ESP32 platform pins the chip so the generated harness and
     // build target follow the platform.
@@ -156,11 +177,11 @@ async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<BuildContex
     let project = ensure_generated_backend_ready(shell, &project_path, project, backend).await?;
     let build_options = build_options(shell, args, backend).await;
 
-    Ok(BuildContext {
+    Ok(Some(BuildContext {
         project,
         backend,
         build_options,
-    })
+    }))
 }
 
 fn ensure_app_project(project: &Project) -> Result<()> {
@@ -715,6 +736,18 @@ const fn apple_target_triple_override(
 #[cfg(test)]
 mod tests {
     use super::{TargetBackend, TargetPlatform, resolve_backend, validate_output_dir_args};
+
+    #[test]
+    fn only_gtk4_is_experimental() {
+        use clap::ValueEnum;
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                backend.is_experimental(),
+                matches!(backend, TargetBackend::Gtk4),
+                "{backend:?} experimental flag drifted"
+            );
+        }
+    }
 
     #[test]
     fn resolve_backend_defaults_match_platforms() {

@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use dialoguer::{Confirm, theme::ColorfulTheme};
+
 use crate::shell::Shell;
 use crate::{note, warn};
 use waterui_cli::{
@@ -46,6 +48,43 @@ async fn detect_sccache_path(shell: &Shell, host: &Host) -> Option<PathBuf> {
     )
 }
 
+/// Confirm that the user accepts running an experimental backend.
+///
+/// Experimental backends are not fully tested ahead of milestone releases, so
+/// every use warns once and requires an explicit second confirmation: the
+/// command's `--yes` flag in scripts and CI, or a prompt everywhere else.
+/// Returns `Ok(false)` when the user declines at the prompt so the caller can
+/// exit quietly; a non-interactive invocation without `yes` is an error.
+fn confirm_experimental_backend(
+    shell: &Shell,
+    backend_name: &str,
+    yes: bool,
+) -> eyre::Result<bool> {
+    warn!(
+        shell,
+        "The {backend_name} backend is experimental and is not fully tested ahead of milestone releases"
+    );
+    if yes {
+        return Ok(true);
+    }
+    if !shell.is_interactive() {
+        eyre::bail!(
+            "the {backend_name} backend is experimental; pass --yes to confirm it in non-interactive environments"
+        );
+    }
+    let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Continue with the experimental {backend_name} backend?"
+        ))
+        .default(false)
+        .interact()?;
+    if !confirmed {
+        warn!(shell, "Cancelled");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 pub mod backend;
 pub mod bench;
 pub mod build;
@@ -86,4 +125,28 @@ fn parse_viewport(s: &str) -> eyre::Result<(u32, u32)> {
     }
 
     Ok((width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirm_experimental_backend;
+    use crate::shell::Shell;
+
+    #[test]
+    fn experimental_backend_yes_flag_confirms_without_prompt() {
+        // A non-interactive shell never prompts; --yes must still pass.
+        let shell = Shell::new(false);
+        assert!(!shell.is_interactive());
+        assert!(
+            confirm_experimental_backend(&shell, "GTK4", true).expect("--yes confirms the gate")
+        );
+    }
+
+    #[test]
+    fn experimental_backend_non_interactive_without_yes_is_an_error() {
+        let shell = Shell::new(false);
+        let err = confirm_experimental_backend(&shell, "GTK4", false)
+            .expect_err("non-interactive use without --yes must fail");
+        assert!(err.to_string().contains("--yes"));
+    }
 }

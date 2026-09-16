@@ -187,6 +187,14 @@ pub enum TargetBackend {
     Dew,
 }
 
+impl TargetBackend {
+    /// Whether the backend is experimental — shipped without full testing
+    /// ahead of milestone releases — so selecting it asks for confirmation.
+    const fn is_experimental(self) -> bool {
+        matches!(self, Self::Gtk4)
+    }
+}
+
 /// Arguments for the run command.
 #[derive(ClapArgs, Debug)]
 // CLI flag structs collect booleans by nature; each flag is a documented
@@ -261,6 +269,11 @@ pub struct Args {
     /// does.
     #[arg(long)]
     no_dev_server: bool,
+
+    /// Skip the confirmation prompt required by experimental backends
+    /// (needed in non-interactive environments).
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 /// Parses one `--env KEY=VALUE` argument into its key and value.
@@ -437,7 +450,9 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // The run context carries the opened project, the resolved device, backend
     // and build options; on Windows that future crosses clippy's `large_futures`
     // threshold (16 KiB), so it is pinned on the heap instead of the caller's stack.
-    let context = Box::pin(prepare_run_context(shell, &args)).await?;
+    let Some(context) = Box::pin(prepare_run_context(shell, &args)).await? else {
+        return Ok(());
+    };
     print_run_header(shell, &context);
     check_run_toolchain(shell, &host, context.platform, context.backend).await?;
 
@@ -513,6 +528,9 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("the TUI backend requires an interactive terminal");
     }
+    if !super::confirm_experimental_backend(shell, "TUI", args.yes)? {
+        return Ok(());
+    }
 
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let project = Project::open(&project_path).await?;
@@ -535,23 +553,22 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
     waterui_cli::tui::exec(&binary)
 }
 
-async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<RunContext> {
+async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let mut project = Project::open(&project_path).await?;
     let platform = resolve_platform(args.platform);
     let backend = resolve_run_backend(&project, platform, args.backend)?;
 
-    if backend == TargetBackend::Gtk4 {
-        warn!(
-            shell,
-            "The GTK4 backend is experimental — hydrolysis is the default"
-        );
-    }
-
     validate_desktop_backend_platform_on_host(platform, backend)?;
     validate_device_arg(platform, backend, args.device.as_deref())?;
     validate_log_pipeline_args(platform, args.logs, args.native_logs)?;
     ensure_run_backend_ready(&project, backend)?;
+
+    if backend.is_experimental()
+        && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
+    {
+        return Ok(None);
+    }
 
     // Selecting an ESP32 platform pins the chip so the generated harness and
     // build target follow the platform (the chip drives the target triple,
@@ -562,11 +579,11 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<RunContext> {
 
     let project = ensure_generated_run_backend(shell, &project_path, project, backend).await?;
 
-    Ok(RunContext {
+    Ok(Some(RunContext {
         project,
         platform,
         backend,
-    })
+    }))
 }
 
 fn resolve_run_backend(
@@ -1886,6 +1903,18 @@ mod tests {
         validate_desktop_backend_platform_on_host, validate_device_arg,
     };
     use waterui_cli::device::{ApplicationExit, DeviceEvent, Local};
+
+    #[test]
+    fn only_gtk4_is_experimental() {
+        use clap::ValueEnum;
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                backend.is_experimental(),
+                matches!(backend, TargetBackend::Gtk4),
+                "{backend:?} experimental flag drifted"
+            );
+        }
+    }
 
     #[test]
     fn env_assignment_splits_on_first_equals() {

@@ -59,6 +59,14 @@ pub enum TargetBackend {
     Hydrolysis,
 }
 
+impl TargetBackend {
+    /// Whether the backend is experimental — shipped without full testing
+    /// ahead of milestone releases — so selecting it asks for confirmation.
+    const fn is_experimental(self) -> bool {
+        matches!(self, Self::Gtk4)
+    }
+}
+
 /// Target architecture for Android builds.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum AndroidArch {
@@ -113,6 +121,11 @@ pub struct Args {
     /// Required when packaging Android backend.
     #[arg(long, value_enum, value_delimiter = ',')]
     arch: Vec<AndroidArch>,
+
+    /// Skip the confirmation prompt required by experimental backends
+    /// (needed in non-interactive environments).
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 struct PackagingContext {
@@ -126,7 +139,9 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // The packaging context carries the opened project, the resolved backend and
     // the build options; on Windows that future crosses clippy's `large_futures`
     // threshold (16 KiB), so it is pinned on the heap instead of the caller's stack.
-    let context = Box::pin(prepare_packaging_context(shell, &args)).await?;
+    let Some(context) = Box::pin(prepare_packaging_context(shell, &args)).await? else {
+        return Ok(());
+    };
     print_packaging_header(
         shell,
         &context.project,
@@ -140,7 +155,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     package_artifact(shell, &args, &context).await
 }
 
-async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<PackagingContext> {
+async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<PackagingContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let project = Project::open(&project_path).await?;
     let backend = resolve_backend(args.platform, args.backend)?;
@@ -148,6 +163,12 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Packagi
     validate_arch_args(backend, &args.arch)?;
     validate_desktop_backend_platform_on_host(args.platform, backend)?;
     ensure_packaging_backend_ready(&project, backend)?;
+
+    if backend.is_experimental()
+        && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
+    {
+        return Ok(None);
+    }
     let project =
         ensure_packaging_backend_generated(shell, &project_path, project, backend).await?;
 
@@ -162,11 +183,11 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Packagi
         build_options = build_options.with_sccache(sccache_path);
     }
 
-    Ok(PackagingContext {
+    Ok(Some(PackagingContext {
         project,
         backend,
         build_options,
-    })
+    }))
 }
 
 fn ensure_packaging_backend_ready(project: &Project, backend: TargetBackend) -> Result<()> {
@@ -661,6 +682,18 @@ const fn backend_name(backend: TargetBackend) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{AndroidArch, TargetBackend, TargetPlatform, resolve_backend, validate_arch_args};
+
+    #[test]
+    fn only_gtk4_is_experimental() {
+        use clap::ValueEnum;
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                backend.is_experimental(),
+                matches!(backend, TargetBackend::Gtk4),
+                "{backend:?} experimental flag drifted"
+            );
+        }
+    }
 
     #[test]
     fn rejects_empty_arch_for_android_backend() {
