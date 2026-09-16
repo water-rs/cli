@@ -72,9 +72,8 @@ fn new_runtime(width: f32, height: f32) -> HeadlessRuntime {
 /// The virtual instant never moves while pacing: the scene is quiescent, so
 /// nothing it scheduled needs a frame, and advancing the clock would carry
 /// every animation past the phase the capture asked for. Once a paced pump
-/// changes the tree while the task count holds, the work is a live producer —
-/// playback, a stream — that outlives the preview by design, and settling
-/// returns rather than waiting out the whole playback.
+/// changes the tree, settling returns to the rebuild loop so whatever the
+/// change scheduled can run before pacing resumes.
 fn settle(runtime: &mut HeadlessRuntime, at: Instant) {
     /// Pump budget for a frame that never stops rebuilding — a perpetual
     /// animation; bounds pump work, not wall clock.
@@ -101,19 +100,12 @@ fn settle(runtime: &mut HeadlessRuntime, at: Instant) {
         }
         // Quiescent but a local task may be parked on a wall-clock wake: give
         // it real time, then run what it re-queued at the same instant.
-        let mut outstanding = waterui::task::outstanding_local_tasks();
         loop {
-            if outstanding == 0 || Instant::now() >= wall_deadline {
+            if waterui::task::outstanding_local_tasks() == 0 || Instant::now() >= wall_deadline {
                 return;
             }
             std::thread::sleep(FRAME);
-            let rebuilt = runtime.pump_at(false, at).rebuilt;
-            let now_outstanding = waterui::task::outstanding_local_tasks();
-            if rebuilt && now_outstanding >= outstanding {
-                return;
-            }
-            outstanding = now_outstanding;
-            if rebuilt {
+            if runtime.pump_at(false, at).rebuilt {
                 break;
             }
         }
