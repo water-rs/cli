@@ -18,6 +18,6 @@ scaffold-packages = ["hydrolysis", "hydrolysis-m3", "waterui-dew", "waterui-gtk"
 
 [workspace.dependencies]
 hydrolysis = { version = "0.2.1", default-features = false }
-hydrolysis-m3 = "0.2.0"
-waterui-dew = "0.2.1"
+hydrolysis-m3 = "0.2.1"
+waterui-dew = { git = "https://github.com/water-rs/dew", rev = "b64f6759a3ebe7ac621bad84be00fe431f978119", version = "0.2.1" }
 waterui-gtk = { git = "https://github.com/water-rs/gtk-backend", rev = "3162043e618e759bea6d6e52ec75c6ee1273c080", version = "0.2.0" }
