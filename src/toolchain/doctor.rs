@@ -33,6 +33,7 @@ use crate::{
         web::{PackageManagerToolchain, Wasm32UnknownUnknownTarget, WasmPack},
         windows_arm64_llvm::WindowsArm64LlvmToolchain,
     },
+    winui::toolchain::WinUiToolchain,
 };
 use eyre;
 use serde::{Deserialize, Serialize};
@@ -245,6 +246,8 @@ pub mod ids {
     pub const LINUX_SYSTEM_PACKAGES: &str = "linux-system-packages";
     /// GTK4/pango pkg-config probes.
     pub const GTK4: &str = "gtk4";
+    /// `WinUI` build prerequisites on Windows hosts.
+    pub const WINUI: &str = "winui";
     /// `sccache` compile cache.
     pub const SCCACHE: &str = "sccache";
     /// The `[web] package_manager` the current project's `Water.toml` declares.
@@ -277,6 +280,7 @@ pub mod ids {
         WASM_PACK,
         LINUX_SYSTEM_PACKAGES,
         GTK4,
+        WINUI,
         SCCACHE,
         WEB_PACKAGE_MANAGER,
     ];
@@ -677,6 +681,23 @@ async fn push_linux_checks(host: &Host, items: &mut Vec<DoctorItem>) {
     }
 }
 
+async fn push_windows_checks(host: &Host, items: &mut Vec<DoctorItem>) {
+    if !cfg!(target_os = "windows") {
+        items.push(DoctorItem::skipped(ids::WINUI, "WinUI"));
+        return;
+    }
+
+    push_toolchain_check(
+        host,
+        items,
+        ids::WINUI,
+        "WinUI",
+        "WinUI build prerequisites are missing",
+        WinUiToolchain,
+    )
+    .await;
+}
+
 /// Run diagnostics on all toolchains on `host` and return a report.
 ///
 /// Item order is fixed and platform branching is driven by `cfg!`, so two runs
@@ -691,6 +712,7 @@ pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
     push_android_run_target_check(host, &mut items).await;
     push_desktop_and_web_checks(host, &mut items).await;
     push_linux_checks(host, &mut items).await;
+    push_windows_checks(host, &mut items).await;
     push_toolchain_check(
         host,
         &mut items,

@@ -377,6 +377,14 @@ impl Project {
             .unwrap_or_else(|| self.crate_name.with_suffix("hydrolysis"))
     }
 
+    /// Get configured or default `WinUI` backend crate name for app mode.
+    #[must_use]
+    pub fn winui_backend_crate_name(&self) -> CrateName {
+        self.app_crate_overrides()
+            .and_then(|crates| crates.winui.clone())
+            .unwrap_or_else(|| self.crate_name.with_suffix("winui"))
+    }
+
     /// Get the generated ESP32 firmware harness crate name.
     #[must_use]
     pub fn esp32_backend_crate_name(&self) -> CrateName {
@@ -471,6 +479,12 @@ impl Project {
         &self,
     ) -> Option<&crate::hydrolysis::backend::HydrolysisBackend> {
         self.manifest.backends.hydrolysis()
+    }
+
+    /// Get the `WinUI` backend configuration if available.
+    #[must_use]
+    pub const fn winui_backend(&self) -> Option<&crate::winui::backend::WinUiBackend> {
+        self.manifest.backends.winui()
     }
 
     /// Get the ESP32 backend configuration if available.
@@ -681,7 +695,7 @@ impl Project {
         use crate::{
             android::platform::clean_android, apple::platform::clean_apple,
             esp32::platform::clean_esp32, gtk4::platform::clean_gtk4,
-            hydrolysis::platform::clean_hydrolysis,
+            hydrolysis::platform::clean_hydrolysis, winui::platform::clean_winui,
         };
 
         if self.is_playground() {
@@ -721,6 +735,11 @@ impl Project {
         // Clean hydrolysis backend if configured
         if self.hydrolysis_backend().is_some() || self.is_playground() {
             clean_hydrolysis(self).await?;
+        }
+
+        // Clean `WinUI` backend if configured
+        if self.winui_backend().is_some() || (self.is_playground() && cfg!(target_os = "windows")) {
+            clean_winui(self).await?;
         }
 
         // Clean ESP32 backend if configured
@@ -1328,6 +1347,30 @@ impl Project {
         Ok(())
     }
 
+    /// Initialize the `WinUI` backend for an existing project.
+    ///
+    /// Creates necessary files/folders for the `WinUI` backend under `backend_path::<WinUiBackend>()`.
+    ///
+    /// # Errors
+    /// Returns an error if scaffolding fails.
+    pub async fn init_winui_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
+        use crate::{backend::Backend, winui::backend::WinUiBackend};
+
+        if !cfg!(target_os = "windows") {
+            return Err(crate::backend::FailToInitBackend::Io(
+                std::io::Error::other("WinUI backend is only supported on Windows hosts"),
+            ));
+        }
+
+        let backend = WinUiBackend::init(self).await?;
+        self.manifest.backends.set_winui(backend);
+        self.manifest
+            .save(&self.root)
+            .await
+            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
+        Ok(())
+    }
+
     /// Initialize the ESP32 backend for an existing project.
     ///
     /// Creates necessary files/folders for the ESP32 firmware harness under
@@ -1407,6 +1450,19 @@ impl Project {
             self.remove_backend_relative_dir(&path).await?;
         }
         self.manifest.backends.clear_gtk4();
+        self.save_manifest().await
+    }
+
+    /// Remove `WinUI` backend configuration and generated files.
+    ///
+    /// # Errors
+    /// Returns an error if deleting files or saving manifest fails.
+    pub async fn remove_winui_backend(&mut self) -> eyre::Result<()> {
+        if let Some(backend) = self.winui_backend() {
+            let path = backend.project_path().clone();
+            self.remove_backend_relative_dir(&path).await?;
+        }
+        self.manifest.backends.clear_winui();
         self.save_manifest().await
     }
 
@@ -2173,6 +2229,9 @@ pub struct AppCrates {
     /// Optional override crate name for generated hydrolysis backend crate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hydrolysis: Option<CrateName>,
+    /// Optional override crate name for generated `WinUI` backend crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winui: Option<CrateName>,
 }
 
 /// `[package]` section in `Water.toml`.

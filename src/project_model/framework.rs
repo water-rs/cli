@@ -1743,6 +1743,12 @@ pub(crate) mod test_fixtures {
                 ("hydrolysis-m3-version".to_owned(), "0.2.0".to_owned()),
                 ("waterui-dew-version".to_owned(), "0.2.1".to_owned()),
                 ("waterui-gtk-version".to_owned(), "0.1.2".to_owned()),
+                ("waterui-winui-version".to_owned(), "0.1.0".to_owned()),
+                (
+                    "waterui-winui-git".to_owned(),
+                    "https://github.com/water-rs/waterui-winui".to_owned(),
+                ),
+                ("waterui-winui-rev".to_owned(), revision('e')),
                 (
                     "apple-backend-url".to_owned(),
                     "https://github.com/water-rs/apple-backend.git".to_owned(),
@@ -3170,6 +3176,18 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                 (
                     "waterui-gtk-rev".to_owned(),
                     "3162043e618e759bea6d6e52ec75c6ee1273c080".to_owned()
+                ),
+                (
+                    "waterui-winui-version".to_owned(),
+                    workspace("waterui-winui")
+                ),
+                (
+                    "waterui-winui-git".to_owned(),
+                    "https://github.com/water-rs/waterui-winui".to_owned()
+                ),
+                (
+                    "waterui-winui-rev".to_owned(),
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned()
                 ),
                 (
                     "apple-backend-url".to_owned(),

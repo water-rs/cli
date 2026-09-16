@@ -96,8 +96,10 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
                     | ids::MACOS_SDK
             );
             let linux_item = matches!(*id, ids::LINUX_SYSTEM_PACKAGES | ids::GTK4);
+            let windows_item = matches!(*id, ids::WINUI);
             (apple_item && !cfg!(target_os = "macos"))
                 || (linux_item && !cfg!(target_os = "linux"))
+                || (windows_item && !cfg!(target_os = "windows"))
                 || (*id == ids::WINDOWS_ARM64_LLVM
                     && !cfg!(all(target_os = "windows", target_arch = "aarch64")))
         })

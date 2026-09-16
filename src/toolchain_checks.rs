@@ -265,6 +265,18 @@ pub async fn check_gtk4(host: &Host) -> Result<()> {
     Ok(())
 }
 
+/// Verify the `WinUI` toolchain is installed.
+///
+/// # Errors
+/// Returns an error describing any missing toolchain component and the `water doctor --fix` remedy.
+pub async fn check_winui(host: &Host) -> Result<()> {
+    let toolchain = crate::winui::toolchain::WinUiToolchain;
+    if let Err(e) = toolchain.check(host).await {
+        bail!("{}", toolchain_check_message("WinUI", &e));
+    }
+    Ok(())
+}
+
 /// Verify the host toolchain components Hydrolysis builds need.
 ///
 /// # Errors
