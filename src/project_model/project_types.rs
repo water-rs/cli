@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +29,55 @@ impl CrateName {
     pub fn with_suffix(&self, suffix: &str) -> Self {
         Self(format!("{}-{suffix}", self.0))
     }
+}
+
+/// The package name of a crate the CLI generates for `project_root`: the
+/// project's crate name, the backend suffix, and a short hash of the
+/// canonical project root.
+///
+/// The hash is load-bearing, not cosmetic. Every generated crate compiles
+/// into the user's shared Cargo target (`~/.water/build_cache/target`),
+/// where Cargo keys dependency artifacts by package id but uplifts the
+/// *final* artifact to an unhashed profile-root file — two projects named
+/// `demo` would both write `debug/demo-hydrolysis`, last writer wins, and a
+/// fingerprint-fresh rebuild of the loser emits nothing, so `water package`
+/// would ship the other project's binary. Tagging the package keeps each
+/// project's binaries, libraries, and `cargo clean -p` scope distinct while
+/// staying stable across opens of the same root.
+#[must_use]
+pub fn generated_crate_name(
+    crate_name: &CrateName,
+    suffix: &str,
+    project_root: &Path,
+) -> CrateName {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(project_root.as_os_str().as_encoded_bytes());
+    crate_name.with_suffix(&format!("{suffix}-{}", hex::encode(&digest[..4])))
+}
+
+/// The bundle-helper binary a generated crate carries when its backend
+/// embeds CEF.
+///
+/// Derived from the generated package name for the same reason
+/// [`generated_crate_name`] exists: its uplifted `debug/<name>` binary in
+/// the shared Cargo target must be unique to its project.
+#[must_use]
+pub fn cef_helper_binary_name(package_name: &str) -> String {
+    format!("{package_name}-cef-helper")
+}
+
+/// Whether the generated manifests declare the CEF subprocess helper
+/// `[[bin]]` for an application whose linked browser engine is `engine`.
+///
+/// The helper exists to host CEF's subprocesses, so it is declared exactly
+/// when the application links the CEF engine crate — a `waterui-chromium`
+/// link alone still stages the CEF runtime but produces no helper. The
+/// build's `build_binary` call and the packaging lookup gate on this same
+/// predicate; widening it asks Cargo for a target the manifest never
+/// emitted (`error: no bin target named ...`).
+#[must_use]
+pub const fn declares_cef_helper(engine: Option<crate::project::ResolvedWebViewBackend>) -> bool {
+    matches!(engine, Some(crate::project::ResolvedWebViewBackend::Cef))
 }
 
 impl TryFrom<String> for CrateName {
@@ -375,7 +425,39 @@ impl PermissionKey {
 
 #[cfg(test)]
 mod tests {
-    use super::{AndroidPackageName, BundleIdentifier};
+    use std::path::Path;
+
+    use super::{AndroidPackageName, BundleIdentifier, CrateName, generated_crate_name};
+
+    /// Two projects that share a crate name (`water create demo` twice, a
+    /// copied project, two checkouts) generate identically suffixed crates —
+    /// and in the shared per-user Cargo target the uplifted profile-root
+    /// artifact is unhashed, so identical package names would overwrite each
+    /// other's binary. The root tag keeps them apart.
+    #[test]
+    fn generated_crate_names_carry_the_project_root_tag() {
+        let demo = CrateName::try_from("demo").expect("crate name");
+        let first = generated_crate_name(&demo, "hydrolysis", Path::new("/work/first/demo"));
+        let second = generated_crate_name(&demo, "hydrolysis", Path::new("/work/second/demo"));
+        assert_ne!(
+            first, second,
+            "same-named projects at different roots must not share a generated package name"
+        );
+        assert!(
+            first.as_str().starts_with("demo-hydrolysis-"),
+            "the tag appends to the conventional suffix name: {first}"
+        );
+        assert_eq!(
+            first,
+            generated_crate_name(&demo, "hydrolysis", Path::new("/work/first/demo")),
+            "the tag is stable across opens of one root"
+        );
+        assert_ne!(
+            first,
+            generated_crate_name(&demo, "gtk4", Path::new("/work/first/demo")),
+            "the suffix still separates a project's own generated crates"
+        );
+    }
 
     #[test]
     fn bundle_identifier_rejects_what_android_rejects() {

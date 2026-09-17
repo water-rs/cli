@@ -566,7 +566,7 @@ mod tests {
     };
     use crate::shell::Shell;
     use clap::Parser;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     // Only the non-Linux host test exercises this.
     #[cfg(not(target_os = "linux"))]
     use super::validate_backends_on_host;
@@ -666,7 +666,7 @@ mod tests {
             let checkout = crate::pinned_framework::checkout();
             let temp = tempfile::tempdir().expect("tempdir");
             let project_path = temp.path().join("web-app");
-            scaffold_web_project(&project_path, checkout.path(), "WaterUI App", "vanilla-ts").await;
+            scaffold_web_project(&project_path, &checkout, "WaterUI App", "vanilla-ts").await;
 
             assert!(project_path.join("web/package.json").exists());
             let water_toml =
@@ -713,9 +713,17 @@ mod tests {
                 .expect("bun run build runs");
             assert!(status.success(), "the branded frontend must build");
 
+            // The scaffold's `cargo check` compiles the pinned framework into
+            // a scratch target dir; pointing it under `target/` lets a nextest
+            // retry — and the next cached CI run — resume instead of
+            // restarting a cold graph every attempt.
             let status = smol::process::Command::new("cargo")
                 .arg("check")
                 .current_dir(&project_path)
+                .env(
+                    "CARGO_TARGET_DIR",
+                    Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures/cargo-target"),
+                )
                 .status()
                 .await
                 .expect("cargo check runs");
@@ -733,7 +741,7 @@ mod tests {
             let checkout = crate::pinned_framework::checkout();
             let temp = tempfile::tempdir().expect("tempdir");
             let project_path = temp.path().join("web-app");
-            scaffold_web_project(&project_path, checkout.path(), "WaterUI App", "react-ts").await;
+            scaffold_web_project(&project_path, &checkout, "WaterUI App", "react-ts").await;
 
             let app_tsx = project_path.join("web/src/App.tsx");
             assert!(app_tsx.is_file(), "react-ts scaffolds src/App.tsx");

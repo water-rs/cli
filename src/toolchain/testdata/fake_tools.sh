@@ -376,7 +376,15 @@ kotlinc)
     esac
     exit 0
     ;;
-cmake | meson | sccache | wasm-pack | sh | bash)
+sccache)
+    case "$*" in
+        --version | -version | -v)
+            printf 'sccache %s (waterui-test)\n' "${WATERUI_FAKE_SCCACHE_VERSION:-1.0.0}"
+            ;;
+    esac
+    exit 0
+    ;;
+cmake | meson | wasm-pack | sh | bash)
     case "$*" in
         --version | -version | -v)
             printf '%s 1.0.0 (waterui-test)\n' "$tool"

@@ -29,6 +29,7 @@ if not defined WATERUI_FAKE_CARGO_VERSION set "WATERUI_FAKE_CARGO_VERSION=1.95.0
 if not defined WATERUI_FAKE_XCODE_VERSION set "WATERUI_FAKE_XCODE_VERSION=16.4"
 if not defined WATERUI_FAKE_ADB_VERSION set "WATERUI_FAKE_ADB_VERSION=36.0.0-test"
 if not defined WATERUI_FAKE_KOTLINC_VERSION set "WATERUI_FAKE_KOTLINC_VERSION=0.0.0"
+if not defined WATERUI_FAKE_SCCACHE_VERSION set "WATERUI_FAKE_SCCACHE_VERSION=1.0.0"
 if not defined WATERUI_FAKE_UNAME_MACHINE set "WATERUI_FAKE_UNAME_MACHINE=x86_64"
 goto :dispatch
 
@@ -93,7 +94,7 @@ if /i "%tool%"=="javac" goto :exit_ok
 if /i "%tool%"=="kotlinc" goto :kotlinc
 if /i "%tool%"=="cmake" goto :simple_version
 if /i "%tool%"=="meson" goto :simple_version
-if /i "%tool%"=="sccache" goto :simple_version
+if /i "%tool%"=="sccache" goto :sccache
 if /i "%tool%"=="wasm-pack" goto :simple_version
 if /i "%tool%"=="sh" goto :simple_version
 if /i "%tool%"=="bash" goto :simple_version
@@ -321,6 +322,12 @@ exit /b 0
 
 :kotlinc
 if "%1"=="-version" (echo info: kotlinc-jvm %WATERUI_FAKE_KOTLINC_VERSION% (JRE 17.0.0) & exit /b 0)
+exit /b 0
+
+:sccache
+if "%1"=="--version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
+if "%1"=="-version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
+if "%1"=="-v" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
 exit /b 0
 
 :simple_version

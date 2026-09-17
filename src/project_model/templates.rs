@@ -490,7 +490,7 @@ impl TemplateContext {
     }
 
     const fn cef_runtime_enabled(&self) -> bool {
-        matches!(self.browser.engine, Some(ResolvedWebViewBackend::Cef))
+        crate::project_model::project_types::declares_cef_helper(self.browser.engine)
     }
 
     /// Set the exact `WaterUI` feature set used by a preview support runtime.
@@ -1072,7 +1072,14 @@ impl Esp32CargoTomlTemplate {
         .inline_toml();
 
         Ok(Self {
-            package_name: ctx.crate_name.with_suffix("esp32").to_string(),
+            package_name: crate::project_model::project_types::generated_crate_name(
+                &ctx.crate_name,
+                "esp32",
+                ctx.project_root_path
+                    .as_deref()
+                    .expect("ESP32 manifests are rendered for a project"),
+            )
+            .to_string(),
             app_crate_name: ctx.crate_name.to_string(),
             app_crate_path: ctx.project_root_relative_path(),
             dew_dependency,
@@ -1181,7 +1188,14 @@ mod tests {
     }
 
     fn app_ctx() -> TemplateContext {
-        ctx(None, None, None, crate::project::PackageType::App)
+        // Generated crate names tag the project root, so any template that
+        // renders one needs a root even when nothing else consumes it.
+        ctx(
+            None,
+            None,
+            Some(PathBuf::from("/tmp/test-app")),
+            crate::project::PackageType::App,
+        )
     }
 
     /// A local checkout without a `backends/android` Gradle project — the
@@ -2217,7 +2231,7 @@ mod tests {
             .as_array()
             .expect("CEF Hydrolysis manifest should declare binaries");
         assert!(bins.iter().any(|bin| {
-            bin["name"].as_str() == Some("waterui-cef-helper")
+            bin["name"].as_str() == Some("waterui-test-hydrolysis-cef-helper")
                 && bin["path"].as_str() == Some("src/bin/waterui-cef-helper.rs")
         }));
     }
@@ -2433,7 +2447,7 @@ mod tests {
             .as_array()
             .expect("CEF FFI companion should declare a helper binary");
         assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0]["name"].as_str(), Some("waterui-cef-helper"));
+        assert_eq!(bins[0]["name"].as_str(), Some("chromium-ffi-cef-helper"));
         assert_eq!(
             bins[0]["path"].as_str(),
             Some("src/bin/waterui-cef-helper.rs")
@@ -4064,7 +4078,7 @@ pub mod hydrolysis {
         }];
         if requires_cef(ctx) {
             bins.push(GeneratedBinSection {
-                name: "waterui-cef-helper".to_string(),
+                name: crate::project_model::project_types::cef_helper_binary_name(package_name),
                 path: "src/bin/waterui-cef-helper.rs".to_string(),
             });
         }
@@ -4966,7 +4980,9 @@ pub mod ffi {
         });
         if ctx.cef_runtime_enabled() {
             manifest.bin.push(Product {
-                name: Some("waterui-cef-helper".to_string()),
+                name: Some(crate::project_model::project_types::cef_helper_binary_name(
+                    package_name,
+                )),
                 path: Some("src/bin/waterui-cef-helper.rs".to_string()),
                 ..Default::default()
             });
@@ -5677,7 +5693,7 @@ pub mod inspector {
         #[ignore = "clones the pinned framework revision"]
         fn the_inspector_app_crate_path_exists() {
             let checkout = crate::pinned_framework::checkout();
-            let crate_path = checkout.path().join(super::INSPECTOR_APP_CRATE);
+            let crate_path = checkout.join(super::INSPECTOR_APP_CRATE);
             assert!(
                 crate_path.join("Cargo.toml").is_file(),
                 "inspector app crate is not at {}",

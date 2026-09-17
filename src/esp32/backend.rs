@@ -251,7 +251,16 @@ impl Esp32Backend {
             (None, None) => None,
         };
 
-        Ok(!manifest.dependencies.contains_key("waterui-dew")
+        // The generated package name carries the project-root tag — a
+        // manifest rendered before it did must be rewritten, or artifact
+        // lookups would go looking for the tagged name.
+        let package_name_matches = manifest
+            .package
+            .as_ref()
+            .is_some_and(|package| package.name == project.esp32_backend_crate_name().as_str());
+
+        Ok(!package_name_matches
+            || !manifest.dependencies.contains_key("waterui-dew")
             || !main_matches_panel
             || !main_matches_fonts
             || !cargo_target_matches

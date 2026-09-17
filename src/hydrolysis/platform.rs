@@ -28,7 +28,7 @@ use crate::{
 #[cfg(target_os = "macos")]
 use crate::{
     macos_bundle::{
-        MacOsUsageDescription, package_binary_as_app, package_cef_helper_app,
+        MacOsAppNames, MacOsUsageDescription, package_binary_as_app, package_cef_helper_app,
         sign_macos_app as sign_app,
     },
     project::BrowserRuntimePlan,
@@ -64,6 +64,15 @@ const fn hydrolysis_loader_search_path(platform: TargetPlatform) -> Option<&'sta
         TargetPlatform::Linux => Some("$ORIGIN"),
         _ => None,
     }
+}
+
+/// The CEF subprocess helper binary the generated hydrolysis crate declares.
+///
+/// `templates::hydrolysis` emits the helper `[[bin]]` under exactly this name
+/// — [`cef_helper_binary_name`] of the generated package — so the build and
+/// the packaging lookup must both resolve it through here.
+fn hydrolysis_cef_helper_name(backend_crate_name: &str) -> String {
+    crate::project_model::project_types::cef_helper_binary_name(backend_crate_name)
 }
 
 /// Build hydrolysis binary for the host platform.
@@ -164,6 +173,22 @@ pub async fn build_hydrolysis_with_envs_and_features(
         )
         .await
         .wrap_err("Failed to build hydrolysis backend with cargo")?;
+
+    // The generated manifest declares the CEF helper as a second `[[bin]]`
+    // when the application links the CEF engine crate; a `--bin <main>`
+    // build never emits it, so it needs its own build before packaging can
+    // bundle it. The gate is the manifest's own predicate — a
+    // `waterui-chromium` link alone declares no helper bin, and asking
+    // Cargo for it would fail with `no bin target`.
+    if project.declares_cef_helper().await? {
+        build
+            .build_binary(
+                &hydrolysis_cef_helper_name(project.hydrolysis_backend_crate_name().as_str()),
+                options.is_release(),
+            )
+            .await
+            .wrap_err("Failed to build the hydrolysis CEF helper with cargo")?;
+    }
 
     build
         .lib_output_dir(options.is_release())
@@ -360,33 +385,45 @@ pub async fn package_hydrolysis(
         }
     }
 
-    let runtime_dir = final_binary_path.parent().ok_or_else(|| {
-        eyre::eyre!(
-            "Hydrolysis binary path has no output directory: {}",
-            final_binary_path.display()
-        )
-    })?;
-    synchronize_shared_runtime(runtime_dir, shared_libraries.as_ref(), &platform.triple()).await?;
-    browser_runtime::stage(runtime_plan, platform, profile_directory, runtime_dir).await?;
+    // The shipped binary and everything `$ORIGIN` resolves beside it stage
+    // into the project's own managed backend directory — the shared Cargo
+    // profile directory would collide two same-named projects on
+    // `<profile>/<product>`.
+    let runtime_dir = crate::platforming::packaging::dist_dir(
+        &backend_path,
+        crate::browser_runtime::platform_name(platform)?,
+        Some(profile),
+    );
+    fs::create_dir_all(&runtime_dir).await?;
+    synchronize_shared_runtime(&runtime_dir, shared_libraries.as_ref(), &platform.triple()).await?;
+    browser_runtime::stage(runtime_plan, platform, profile_directory, &runtime_dir).await?;
+
+    // Ship the binary under the product name; the tagged Cargo artifact name
+    // is internal to the shared target directory.
+    let binary_name = project.hydrolysis_binary_name();
+    let shipped_name = if platform == TargetPlatform::Windows {
+        format!("{binary_name}.exe")
+    } else {
+        binary_name.to_string()
+    };
+    let packaged_binary = crate::platforming::packaging::stage_binary_as(
+        &final_binary_path,
+        &runtime_dir,
+        &shipped_name,
+    )
+    .await?;
 
     if platform == TargetPlatform::Linux {
-        let executable_name = final_binary_path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .ok_or_else(|| eyre::eyre!("Hydrolysis binary has no valid executable name"))?;
         crate::platforming::linux_share::write_linux_share_material(
             project,
             &project.manifest().package.name,
-            executable_name,
-            &backend_path.join("dist/share"),
+            binary_name.as_str(),
+            &runtime_dir.join("share"),
         )
         .await?;
     }
 
-    Ok(Artifact::new(
-        project.bundle_identifier(),
-        final_binary_path,
-    ))
+    Ok(Artifact::new(project.bundle_identifier(), packaged_binary))
 }
 
 #[cfg(target_os = "macos")]
@@ -411,7 +448,7 @@ async fn package_hydrolysis_macos(
     } else {
         app_name
     };
-    let dist_dir = backend_path.join("dist");
+    let dist_dir = crate::platforming::packaging::dist_dir(backend_path, "macos", None);
     fs::create_dir_all(&dist_dir).await?;
     let usage_descriptions = project
         .manifest()
@@ -431,7 +468,10 @@ async fn package_hydrolysis_macos(
     let app_path = package_binary_as_app(
         binary_path,
         project.bundle_identifier(),
-        &app_name,
+        MacOsAppNames {
+            app_name: &app_name,
+            executable_name: project.hydrolysis_binary_name().as_str(),
+        },
         &usage_descriptions,
         Some(&backend_path.join("resources")),
         &icns,
@@ -446,14 +486,21 @@ async fn package_hydrolysis_macos(
     .await?;
     browser_runtime::stage_macos_app(runtime_plan, profile_directory, &app_path.join("Contents"))
         .await?;
-    if runtime_plan.requires_cef() {
+    if project.declares_cef_helper().await? {
         let helper_binary = binary_path
             .parent()
             .expect("Hydrolysis application binary must have a profile directory")
-            .join("waterui-cef-helper");
+            .join(hydrolysis_cef_helper_name(
+                project.hydrolysis_backend_crate_name().as_str(),
+            ));
+        // The helper apps are named after the shipped executable, so they
+        // derive from the packaged copy — not the tagged Cargo artifact.
+        let main_binary = app_path
+            .join("Contents/MacOS")
+            .join(project.hydrolysis_binary_name().as_str());
         let _helper_apps = package_cef_helper_app(
             &app_path,
-            binary_path,
+            &main_binary,
             &helper_binary,
             project.bundle_identifier(),
         )
@@ -846,5 +893,99 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         Some("ico") => "image/x-icon",
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::{
+        framework::test_fixtures::stable_framework,
+        project::ResolvedWebViewBackend,
+        project_types::{BundleIdentifier, CrateName, declares_cef_helper},
+        templates::TemplateContext,
+    };
+
+    fn demo_context() -> TemplateContext {
+        TemplateContext::for_support_playground(
+            "Demo",
+            CrateName::try_from("demo").expect("crate name must be valid"),
+            BundleIdentifier::try_from("dev.waterui.demo").expect("bundle id must be valid"),
+            None,
+            &stable_framework(),
+            false,
+            None,
+        )
+    }
+
+    fn rendered_bin_names(ctx: &TemplateContext, package_name: &str) -> Vec<String> {
+        let cargo_toml = crate::templates::hydrolysis::rendered_outputs(ctx, package_name)
+            .expect("hydrolysis outputs should render")
+            .into_iter()
+            .find_map(|(path, content)| {
+                (path == Path::new("Cargo.toml"))
+                    .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
+            })
+            .expect("hydrolysis Cargo.toml output should exist");
+        cargo_toml
+            .parse::<toml::Table>()
+            .expect("hydrolysis Cargo.toml should parse")["bin"]
+            .as_array()
+            .expect("a hydrolysis manifest should declare binaries")
+            .iter()
+            .filter_map(|bin| bin["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// `package_hydrolysis_macos` locates the built helper under the name
+    /// [`super::hydrolysis_cef_helper_name`] returns; the generated manifest
+    /// declares the helper `[[bin]]` under `cef_helper_binary_name` of the
+    /// package. Pin the two together so a rename on either side fails here
+    /// instead of at packaging time on a user's machine.
+    #[test]
+    fn cef_helper_lookup_name_is_a_bin_the_manifest_declares() {
+        let ctx = demo_context()
+            .with_webview_enabled(true)
+            .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
+        let package_name = "demo-hydrolysis-deadbeef";
+        let bin_names = rendered_bin_names(&ctx, package_name);
+        let helper_name = super::hydrolysis_cef_helper_name(package_name);
+        assert!(
+            bin_names.contains(&helper_name),
+            "the helper the packager looks up must be a declared bin: {bin_names:?}"
+        );
+        assert!(
+            bin_names.contains(&package_name.to_string()),
+            "the main binary must remain declared too: {bin_names:?}"
+        );
+    }
+
+    /// The build compiles the helper under
+    /// [`crate::project_types::declares_cef_helper`] — the manifest's own
+    /// predicate — not `BrowserRuntimePlan::requires_cef`, which is wider:
+    /// a `waterui-chromium` link without a CEF engine still requires the CEF
+    /// runtime but declares no helper `[[bin]]`, and gating the build on the
+    /// wider predicate fails with Cargo's `no bin target`.
+    #[test]
+    fn chromium_without_the_cef_engine_declares_no_helper_bin() {
+        let package_name = "demo-hydrolysis-deadbeef";
+
+        // Chromium linked, no engine crate: the runtime plan requires CEF
+        // but the manifest declares only the main binary.
+        let ctx = demo_context().with_chromium_enabled(true);
+        assert_eq!(rendered_bin_names(&ctx, package_name), [package_name]);
+
+        // Chromium plus a non-CEF engine is the same shape.
+        let ctx = demo_context()
+            .with_chromium_enabled(true)
+            .with_browser_engine(Some(ResolvedWebViewBackend::Wpe));
+        assert_eq!(rendered_bin_names(&ctx, package_name), [package_name]);
+
+        // The predicate the build and packaging gates consult agrees with
+        // both renders — and still says yes for the CEF engine.
+        assert!(declares_cef_helper(Some(ResolvedWebViewBackend::Cef)));
+        assert!(!declares_cef_helper(Some(ResolvedWebViewBackend::Wpe)));
+        assert!(!declares_cef_helper(None));
     }
 }

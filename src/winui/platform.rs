@@ -198,12 +198,13 @@ pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::
         }
     };
 
-    let runtime_dir = final_binary_path.parent().ok_or_else(|| {
-        eyre::eyre!(
-            "WinUI binary path has no output directory: {}",
-            final_binary_path.display()
-        )
-    })?;
+    // The shipped binary and everything it resolves beside itself stage
+    // into the project's own managed backend directory — the shared Cargo
+    // profile directory would collide two same-named projects on
+    // `<profile>/<product>`.
+    let runtime_dir =
+        crate::platforming::packaging::dist_dir(&backend_path, "windows", Some(profile));
+    fs::create_dir_all(&runtime_dir).await?;
 
     // The runtime resolves bundled assets relative to the executable, so the
     // staged `resources/` directory must sit next to the produced binary.
@@ -213,18 +214,25 @@ pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::
     }
 
     if options.uses_shared_rust_runtime() {
-        RustDynamicLibraries::resolve(runtime_dir, &TargetPlatform::Windows.triple())
+        RustDynamicLibraries::resolve(&target_dir, &TargetPlatform::Windows.triple())
             .await?
-            .stage(runtime_dir)
+            .stage(&runtime_dir)
             .await?;
     } else {
-        RustDynamicLibraries::remove_staged(runtime_dir, &TargetPlatform::Windows.triple()).await?;
+        RustDynamicLibraries::remove_staged(&runtime_dir, &TargetPlatform::Windows.triple())
+            .await?;
     }
 
-    Ok(Artifact::new(
-        project.bundle_identifier(),
-        final_binary_path,
-    ))
+    // Ship the binary under the product name; the tagged Cargo artifact name
+    // is internal to the shared target directory.
+    let packaged_binary = crate::platforming::packaging::stage_binary_as(
+        &final_binary_path,
+        &runtime_dir,
+        &format!("{}.exe", project.winui_binary_name()),
+    )
+    .await?;
+
+    Ok(Artifact::new(project.bundle_identifier(), packaged_binary))
 }
 
 // ============================================================================

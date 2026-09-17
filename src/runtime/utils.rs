@@ -77,6 +77,21 @@ pub const fn sccache_install_hint() -> &'static str {
     }
 }
 
+/// Returns a platform-appropriate upgrade hint for an already-installed
+/// sccache that is too old — `install` is a no-op on an existing package.
+#[must_use]
+pub const fn sccache_upgrade_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew upgrade sccache"
+    } else if cfg!(target_os = "linux") {
+        "your distro package manager or cargo install sccache --force"
+    } else if cfg!(target_os = "windows") {
+        "winget upgrade Mozilla.sccache or cargo install sccache --force"
+    } else {
+        "cargo install sccache --force"
+    }
+}
+
 // Warn: You will lose stdout/stderr piping if you modify this function!
 pub(crate) fn command(command: &mut Command) -> &mut Command {
     command

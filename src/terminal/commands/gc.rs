@@ -33,6 +33,11 @@ struct BuildCacheArgs {
     /// Report what the managed build cache is holding without removing anything.
     #[arg(long)]
     dry_run: bool,
+
+    /// Remove the shared Cargo target directory (`~/.water/build_cache/target`)
+    /// now instead of waiting for the unused-days policy to collect it.
+    #[arg(long, conflicts_with = "dry_run")]
+    shared_target: bool,
 }
 
 /// Run the gc command.
@@ -47,6 +52,18 @@ async fn run_build_cache(shell: &Shell, args: BuildCacheArgs) -> Result<()> {
 
     if args.dry_run {
         return report_build_cache_usage(shell, &project_path).await;
+    }
+
+    if args.shared_target {
+        match water_dir::remove_shared_target_dir().await? {
+            Some(bytes) => success!(
+                shell,
+                "Removed the shared Cargo target directory ({} reclaimed)",
+                human_bytes(bytes)
+            ),
+            None => note!(shell, "No shared Cargo target directory exists"),
+        }
+        return Ok(());
     }
 
     header!(

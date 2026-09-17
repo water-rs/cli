@@ -138,7 +138,13 @@ pub async fn web_mount(
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> eyre::Result<Option<BundleMountMeta>> {
-    let rlib = build_host_rlib(project.root(), sccache_path, progress).await?;
+    let rlib = build_host_rlib(
+        project.root(),
+        &project.host_target_dir().await?,
+        sccache_path,
+        progress,
+    )
+    .await?;
     let symbols = ArtifactSymbols::read(&rlib)?;
     decode_web_mount(&symbols)
 }

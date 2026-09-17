@@ -392,7 +392,7 @@ async fn build_preview_dylib(
         }
         let build_start = Instant::now();
         let built_path = rust_build
-            .build_dylib(preview_crate_name.as_str(), false)
+            .build_dylib(false)
             .await
             .wrap_err("Failed to build dylib")?;
         prepare_preview_module_linkage(&built_path, link_mode, platform).await?;
