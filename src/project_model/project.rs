@@ -601,7 +601,7 @@ impl Project {
             .linked_packages
             .get_or_init(|| async move {
                 cargo_layout.await?;
-                resolve_linked_runtime_packages(project_root)
+                resolve_linked_runtime_packages(project_root, false)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -633,7 +633,7 @@ impl Project {
             .enabled_features
             .get_or_init(|| async move {
                 cargo_layout.await?;
-                resolve_enabled_features(project_root)
+                resolve_enabled_features(project_root, false)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -1958,7 +1958,11 @@ async fn resolve_cargo_layout(
 
 /// Run `cargo tree` for the application package rooted at `project_root`'s
 /// manifest, over the given edge kinds, and return the `{p}`-formatted tree.
-async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
+///
+/// `locked` passes `--locked` to the resolve: trees that are read-only input —
+/// the shared pinned-framework checkout — must fail loudly on a stale
+/// committed lockfile instead of letting cargo rewrite it in place.
+async fn cargo_tree(project_root: &Path, edges: &str, locked: bool) -> eyre::Result<String> {
     // `dunce`, not `std::fs::canonicalize`: on Windows the standard one returns
     // an extended-length path (`\\?\D:\...`), while `cargo metadata` reports the
     // plain one, so comparing the two never matched and the package below was
@@ -1969,10 +1973,12 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
     let application_manifest = dunce::canonicalize(project_root.join("Cargo.toml"))?;
     let metadata_manifest = application_manifest.clone();
     let metadata = unblock(move || {
-        cargo_metadata::MetadataCommand::new()
-            .no_deps()
-            .manifest_path(metadata_manifest)
-            .exec()
+        let mut command = cargo_metadata::MetadataCommand::new();
+        command.no_deps().manifest_path(metadata_manifest);
+        if locked {
+            command.other_options(vec!["--locked".to_string()]);
+        }
+        command.exec()
     })
     .await?;
     let root = metadata
@@ -1986,8 +1992,8 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
             )
         })?;
     let package_spec = root.id.to_string();
-    let output = Command::new("cargo")
-        .arg("tree")
+    let mut tree = Command::new("cargo");
+    tree.arg("tree")
         .arg("--manifest-path")
         .arg(&application_manifest)
         .arg("--package")
@@ -1998,9 +2004,11 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
         .arg("none")
         .arg("--format")
         .arg("{p}")
-        .current_dir(project_root)
-        .output()
-        .await?;
+        .current_dir(project_root);
+    if locked {
+        tree.arg("--locked");
+    }
+    let output = tree.output().await?;
     if !output.status.success() {
         return Err(eyre::eyre!(
             "failed to resolve runtime dependency graph for {}: {}",
@@ -2015,8 +2023,9 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
 
 async fn resolve_linked_runtime_packages(
     project_root: PathBuf,
+    locked: bool,
 ) -> eyre::Result<BTreeMap<String, String>> {
-    let tree = cargo_tree(&project_root, "normal").await?;
+    let tree = cargo_tree(&project_root, "normal", locked).await?;
     let mut linked = BTreeMap::new();
     for package in tree.lines() {
         let name = package
@@ -2033,8 +2042,11 @@ async fn resolve_linked_runtime_packages(
 /// features`, `cargo tree` reports each enabled feature as a
 /// `<package> feature "<name>"` node; only the names are kept, since the
 /// question asked of this set is always "is a feature named X enabled".
-async fn resolve_enabled_features(project_root: PathBuf) -> eyre::Result<BTreeSet<String>> {
-    let tree = cargo_tree(&project_root, "features").await?;
+async fn resolve_enabled_features(
+    project_root: PathBuf,
+    locked: bool,
+) -> eyre::Result<BTreeSet<String>> {
+    let tree = cargo_tree(&project_root, "features", locked).await?;
     let mut features = BTreeSet::new();
     for node in tree.lines() {
         if let Some(feature) = node
@@ -2633,6 +2645,7 @@ mod webview_backend_tests {
         let repository = crate::pinned_framework::checkout();
         let chromium = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/chromium"),
+            true,
         ))
         .expect("Chromium example runtime graph must resolve");
         assert!(
@@ -2661,6 +2674,7 @@ mod webview_backend_tests {
         );
         let chromium_features = smol::block_on(resolve_enabled_features(
             repository.join("examples/chromium"),
+            true,
         ))
         .expect("Chromium example feature graph must resolve");
         assert!(
@@ -2671,6 +2685,7 @@ mod webview_backend_tests {
 
         let webview = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/webview"),
+            true,
         ))
         .expect("WebView example runtime graph must resolve");
         assert!(
@@ -2679,6 +2694,7 @@ mod webview_backend_tests {
         );
         let webview_features = smol::block_on(resolve_enabled_features(
             repository.join("examples/webview"),
+            true,
         ))
         .expect("WebView example feature graph must resolve");
         assert!(
@@ -2696,6 +2712,7 @@ mod webview_backend_tests {
 
         let cef_webview = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/webview-cef"),
+            true,
         ))
         .expect("CEF WebView example runtime graph must resolve");
         assert!(
@@ -2722,6 +2739,7 @@ mod webview_backend_tests {
 
         let map = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/map"),
+            true,
         ))
         .expect("map example runtime graph must resolve");
         assert!(
@@ -2731,6 +2749,7 @@ mod webview_backend_tests {
 
         let webview = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/webview"),
+            true,
         ))
         .expect("WebView example runtime graph must resolve");
         assert!(
