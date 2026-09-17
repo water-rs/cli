@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use cargo_metadata::{Message, TargetKind};
+use cargo_metadata::TargetKind;
 use color_eyre::eyre::{Context as _, Result, bail};
 use object::read::archive::ArchiveFile;
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
@@ -216,13 +216,10 @@ pub async fn build_host_rlib(
         );
     }
 
-    for message in Message::parse_stream(output.stdout.as_slice()) {
-        let Message::CompilerArtifact(artifact) =
-            message.wrap_err("failed to parse cargo build message")?
-        else {
-            continue;
-        };
-        if artifact.manifest_path.as_std_path() != manifest_path
+    for artifact in crate::build::compiler_artifacts(&output.stdout)
+        .wrap_err("failed to parse cargo build messages")?
+    {
+        if !crate::build::same_manifest_path(artifact.manifest_path.as_std_path(), &manifest_path)
             || !artifact
                 .target
                 .kind

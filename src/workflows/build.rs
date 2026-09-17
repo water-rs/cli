@@ -1449,8 +1449,6 @@ pub(crate) fn reported_artifact(
     cargo_target: CargoTarget<'_>,
     artifact_extension: Option<&'static str>,
 ) -> Result<PathBuf, RustBuildError> {
-    use cargo_metadata::Message;
-
     let manifest_path = dunce::canonicalize(crate_dir.join("Cargo.toml")).map_err(|error| {
         RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
             "failed to canonicalize {}: {error}",
@@ -1458,17 +1456,77 @@ pub(crate) fn reported_artifact(
         )))
     })?;
     let mut artifacts = Vec::new();
-    for message in Message::parse_stream(stdout) {
-        let Ok(Message::CompilerArtifact(artifact)) = message else {
-            continue;
-        };
-        if artifact.manifest_path.as_std_path() == manifest_path
-            && cargo_target.matches(&artifact.target)
+    for artifact in compiler_artifacts(stdout)? {
+        if cargo_target.matches(&artifact.target)
+            && same_manifest_path(artifact.manifest_path.as_std_path(), &manifest_path)
         {
             artifacts.push(artifact);
         }
     }
     reported_artifact_file(&artifacts, cargo_target, artifact_extension, &manifest_path)
+}
+
+/// Every `compiler-artifact` message in a cargo `--message-format=json`
+/// stdout stream.
+///
+/// Cargo's report is the only record of what a build wrote, so a line naming
+/// itself `compiler-artifact` that does not deserialize is a hard error
+/// carrying the line — silently dropping it degrades into a misleading "no
+/// artifact reported" failure downstream. Messages with any other `reason`,
+/// and lines that are not cargo messages at all, are ignored.
+pub(crate) fn compiler_artifacts(
+    stdout: &[u8],
+) -> Result<Vec<cargo_metadata::Artifact>, RustBuildError> {
+    /// The one field that classifies a cargo message line.
+    #[derive(serde::Deserialize)]
+    struct Reason {
+        reason: String,
+    }
+
+    let mut artifacts = Vec::new();
+    for (index, line) in stdout.split(|byte| *byte == b'\n').enumerate() {
+        let Ok(line) = str::from_utf8(line) else {
+            continue;
+        };
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let malformed = |error: serde_json::Error| {
+            RustBuildError::FailToBuildRustLibrary(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cargo emitted a malformed `compiler-artifact` message on line {}: {error}\n{line}",
+                    index + 1
+                ),
+            ))
+        };
+        match serde_json::from_str::<Reason>(line) {
+            Ok(Reason { reason }) if reason == "compiler-artifact" => {
+                let artifact =
+                    serde_json::from_str::<cargo_metadata::Artifact>(line).map_err(malformed)?;
+                artifacts.push(artifact);
+            }
+            // A line that is not readable JSON cannot yield its `reason`
+            // field; one that still names itself a `compiler-artifact`
+            // carries an unreadable payload — the hard error, never a drop.
+            Err(error) if line.contains("\"reason\":\"compiler-artifact\"") => {
+                return Err(malformed(error));
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Ok(artifacts)
+}
+
+/// Whether a `manifest_path` cargo reported is `expected`, the manifest of
+/// the crate this build ran. Cargo reports the path in the spelling its own
+/// working directory carried — a verbatim `\\?\` or an 8.3 short-name root on
+/// Windows — so a lexical miss canonicalizes the reported path (it exists;
+/// cargo just built from it) before deciding.
+pub(crate) fn same_manifest_path(reported: &Path, expected: &Path) -> bool {
+    reported == expected
+        || dunce::canonicalize(reported).is_ok_and(|canonical| canonical == expected)
 }
 
 /// Picks the single file the selected target emitted out of its collected
@@ -1563,13 +1621,8 @@ fn reported_artifact_file(
 /// a different source's build, and the unhashed artifact it accompanies does
 /// not belong to this project.
 async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustBuildError> {
-    use cargo_metadata::Message;
-
     let mut stale = Vec::new();
-    for message in Message::parse_stream(stdout) {
-        let Ok(Message::CompilerArtifact(artifact)) = message else {
-            continue;
-        };
+    for artifact in compiler_artifacts(stdout)? {
         if !artifact.fresh {
             continue;
         }
@@ -2080,30 +2133,44 @@ mod tests {
         std::fs::create_dir_all(reported.parent().expect("deps dir")).expect("deps dir");
         std::fs::write(&reported, []).expect("reported artifact");
 
+        // The messages are serialized, never formatted: a `Path` must land in
+        // the JSON as an escaped string, which `display()` cannot do on
+        // Windows where paths carry backslashes.
         let artifact_json = |manifest: &std::path::Path, file: &std::path::Path, name: &str| {
-            format!(
-                concat!(
-                    r#"{{"reason":"compiler-artifact","package_id":"path+file:///x#{name}@0.1.0","#,
-                    r#""manifest_path":"{manifest}","target":{{"kind":["lib"],"crate_types":["lib"],"#,
-                    r#""name":"{name}","src_path":"/x/src/lib.rs","edition":"2021","doc":true,"#,
-                    r#""doctest":true,"test":true}},"profile":{{"opt_level":"0","debuginfo":0,"#,
-                    r#""debug_assertions":true,"overflow_checks":true,"test":false}},"features":[],"#,
-                    r#""filenames":["{file}"],"executable":null,"fresh":true}}"#,
-                ),
-                manifest = manifest.display(),
-                file = file.display(),
-                name = name,
-            )
+            serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": format!("path+file:///x#{name}@0.1.0"),
+                "manifest_path": manifest,
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "name": name,
+                    "src_path": manifest.parent().expect("manifest dir").join("src/lib.rs"),
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true,
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 0,
+                    "debug_assertions": true,
+                    "overflow_checks": true,
+                    "test": false,
+                },
+                "features": [],
+                "filenames": [file],
+                "executable": null,
+                "fresh": true,
+            })
+            .to_string()
         };
 
         let other_manifest = temporary.path().join("other").join("Cargo.toml");
+        let other_file = temporary.path().join("other.rlib");
         let stdout = format!(
             "{}\n{}\n",
-            artifact_json(
-                &other_manifest,
-                std::path::Path::new("/tmp/other.rlib"),
-                "other"
-            ),
+            artifact_json(&other_manifest, &other_file, "other"),
             artifact_json(&manifest, &reported, "demo_hydrolysis_deadbeef"),
         );
         let resolved = super::reported_artifact(
@@ -2115,11 +2182,7 @@ mod tests {
         .expect("the matching manifest's artifact resolves");
         assert_eq!(resolved, reported);
 
-        let foreign_only = artifact_json(
-            &other_manifest,
-            std::path::Path::new("/tmp/other.rlib"),
-            "other",
-        );
+        let foreign_only = artifact_json(&other_manifest, &other_file, "other");
         assert!(
             super::reported_artifact(
                 foreign_only.as_bytes(),
@@ -2151,19 +2214,33 @@ mod tests {
             std::fs::write(&manifest, "").expect("manifest");
 
             let artifact = |fresh: bool| {
-                format!(
-                    concat!(
-                        r#"{{"reason":"compiler-artifact","package_id":"path+file:///x#waterui-dylib@0.1.0","#,
-                        r#""manifest_path":"{manifest}","target":{{"kind":["lib"],"crate_types":["dylib"],"#,
-                        r#""name":"waterui_dylib","src_path":"/x/src/lib.rs","edition":"2021","doc":true,"#,
-                        r#""doctest":true,"test":true}},"profile":{{"opt_level":"0","debuginfo":0,"#,
-                        r#""debug_assertions":true,"overflow_checks":true,"test":false}},"features":[],"#,
-                        r#""filenames":["{file}"],"executable":null,"fresh":{fresh}}}"#,
-                    ),
-                    manifest = manifest.display(),
-                    file = dylib.display(),
-                    fresh = fresh,
-                )
+                serde_json::json!({
+                    "reason": "compiler-artifact",
+                    "package_id": "path+file:///x#waterui-dylib@0.1.0",
+                    "manifest_path": manifest,
+                    "target": {
+                        "kind": ["lib"],
+                        "crate_types": ["dylib"],
+                        "name": "waterui_dylib",
+                        "src_path": ours.join("src/lib.rs"),
+                        "edition": "2021",
+                        "doc": true,
+                        "doctest": true,
+                        "test": true,
+                    },
+                    "profile": {
+                        "opt_level": "0",
+                        "debuginfo": 0,
+                        "debug_assertions": true,
+                        "overflow_checks": true,
+                        "test": false,
+                    },
+                    "features": [],
+                    "filenames": [dylib],
+                    "executable": null,
+                    "fresh": fresh,
+                })
+                .to_string()
             };
             let dep_info = deps.join("waterui_dylib.d");
 
