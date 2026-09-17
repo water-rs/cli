@@ -209,6 +209,11 @@ impl Project {
     /// This is required because Android packaging is ABI-dependent (e.g., `x86_64` emulator vs
     /// `arm64-v8a` physical device).
     ///
+    /// `build_options` decides the Rust runtime linkage: a support app that
+    /// `dlopen`s `WaterUI` modules (the preview app) must pass
+    /// [`BuildOptions::with_dynamic_module_loading`] so the shared runtime is
+    /// built and packaged; a standalone app links it in.
+    ///
     /// # Errors
     /// Returns an error if building, packaging, or launching the Android app fails.
     pub async fn run_android_with_options<D: Device + AndroidAbiProvider>(
@@ -216,6 +221,7 @@ impl Project {
         _backend: &AndroidBackend,
         device: D,
         run_options: RunOptions,
+        build_options: BuildOptions,
         progress: Option<BuildProgress>,
     ) -> Result<Running, FailToRun> {
         let abi = device.android_abi();
@@ -228,7 +234,7 @@ impl Project {
             .await
             .map_err(FailToRun::Build)?;
 
-        let mut build_options = BuildOptions::development(BuildProfile::Debug);
+        let mut build_options = build_options;
         if let Some(progress) = &progress {
             build_options = build_options.with_progress(progress.clone());
         }
@@ -2180,6 +2186,15 @@ pub struct PermissionEntry {
 }
 
 impl PermissionEntry {
+    /// Create an enabled permission entry with the given rationale.
+    #[must_use]
+    pub fn enabled(description: impl Into<String>) -> Self {
+        Self {
+            enable: true,
+            description: description.into(),
+        }
+    }
+
     /// Check if this permission is enabled.
     #[must_use]
     pub const fn is_enabled(&self) -> bool {

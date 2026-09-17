@@ -143,6 +143,15 @@ rustup)
             printf '%s\n' "$last_arg" >> "$_st_tc"
             exit 0
             ;;
+        "toolchain list")
+            eval "_toolchains=\${WATERUI_FAKE_RUSTUP_TOOLCHAINS-}"
+            [ -n "$_toolchains" ] && printf '%s\n' "$_toolchains"
+            if [ -f "${WATERUI_FAKE_RESPONSES:-/nonexistent}/RUSTUP_TOOLCHAINS" ]; then
+                print_file "$WATERUI_FAKE_RESPONSES/RUSTUP_TOOLCHAINS"
+            fi
+            [ -f "$_st_tc" ] && print_file "$_st_tc"
+            exit 0
+            ;;
         "default "*)
             printf '%s\n' "$last_arg" >> "$_st_tc"
             printf '%s\n' "$last_arg" > "$_st_def"
@@ -168,7 +177,7 @@ rustup)
             printf '%s\n' "$last_arg" >> "$_st_tgt"
             exit 0
             ;;
-        "component list --installed"*)
+        "component list"*)
             eval "_components=\${WATERUI_FAKE_RUSTUP_INSTALLED_COMPONENTS-}"
             [ -n "$_components" ] && printf '%s\n' "$_components"
             if [ -f "${WATERUI_FAKE_RESPONSES:-/nonexistent}/RUSTUP_INSTALLED_COMPONENTS" ]; then
@@ -180,6 +189,15 @@ rustup)
         "component add "*)
             printf '%s\n' "$last_arg" >> "$_st_cmp"
             exit 0
+            ;;
+        "run "*)
+            # `rustup run <toolchain> <tool> <args…>` proxies to the named
+            # tool — dispatch to the sibling fake on this scratch PATH.
+            shift
+            shift
+            _run_tool="${0%/*}/$1"
+            shift
+            exec "$_run_tool" "$@"
             ;;
         --version | -V)
             echo "rustup 1.28.2 (waterui-test)"
