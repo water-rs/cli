@@ -4,7 +4,7 @@ use askama::Template;
 use eyre::{Context as _, Result, bail};
 
 use crate::backend::reinit_backend;
-use crate::build::{BuildOptions, BuildProfile, RustLinkage};
+use crate::build::{BuildOptions, BuildProfile, BuildProgress, RustLinkage};
 use crate::hydrolysis::backend::HydrolysisBackend;
 use crate::hydrolysis::platform::{
     build_hydrolysis_with_envs_and_features, built_hydrolysis_binary_path,
@@ -102,6 +102,8 @@ pub struct HydrolysisPreviewRequest<'a> {
     pub height: f32,
     /// `sccache` binary used for compilation caching, when available.
     pub sccache_path: Option<PathBuf>,
+    /// Sink compile progress is reported to while the preview build runs cargo.
+    pub progress: Option<BuildProgress>,
 }
 
 /// Render a preview via the managed Hydrolysis backend binary.
@@ -120,14 +122,18 @@ pub async fn render_preview_with_hydrolysis(
         width,
         height,
         sccache_path,
+        progress,
     } = request;
     let project = ensure_hydrolysis_backend_ready(project_path).await?;
     write_preview_bindings(&project, source, theme, None).await?;
-    stage_hydrolysis_resources(&project, theme, sccache_path.as_deref()).await?;
+    stage_hydrolysis_resources(&project, theme, sccache_path.as_deref(), progress.as_ref()).await?;
 
     let mut build_options = BuildOptions::development(BuildProfile::Debug);
     if let Some(sccache_path) = sccache_path {
         build_options = build_options.with_sccache(sccache_path);
+    }
+    if let Some(progress) = progress {
+        build_options = build_options.with_progress(progress);
     }
     build_hydrolysis_with_envs_and_features(
         &project,
@@ -164,14 +170,18 @@ pub async fn test_preview_with_hydrolysis(
         width,
         height,
         sccache_path,
+        progress,
     } = request;
     let project = ensure_hydrolysis_backend_ready(project_path).await?;
     write_preview_bindings(&project, source, theme, Some(automation_body)).await?;
-    stage_hydrolysis_resources(&project, theme, sccache_path.as_deref()).await?;
+    stage_hydrolysis_resources(&project, theme, sccache_path.as_deref(), progress.as_ref()).await?;
 
     let mut build_options = BuildOptions::development(BuildProfile::Debug);
     if let Some(sccache_path) = sccache_path {
         build_options = build_options.with_sccache(sccache_path);
+    }
+    if let Some(progress) = progress {
+        build_options = build_options.with_progress(progress);
     }
     build_hydrolysis_with_envs_and_features(
         &project,
@@ -200,12 +210,19 @@ pub async fn stage_hydrolysis_resources(
     project: &Project,
     theme: HydrolysisPreviewTheme,
     sccache_path: Option<&Path>,
+    progress: Option<&BuildProgress>,
 ) -> Result<()> {
     let resources_dir = project
         .backend_path::<HydrolysisBackend>()
         .join("resources");
-    let manifest =
-        assets::stage_project_assets_for_gtk(project, &resources_dir, sccache_path, false).await?;
+    let manifest = assets::stage_project_assets_for_gtk(
+        project,
+        &resources_dir,
+        sccache_path,
+        false,
+        progress,
+    )
+    .await?;
 
     let mut font_declarations = assets::scan_fonts(project).await?;
     font_declarations.extend(theme.font_declarations());

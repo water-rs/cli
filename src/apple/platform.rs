@@ -21,7 +21,7 @@ use crate::{
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
     assets::{self, ResolvedFont},
-    build::{BuildOptions, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
@@ -195,6 +195,9 @@ pub async fn build_rust_lib(
         .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
+    }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
     }
     build = build
         .with_env("PKG_CONFIG_ALLOW_CROSS", "1")
@@ -611,7 +614,14 @@ pub async fn package_apple(
 
     // Copy project assets and fonts
     let app_resources_dir = project_path.join(&backend.scheme);
-    copy_assets_and_fonts(project, &app_resources_dir, None, options.uses_dev_server()).await?;
+    copy_assets_and_fonts(
+        project,
+        &app_resources_dir,
+        None,
+        options.uses_dev_server(),
+        options.progress(),
+    )
+    .await?;
 
     let configuration = if options.is_debug() {
         "Debug"
@@ -859,10 +869,17 @@ async fn copy_assets_and_fonts(
     dest_dir: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     // Stage project assets using platform-native conventions.
-    let manifest =
-        assets::stage_project_assets_for_apple(project, dest_dir, sccache_path, dev_server).await?;
+    let manifest = assets::stage_project_assets_for_apple(
+        project,
+        dest_dir,
+        sccache_path,
+        dev_server,
+        progress,
+    )
+    .await?;
 
     // Scan and resolve dependency fonts
     let font_declarations = assets::scan_fonts(project).await?;

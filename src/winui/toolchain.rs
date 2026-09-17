@@ -15,6 +15,6 @@ impl Toolchain for WinUiToolchain {
     type Installation = <RustToolchain as Toolchain>::Installation;
 
     async fn check(&self, host: &Host) -> Result<(), ToolchainError<Self::Installation>> {
-        RustToolchain.check(host).await
+        RustToolchain::default().check(host).await
     }
 }

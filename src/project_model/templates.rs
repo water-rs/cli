@@ -1265,9 +1265,13 @@ mod tests {
     fn esp32_templates_are_chip_architecture_aware() {
         use crate::esp32::chip::Esp32Chip;
 
+        // `waterui-dew` is git-pinned — `stable` withholds it, so the
+        // firmware templates render against a `dev` resolution.
         let mut s3 = app_ctx();
+        s3.framework = dev_framework();
         s3.esp32 = Esp32TemplateEntry::new(Esp32Chip::Esp32S3, 410, 502, 16);
         let mut c3 = app_ctx();
+        c3.framework = dev_framework();
         c3.esp32 = Esp32TemplateEntry::new(Esp32Chip::Esp32C3, 200, 240, 16);
 
         // .cargo/config.toml: Xtensa per-chip triple vs RISC-V architecture triple.
@@ -1341,7 +1345,11 @@ mod tests {
         // `configure_environment!` installs, so every environment boundary the
         // CLI generates must go through it — previews, preview tests and
         // firmware alike.
-        let ctx = app_ctx().with_backend_project_path(PathBuf::from("managed_backends/hydrolysis"));
+        let mut ctx =
+            app_ctx().with_backend_project_path(PathBuf::from("managed_backends/hydrolysis"));
+        // The esp32 and gtk4 manifests resolve git-pinned scaffold packages
+        // `stable` withholds — the assertions below render them on `dev`.
+        ctx.framework = dev_framework();
 
         for relative in [
             "src/main.rs.tpl",
@@ -2041,8 +2049,11 @@ mod tests {
     }
 
     #[test]
-    fn gtk4_scaffold_uses_embedded_workspace_version() {
-        let ctx = app_ctx();
+    fn gtk4_scaffold_pins_the_declared_git_source() {
+        // `waterui-gtk` is git-pinned in the workspace manifest — `stable`
+        // withholds it, so the scaffold resolves the pin `dev` carries.
+        let mut ctx = app_ctx();
+        ctx.framework = dev_framework();
         let tempdir = tempdir().expect("temporary gtk scaffold dir");
 
         smol::block_on(crate::templates::gtk4::scaffold(
@@ -2055,16 +2066,24 @@ mod tests {
         let cargo_toml = std::fs::read_to_string(tempdir.path().join("Cargo.toml"))
             .expect("gtk4 Cargo.toml should be written");
         let manifest: toml::Value = toml::from_str(&cargo_toml).unwrap();
+        let gtk = &manifest["dependencies"]["waterui-gtk"];
         assert_eq!(
-            manifest["dependencies"]["waterui-gtk"]["version"].as_str(),
-            Some(pinned("waterui-gtk-version").as_str())
+            gtk["git"].as_str(),
+            Some(ctx.framework.scaffold_value("waterui-gtk-git"))
+        );
+        assert_eq!(
+            gtk["rev"].as_str(),
+            Some(ctx.framework.scaffold_value("waterui-gtk-rev"))
         );
         assert!(!cargo_toml.contains("webview-default"));
     }
 
     #[test]
     fn winui_scaffold_pins_the_backend_and_its_vendored_patch_to_one_source() {
-        let ctx = app_ctx();
+        // `waterui-winui` has no registry release — `stable` withholds it —
+        // so the scaffold resolves the pin `dev` carries.
+        let mut ctx = app_ctx();
+        ctx.framework = dev_framework();
         let manifest = crate::templates::winui::rendered_outputs(&ctx, "waterui-test-winui")
             .expect("winui outputs should render")
             .into_iter()
@@ -2075,7 +2094,7 @@ mod tests {
             .expect("winui Cargo.toml output should exist");
         let manifest: toml::Value = toml::from_str(&manifest).expect("winui manifest must parse");
 
-        let framework = stable_framework();
+        let framework = dev_framework();
         let backend = &manifest["dependencies"]["waterui-winui"];
         assert_eq!(
             backend["git"].as_str(),
@@ -2110,8 +2129,10 @@ mod tests {
     #[test]
     fn generated_native_backends_only_bridge_the_platform_engine_when_no_engine_is_linked() {
         // No engine crate in the graph: the backend bridges what the platform
-        // gives it.
-        let gtk_ctx = app_ctx().with_webview_enabled(true);
+        // gives it. `waterui-gtk` is git-pinned — `stable` withholds it — so
+        // the GTK scaffolds render against a `dev` resolution.
+        let mut gtk_ctx = app_ctx().with_webview_enabled(true);
+        gtk_ctx.framework = dev_framework();
         let tempdir = tempdir().expect("temporary gtk webview scaffold dir");
         smol::block_on(crate::templates::gtk4::scaffold(
             tempdir.path(),
@@ -2125,9 +2146,10 @@ mod tests {
 
         // An application that linked its own engine draws through that, so the
         // backend compiles no web engine at all.
-        let gtk_wpe_ctx = app_ctx()
+        let mut gtk_wpe_ctx = app_ctx()
             .with_webview_enabled(true)
             .with_browser_engine(Some(ResolvedWebViewBackend::Wpe));
+        gtk_wpe_ctx.framework = dev_framework();
         let gtk_wpe_manifest =
             crate::templates::gtk4::rendered_outputs(&gtk_wpe_ctx, "waterui-test-gtk-wpe")
                 .expect("GTK WPE outputs should render")
@@ -3482,9 +3504,16 @@ impl GeneratedDependencyDetail {
         }
     }
 
-    fn framework(ctx: &TemplateContext, name: &str) -> Self {
+    /// The dependency `name` — a scaffold package — resolves to on the
+    /// selected channel. A package the channel withholds (`stable`'s
+    /// git-pinned experimental set) is an error, not a panic: the check must
+    /// fire wherever a generated crate is rendered, not only at `create`.
+    fn framework(ctx: &TemplateContext, name: &str) -> io::Result<Self> {
+        ctx.framework
+            .require_distributable(name)
+            .map_err(io::Error::other)?;
         let dependency = ctx.framework.dependency(name);
-        Self {
+        Ok(Self {
             version: dependency.version.map(|version| version.to_string()),
             path: dependency.path,
             git: dependency.git,
@@ -3495,7 +3524,7 @@ impl GeneratedDependencyDetail {
             default_features: None,
             features: Vec::new(),
             optional: false,
-        }
+        })
     }
 
     fn path(path: &Path) -> Self {
@@ -3575,7 +3604,7 @@ fn generated_dependency_from_spec(
                 ..GeneratedDependencyDetail::default()
             }
         }
-        (None, _) => GeneratedDependencyDetail::framework(ctx, spec.crate_name),
+        (None, _) => GeneratedDependencyDetail::framework(ctx, spec.crate_name)?,
     };
 
     // Features the checkout's declared entry carries resolve exactly like a
@@ -5141,7 +5170,7 @@ pub mod root {
 
     /// Generate Cargo.toml programmatically using serde-compatible structs for type safety.
     async fn generate_cargo_toml(base_dir: &Path, ctx: &TemplateContext) -> io::Result<()> {
-        let waterui_dependency = waterui_dependency(ctx);
+        let waterui_dependency = waterui_dependency(ctx)?;
         let manifest = GeneratedCargoManifest {
             package: super::generated_package(ctx.crate_name.as_str(), vec![ctx.author.clone()]),
             lib: super::generated_lib(&["lib"]),
@@ -5171,14 +5200,12 @@ pub mod root {
         write_generated_cargo_toml(base_dir, super::render_generated_cargo_toml(&manifest)?).await
     }
 
-    fn waterui_dependency(ctx: &TemplateContext) -> GeneratedDependencyDetail {
-        ctx.waterui_path
-            .as_ref()
-            .map_or_else(
-                || GeneratedDependencyDetail::framework(ctx, "waterui"),
-                |waterui_path| GeneratedDependencyDetail::path(waterui_path),
-            )
-            .with_default_features(false)
+    fn waterui_dependency(ctx: &TemplateContext) -> io::Result<GeneratedDependencyDetail> {
+        let detail = ctx.waterui_path.as_ref().map_or_else(
+            || GeneratedDependencyDetail::framework(ctx, "waterui"),
+            |waterui_path| Ok(GeneratedDependencyDetail::path(waterui_path)),
+        )?;
+        Ok(detail.with_default_features(false))
     }
 
     fn native_target_section(
@@ -5336,7 +5363,7 @@ pub mod preview {
             dependencies.insert(
                 "waterui".to_string(),
                 SupportDependencyValue::Detailed(
-                    super::GeneratedDependencyDetail::framework(ctx, "waterui")
+                    super::GeneratedDependencyDetail::framework(ctx, "waterui")?
                         .with_default_features(false)
                         .into(),
                 ),
@@ -5344,7 +5371,7 @@ pub mod preview {
             dependencies.insert(
                 "waterui-preview".to_string(),
                 SupportDependencyValue::Detailed(
-                    super::GeneratedDependencyDetail::framework(ctx, "waterui-preview").into(),
+                    super::GeneratedDependencyDetail::framework(ctx, "waterui-preview")?.into(),
                 ),
             );
         }

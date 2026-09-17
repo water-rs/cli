@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 
+use crate::build::BuildProgress;
 use target_lexicon::{
     Aarch64Architecture, Architecture, DefaultToHost, Environment, OperatingSystem,
     Riscv32Architecture, Triple, Vendor,
@@ -69,6 +70,23 @@ pub enum TargetBackend {
     WinUi,
     /// Dew backend (embedded-first CPU renderer for ESP32-class chips)
     Dew,
+}
+
+impl TargetBackend {
+    /// The framework scaffold packages the backend's generated crate links —
+    /// the names a `framework.json` `scaffold` (or `experimental-packages`)
+    /// table keys on. A withheld package means the selected channel cannot
+    /// scaffold the backend at all.
+    #[must_use]
+    pub const fn scaffold_packages(&self) -> &'static [&'static str] {
+        match self {
+            Self::Apple | Self::Android => &[],
+            Self::Gtk4 => &["waterui-gtk"],
+            Self::Hydrolysis => &["hydrolysis", "hydrolysis-m3"],
+            Self::WinUi => &["waterui-winui"],
+            Self::Dew => &["waterui-dew"],
+        }
+    }
 }
 
 impl TargetPlatform {
@@ -307,6 +325,10 @@ pub struct PackageOptions {
 
     /// How `include_web!` mounts reach the packaged app.
     web_frontend: WebFrontendMode,
+
+    /// Sink compile progress is reported to while packaging runs cargo —
+    /// asset-manifest planning compiles the project rlib for its symbol table.
+    progress: Option<BuildProgress>,
 }
 
 /// Whether an `include_web!` mount is staged from a frontend build or served
@@ -334,6 +356,7 @@ impl PackageOptions {
             debug: true,
             shared_rust_runtime: true,
             web_frontend: WebFrontendMode::Stage,
+            progress: None,
         }
     }
 
@@ -345,6 +368,7 @@ impl PackageOptions {
             debug,
             shared_rust_runtime: false,
             web_frontend: WebFrontendMode::Stage,
+            progress: None,
         }
     }
 
@@ -388,6 +412,20 @@ impl PackageOptions {
     #[must_use]
     pub const fn uses_dev_server(&self) -> bool {
         matches!(self.web_frontend, WebFrontendMode::DevServer)
+    }
+
+    /// Attach a compile-progress sink the cargo invocations this packaging
+    /// pass performs report to.
+    #[must_use]
+    pub fn with_progress(mut self, progress: BuildProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// The compile-progress sink, when one is attached.
+    #[must_use]
+    pub const fn progress(&self) -> Option<&BuildProgress> {
+        self.progress.as_ref()
     }
 }
 

@@ -21,7 +21,7 @@ use crate::{
         toolchain::{AndroidNdk, AndroidSdk, Java, Kotlin, java_proxy_properties_from_env},
     },
     assets::{self, ResolvedFont},
-    build::{BuildOptions, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     platform::{PackageOptions, TargetPlatform},
     project::Project,
@@ -457,7 +457,14 @@ impl AndroidPlatform {
         let backend_path = project.backend_path::<AndroidBackend>();
 
         // Copy project assets and dependency fonts
-        copy_assets_and_fonts(project, &backend_path, None, options.uses_dev_server()).await?;
+        copy_assets_and_fonts(
+            project,
+            &backend_path,
+            None,
+            options.uses_dev_server(),
+            options.progress(),
+        )
+        .await?;
 
         let gradlew = backend_path.join(if cfg!(windows) {
             "gradlew.bat"
@@ -704,6 +711,9 @@ async fn configure_android_rust_build(
     }
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
+    }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
     }
     for (key, value) in &context.llvm_envs {
         build = build.with_env(key.clone(), value.clone());
@@ -1028,13 +1038,19 @@ async fn copy_assets_and_fonts(
     backend_path: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     let assets_dir = backend_path.join("app/src/main/assets");
 
     // Stage project assets using platform-native conventions.
-    let manifest =
-        assets::stage_project_assets_for_android(project, backend_path, sccache_path, dev_server)
-            .await?;
+    let manifest = assets::stage_project_assets_for_android(
+        project,
+        backend_path,
+        sccache_path,
+        dev_server,
+        progress,
+    )
+    .await?;
 
     // Scan and resolve dependency fonts
     let font_declarations = assets::scan_fonts(project).await?;

@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 
+pub mod cargo_helpers;
 pub mod cmake;
 pub mod doctor;
 pub mod host;
