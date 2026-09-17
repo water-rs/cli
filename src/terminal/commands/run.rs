@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 #[cfg(target_os = "macos")]
 use jiff::Timestamp;
 
-use super::detect_sccache_path;
+use super::{TargetBackend, detect_sccache_path};
 use crate::shell::Shell;
 use crate::{error, header, line, note, success, warn};
 use waterui_cli::toolchain_checks;
@@ -174,32 +174,6 @@ impl TargetPlatform {
             Self::Esp32p4 => Some(Esp32Chip::Esp32P4),
             _ => None,
         }
-    }
-}
-
-/// Target backend for running (how the app is built and rendered).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TargetBackend {
-    /// Apple backend (UIKit/AppKit).
-    Apple,
-    /// Android backend (Android Views).
-    Android,
-    /// GTK4 backend (Linux only, experimental).
-    Gtk4,
-    /// Hydrolysis backend (self-drawn renderer).
-    Hydrolysis,
-    /// `WinUI` backend (Windows only, experimental).
-    #[value(name = "winui")]
-    WinUi,
-    /// Dew backend (ESP32 firmware).
-    Dew,
-}
-
-impl TargetBackend {
-    /// Whether the backend is experimental — shipped without full testing
-    /// ahead of milestone releases — so selecting it asks for confirmation.
-    const fn is_experimental(self) -> bool {
-        matches!(self, Self::Gtk4 | Self::WinUi)
     }
 }
 
@@ -850,11 +824,11 @@ async fn build_run_config(
 
 /// Resolve the Cargo profile `water run` builds under.
 ///
-/// Self-drawn backends (Hydrolysis) spend their per-frame budget in the
-/// rendering stack, so a plain `water run` lifts the dev profile to a light
-/// optimization level rather than paying debug-code frame times. `--debug`
-/// opts back into a fully unoptimized build; `--release` and `--profiling`
-/// select the release profile without and with debug info.
+/// With no profile flag the backend's default development profile applies —
+/// the same default `water build` uses, so a run reuses the units an earlier
+/// build compiled into the shared target directory. `--debug` opts back into
+/// a fully unoptimized build; `--release` and `--profiling` select the
+/// release profile without and with debug info.
 const fn run_profile(args: &Args, backend: TargetBackend) -> BuildProfile {
     if args.release {
         BuildProfile::Release
@@ -862,10 +836,8 @@ const fn run_profile(args: &Args, backend: TargetBackend) -> BuildProfile {
         BuildProfile::Profiling
     } else if args.debug {
         BuildProfile::Debug
-    } else if matches!(backend, TargetBackend::Hydrolysis) {
-        BuildProfile::Optimized
     } else {
-        BuildProfile::Debug
+        backend.lib_backend().default_development_profile()
     }
 }
 
@@ -1961,12 +1933,69 @@ fn handle_device_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendAvailability, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend,
+        Args, BackendAvailability, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend,
         TargetPlatform, device_choice, handle_device_event, parse_env_assignment,
         prompt_for_device, resolve_backend, resolve_default_backend_for_project, resolve_platform,
-        validate_desktop_backend_platform_on_host, validate_device_arg,
+        run_profile, validate_desktop_backend_platform_on_host, validate_device_arg,
     };
+    use clap::Parser as _;
+    use waterui_cli::build::BuildProfile;
     use waterui_cli::device::{ApplicationExit, DeviceEvent, Local};
+
+    /// The run `Args` wrapped in a `Parser` so tests can exercise the real
+    /// flag surface instead of constructing the clap struct field by field.
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn run_args(argv: &[&str]) -> Args {
+        let mut full = vec!["water-run"];
+        full.extend_from_slice(argv);
+        TestCli::try_parse_from(full).expect("run args parse").args
+    }
+
+    #[test]
+    fn run_profile_defaults_to_backend_development_profile() {
+        // `water run` and `water build` share the generated crates' Cargo
+        // target directory; if their flag-free defaults ever disagree, every
+        // dependency unit re-fingerprints and the run cold-compiles the whole
+        // graph (nightly "Fresh user / Windows" timeout).
+        use clap::ValueEnum;
+        let args = run_args(&[]);
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                run_profile(&args, *backend),
+                backend.lib_backend().default_development_profile(),
+                "{backend:?} flag-free profile drifted from the backend default"
+            );
+        }
+        assert_eq!(
+            run_profile(&args, TargetBackend::Hydrolysis),
+            BuildProfile::Optimized
+        );
+        assert_eq!(
+            run_profile(&args, TargetBackend::Apple),
+            BuildProfile::Debug
+        );
+    }
+
+    #[test]
+    fn run_profile_flags_override_the_default() {
+        assert_eq!(
+            run_profile(&run_args(&["--debug"]), TargetBackend::Hydrolysis),
+            BuildProfile::Debug
+        );
+        assert_eq!(
+            run_profile(&run_args(&["--release"]), TargetBackend::Hydrolysis),
+            BuildProfile::Release
+        );
+        assert_eq!(
+            run_profile(&run_args(&["--profiling"]), TargetBackend::Hydrolysis),
+            BuildProfile::Profiling
+        );
+    }
 
     #[test]
     fn only_gtk4_and_winui_are_experimental() {

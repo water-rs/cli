@@ -425,7 +425,7 @@ pub enum BuildProfile {
     #[default]
     Debug,
     /// The `dev` profile lifted to a light optimization level with full debug
-    /// info — the `water run` default for self-drawn backends, whose
+    /// info — the development default for self-drawn backends, whose
     /// per-frame cost sits in rendering dependencies rather than in app code.
     Optimized,
     /// The `release` profile at full speed optimization, without debug info.

@@ -2,14 +2,58 @@
 
 use std::path::PathBuf;
 
+use clap::ValueEnum;
 use dialoguer::{Confirm, theme::ColorfulTheme};
 
 use crate::shell::Shell;
 use crate::{note, warn};
 use waterui_cli::{
+    platform::TargetBackend as LibTargetBackend,
     toolchain::{Host, sccache::Sccache},
     utils::sccache_install_hint,
 };
+
+/// Target backend (how the app is built and rendered).
+///
+/// Shared by every command that takes `--backend`; commands accepting a
+/// narrower or wider set (`water package` has no ESP32 firmware backend,
+/// `water clean` adds `all`) define their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TargetBackend {
+    /// Apple backend (UIKit/AppKit).
+    Apple,
+    /// Android backend (Android Views).
+    Android,
+    /// GTK4 backend (Linux only, experimental).
+    Gtk4,
+    /// Hydrolysis backend (self-drawn renderer).
+    Hydrolysis,
+    /// `WinUI` backend (Windows only, experimental).
+    #[value(name = "winui")]
+    WinUi,
+    /// Dew backend (ESP32 firmware).
+    Dew,
+}
+
+impl TargetBackend {
+    /// Whether the backend is experimental — shipped without full testing
+    /// ahead of milestone releases — so selecting it asks for confirmation.
+    pub const fn is_experimental(self) -> bool {
+        matches!(self, Self::Gtk4 | Self::WinUi)
+    }
+
+    /// The library backend enum this CLI value selects.
+    pub const fn lib_backend(self) -> LibTargetBackend {
+        match self {
+            Self::Apple => LibTargetBackend::Apple,
+            Self::Android => LibTargetBackend::Android,
+            Self::Gtk4 => LibTargetBackend::Gtk4,
+            Self::Hydrolysis => LibTargetBackend::Hydrolysis,
+            Self::WinUi => LibTargetBackend::WinUi,
+            Self::Dew => LibTargetBackend::Dew,
+        }
+    }
+}
 
 /// Whether the host environment permits routing builds through `sccache`.
 fn sccache_allowed(host: &Host) -> bool {

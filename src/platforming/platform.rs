@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use crate::build::BuildProgress;
+use crate::build::{BuildProfile, BuildProgress};
 use target_lexicon::{
     Aarch64Architecture, Architecture, DefaultToHost, Environment, OperatingSystem,
     Riscv32Architecture, Triple, Vendor,
@@ -85,6 +85,25 @@ impl TargetBackend {
             Self::Hydrolysis => &["hydrolysis", "hydrolysis-m3"],
             Self::WinUi => &["waterui-winui"],
             Self::Dew => &["waterui-dew"],
+        }
+    }
+
+    /// The [`BuildProfile`] a development `water build` or `water run` uses
+    /// for this backend when the user passes no profile flag.
+    ///
+    /// Self-drawn backends spend their per-frame budget in the rendering
+    /// stack, so a Hydrolysis development build lifts the `dev` profile to a
+    /// light optimization level rather than paying debug-code frame times;
+    /// every other backend builds the declared `dev` profile. The two
+    /// commands must agree on this default: generated backend crates share
+    /// one Cargo target directory, and a profile mismatch re-fingerprints
+    /// every dependency unit — the build's artifacts then warm nothing the
+    /// run reuses.
+    #[must_use]
+    pub const fn default_development_profile(&self) -> BuildProfile {
+        match self {
+            Self::Hydrolysis => BuildProfile::Optimized,
+            _ => BuildProfile::Debug,
         }
     }
 }
