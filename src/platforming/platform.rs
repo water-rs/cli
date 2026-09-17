@@ -72,6 +72,23 @@ pub enum TargetBackend {
     Dew,
 }
 
+impl TargetBackend {
+    /// The framework scaffold packages the backend's generated crate links —
+    /// the names a `framework.json` `scaffold` (or `experimental-packages`)
+    /// table keys on. A withheld package means the selected channel cannot
+    /// scaffold the backend at all.
+    #[must_use]
+    pub const fn scaffold_packages(&self) -> &'static [&'static str] {
+        match self {
+            Self::Apple | Self::Android => &[],
+            Self::Gtk4 => &["waterui-gtk"],
+            Self::Hydrolysis => &["hydrolysis", "hydrolysis-m3"],
+            Self::WinUi => &["waterui-winui"],
+            Self::Dew => &["waterui-dew"],
+        }
+    }
+}
+
 impl TargetPlatform {
     /// Get the target triple for this platform.
     ///
