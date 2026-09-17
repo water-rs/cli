@@ -66,6 +66,20 @@ pub fn cef_helper_binary_name(package_name: &str) -> String {
     format!("{package_name}-cef-helper")
 }
 
+/// Whether the generated manifests declare the CEF subprocess helper
+/// `[[bin]]` for an application whose linked browser engine is `engine`.
+///
+/// The helper exists to host CEF's subprocesses, so it is declared exactly
+/// when the application links the CEF engine crate — a `waterui-chromium`
+/// link alone still stages the CEF runtime but produces no helper. The
+/// build's `build_binary` call and the packaging lookup gate on this same
+/// predicate; widening it asks Cargo for a target the manifest never
+/// emitted (`error: no bin target named ...`).
+#[must_use]
+pub const fn declares_cef_helper(engine: Option<crate::project::ResolvedWebViewBackend>) -> bool {
+    matches!(engine, Some(crate::project::ResolvedWebViewBackend::Cef))
+}
+
 impl TryFrom<String> for CrateName {
     type Error = String;
 

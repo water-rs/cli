@@ -761,6 +761,27 @@ impl Project {
         }
     }
 
+    /// Whether the generated backend manifests declare the CEF subprocess
+    /// helper `[[bin]]`.
+    ///
+    /// This is the manifest's own predicate: the helper exists only when the
+    /// application links the CEF engine crate, while a `waterui-chromium`
+    /// link alone does not declare it. Builds and packaging that touch the
+    /// helper must gate on this rather than
+    /// [`BrowserRuntimePlan::requires_cef`], which is wider — it also turns
+    /// on for chromium — and would request a bin target Cargo never
+    /// received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Cargo metadata cannot be resolved or the
+    /// application links two engines at once.
+    pub async fn declares_cef_helper(&self) -> eyre::Result<bool> {
+        Ok(crate::project_types::declares_cef_helper(
+            self.linked_browser_engine().await?,
+        ))
+    }
+
     /// Resolves and validates every embedded browser runtime linked by the application.
     ///
     /// # Errors

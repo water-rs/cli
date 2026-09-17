@@ -490,7 +490,7 @@ impl TemplateContext {
     }
 
     const fn cef_runtime_enabled(&self) -> bool {
-        matches!(self.browser.engine, Some(ResolvedWebViewBackend::Cef))
+        crate::project_model::project_types::declares_cef_helper(self.browser.engine)
     }
 
     /// Set the exact `WaterUI` feature set used by a preview support runtime.

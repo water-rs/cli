@@ -175,13 +175,12 @@ pub async fn build_hydrolysis_with_envs_and_features(
         .wrap_err("Failed to build hydrolysis backend with cargo")?;
 
     // The generated manifest declares the CEF helper as a second `[[bin]]`
-    // when the application graph selects CEF; a `--bin <main>` build never
-    // emits it, so it needs its own build before packaging can bundle it.
-    if project
-        .browser_runtime_plan(platform, crate::platform::TargetBackend::Hydrolysis)
-        .await?
-        .requires_cef()
-    {
+    // when the application links the CEF engine crate; a `--bin <main>`
+    // build never emits it, so it needs its own build before packaging can
+    // bundle it. The gate is the manifest's own predicate — a
+    // `waterui-chromium` link alone declares no helper bin, and asking
+    // Cargo for it would fail with `no bin target`.
+    if project.declares_cef_helper().await? {
         build
             .build_binary(
                 &hydrolysis_cef_helper_name(project.hydrolysis_backend_crate_name().as_str()),
@@ -483,7 +482,7 @@ async fn package_hydrolysis_macos(
     .await?;
     browser_runtime::stage_macos_app(runtime_plan, profile_directory, &app_path.join("Contents"))
         .await?;
-    if runtime_plan.requires_cef() {
+    if project.declares_cef_helper().await? {
         let helper_binary = binary_path
             .parent()
             .expect("Hydrolysis application binary must have a profile directory")
@@ -900,18 +899,12 @@ mod tests {
     use crate::{
         framework::test_fixtures::stable_framework,
         project::ResolvedWebViewBackend,
-        project_types::{BundleIdentifier, CrateName},
+        project_types::{BundleIdentifier, CrateName, declares_cef_helper},
         templates::TemplateContext,
     };
 
-    /// `package_hydrolysis_macos` locates the built helper under the name
-    /// [`super::hydrolysis_cef_helper_name`] returns; the generated manifest
-    /// declares the helper `[[bin]]` under `cef_helper_binary_name` of the
-    /// package. Pin the two together so a rename on either side fails here
-    /// instead of at packaging time on a user's machine.
-    #[test]
-    fn cef_helper_lookup_name_is_a_bin_the_manifest_declares() {
-        let ctx = TemplateContext::for_support_playground(
+    fn demo_context() -> TemplateContext {
+        TemplateContext::for_support_playground(
             "Demo",
             CrateName::try_from("demo").expect("crate name must be valid"),
             BundleIdentifier::try_from("dev.waterui.demo").expect("bundle id must be valid"),
@@ -920,10 +913,10 @@ mod tests {
             false,
             None,
         )
-        .with_webview_enabled(true)
-        .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
-        let package_name = "demo-hydrolysis-deadbeef";
-        let cargo_toml = crate::templates::hydrolysis::rendered_outputs(&ctx, package_name)
+    }
+
+    fn rendered_bin_names(ctx: &TemplateContext, package_name: &str) -> Vec<String> {
+        let cargo_toml = crate::templates::hydrolysis::rendered_outputs(ctx, package_name)
             .expect("hydrolysis outputs should render")
             .into_iter()
             .find_map(|(path, content)| {
@@ -931,23 +924,64 @@ mod tests {
                     .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
             })
             .expect("hydrolysis Cargo.toml output should exist");
-        let manifest = cargo_toml
+        cargo_toml
             .parse::<toml::Table>()
-            .expect("hydrolysis Cargo.toml should parse");
-        let bin_names = manifest["bin"]
+            .expect("hydrolysis Cargo.toml should parse")["bin"]
             .as_array()
-            .expect("a CEF hydrolysis manifest should declare binaries")
+            .expect("a hydrolysis manifest should declare binaries")
             .iter()
-            .filter_map(|bin| bin["name"].as_str())
-            .collect::<Vec<_>>();
+            .filter_map(|bin| bin["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// `package_hydrolysis_macos` locates the built helper under the name
+    /// [`super::hydrolysis_cef_helper_name`] returns; the generated manifest
+    /// declares the helper `[[bin]]` under `cef_helper_binary_name` of the
+    /// package. Pin the two together so a rename on either side fails here
+    /// instead of at packaging time on a user's machine.
+    #[test]
+    fn cef_helper_lookup_name_is_a_bin_the_manifest_declares() {
+        let ctx = demo_context()
+            .with_webview_enabled(true)
+            .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
+        let package_name = "demo-hydrolysis-deadbeef";
+        let bin_names = rendered_bin_names(&ctx, package_name);
         let helper_name = super::hydrolysis_cef_helper_name(package_name);
         assert!(
-            bin_names.contains(&helper_name.as_str()),
+            bin_names.contains(&helper_name),
             "the helper the packager looks up must be a declared bin: {bin_names:?}"
         );
         assert!(
-            bin_names.contains(&package_name),
+            bin_names.contains(&package_name.to_string()),
             "the main binary must remain declared too: {bin_names:?}"
         );
+    }
+
+    /// The build compiles the helper under
+    /// [`crate::project_types::declares_cef_helper`] — the manifest's own
+    /// predicate — not `BrowserRuntimePlan::requires_cef`, which is wider:
+    /// a `waterui-chromium` link without a CEF engine still requires the CEF
+    /// runtime but declares no helper `[[bin]]`, and gating the build on the
+    /// wider predicate fails with Cargo's `no bin target`.
+    #[test]
+    fn chromium_without_the_cef_engine_declares_no_helper_bin() {
+        let package_name = "demo-hydrolysis-deadbeef";
+
+        // Chromium linked, no engine crate: the runtime plan requires CEF
+        // but the manifest declares only the main binary.
+        let ctx = demo_context().with_chromium_enabled(true);
+        assert_eq!(rendered_bin_names(&ctx, package_name), [package_name]);
+
+        // Chromium plus a non-CEF engine is the same shape.
+        let ctx = demo_context()
+            .with_chromium_enabled(true)
+            .with_browser_engine(Some(ResolvedWebViewBackend::Wpe));
+        assert_eq!(rendered_bin_names(&ctx, package_name), [package_name]);
+
+        // The predicate the build and packaging gates consult agrees with
+        // both renders — and still says yes for the CEF engine.
+        assert!(declares_cef_helper(Some(ResolvedWebViewBackend::Cef)));
+        assert!(!declares_cef_helper(Some(ResolvedWebViewBackend::Wpe)));
+        assert!(!declares_cef_helper(None));
     }
 }
