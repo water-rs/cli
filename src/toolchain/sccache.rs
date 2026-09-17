@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use eyre::WrapErr as _;
 use smol::process::Command;
 
 use crate::{
@@ -36,16 +37,31 @@ use crate::{
 /// ≥ 0.9.0 prefers it when both are set; the port is still set unconditionally
 /// because older builds ignore the socket variable entirely and would fall
 /// back to the shared default address.
-pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) {
-    for (key, value) in compilation_cache_env(sccache_path) {
+/// # Errors
+/// Returns an error when the socket directory under the user's Water home
+/// cannot be created or exists with permissions wider than `0700`.
+pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) -> eyre::Result<()> {
+    for (key, value) in compilation_cache_env(sccache_path)? {
         command.env(key, value);
     }
+    Ok(())
 }
 
 /// The environment a compile command needs for per-user sccache routing, as
 /// `(key, value)` pairs so the whole contract is observable without spawning
 /// a process.
-fn compilation_cache_env(sccache_path: &Path) -> Vec<(&'static str, OsString)> {
+fn compilation_cache_env(sccache_path: &Path) -> eyre::Result<Vec<(&'static str, OsString)>> {
+    let water_home = crate::project_model::water_dir::water_home_dir().ok();
+    compilation_cache_env_in(sccache_path, water_home.as_deref())
+}
+
+/// `compilation_cache_env` with the Water home supplied — tests inject a
+/// scratch directory so the contract is observable without touching the real
+/// `~/.water` or depending on the machine's home-path length.
+fn compilation_cache_env_in(
+    sccache_path: &Path,
+    #[cfg_attr(not(unix), allow(unused))] water_home: Option<&Path>,
+) -> eyre::Result<Vec<(&'static str, OsString)>> {
     let mut env = vec![
         ("RUSTC_WRAPPER", sccache_path.as_os_str().to_os_string()),
         (
@@ -54,10 +70,10 @@ fn compilation_cache_env(sccache_path: &Path) -> Vec<(&'static str, OsString)> {
         ),
     ];
     #[cfg(unix)]
-    if let Some(socket) = server_socket_path() {
+    if let Some(socket) = water_home.map(server_socket_path_in).transpose()?.flatten() {
         env.push(("SCCACHE_SERVER_UDS", socket.into_os_string()));
     }
-    env
+    Ok(env)
 }
 
 /// `sun_path` is 108 bytes on Linux and 104 on macOS/BSD, including the
@@ -65,24 +81,52 @@ fn compilation_cache_env(sccache_path: &Path) -> Vec<(&'static str, OsString)> {
 #[cfg(unix)]
 const MAX_SUN_PATH_BYTES: usize = 103;
 
-/// The unix socket a per-user sccache server listens on, under the invoking
-/// user's own `~/.water` so no other account can reach — or be reached by —
-/// it. `None` when the home directory cannot be resolved or created, or when
-/// the path would not fit `sun_path`: a socket that cannot bind is no
-/// fallback at all, so only the per-user port is offered then.
+/// The unix socket a per-user sccache server listens on, under a dedicated
+/// `0700` directory in the invoking user's Water home so no other account can
+/// reach — or be reached by — it. `Ok(None)` when the path would not fit
+/// `sun_path`: a socket that cannot bind is no fallback at all, so only the
+/// per-user port is offered then.
+///
+/// # Errors
+/// Returns an error when the socket directory cannot be created, or exists
+/// with permissions wider than `0700` — sccache's server runs compile jobs
+/// under its owner's identity with no authentication, so a socket another
+/// account could traverse to is not an isolation mechanism and the build must
+/// not silently fall back to the shared-address exposure.
 #[cfg(unix)]
-fn server_socket_path() -> Option<PathBuf> {
-    let water_home = crate::project_model::water_dir::water_home_dir().ok()?;
-    server_socket_path_in(&water_home)
+fn server_socket_path_in(water_home: &Path) -> eyre::Result<Option<PathBuf>> {
+    let socket_dir = water_home.join("sccache");
+    ensure_private_socket_dir(&socket_dir)?;
+    let socket = socket_dir.join("server.sock");
+    Ok((socket.as_os_str().len() <= MAX_SUN_PATH_BYTES).then_some(socket))
 }
 
-/// `water_home` resolved: the socket under it, when the directory can be
-/// created and the resulting path can actually be bound.
+/// Create `dir` mode `0700`, or verify an existing one is that private. A
+/// wider directory fails loudly: the socket inside is how one account would
+/// submit compile jobs to another user's server, so narrowing the check to a
+/// warning would leave the door it exists to close.
 #[cfg(unix)]
-fn server_socket_path_in(water_home: &Path) -> Option<PathBuf> {
-    std::fs::create_dir_all(water_home).ok()?;
-    let socket = water_home.join("sccache-server.sock");
-    (socket.as_os_str().len() <= MAX_SUN_PATH_BYTES).then_some(socket)
+fn ensure_private_socket_dir(dir: &Path) -> eyre::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(dir)
+        .wrap_err_with(|| format!("Failed to create sccache socket dir {}", dir.display()))?;
+    let mode = std::fs::metadata(dir)
+        .wrap_err_with(|| format!("Failed to stat sccache socket dir {}", dir.display()))?
+        .mode()
+        & 0o777;
+    eyre::ensure!(
+        mode.trailing_zeros() >= 6,
+        "sccache socket dir {} has mode {mode:o}, wider than 0700 — other local \
+         accounts could submit compile jobs to this user's sccache server. \
+         Tighten it with `chmod 700 {}`.",
+        dir.display(),
+        dir.display()
+    );
+    Ok(())
 }
 
 /// A deterministic per-user TCP port for the sccache server, in the
@@ -110,7 +154,10 @@ fn port_for_identity(identity: &str) -> u16 {
 /// The machine-unique identity of the invoking user. Hashing the user *name*
 /// instead would let two accounts share a port — `ayy` and `cad` both
 /// produced 46119 — and a name that cannot be read would pin every such
-/// machine to one port. The uid cannot collide and cannot be absent.
+/// machine to one port. The uid is always present and distinct per account;
+/// the FNV-1a reduction into 9151 slots can still map two uids to one port —
+/// rare, and it re-shares a server rather than failing, so it is worth
+/// keeping the identity as distinct as the OS makes possible.
 #[cfg(unix)]
 fn user_identity() -> String {
     nix::unistd::getuid().to_string()
@@ -412,7 +459,7 @@ mod host_tests {
     use std::path::Path;
 
     use super::{
-        Sccache, SccacheInstallation, compilation_cache_env, per_user_server_port,
+        Sccache, SccacheInstallation, compilation_cache_env_in, per_user_server_port,
         port_for_identity,
     };
     use crate::toolchain::testing::TestMachine;
@@ -482,10 +529,15 @@ mod host_tests {
 
     /// The environment contract: `RUSTC_WRAPPER` routes compiles through
     /// sccache, the port is always set — sccache < 0.9.0 knows nothing else —
-    /// and unix additionally gets the socket that newer builds prefer.
+    /// and unix additionally gets the socket that newer builds prefer. The
+    /// Water home is injected so the test never touches the real `~/.water`
+    /// or depends on this machine's home-path length.
     #[test]
     fn compilation_cache_env_sets_wrapper_port_and_unix_socket() {
-        let env = compilation_cache_env(Path::new("/toolchain/bin/sccache"));
+        let water_home = tempfile::tempdir().expect("water home");
+        let env =
+            compilation_cache_env_in(Path::new("/toolchain/bin/sccache"), Some(water_home.path()))
+                .expect("a scratch Water home yields the env");
 
         assert!(
             env.contains(&("RUSTC_WRAPPER", OsString::from("/toolchain/bin/sccache"))),
@@ -512,8 +564,12 @@ mod host_tests {
                 .map(|(_, value)| value.to_string_lossy().into_owned())
                 .expect("unix builds get the per-user socket");
             assert!(
-                socket.ends_with(".water/sccache-server.sock"),
-                "the socket lives under the user's Water home: {socket}"
+                socket.ends_with("sccache/server.sock"),
+                "the socket lives in a private dir under the Water home: {socket}"
+            );
+            assert!(
+                socket.starts_with(&water_home.path().display().to_string()),
+                "the socket lives under the injected Water home: {socket}"
             );
         }
         #[cfg(not(unix))]
@@ -523,19 +579,62 @@ mod host_tests {
         );
     }
 
-    /// A `~/.water` path that cannot fit `sun_path` must not produce a socket
+    /// A socket path that cannot fit `sun_path` must not produce a socket
     /// that fails to bind — the port then carries the whole contract.
     #[cfg(unix)]
     #[test]
     fn oversized_home_path_falls_back_to_port_only() {
-        let long_home = Path::new("/").join("a".repeat(200));
-        assert!(super::server_socket_path_in(&long_home).is_none());
+        let long_home = tempfile::tempdir()
+            .expect("water home")
+            .path()
+            .join("a".repeat(200));
+        assert!(
+            super::server_socket_path_in(&long_home)
+                .expect("creatable but overlong home")
+                .is_none()
+        );
 
         let home = tempfile::tempdir().expect("water home");
         let socket = super::server_socket_path_in(&home.path().join(".water"))
+            .expect("a normal Water home gets a socket")
             .expect("a normal Water home gets a socket");
-        assert!(socket.ends_with("sccache-server.sock"));
-        assert!(socket.parent().expect("socket parent").ends_with(".water"));
+        assert!(socket.ends_with("sccache/server.sock"));
+        assert!(
+            socket
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|dir| dir.ends_with(".water")),
+            "the socket's parent dir sits directly under the Water home: {}",
+            socket.display()
+        );
+    }
+
+    /// A socket dir another account can traverse is the exact exposure the
+    /// mechanism exists to close — an existing `sccache/` wider than `0700`
+    /// must fail rather than quietly offer the socket.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_dir_wider_than_private_is_rejected() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = tempfile::tempdir().expect("water home");
+        let socket_dir = home.path().join("sccache");
+        std::fs::create_dir(&socket_dir).expect("socket dir");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod socket dir");
+
+        let error = super::server_socket_path_in(home.path())
+            .expect_err("a world-traversable socket dir must be rejected");
+        assert!(
+            error.to_string().contains("0755") || error.to_string().contains("755"),
+            "the error names the offending mode: {error}"
+        );
+
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("tighten socket dir");
+        super::server_socket_path_in(home.path())
+            .expect("a 0700 socket dir is accepted")
+            .expect("a 0700 socket dir yields a socket");
     }
 
     #[test]
