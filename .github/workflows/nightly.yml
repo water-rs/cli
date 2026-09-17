@@ -406,7 +406,13 @@ jobs:
           }
           taskkill /T /F /PID $p.Id 2>$null | Out-Null
           Get-Process e2eplay -ErrorAction SilentlyContinue | Stop-Process -Force
-          if (-not $started) { Fail "water run never reported 'Application started'" }
+          if (-not $started) {
+            Write-Output "---- run-play.out (tail) ----"
+            Get-Content "$logs\run-play.out" -Tail 60 -ErrorAction SilentlyContinue
+            Write-Output "---- run-play.err (tail) ----"
+            Get-Content "$logs\run-play.err" -Tail 60 -ErrorAction SilentlyContinue
+            Fail "water run never reported 'Application started'"
+          }
           if ((Select-String "$logs\run-play.out" -Pattern 'Application crashed|Application exited' -Quiet -ErrorAction SilentlyContinue) -or
               (Select-String "$logs\run-play.err" -Pattern 'Application crashed|Application exited' -Quiet -ErrorAction SilentlyContinue)) {
             Fail "water run launched but the app died within the grace window"
@@ -520,6 +526,9 @@ jobs:
           fi
           kill "$run_pid" 2>/dev/null; sleep 2; kill -9 "$run_pid" 2>/dev/null
           pkill -f 'water run' 2>/dev/null; pkill -f 'e2eplay' 2>/dev/null; pkill Xvfb 2>/dev/null
+          if [ "$started" -ne 0 ]; then
+            tail -30 "$HOME/e2e-logs/run-play.log" 2>/dev/null || true
+          fi
           if [ "$started" -eq 1 ]; then
             echo "::error::water run never reported 'Application started'"
           fi

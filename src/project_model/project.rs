@@ -300,22 +300,27 @@ impl Project {
 
     /// Resolve the Cargo target directory every generated backend crate builds into.
     ///
-    /// Generated backends need an explicit target directory, because the default one
-    /// would land inside the managed build cache next to the generated sources — and
-    /// those sources are deleted and regenerated whenever the CLI's scaffold templates
-    /// change. Compiled artifacts do not become stale for that reason, so keeping them
-    /// there meant one CLI upgrade discarded the compiled dependency graph of every
-    /// project on the machine.
+    /// The directory is shared by every project on the machine — one
+    /// `~/.water/build_cache/target` subtree — because Cargo already keys each
+    /// compiled unit by target triple, resolved features, and profile: a second
+    /// project's build reuses the dependency graph the first one compiled
+    /// instead of cold-building it, the way sccache-equipped machines behave.
+    /// The shared root sits beside the per-project managed containers rather
+    /// than inside one: generated backend sources are deleted and regenerated
+    /// whenever the CLI's scaffold templates change, while compiled artifacts
+    /// do not become stale for that reason — keeping them together meant one
+    /// CLI upgrade discarded the compiled dependency graph of every project on
+    /// the machine.
     ///
-    /// One directory serves every backend, platform, and feature set of a linkage:
-    /// Cargo already keys each compiled unit by target triple, resolved features, and
-    /// profile, so switching backends only rebuilds the units the two graphs do not
-    /// share — measured on an example app, over 80% of the Apple FFI graph resolves
-    /// identically to the Hydrolysis graph and is reused as-is. Builds must therefore
-    /// agree on everything Cargo hashes into every unit — pass an explicit `--target`
-    /// and keep final-artifact link flags out of `RUSTFLAGS` (see
-    /// `RustBuild::with_final_rustc_arg`) — or two variants sharing this directory
-    /// re-fingerprint each other's entire dependency graph on every switch.
+    /// One directory serves every backend, platform, and feature set of a
+    /// linkage: switching backends only rebuilds the units the two graphs do
+    /// not share — measured on an example app, over 80% of the Apple FFI graph
+    /// resolves identically to the Hydrolysis graph and is reused as-is.
+    /// Builds must therefore agree on everything Cargo hashes into every unit —
+    /// pass an explicit `--target` and keep final-artifact link flags out of
+    /// `RUSTFLAGS` (see `RustBuild::with_final_rustc_arg`) — or two variants
+    /// sharing this directory re-fingerprint each other's entire dependency
+    /// graph on every switch.
     ///
     /// Linkage is the one axis Cargo cannot separate: shared-runtime development
     /// builds carry `-Cprefer-dynamic -Crpath` in `RUSTFLAGS` and static packaging
@@ -325,17 +330,13 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// Returns an error when Cargo metadata cannot resolve the project target directory.
+    /// Returns an error when the shared build-cache directory cannot be resolved.
     pub async fn water_target_dir(&self, linkage: RustLinkage) -> eyre::Result<PathBuf> {
         let variant = match linkage {
             RustLinkage::SharedRuntime => "shared",
             RustLinkage::Static => "static",
         };
-        Ok(self
-            .target_dir()
-            .await?
-            .join("water-backends")
-            .join(variant))
+        Ok(crate::water_dir::shared_target_dir().await?.join(variant))
     }
 
     /// Resolve an isolated target directory for a backend built by a different Rust
@@ -347,13 +348,26 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// Returns an error when Cargo metadata cannot resolve the project target directory.
+    /// Returns an error when the shared build-cache directory cannot be resolved.
     pub async fn toolchain_target_dir(&self, toolchain: &str) -> eyre::Result<PathBuf> {
-        Ok(self
-            .target_dir()
+        Ok(crate::water_dir::shared_target_dir()
             .await?
-            .join("water-backends")
-            .join(toolchain))
+            .join(format!("toolchain-{toolchain}")))
+    }
+
+    /// Resolve the target directory the project's host-side rlib builds into.
+    ///
+    /// `build_host_rlib` compiles the user crate for the host to read its
+    /// `waterui_meta_*` symbols. That compile shares the dependency graph with
+    /// every other project's host build, so it lives beside the backend
+    /// variants in the shared target root rather than in the project's own
+    /// `target/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared build-cache directory cannot be resolved.
+    pub async fn host_target_dir(&self) -> eyre::Result<PathBuf> {
+        crate::water_dir::shared_host_target_dir().await
     }
 
     /// Get the backends configured for the project.
@@ -758,10 +772,11 @@ impl Project {
 
         if self.is_playground() {
             crate::water_dir::remove_project_build_cache(self.root()).await?;
-            // A playground's Cargo target directory is the user's own (often a
-            // workspace-wide one), so only the CLI-owned `water-backends` subtree
-            // is removed — including target directories older CLI layouts left
-            // behind — never the user's other compiled artifacts.
+            // Compiled artifacts live in the per-user shared target directory
+            // and outlive any single project, so they stay. What remains to
+            // sweep here is the `water-backends` subtree older CLI layouts
+            // left under the project's own Cargo target directory — never the
+            // user's other compiled artifacts.
             let water_backends_root = self.target_dir().await?.join("water-backends");
             if water_backends_root.exists() {
                 smol::fs::remove_dir_all(&water_backends_root).await?;

@@ -491,7 +491,13 @@ async fn discover_preview_targets(
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
-    let rlib = build_host_rlib(project_path, sccache_path, progress).await?;
+    let rlib = build_host_rlib(
+        project_path,
+        &waterui_cli::water_dir::shared_host_target_dir().await?,
+        sccache_path,
+        progress,
+    )
+    .await?;
     let symbols = ArtifactSymbols::read(&rlib)?;
     // `#[preview]` exports `waterui_preview_<crate>_<fn>`; crate names are
     // normalized like `function_path_to_symbol` does (dashes become

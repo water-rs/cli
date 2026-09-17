@@ -340,7 +340,13 @@ async fn build_manifest(
 ) -> eyre::Result<BundleManifest> {
     let mut assets = plan_main_assets(project)?;
 
-    let rlib = build_host_rlib(project.root(), sccache_path, progress).await?;
+    let rlib = build_host_rlib(
+        project.root(),
+        &project.host_target_dir().await?,
+        sccache_path,
+        progress,
+    )
+    .await?;
     let symbols = ArtifactSymbols::read(&rlib)?;
     // The declared frontend toolchain is a manifest concern: `[web]` absent
     // means bun, and the declared manager is never substituted.

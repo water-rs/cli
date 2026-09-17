@@ -2,7 +2,10 @@
 //!
 //! Playground projects store generated backends under
 //! `~/.water/build_cache/<absolute-project-path>/managed_backends/` instead of
-//! scattering `.water` directories into user projects.
+//! scattering `.water` directories into user projects. Compiled Cargo artifacts
+//! live in the sibling `~/.water/build_cache/target/` — one directory shared by
+//! every project, so a machine compiles each dependency revision once no matter
+//! how many projects use it.
 
 use std::{
     ffi::OsStr,
@@ -23,6 +26,7 @@ pub const CLI_COMMIT: &str = env!("WATERUI_CLI_COMMIT");
 
 const BUILD_CACHE_DIR_NAME: &str = "build_cache";
 const MANAGED_BACKENDS_DIR_NAME: &str = "managed_backends";
+const SHARED_TARGET_DIR_NAME: &str = "target";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const METADATA_FILE_NAME: &str = "metadata.toml";
 const CLEANUP_LOCK_FILE_NAME: &str = ".cleanup.lock";
@@ -128,6 +132,64 @@ pub async fn build_cache_root() -> eyre::Result<PathBuf> {
     let water_home = water_home_dir()?;
     let (_, cache_root) = resolved_build_cache_root_in(&water_home).await?;
     Ok(cache_root)
+}
+
+/// Return the Cargo target directory every project's CLI-managed builds share,
+/// creating it if needed.
+///
+/// Compiled units are fingerprint-keyed, so one `~/.water/build_cache/target`
+/// serves every project on the machine: a second `water run` reuses the
+/// dependency graph the first one compiled instead of cold-building it per
+/// project. The directory sits beside the per-project `managed_backends`
+/// containers rather than inside one — generated sources are wiped when the
+/// CLI's scaffold templates change, while compiled artifacts do not go stale
+/// for that reason.
+///
+/// The directory is a first-class cache entry: it carries the same
+/// `metadata.toml` the per-project containers do, so the garbage collector
+/// reports it in usage surveys and reclaims it under the same unused-days
+/// policy once nothing has built for that long.
+///
+/// # Errors
+/// Returns an error if the Water home cannot be determined, the global config
+/// cannot be loaded, or the cache directory cannot be created.
+pub async fn shared_target_dir() -> eyre::Result<PathBuf> {
+    let cache_root = build_cache_root().await?;
+    ensure_shared_target_dir_in(&cache_root).await
+}
+
+/// Return the shared target directory host-side rlib builds use.
+///
+/// `build_host_rlib` compiles the project's library for the host to read its
+/// `waterui_meta_*` symbols; the dependency graph it compiles is the same for
+/// every project on the machine, so it shares the per-user target root.
+///
+/// # Errors
+/// Returns an error if the shared build-cache directory cannot be resolved.
+pub async fn shared_host_target_dir() -> eyre::Result<PathBuf> {
+    Ok(shared_target_dir().await?.join("host"))
+}
+
+async fn ensure_shared_target_dir_in(cache_root: &Path) -> eyre::Result<PathBuf> {
+    let target_dir = cache_root.join(SHARED_TARGET_DIR_NAME);
+    fs::create_dir_all(&target_dir).await.wrap_err_with(|| {
+        format!(
+            "Failed to create shared target dir {}",
+            target_dir.display()
+        )
+    })?;
+    // `project_root` is the entry itself: it exists exactly as long as the
+    // cache does, so only the unused-days policy can collect it.
+    write_metadata(
+        &target_dir,
+        &CacheMetadata {
+            project_root: target_dir.display().to_string(),
+            cli_commit: CLI_COMMIT.to_string(),
+            last_used_unix_seconds: now_unix_seconds()?,
+        },
+    )
+    .await?;
+    Ok(target_dir)
 }
 
 /// Return the managed build-cache directory for a project.
@@ -701,6 +763,7 @@ async fn try_acquire_cleanup_lock(lock_path: &Path) -> eyre::Result<Option<std::
 async fn discover_managed_build_cache_dirs(cache_root: &Path) -> eyre::Result<Vec<PathBuf>> {
     let cache_root = cache_root.to_path_buf();
     smol::unblock(move || -> eyre::Result<Vec<PathBuf>> {
+        let shared_target_dir = cache_root.join(SHARED_TARGET_DIR_NAME);
         let mut cache_dirs = Vec::new();
         for entry in WalkDir::new(&cache_root).follow_links(false) {
             let entry = entry.map_err(eyre::Report::from)?;
@@ -711,7 +774,11 @@ async fn discover_managed_build_cache_dirs(cache_root: &Path) -> eyre::Result<Ve
             let cache_dir = entry.path().parent().ok_or_else(|| {
                 eyre::eyre!("Cache metadata {} has no parent", entry.path().display())
             })?;
-            if cache_dir.file_name() != Some(OsStr::new(MANAGED_BACKENDS_DIR_NAME)) {
+            // Entries are per-project `managed_backends` containers and the
+            // shared Cargo target directory every project's builds write into.
+            if cache_dir != shared_target_dir
+                && cache_dir.file_name() != Some(OsStr::new(MANAGED_BACKENDS_DIR_NAME))
+            {
                 continue;
             }
             cache_dirs.push(cache_dir.to_path_buf());
@@ -1064,6 +1131,76 @@ mod tests {
             assert_eq!(outcome, super::BuildCacheGcOutcome::SkippedAlreadyRunning);
 
             drop(held);
+        });
+    }
+
+    #[test]
+    fn shared_target_dir_is_discovered_and_kept_while_in_use() {
+        smol::block_on(async {
+            let project = tempdir().expect("project dir");
+            let config = WaterConfig::default();
+            let cache_root = tempdir().expect("cache root");
+
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+
+            assert_eq!(target_dir, cache_root.path().join("target"));
+
+            let discovered = super::discover_managed_build_cache_dirs(cache_root.path())
+                .await
+                .expect("discover cache dirs");
+            assert_eq!(discovered, vec![target_dir.clone()]);
+
+            let outcome =
+                super::cleanup_stale_caches_if_idle(cache_root.path(), project.path(), &config)
+                    .await
+                    .expect("cleanup caches");
+            assert_eq!(
+                outcome,
+                super::BuildCacheGcOutcome::Ran(super::BuildCacheGcSummary {
+                    scanned_entries: 1,
+                    removed_entries: 0,
+                })
+            );
+            assert!(target_dir.exists());
+        });
+    }
+
+    #[test]
+    fn stale_shared_target_dir_is_collected() {
+        smol::block_on(async {
+            let project = tempdir().expect("project dir");
+            let config = WaterConfig::default();
+            let cache_root = tempdir().expect("cache root");
+
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            let stale_metadata = super::CacheMetadata {
+                project_root: target_dir.display().to_string(),
+                cli_commit: CLI_COMMIT.to_string(),
+                last_used_unix_seconds: 1,
+            };
+            smol::fs::write(
+                metadata_path(&target_dir),
+                toml::to_string(&stale_metadata).expect("serialize stale metadata"),
+            )
+            .await
+            .expect("write stale metadata");
+
+            let outcome =
+                super::cleanup_stale_caches_if_idle(cache_root.path(), project.path(), &config)
+                    .await
+                    .expect("cleanup caches");
+            assert_eq!(
+                outcome,
+                super::BuildCacheGcOutcome::Ran(super::BuildCacheGcSummary {
+                    scanned_entries: 1,
+                    removed_entries: 1,
+                })
+            );
+            assert!(!target_dir.exists());
         });
     }
 }

@@ -174,16 +174,20 @@ fn leaf_of(name: &str) -> Option<&str> {
 /// of the produced `.rlib`.
 ///
 /// Runs `cargo build --lib --message-format=json-render-diagnostics` with
-/// `project_path` as the working directory. `sccache_path`, when given, is
-/// installed as `RUSTC_WRAPPER` through the same helper every other CLI build
-/// uses. `progress`, when given, receives cargo's compile events — the same
-/// streaming a [`crate::build::RustBuild`] reports — because this compile is
-/// often the first thing `water run` does and a cold one takes minutes.
+/// `project_path` as the working directory and `target_dir` as the explicit
+/// Cargo target directory — callers pass the CLI's shared per-user target so
+/// the dependency graph compiles once per machine rather than once per
+/// project. `sccache_path`, when given, is installed as `RUSTC_WRAPPER`
+/// through the same helper every other CLI build uses. `progress`, when
+/// given, receives cargo's compile events — the same streaming a
+/// [`crate::build::RustBuild`] reports — because this compile is often the
+/// first thing `water run` does and a cold one takes minutes.
 ///
 /// # Errors
 /// Returns an error when cargo fails or the project produces no rlib.
 pub async fn build_host_rlib(
     project_path: &Path,
+    target_dir: &Path,
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<PathBuf> {
@@ -193,6 +197,8 @@ pub async fn build_host_rlib(
     let mut cargo = smol::process::Command::new("cargo");
     cargo
         .args(["build", "--lib", "--message-format=json-render-diagnostics"])
+        .arg("--target-dir")
+        .arg(target_dir)
         .current_dir(project_path);
     if let Some(sccache_path) = sccache_path {
         crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path);
@@ -248,7 +254,7 @@ mod tests {
     fn reads_meta_statics_and_exports_from_built_rlib() {
         futures_lite::future::block_on(async {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/meta_static");
-            let rlib = build_host_rlib(&fixture, None, None)
+            let rlib = build_host_rlib(&fixture, &fixture.join("target"), None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
@@ -416,7 +422,7 @@ mod tests {
     fn reads_include_web_mount_meta_from_built_rlib() {
         futures_lite::future::block_on(async {
             let fixture = web_meta_fixture();
-            let rlib = build_host_rlib(&fixture, None, None)
+            let rlib = build_host_rlib(&fixture, &fixture.join("target"), None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
