@@ -1278,14 +1278,16 @@ Automatic meson installation failed: {install_err}\n\n{}",
         let mut cmd = cmd.arg(cargo_subcommand);
         if self.build_std_toolchain.is_some() {
             // `-Zbuild-std-features` replaces Cargo's default std feature set
-            // (`panic-unwind`, `backtrace`), so both are listed back
-            // explicitly. `compiler-builtins-c` links the NDK's prebuilt
-            // compiler-rt archive — on aarch64 that provides the LSE
+            // — `panic-unwind,backtrace,default` (cargo's `standard_lib.rs`)
+            // — so all three are listed back explicitly; `default` keeps each
+            // std-workspace crate's own defaults, notably `compiler_builtins`'s
+            // `arch` routines. `compiler-builtins-c` then links the NDK's
+            // prebuilt compiler-rt archive — on aarch64 that provides the LSE
             // outline-atomics helpers (`__aarch64_ldadd4_acq_rel` & friends)
             // that NDK-compiled C objects reference, which otherwise stay
             // undefined and make `dlopen` reject the libraries.
             cmd = cmd.arg("-Zbuild-std=std,panic_abort");
-            cmd = cmd.arg("-Zbuild-std-features=panic-unwind,backtrace,compiler-builtins-c");
+            cmd = cmd.arg("-Zbuild-std-features=panic-unwind,backtrace,default,compiler-builtins-c");
         }
         let mut cmd = cmd
             .args(cargo_target.cargo_args())
