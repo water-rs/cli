@@ -20,6 +20,25 @@ pub async fn stage_binary_as(binary_path: &Path, dir: &Path, name: &str) -> eyre
     Ok(destination)
 }
 
+/// The `dist/<platform>[/<profile>]` directory a backend's shipped
+/// artifacts stage into.
+///
+/// `backend_path` already carries the per-project `managed_backends`
+/// component, so a staged executable — and the runtime files `$ORIGIN`
+/// resolves beside it — lands in a path unique to the project. Staging
+/// into the shared Cargo profile directory instead would collide two
+/// same-named projects on `<profile>/<product>`: last-writer-wins copies,
+/// `ETXTBSY` against a still-running staged binary, and previously
+/// reported artifact paths silently re-targeting a sibling's bytes.
+#[must_use]
+pub fn dist_dir(backend_path: &Path, platform: &str, profile: Option<&str>) -> PathBuf {
+    let mut dir = backend_path.join("dist").join(platform);
+    if let Some(profile) = profile {
+        dir = dir.join(profile);
+    }
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     /// The packaged path is the product name; the tagged Cargo artifact it

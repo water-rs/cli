@@ -773,7 +773,12 @@ async fn write_json(path: &Path, value: &(impl Serialize + Sync)) -> eyre::Resul
     Ok(())
 }
 
-fn platform_name(platform: TargetPlatform) -> eyre::Result<&'static str> {
+/// The lowercase name a browser runtime records for `platform` — also the
+/// `dist/<platform>` directory packaged artifacts stage under.
+///
+/// # Errors
+/// Returns an error when the platform has no browser runtime support.
+pub fn platform_name(platform: TargetPlatform) -> eyre::Result<&'static str> {
     match platform {
         TargetPlatform::MacOS => Ok("macos"),
         TargetPlatform::Linux => Ok("linux"),

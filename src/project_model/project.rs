@@ -2853,6 +2853,8 @@ mod webview_backend_tests {
 
 #[cfg(test)]
 mod scaffold_tests {
+    use std::path::Path;
+
     use super::{BundleIdentifier, CreateOptions, PackageType, Project, TargetBackend};
 
     /// The documented `assets!` workflow requires the assets root to exist: the
@@ -2993,6 +2995,62 @@ mod scaffold_tests {
                 tagged.as_str().len() - shipped.as_str().len(),
                 9,
                 "the tag is a dash plus eight hex digits: {tagged}"
+            );
+        }
+    }
+
+    /// Packaged executables stage under the project's own managed backend
+    /// directory — `dist/<platform>/<profile>` below `backend_path` — so
+    /// two projects sharing a crate name, most often two worktrees of one
+    /// project, never write the same shipped path the way the shared Cargo
+    /// profile directory made them.
+    #[test]
+    fn same_named_projects_stage_packaged_binaries_under_their_own_backends() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let create = |root: &Path| {
+            smol::block_on(Project::create(
+                root,
+                CreateOptions {
+                    name: "Water Example".to_string(),
+                    bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                        .expect("bundle identifier"),
+                    package_type: PackageType::App,
+                    waterui_path: None,
+                    channel: None,
+                    framework_manifest: None,
+                    framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    author: "Lexo Liu".to_string(),
+                    backends: Vec::new(),
+                    web: None,
+                },
+            ))
+            .expect("project creation must succeed")
+        };
+        let first = create(&dir.path().join("one/demo"));
+        let second = create(&dir.path().join("two/demo"));
+
+        let staged = |project: &Project| {
+            crate::platforming::packaging::dist_dir(
+                &project.backend_path::<crate::hydrolysis::backend::HydrolysisBackend>(),
+                "linux",
+                Some("release"),
+            )
+            .join(project.hydrolysis_binary_name().as_str())
+        };
+        let first_staged = staged(&first);
+        let second_staged = staged(&second);
+
+        assert_ne!(
+            first_staged, second_staged,
+            "same-named projects must not stage the same shipped path"
+        );
+        for (project, staged) in [(&first, &first_staged), (&second, &second_staged)] {
+            assert!(
+                staged.starts_with(
+                    project.backend_path::<crate::hydrolysis::backend::HydrolysisBackend>()
+                ),
+                "{} must live under the project's own managed backend directory",
+                staged.display()
             );
         }
     }

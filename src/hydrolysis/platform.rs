@@ -385,14 +385,18 @@ pub async fn package_hydrolysis(
         }
     }
 
-    let runtime_dir = final_binary_path.parent().ok_or_else(|| {
-        eyre::eyre!(
-            "Hydrolysis binary path has no output directory: {}",
-            final_binary_path.display()
-        )
-    })?;
-    synchronize_shared_runtime(runtime_dir, shared_libraries.as_ref(), &platform.triple()).await?;
-    browser_runtime::stage(runtime_plan, platform, profile_directory, runtime_dir).await?;
+    // The shipped binary and everything `$ORIGIN` resolves beside it stage
+    // into the project's own managed backend directory — the shared Cargo
+    // profile directory would collide two same-named projects on
+    // `<profile>/<product>`.
+    let runtime_dir = crate::platforming::packaging::dist_dir(
+        &backend_path,
+        crate::browser_runtime::platform_name(platform)?,
+        Some(profile),
+    );
+    fs::create_dir_all(&runtime_dir).await?;
+    synchronize_shared_runtime(&runtime_dir, shared_libraries.as_ref(), &platform.triple()).await?;
+    browser_runtime::stage(runtime_plan, platform, profile_directory, &runtime_dir).await?;
 
     // Ship the binary under the product name; the tagged Cargo artifact name
     // is internal to the shared target directory.
@@ -404,7 +408,7 @@ pub async fn package_hydrolysis(
     };
     let packaged_binary = crate::platforming::packaging::stage_binary_as(
         &final_binary_path,
-        runtime_dir,
+        &runtime_dir,
         &shipped_name,
     )
     .await?;
@@ -414,7 +418,7 @@ pub async fn package_hydrolysis(
             project,
             &project.manifest().package.name,
             binary_name.as_str(),
-            &backend_path.join("dist/share"),
+            &runtime_dir.join("share"),
         )
         .await?;
     }
@@ -444,7 +448,7 @@ async fn package_hydrolysis_macos(
     } else {
         app_name
     };
-    let dist_dir = backend_path.join("dist");
+    let dist_dir = crate::platforming::packaging::dist_dir(backend_path, "macos", None);
     fs::create_dir_all(&dist_dir).await?;
     let usage_descriptions = project
         .manifest()

@@ -190,34 +190,36 @@ pub async fn package_gtk4(project: &Project, options: PackageOptions) -> eyre::R
     let runtime_plan = project
         .browser_runtime_plan(TargetPlatform::Linux, crate::platform::TargetBackend::Gtk4)
         .await?;
-    let runtime_dir = final_binary_path.parent().ok_or_else(|| {
-        eyre::eyre!(
-            "GTK4 binary path has no output directory: {}",
-            final_binary_path.display()
-        )
-    })?;
+
+    // The shipped binary and everything `$ORIGIN` resolves beside it stage
+    // into the project's own managed backend directory — the shared Cargo
+    // profile directory would collide two same-named projects on
+    // `<profile>/<product>`.
+    let runtime_dir =
+        crate::platforming::packaging::dist_dir(&backend_path, "linux", Some(profile));
+    fs::create_dir_all(&runtime_dir).await?;
     browser_runtime::stage(
         runtime_plan,
         TargetPlatform::Linux,
         &target_dir,
-        runtime_dir,
+        &runtime_dir,
     )
     .await?;
 
     if options.uses_shared_rust_runtime() {
-        RustDynamicLibraries::resolve(runtime_dir, &TargetPlatform::Linux.triple())
+        RustDynamicLibraries::resolve(&target_dir, &TargetPlatform::Linux.triple())
             .await?
-            .stage(runtime_dir)
+            .stage(&runtime_dir)
             .await?;
     } else {
-        RustDynamicLibraries::remove_staged(runtime_dir, &TargetPlatform::Linux.triple()).await?;
+        RustDynamicLibraries::remove_staged(&runtime_dir, &TargetPlatform::Linux.triple()).await?;
     }
 
     // Ship the binary under the product name; the tagged Cargo artifact name
     // is internal to the shared target directory.
     let packaged_binary = crate::platforming::packaging::stage_binary_as(
         &final_binary_path,
-        runtime_dir,
+        &runtime_dir,
         project.gtk4_binary_name().as_str(),
     )
     .await?;

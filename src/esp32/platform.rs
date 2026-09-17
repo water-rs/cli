@@ -538,7 +538,7 @@ pub async fn package_esp32(project: &Project, options: PackageOptions) -> eyre::
     let backend_path = project.backend_path::<Esp32Backend>();
     let chip = esp32_chip(project)?;
 
-    let dist_dir = backend_path.join("dist");
+    let dist_dir = crate::platforming::packaging::dist_dir(&backend_path, "esp32", Some(profile));
     fs::create_dir_all(&dist_dir).await?;
     // The image ships under the product name; the tagged crate name is
     // internal to the shared Cargo target directory.
