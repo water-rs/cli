@@ -414,12 +414,21 @@ jobs:
           }
 
           Phase "water run e2eplay"
+          # windows-latest has no GPU: the only surface-compatible adapter is
+          # the D3D12 WARP software device, which Hydrolysis refuses in
+          # production selection unless the diagnostic switch is set. WARP
+          # still runs the full compute pipeline, so the launch is the real
+          # one; the switch only widens adapter selection.
+          $env:WATER_HYDROLYSIS_FORCE_FALLBACK_ADAPTER = "1"
           $p = Start-Process -FilePath water -ArgumentList "run --platform $env:E2E_PLATFORM --backend $env:E2E_BACKEND" -PassThru `
             -WorkingDirectory "$env:USERPROFILE\e2eplay" `
             -RedirectStandardOutput "$logs\run-play.out" -RedirectStandardError "$logs\run-play.err"
           $runStart = Get-Date
           $started = $false
-          $deadline = (Get-Date).AddMinutes(20)
+          # A fresh user pays a cold build of the whole graph here; the
+          # macOS leg has measured over 20 minutes for it, so the budget is
+          # an hour and the notice line below records the real number.
+          $deadline = (Get-Date).AddMinutes(60)
           # The run's own output lands in the redirect files; echo new lines
           # as they appear so this phase is visible in the job log instead of
           # a silence that hides which unit is compiling.
@@ -523,9 +532,11 @@ jobs:
           run_start=$SECONDS
           started=1
           # Stream new log lines as they land so a long cold compile is
-          # visible in the job log instead of a silence.
+          # visible in the job log instead of a silence. The budget is an
+          # hour: a fresh user pays a cold build of the whole graph here and
+          # the macOS leg has measured over 20 minutes for it.
           seen=0
-          for _ in $(seq 1 300); do
+          for _ in $(seq 1 900); do
             if [ -f "$RUNNER_TEMP/run-play.log" ]; then
               total=$(wc -l < "$RUNNER_TEMP/run-play.log" | tr -d ' ')
               if [ "$total" -gt "$seen" ]; then
@@ -584,9 +595,11 @@ jobs:
           run_start=$SECONDS
           started=1
           # Stream new log lines as they land so a long cold compile is
-          # visible in the job log instead of a silence.
+          # visible in the job log instead of a silence. The budget is an
+          # hour: a fresh user pays a cold build of the whole graph here and
+          # the macOS leg has measured over 20 minutes for it.
           seen=0
-          for _ in $(seq 1 300); do
+          for _ in $(seq 1 900); do
             if [ -f "$HOME/e2e-logs/run-play.log" ]; then
               total=$(wc -l < "$HOME/e2e-logs/run-play.log" | tr -d ' ')
               if [ "$total" -gt "$seen" ]; then
