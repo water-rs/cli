@@ -1411,6 +1411,13 @@ Automatic meson installation failed: {install_err}\n\n{}",
                 sccache_path,
             );
         }
+        // A workspace wrapper replaces `RUSTC_WRAPPER` on workspace-member
+        // units — the support app's ffi crate and the generated module crate
+        // are exactly the link-emitting members that need the `std` dylib
+        // extern. Without it they would link `std` statically while the deps
+        // link dynamically: two panic runtimes in one process.
+        cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+        cmd.env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER");
         Ok(cmd)
     }
 
