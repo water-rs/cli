@@ -1695,14 +1695,34 @@ fn dep_info_path(artifact_file: &Path) -> Option<PathBuf> {
 ///
 /// Cargo writes Makefile syntax: one `<target>: <space-separated
 /// prerequisites>` rule per emitted artifact, then an empty `<path>:` rule
-/// per prerequisite. The target splits from its prerequisites at the first
-/// `": "` — a Windows drive colon arrives as `C:\` (colon, backslash), and a
-/// literal `": "` inside a name is escaped `":\ "`, so the unescaped
-/// separator is unambiguous. rustc escapes only a literal space as `\ `;
-/// every other byte, a Windows backslash included, is verbatim.
+/// per prerequisite. rustc's `escape_dep_filename`
+/// (`compiler/rustc_interface/src/passes.rs`) escapes *only* a literal space
+/// as `\ ` — every other byte, a Windows backslash or drive-letter colon
+/// included, is verbatim — and Cargo's own `parse_rustc_dep_info`
+/// (`src/cargo/core/compiler/fingerprint/dep_info.rs`) reads the same
+/// contract: split a rule at its first `": "` — `C:\` is colon-then-
+/// backslash and a literal `": "` inside a name arrives escaped `":\ "`, so
+/// the separator is unambiguous — then treat a token's trailing `\` as the
+/// escaped space joining it to the next token. rustc never emits `$$` or
+/// `\\` escapes in prerequisites, so neither is unescaped here: doing so
+/// would corrupt the verbatim bytes a Windows path carries. A `\` at the
+/// end of a line is make's continuation and joins the next line before
+/// tokenizing.
 fn dep_info_prerequisites(contents: &str) -> Vec<PathBuf> {
-    let mut prerequisites = Vec::new();
+    // Join `\<newline>` continuations into one logical line per rule before
+    // anything looks for the `": "` separator.
+    let mut joined = String::with_capacity(contents.len());
     for line in contents.lines() {
+        if let Some(head) = line.strip_suffix('\\') {
+            joined.push_str(head);
+            joined.push(' ');
+        } else {
+            joined.push_str(line);
+            joined.push('\n');
+        }
+    }
+    let mut prerequisites = Vec::new();
+    for line in joined.lines() {
         let Some((_, rest)) = line.split_once(": ") else {
             continue;
         };
@@ -1865,6 +1885,7 @@ mod tests {
     use tempfile::tempdir;
 
     use std::ffi::OsString;
+    use std::path::PathBuf;
 
     use super::{
         BuildOptions, BuildProfile, CargoTarget, CompileEvent, RustDynamicLibraries, RustLinkage,
@@ -2248,7 +2269,10 @@ mod tests {
             let dylib = deps.join("libwaterui_dylib.so");
             std::fs::write(&dylib, []).expect("dylib");
 
-            let ours = temporary.path().join("ours");
+            // The manifest root carries a space so the dep-info fixture
+            // exercises the `\ ` escape end to end: the written prerequisite
+            // must still resolve to this root.
+            let ours = temporary.path().join("our project");
             std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
             let manifest = ours.join("Cargo.toml");
             std::fs::write(&manifest, "").expect("manifest");
@@ -2324,6 +2348,28 @@ mod tests {
                 .expect("scan");
             assert!(stale.is_empty(), "a non-fresh unit wrote the file itself");
         });
+    }
+
+    /// Dep-info prerequisites arrive in Makefile spelling: `\ ` escapes a
+    /// literal space, a `\` at end of line continues the rule, and a Windows
+    /// drive-letter colon is data — only the first `": "` separates the
+    /// target. rustc escapes nothing else, so `$$` and `\\` stay verbatim.
+    #[test]
+    fn dep_info_prerequisites_unescape_spaces_and_join_continued_rules() {
+        let contents = concat!(
+            "C:\\out\\app.dll: C:\\work\\my\\ app\\src\\lib.rs \\\n",
+            "    C:\\work\\my\\ app\\build.rs C:\\work\\cost$$.rs\n",
+            "\n",
+            "C:\\work\\my\\ app\\src\\lib.rs:\n",
+        );
+        assert_eq!(
+            super::dep_info_prerequisites(contents),
+            vec![
+                PathBuf::from("C:\\work\\my app\\src\\lib.rs"),
+                PathBuf::from("C:\\work\\my app\\build.rs"),
+                PathBuf::from("C:\\work\\cost$$.rs"),
+            ]
+        );
     }
 
     #[test]
