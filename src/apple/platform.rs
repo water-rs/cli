@@ -210,31 +210,26 @@ pub async fn build_rust_lib(
         build = build.with_preferred_dynamic_linking();
     }
     build = build.with_target_dir(project.water_target_dir(options.linkage()).await?);
-    let lib_dir = build.build_lib(options.is_release()).await?;
+    let built_target = build.build_lib(options.is_release()).await?;
+    let lib_dir = built_target.profile_dir.clone();
     if browser_runtime_plan.requires_cef() {
         build
             .clone()
             .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
-            .build_binary("waterui-cef-helper", options.is_release())
+            .build_binary(
+                &crate::project_model::project_types::cef_helper_binary_name(
+                    project.ffi_crate_name().as_str(),
+                ),
+                options.is_release(),
+            )
             .await?;
     }
 
     // If output_dir is specified, copy the library there
     if let Some(output_dir) = options.output_dir() {
-        let lib_name = project.ffi_crate_name().replace('-', "_");
-        let source_lib = lib_dir.join(format!("lib{lib_name}.{}", host_library.built_extension()));
-
-        if !source_lib.exists() {
-            bail!(
-                "Built library not found at {} (expected {} for Apple target {})",
-                source_lib.display(),
-                host_library.crate_type(),
-                triple
-            );
-        }
         fs::create_dir_all(output_dir).await?;
         let dest_lib = output_dir.join(host_library.linked_file_name());
-        copy_file(&source_lib, &dest_lib).await?;
+        copy_file(&built_target.artifact, &dest_lib).await?;
         remove_superseded_host_library(output_dir, host_library).await?;
         if options.linkage() == RustLinkage::SharedRuntime {
             let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple).await?;
@@ -826,7 +821,10 @@ pub async fn package_apple(
         )
         .await?;
         let main_binary = app_path.join("Contents/MacOS").join(product_name);
-        let helper_binary = lib_dir.join("waterui-cef-helper");
+        let helper_binary =
+            lib_dir.join(crate::project_model::project_types::cef_helper_binary_name(
+                project.ffi_crate_name().as_str(),
+            ));
         package_cef_helper_app(
             &app_path,
             &main_binary,

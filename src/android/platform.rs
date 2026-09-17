@@ -371,10 +371,17 @@ impl AndroidPlatform {
             .with_envs(options.cargo_envs().iter().cloned())
             .with_target_dir(project.water_target_dir(options.linkage()).await?);
 
-        let lib_dir = build.build_lib(options.is_release()).await?;
-        copy_android_build_outputs(project, &options, abi, &build_context.ndk_path, &lib_dir)
-            .await?;
-        Ok(lib_dir)
+        let built_target = build.build_lib(options.is_release()).await?;
+        copy_android_build_outputs(
+            project,
+            &options,
+            abi,
+            &build_context.ndk_path,
+            &built_target.profile_dir,
+            &built_target.artifact,
+        )
+        .await?;
+        Ok(built_target.profile_dir)
     }
 
     /// Clean all jniLibs directories to remove stale libraries from previous builds.
@@ -719,17 +726,8 @@ async fn copy_android_build_outputs(
     abi: AndroidAbi,
     ndk_path: &Path,
     lib_dir: &Path,
+    source_lib: &Path,
 ) -> eyre::Result<()> {
-    let lib_name = project.ffi_crate_name().replace('-', "_");
-    let source_lib = lib_dir.join(format!("lib{lib_name}.so"));
-
-    if !source_lib.exists() {
-        bail!(
-            "Rust shared library not found at {}. Did the build succeed?",
-            source_lib.display()
-        );
-    }
-
     let output_dir = options.output_dir().map_or_else(
         || {
             project
@@ -740,7 +738,7 @@ async fn copy_android_build_outputs(
         std::path::Path::to_path_buf,
     );
     fs::create_dir_all(&output_dir).await?;
-    copy_file(&source_lib, &output_dir.join("libwaterui_app.so")).await?;
+    copy_file(source_lib, &output_dir.join("libwaterui_app.so")).await?;
 
     if options.linkage() == RustLinkage::SharedRuntime {
         let triple = AndroidPlatform::new(abi).triple();

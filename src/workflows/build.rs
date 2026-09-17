@@ -1,7 +1,7 @@
 //! Build system
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io::{self, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
@@ -62,7 +62,7 @@ pub async fn rust_target_libdir(triple: &Triple) -> eyre::Result<PathBuf> {
 /// target kind in the type keeps `cargo rustc -- --crate-type` from ever reaching a
 /// binary build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CargoTarget<'a> {
+pub(crate) enum CargoTarget<'a> {
     /// The crate's library target.
     Lib,
     /// One named binary target.
@@ -80,6 +80,41 @@ impl<'a> CargoTarget<'a> {
     const fn accepts_crate_type_override(self) -> bool {
         matches!(self, Self::Lib)
     }
+
+    /// Whether a `compiler-artifact` message's target is the one this build
+    /// selected.
+    fn matches(&self, target: &cargo_metadata::Target) -> bool {
+        use cargo_metadata::TargetKind;
+        match self {
+            Self::Binary(name) => {
+                target.name.as_str() == *name && target.kind.contains(&TargetKind::Bin)
+            }
+            Self::Lib => target.kind.iter().any(|kind| {
+                matches!(
+                    kind,
+                    TargetKind::Lib
+                        | TargetKind::RLib
+                        | TargetKind::DyLib
+                        | TargetKind::CDyLib
+                        | TargetKind::StaticLib
+                        | TargetKind::ProcMacro
+                )
+            }),
+        }
+    }
+}
+
+/// The outcome of one Cargo invocation: the profile directory everything
+/// landed under and the artifact Cargo reported for the selected target.
+#[derive(Debug)]
+pub struct BuiltTarget {
+    /// `<target>/<triple>/<profile>` — dependency artifacts and staged
+    /// runtime libraries resolve from this directory.
+    pub profile_dir: PathBuf,
+    /// The final artifact Cargo reported writing for the selected target —
+    /// its own `compiler-artifact` message, not a name reconstructed under
+    /// the profile root.
+    pub artifact: PathBuf,
 }
 
 /// Selects how Rust dependencies are linked into a native application.
@@ -964,70 +999,62 @@ impl RustBuild {
     ///
     /// Will produce debug symbols and less optimizations for faster builds.
     ///
-    /// Return the path to the built library.
-    ///
     /// # Errors
     /// - `RustBuildError::FailToExecuteCargoBuild`: If there was an error executing the cargo build command.
     /// - `RustBuildError::FailToBuildRustLibrary`: If there was an error building the Rust library.
-    pub async fn dev_build(&self) -> Result<PathBuf, RustBuildError> {
+    pub async fn dev_build(&self) -> Result<BuiltTarget, RustBuildError> {
         self.build_lib(false).await
     }
 
     /// Build rust library in release mode.
     ///
-    /// Return the directory path containing the built library.
-    ///
     /// # Errors
     /// - `RustBuildError::FailToExecuteCargoBuild`: If there was an error executing the cargo build command.
     /// - `RustBuildError::FailToBuildRustLibrary`: If there was an error building the Rust library.
-    pub async fn release_build(&self) -> Result<PathBuf, RustBuildError> {
+    pub async fn release_build(&self) -> Result<BuiltTarget, RustBuildError> {
         self.build_lib(true).await
     }
 
-    /// Build a library with the specified crate type.
+    /// Build the crate's library target.
     ///
-    /// Return the directory path containing the built library.
+    /// The returned [`BuiltTarget`] carries the profile directory plus the
+    /// artifact Cargo reported. A crate emitting several library crate types
+    /// needs [`Self::with_crate_type_override`] to say which one is wanted —
+    /// the build fails rather than guess.
     ///
     /// # Errors
     /// - `RustBuildError::FailToExecuteCargoBuild`: If there was an error executing the cargo build command.
     /// - `RustBuildError::FailToBuildRustLibrary`: If there was an error building the Rust library.
-    pub async fn build_lib(&self, release: bool) -> Result<PathBuf, RustBuildError> {
-        self.build_inner(release, CargoTarget::Lib).await
+    pub async fn build_lib(&self, release: bool) -> Result<BuiltTarget, RustBuildError> {
+        self.build_inner(release, CargoTarget::Lib, self.lib_artifact_extension())
+            .await
     }
 
     /// Build a dynamic library (cdylib) and return the full path to the dylib file.
     ///
-    /// This is a convenience method that builds the library and computes the full
-    /// path to the resulting dylib file based on the crate name and target triple.
+    /// The path is Cargo's own `compiler-artifact` report, so the returned file
+    /// is the one this build wrote even when another project's identically
+    /// named crate shares the target directory.
     ///
     /// # Errors
     /// - `RustBuildError::FailToExecuteCargoBuild`: If there was an error executing the cargo build command.
     /// - `RustBuildError::FailToBuildRustLibrary`: If the library was not found after building.
-    pub async fn build_dylib(
-        &self,
-        crate_name: &str,
-        release: bool,
-    ) -> Result<PathBuf, RustBuildError> {
-        let lib_dir = self.build_inner(release, CargoTarget::Lib).await?;
-
-        let lib_name = crate_name.replace('-', "_");
-        let ext = lib_extension_for_triple(&self.triple);
-        let dylib_path = lib_dir.join(format!("lib{lib_name}.{ext}"));
-
-        if !dylib_path.exists() {
-            return Err(RustBuildError::FailToBuildRustLibrary(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "Dynamic library not found at {} after cargo build",
-                    dylib_path.display()
-                ),
-            )));
-        }
-
-        Ok(dylib_path)
+    pub async fn build_dylib(&self, release: bool) -> Result<PathBuf, RustBuildError> {
+        let built = self
+            .build_inner(
+                release,
+                CargoTarget::Lib,
+                Some(lib_extension_for_triple(&self.triple)),
+            )
+            .await?;
+        Ok(built.artifact)
     }
 
     /// Builds one named binary and returns its full output path.
+    ///
+    /// The path is Cargo's own `compiler-artifact` report (`executable` of the
+    /// `--bin` unit), so it is the binary this build wrote even when another
+    /// project's identically named crate shares the target directory.
     ///
     /// # Errors
     ///
@@ -1037,25 +1064,10 @@ impl RustBuild {
         binary_name: &str,
         release: bool,
     ) -> Result<PathBuf, RustBuildError> {
-        let output_dir = self
-            .build_inner(release, CargoTarget::Binary(binary_name))
+        let built = self
+            .build_inner(release, CargoTarget::Binary(binary_name), None)
             .await?;
-        let binary_file_name = if self.triple.operating_system == OperatingSystem::Windows {
-            format!("{binary_name}.exe")
-        } else {
-            binary_name.to_string()
-        };
-        let binary_path = output_dir.join(binary_file_name);
-        if !binary_path.is_file() {
-            return Err(RustBuildError::FailToBuildRustLibrary(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "Binary not found at {} after cargo build",
-                    binary_path.display()
-                ),
-            )));
-        }
-        Ok(binary_path)
+        Ok(built.artifact)
     }
 
     /// Compute the expected dylib output path without building.
@@ -1081,7 +1093,8 @@ impl RustBuild {
         &self,
         release: bool,
         cargo_target: CargoTarget<'_>,
-    ) -> Result<PathBuf, RustBuildError> {
+        artifact_extension: Option<&'static str>,
+    ) -> Result<BuiltTarget, RustBuildError> {
         let mut output = self.cargo_build_output(release, cargo_target).await?;
 
         if !output.status.success() {
@@ -1124,7 +1137,47 @@ Automatic meson installation failed: {install_err}\n\n{}",
             ));
         }
 
-        self.lib_output_dir(release).await
+        // A dependency's final `dylib`/`cdylib` artifact uplifts to an
+        // unhashed name (`deps/libwaterui_dylib.so`), so one filename serves
+        // every same-named package sharing this target — last writer wins.
+        // A `fresh` unit emits nothing yet still reports that path, which can
+        // leave a different source's bytes where `water run` expects its own
+        // runtime. The dep-info `.d` written alongside records the producing
+        // sources; when they are not this unit's, clean the package so the
+        // rebuild below emits this source's artifact.
+        let stale = stale_shared_dylib_packages(&output.stdout).await?;
+        if !stale.is_empty() {
+            let target_dir = self.target_directory().await?;
+            for package in &stale {
+                clean_cargo_package(&self.path, package, &target_dir).await?;
+            }
+            output = self.cargo_build_output(release, cargo_target).await?;
+            if !output.status.success() {
+                let combined = combined_build_output(&output);
+                return Err(RustBuildError::FailToBuildRustLibrary(
+                    std::io::Error::other(format!(
+                        "Cargo build failed:\n{}",
+                        self.failure_report(&combined)
+                    )),
+                ));
+            }
+        }
+
+        let artifact =
+            reported_artifact(&output.stdout, &self.path, cargo_target, artifact_extension)?;
+        let profile_dir = self.lib_output_dir(release).await?;
+        Ok(BuiltTarget {
+            profile_dir,
+            artifact,
+        })
+    }
+
+    /// The artifact extension this build's `--crate-type` override produces,
+    /// when one is set and the type has a known file shape.
+    fn lib_artifact_extension(&self) -> Option<&'static str> {
+        self.crate_type_override
+            .as_deref()
+            .and_then(|crate_type| crate_type_artifact_extension(crate_type, &self.triple))
     }
 
     /// The text a build failure report embeds: the whole captured output, or
@@ -1198,6 +1251,7 @@ Automatic meson installation failed: {install_err}\n\n{}",
         };
         let mut cmd = cmd
             .arg(cargo_subcommand)
+            .arg("--message-format=json-render-diagnostics")
             .args(cargo_target.cargo_args())
             .args(["--target", self.triple.to_string().as_str()])
             .current_dir(&self.path);
@@ -1227,7 +1281,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
 
         // Use sccache as rustc wrapper if configured
         if let Some(sccache_path) = &self.sccache_path {
-            crate::toolchain::sccache::configure_compilation_cache(cmd, sccache_path);
+            crate::toolchain::sccache::configure_compilation_cache(cmd, sccache_path).map_err(
+                |error| {
+                    RustBuildError::FailToBuildRustLibrary(std::io::Error::other(error.to_string()))
+                },
+            )?;
         }
 
         // Set target-scoped bindgen clang args for simulator builds.
@@ -1354,6 +1412,271 @@ Automatic meson installation failed: {install_err}\n\n{}",
             "--target={arch}-apple-{target_os}{min_version}-simulator -isysroot {sdk_path}"
         ))
     }
+}
+
+/// The file extension the produced artifact carries for a `--crate-type`
+/// value — `None` for a type with no single known file shape.
+fn crate_type_artifact_extension(crate_type: &str, triple: &Triple) -> Option<&'static str> {
+    match crate_type {
+        "lib" | "rlib" => Some("rlib"),
+        "staticlib" => Some(if matches!(triple.environment, Environment::Msvc) {
+            "lib"
+        } else {
+            "a"
+        }),
+        "cdylib" | "dylib" | "proc-macro" => Some(lib_extension_for_triple(triple)),
+        _ => None,
+    }
+}
+
+/// The final artifact Cargo reported for the selected target: the
+/// `compiler-artifact` message for `crate_dir`'s manifest, matched by target
+/// kind — Cargo's own report of what it wrote, never a name reconstructed
+/// under the profile directory.
+///
+/// Every generated crate builds into one shared per-user Cargo target, so
+/// `<profile>/<name>` alone is not evidence the file came from this build.
+/// `artifact_extension` disambiguates a library target that emitted several
+/// crate types; without one, the build reports exactly one file or this
+/// fails rather than guesses.
+///
+/// # Errors
+/// Returns an error when no `compiler-artifact` message for the selected
+/// target reports a matching file, or the reported file does not exist.
+pub(crate) fn reported_artifact(
+    stdout: &[u8],
+    crate_dir: &Path,
+    cargo_target: CargoTarget<'_>,
+    artifact_extension: Option<&'static str>,
+) -> Result<PathBuf, RustBuildError> {
+    use cargo_metadata::Message;
+
+    let manifest_path = dunce::canonicalize(crate_dir.join("Cargo.toml")).map_err(|error| {
+        RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
+            "failed to canonicalize {}: {error}",
+            crate_dir.join("Cargo.toml").display()
+        )))
+    })?;
+    let mut artifacts = Vec::new();
+    for message in Message::parse_stream(stdout) {
+        let Ok(Message::CompilerArtifact(artifact)) = message else {
+            continue;
+        };
+        if artifact.manifest_path.as_std_path() == manifest_path
+            && cargo_target.matches(&artifact.target)
+        {
+            artifacts.push(artifact);
+        }
+    }
+    reported_artifact_file(&artifacts, cargo_target, artifact_extension, &manifest_path)
+}
+
+/// Picks the single file the selected target emitted out of its collected
+/// `compiler-artifact` messages.
+fn reported_artifact_file(
+    artifacts: &[cargo_metadata::Artifact],
+    cargo_target: CargoTarget<'_>,
+    artifact_extension: Option<&'static str>,
+    manifest_path: &Path,
+) -> Result<PathBuf, RustBuildError> {
+    let what = || -> String {
+        match cargo_target {
+            CargoTarget::Lib => format!("the library target of {}", manifest_path.display()),
+            CargoTarget::Binary(name) => {
+                format!("binary `{name}` of {}", manifest_path.display())
+            }
+        }
+    };
+    let not_found = |detail: String| {
+        RustBuildError::FailToBuildRustLibrary(io::Error::new(io::ErrorKind::NotFound, detail))
+    };
+
+    let files: Vec<PathBuf> = artifacts
+        .iter()
+        .flat_map(|artifact| {
+            artifact
+                .filenames
+                .iter()
+                .map(|file| file.as_std_path().to_path_buf())
+        })
+        .collect();
+    let artifact = match cargo_target {
+        CargoTarget::Binary(_) => artifacts
+            .iter()
+            .find_map(|artifact| artifact.executable.as_ref())
+            .map(|path| path.as_std_path().to_path_buf())
+            .ok_or_else(|| {
+                not_found(format!(
+                    "Cargo reported no artifact for {} (reported files: {files:?})",
+                    what()
+                ))
+            })?,
+        CargoTarget::Lib => {
+            let matching: Vec<&PathBuf> = artifact_extension.map_or_else(
+                || files.iter().collect(),
+                |extension| {
+                    files
+                        .iter()
+                        .filter(|file| file.extension().is_some_and(|e| *e == *extension))
+                        .collect()
+                },
+            );
+            match matching.as_slice() {
+                [only] => (*only).clone(),
+                _ => {
+                    return Err(not_found(artifact_extension.map_or_else(
+                        || {
+                            format!(
+                                "Cargo reported {} artifacts for {} — select one with a crate-type override (reported files: {files:?})",
+                                matching.len(),
+                                what()
+                            )
+                        },
+                        |extension| {
+                            format!(
+                                "Cargo reported no `.{extension}` artifact for {} (reported files: {files:?})",
+                                what()
+                            )
+                        },
+                    )));
+                }
+            }
+        }
+    };
+    if !artifact.is_file() {
+        return Err(not_found(format!(
+            "Cargo reported {} for {} but the file does not exist",
+            artifact.display(),
+            what()
+        )));
+    }
+    Ok(artifact)
+}
+
+/// Names of dependency packages whose `fresh` dynamic-library unit reports an
+/// artifact another source's build of the same-named package last wrote.
+///
+/// Dep-info is the one record that names the producing sources: the `.d`
+/// Cargo writes beside an uplifted dylib lists the writer's inputs, while the
+/// unit's own `manifest_path` says which source *this* graph resolved. A
+/// dep-info that names no file under the unit's manifest root was produced by
+/// a different source's build, and the unhashed artifact it accompanies does
+/// not belong to this project.
+async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustBuildError> {
+    use cargo_metadata::Message;
+
+    let mut stale = Vec::new();
+    for message in Message::parse_stream(stdout) {
+        let Ok(Message::CompilerArtifact(artifact)) = message else {
+            continue;
+        };
+        if !artifact.fresh {
+            continue;
+        }
+        let Some(manifest_dir) = artifact.manifest_path.as_std_path().parent() else {
+            continue;
+        };
+        let manifest_root = format!("{}/", manifest_dir.display().to_string().replace('\\', "/"));
+        let mut package_stale = false;
+        for filename in &artifact.filenames {
+            let file = filename.as_std_path();
+            if !is_dynamic_library(file) {
+                continue;
+            }
+            let Some(dep_info) = dep_info_path(file) else {
+                continue;
+            };
+            // Dep-info escapes `\` and ` ` in paths; a normalized
+            // forward-slash scan still matches every root the CLI builds
+            // from, and a rare miss costs one package rebuild — never a
+            // wrong artifact.
+            let contents = smol::fs::read_to_string(&dep_info)
+                .await
+                .map_err(|error| {
+                    RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
+                        "Cargo reported {} fresh but its dep-info {} is unreadable: {error}",
+                        file.display(),
+                        dep_info.display()
+                    )))
+                })?
+                .replace("\\\\", "/")
+                .replace('\\', "/");
+            if !contents.contains(&manifest_root) {
+                package_stale = true;
+            }
+        }
+        if package_stale {
+            stale.push(artifact_package_name(&artifact.package_id).to_owned());
+        }
+    }
+    stale.sort_unstable();
+    stale.dedup();
+    Ok(stale)
+}
+
+/// Whether `file` names a dynamically linked library — the artifact shape a
+/// dependency's final target uplifts to one unhashed filename per name.
+fn is_dynamic_library(file: &Path) -> bool {
+    file.extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("so" | "dylib" | "dll")))
+}
+
+/// The dep-info `.d` Cargo wrote for the unit that produced `artifact_file`:
+/// `<name>.d` in the profile's `deps/` directory, named after the library
+/// with its `lib` prefix and extension stripped.
+fn dep_info_path(artifact_file: &Path) -> Option<PathBuf> {
+    let stem = artifact_file.file_stem()?.to_str()?;
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    let dir = artifact_file.parent()?;
+    let deps = if dir.file_name() == Some(OsStr::new("deps")) {
+        dir.to_path_buf()
+    } else {
+        dir.join("deps")
+    };
+    Some(deps.join(format!("{stem}.d")))
+}
+
+/// The package name a `package_id` specifier carries — `source#name@version`,
+/// or the source's final path segment for the older `source#version` form.
+fn artifact_package_name(package_id: &cargo_metadata::PackageId) -> &str {
+    let repr = package_id.repr.as_str();
+    let (source, fragment) = repr.rsplit_once('#').unwrap_or((repr, ""));
+    fragment.split_once('@').map_or_else(
+        || source.rsplit('/').next().unwrap_or(repr),
+        |(name, _)| name,
+    )
+}
+
+/// `cargo clean -p <package>` in `crate_dir`, confined to `target_dir`: drops
+/// the package's units — including the unhashed artifact another source's
+/// build left behind — so the next build re-emits this graph's own.
+async fn clean_cargo_package(
+    crate_dir: &Path,
+    package: &str,
+    target_dir: &Path,
+) -> Result<(), RustBuildError> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("clean")
+        .arg("-p")
+        .arg(package)
+        .arg("--target-dir")
+        .arg(target_dir)
+        .current_dir(crate_dir);
+    configure_generated_crate_compilation(&mut command);
+    let output = command
+        .output()
+        .await
+        .map_err(RustBuildError::FailToExecuteCargoBuild)?;
+    if !output.status.success() {
+        return Err(RustBuildError::FailToBuildRustLibrary(io::Error::other(
+            format!(
+                "cargo clean -p {package} failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        )));
+    }
+    Ok(())
 }
 
 fn combined_build_output(output: &std::process::Output) -> String {
@@ -1681,6 +2004,202 @@ mod tests {
             classify_compile_line(colored_finished),
             CompileEvent::Finished(colored_finished.trim().to_string())
         );
+    }
+
+    /// Two projects named `demo` in different directories generate crates
+    /// whose package names differ by the project-root tag, so one shared
+    /// Cargo target gives each its own uplifted artifact — and the build
+    /// resolves it from Cargo's `compiler-artifact` report rather than a
+    /// bare `<profile>/<name>` guess.
+    #[test]
+    fn same_named_projects_resolve_their_own_artifacts_in_one_shared_target() {
+        use crate::project_model::project_types::{CrateName, generated_crate_name};
+
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let shared_target = temporary.path().join("shared-target");
+            let demo = CrateName::try_from("demo").expect("crate name");
+            let mut artifacts = Vec::new();
+            for (directory, marker) in [("first", "first"), ("second", "second")] {
+                let project_root = temporary.path().join(directory);
+                let crate_dir = project_root.join("hydrolysis");
+                std::fs::create_dir_all(crate_dir.join("src")).expect("crate dir");
+                let package = generated_crate_name(&demo, "hydrolysis", &project_root);
+                std::fs::write(
+                    crate_dir.join("Cargo.toml"),
+                    format!(
+                        "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    ),
+                )
+                .expect("manifest");
+                std::fs::write(
+                    crate_dir.join("src/main.rs"),
+                    format!("fn main() {{ println!(\"{marker}\"); }}\n"),
+                )
+                .expect("main.rs");
+
+                let artifact = super::RustBuild::new(&crate_dir, Triple::host())
+                    .with_target_dir(&shared_target)
+                    .build_binary(package.as_str(), false)
+                    .await
+                    .expect("the generated crate builds");
+                assert!(artifact.is_file(), "the reported artifact exists");
+                artifacts.push(artifact);
+            }
+
+            assert_ne!(
+                artifacts[0], artifacts[1],
+                "each same-named project resolves its own artifact"
+            );
+            for (artifact, marker) in artifacts.iter().zip(["first", "second"]) {
+                let ran = std::process::Command::new(artifact)
+                    .output()
+                    .expect("the resolved artifact executes");
+                assert_eq!(
+                    String::from_utf8_lossy(&ran.stdout).trim(),
+                    marker,
+                    "the artifact is this project's binary, not the sibling's"
+                );
+            }
+        });
+    }
+
+    /// `reported_artifact` matches on the artifact's manifest path — the
+    /// identity Cargo assigns the unit — and returns the file the message
+    /// reports even when that path is the hash-suffixed `deps/` copy, so a
+    /// sibling package's artifact in the same stream is never picked up.
+    #[test]
+    fn reported_artifact_selects_the_matching_manifests_file() {
+        let temporary = tempdir().expect("tempdir");
+        let crate_dir = temporary.path().join("demo-hydrolysis-deadbeef");
+        std::fs::create_dir_all(&crate_dir).expect("crate dir");
+        std::fs::write(crate_dir.join("Cargo.toml"), "[package]\n").expect("manifest");
+        let manifest =
+            dunce::canonicalize(crate_dir.join("Cargo.toml")).expect("canonical manifest");
+        let reported = crate_dir.join("target/debug/deps/demo_hydrolysis_deadbeef-abc123.rlib");
+        std::fs::create_dir_all(reported.parent().expect("deps dir")).expect("deps dir");
+        std::fs::write(&reported, []).expect("reported artifact");
+
+        let artifact_json = |manifest: &std::path::Path, file: &std::path::Path, name: &str| {
+            format!(
+                concat!(
+                    r#"{{"reason":"compiler-artifact","package_id":"path+file:///x#{name}@0.1.0","#,
+                    r#""manifest_path":"{manifest}","target":{{"kind":["lib"],"crate_types":["lib"],"#,
+                    r#""name":"{name}","src_path":"/x/src/lib.rs","edition":"2021","doc":true,"#,
+                    r#""doctest":true,"test":true}},"profile":{{"opt_level":"0","debuginfo":0,"#,
+                    r#""debug_assertions":true,"overflow_checks":true,"test":false}},"features":[],"#,
+                    r#""filenames":["{file}"],"executable":null,"fresh":true}}"#,
+                ),
+                manifest = manifest.display(),
+                file = file.display(),
+                name = name,
+            )
+        };
+
+        let other_manifest = temporary.path().join("other").join("Cargo.toml");
+        let stdout = format!(
+            "{}\n{}\n",
+            artifact_json(
+                &other_manifest,
+                std::path::Path::new("/tmp/other.rlib"),
+                "other"
+            ),
+            artifact_json(&manifest, &reported, "demo_hydrolysis_deadbeef"),
+        );
+        let resolved = super::reported_artifact(
+            stdout.as_bytes(),
+            &crate_dir,
+            CargoTarget::Lib,
+            Some("rlib"),
+        )
+        .expect("the matching manifest's artifact resolves");
+        assert_eq!(resolved, reported);
+
+        let foreign_only = artifact_json(
+            &other_manifest,
+            std::path::Path::new("/tmp/other.rlib"),
+            "other",
+        );
+        assert!(
+            super::reported_artifact(
+                foreign_only.as_bytes(),
+                &crate_dir,
+                CargoTarget::Lib,
+                Some("rlib"),
+            )
+            .is_err(),
+            "an artifact for another manifest is never selected"
+        );
+    }
+
+    /// A dependency's uplifted dylib is unhashed, so a `fresh` report does not
+    /// prove the file is this source's — the dep-info beside it records the
+    /// producing sources, and only a dep-info naming this unit's own manifest
+    /// root clears it.
+    #[test]
+    fn stale_shared_dylib_packages_flags_a_foreign_written_artifact() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let deps = temporary.path().join("debug/deps");
+            std::fs::create_dir_all(&deps).expect("deps dir");
+            let dylib = deps.join("libwaterui_dylib.so");
+            std::fs::write(&dylib, []).expect("dylib");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(&ours).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+
+            let artifact = |fresh: bool| {
+                format!(
+                    concat!(
+                        r#"{{"reason":"compiler-artifact","package_id":"path+file:///x#waterui-dylib@0.1.0","#,
+                        r#""manifest_path":"{manifest}","target":{{"kind":["lib"],"crate_types":["dylib"],"#,
+                        r#""name":"waterui_dylib","src_path":"/x/src/lib.rs","edition":"2021","doc":true,"#,
+                        r#""doctest":true,"test":true}},"profile":{{"opt_level":"0","debuginfo":0,"#,
+                        r#""debug_assertions":true,"overflow_checks":true,"test":false}},"features":[],"#,
+                        r#""filenames":["{file}"],"executable":null,"fresh":{fresh}}}"#,
+                    ),
+                    manifest = manifest.display(),
+                    file = dylib.display(),
+                    fresh = fresh,
+                )
+            };
+            let dep_info = deps.join("waterui_dylib.d");
+
+            // A `fresh` unit whose dep-info names another source's checkout.
+            std::fs::write(
+                &dep_info,
+                format!("{}: /elsewhere/waterui-dylib/src/lib.rs\n", dylib.display()),
+            )
+            .expect("foreign dep-info");
+            let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
+                .await
+                .expect("scan");
+            assert_eq!(stale, ["waterui-dylib"]);
+
+            // The same file written by this unit's own source is trusted.
+            std::fs::write(
+                &dep_info,
+                format!("{}: {}/src/lib.rs\n", dylib.display(), ours.display()),
+            )
+            .expect("own dep-info");
+            let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
+                .await
+                .expect("scan");
+            assert!(stale.is_empty(), "our own artifact is never stale");
+
+            // A unit cargo just emitted needs no dep-info check at all.
+            std::fs::write(
+                &dep_info,
+                format!("{}: /elsewhere/waterui-dylib/src/lib.rs\n", dylib.display()),
+            )
+            .expect("foreign dep-info");
+            let stale = super::stale_shared_dylib_packages(artifact(false).as_bytes())
+                .await
+                .expect("scan");
+            assert!(stale.is_empty(), "a non-fresh unit wrote the file itself");
+        });
     }
 
     #[test]

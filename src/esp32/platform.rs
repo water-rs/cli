@@ -243,21 +243,16 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
         );
     }
 
-    let profile = if options.is_release() {
-        "release"
-    } else {
-        "debug"
-    };
-
     let chip = esp32_chip(project)?;
 
     let mut cargo = smol::process::Command::new("cargo");
     cargo.current_dir(&backend_path);
     cargo.arg("build");
+    cargo.arg("--message-format=json-render-diagnostics");
     cargo.arg("--target-dir").arg(&backend_target_dir);
     crate::build::configure_generated_crate_compilation(&mut cargo);
     if let Some(sccache_path) = options.sccache_path() {
-        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path);
+        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path)?;
     }
     for (key, value) in esp_toolchain_envs(chip)? {
         cargo.env(key, value);
@@ -291,7 +286,17 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
         );
     }
 
-    Ok(backend_target_dir.join(chip.target_triple()).join(profile))
+    // The ELF path comes from cargo's own artifact report — the shared
+    // toolchain target directory hosts other projects' builds, so a bare
+    // `<profile>/<name>` lookup is not evidence the file is this project's.
+    let crate_name = project.esp32_backend_crate_name();
+    crate::build::reported_artifact(
+        &output.stdout,
+        &backend_path,
+        crate::build::CargoTarget::Binary(crate_name.as_str()),
+        None,
+    )
+    .map_err(|error| eyre!("failed to resolve the built ESP32 firmware: {error}"))
 }
 
 /// Resolve the built ESP32 firmware ELF path for the given profile.
@@ -337,14 +342,8 @@ pub async fn run_esp32(
     options: BuildOptions,
     device: Option<&str>,
 ) -> eyre::Result<()> {
-    let profile = if options.is_release() {
-        "release"
-    } else {
-        "debug"
-    };
     let chip = esp32_chip(project)?;
-    build_esp32(project, options).await?;
-    let elf = built_esp32_binary_path(project, profile).await?;
+    let elf = build_esp32(project, options).await?;
 
     match device {
         Some("qemu") => qemu_esp32(project, chip, &elf).await,

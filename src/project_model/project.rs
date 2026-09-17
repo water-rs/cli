@@ -383,17 +383,20 @@ impl Project {
     }
 
     /// Get configured or default FFI crate name for app mode.
+    ///
+    /// The default is tagged with this project's root — see
+    /// [`generated_crate_name`]; an explicit `[crates]` override is verbatim.
     #[must_use]
     pub fn ffi_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
             .and_then(|crates| crates.ffi.clone())
-            .unwrap_or_else(|| self.crate_name.with_suffix("ffi"))
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "ffi", &self.root))
     }
 
     /// Get configured preview wrapper crate name for preview dylib builds.
     #[must_use]
     pub fn preview_ffi_crate_name(&self) -> CrateName {
-        self.crate_name.with_suffix("preview-ffi")
+        generated_crate_name(&self.crate_name, "preview-ffi", &self.root)
     }
 
     /// Get the crate root path used to build preview dylibs.
@@ -413,7 +416,7 @@ impl Project {
     pub fn gtk_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
             .and_then(|crates| crates.gtk.clone())
-            .unwrap_or_else(|| self.crate_name.with_suffix("gtk4"))
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "gtk4", &self.root))
     }
 
     /// Get configured or default hydrolysis backend crate name for app mode.
@@ -421,7 +424,7 @@ impl Project {
     pub fn hydrolysis_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
             .and_then(|crates| crates.hydrolysis.clone())
-            .unwrap_or_else(|| self.crate_name.with_suffix("hydrolysis"))
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "hydrolysis", &self.root))
     }
 
     /// Get configured or default `WinUI` backend crate name for app mode.
@@ -429,19 +432,19 @@ impl Project {
     pub fn winui_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
             .and_then(|crates| crates.winui.clone())
-            .unwrap_or_else(|| self.crate_name.with_suffix("winui"))
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "winui", &self.root))
     }
 
     /// Get the generated ESP32 firmware harness crate name.
     #[must_use]
     pub fn esp32_backend_crate_name(&self) -> CrateName {
-        self.crate_name.with_suffix("esp32")
+        generated_crate_name(&self.crate_name, "esp32", &self.root)
     }
 
     /// Get the crate name of the generated experimental TUI launcher.
     #[must_use]
     pub fn tui_backend_crate_name(&self) -> CrateName {
-        self.crate_name.with_suffix("tui")
+        generated_crate_name(&self.crate_name, "tui", &self.root)
     }
 
     /// Get package type declared in `Water.toml`.
@@ -2076,7 +2079,7 @@ use crate::{
     build::{BuildOptions, BuildProfile},
     device::{Artifact, Device, FailToRun, RunOptions, Running},
     platform::{PackageOptions, TargetBackend, TargetPlatform},
-    project_types::{BundleIdentifier, CrateName, PermissionKey},
+    project_types::{BundleIdentifier, CrateName, PermissionKey, generated_crate_name},
     templates::{self, TemplateContext},
     utils::command,
     web,
