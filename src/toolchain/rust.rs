@@ -479,13 +479,121 @@ fn is_no_active_toolchain_error(error: &str) -> bool {
         || normalized.contains("not installed")
 }
 
+/// A nightly toolchain that can compile the standard library from source.
+///
+/// `-Zbuild-std` needs a nightly cargo and the `rust-src` component. The
+/// Android preview needs both: the only shared `libstd` rustup ships is
+/// 4 KB-aligned, and a device with 16 KB pages refuses to map it, so the
+/// preview runtime builds `std` itself under the page-size link flag.
+///
+/// The choice is deterministic — the plain `nightly` channel first, then the
+/// newest dated nightly — because the support app and the preview module are
+/// separate Cargo invocations that must land on the same `libstd-<hash>.so`.
+///
+/// # Errors
+/// Returns an error when no nightly toolchain is installed, or when
+/// `rust-src` is missing and cannot be added to the selected toolchain.
+pub async fn nightly_toolchain_with_rust_src(host: &Host) -> eyre::Result<String> {
+    let list = host
+        .run("rustup", ["toolchain", "list"])
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "Android preview needs a nightly Rust toolchain to build `std` from source, \
+                 and `rustup toolchain list` failed: {error}"
+            )
+        })?;
+    let host_triple = target_lexicon::Triple::host().to_string();
+    let Some(toolchain) = pick_nightly(&list, &host_triple) else {
+        eyre::bail!(
+            "Android preview needs a nightly Rust toolchain to build `std` from source. \
+             Install one with `rustup toolchain install nightly --component rust-src`."
+        );
+    };
+
+    let components = host
+        .run(
+            "rustup",
+            [
+                "component",
+                "list",
+                "--toolchain",
+                &toolchain,
+                "--installed",
+            ],
+        )
+        .await
+        .map_err(|error| {
+            eyre::eyre!("Failed to list components of Rust toolchain `{toolchain}`: {error}")
+        })?;
+    let has_rust_src = components
+        .lines()
+        .map(str::trim)
+        .any(|line| line == "rust-src" || line.starts_with("rust-src "));
+    if !has_rust_src {
+        host.run(
+            "rustup",
+            ["component", "add", "--toolchain", &toolchain, "rust-src"],
+        )
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "Android preview needs the `rust-src` component on `{toolchain}` \
+                 (`rustup component add --toolchain {toolchain} rust-src`): {error}"
+            )
+        })?;
+    }
+    Ok(toolchain)
+}
+
+/// Pick the toolchain a `-Zbuild-std` build should use out of `rustup
+/// toolchain list` output: `nightly-<host>` first, else the newest dated
+/// nightly for the host.
+fn pick_nightly(list_output: &str, host_triple: &str) -> Option<String> {
+    let default_nightly = format!("nightly-{host_triple}");
+    let mut dated = Vec::new();
+    for name in list_output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        if name == default_nightly {
+            return Some(name.to_string());
+        }
+        if name.starts_with("nightly-") && name.ends_with(&format!("-{host_triple}")) {
+            dated.push(name.to_string());
+        }
+    }
+    dated.sort_unstable();
+    dated.pop()
+}
+
 #[cfg(test)]
 mod tests {
     use semver::Version;
 
     use super::{
         RustToolchainInstallation, parse_active_toolchain, parse_host_target, parse_rustc_version,
+        pick_nightly,
     };
+
+    #[test]
+    fn pick_nightly_prefers_the_plain_channel_then_the_newest_date() {
+        let host = "aarch64-apple-darwin";
+        let list = "stable-aarch64-apple-darwin (default)\nnightly-aarch64-apple-darwin\nnightly-2026-05-28-aarch64-apple-darwin\n";
+        assert_eq!(
+            pick_nightly(list, host).as_deref(),
+            Some("nightly-aarch64-apple-darwin")
+        );
+
+        let dated =
+            "nightly-2026-05-28-aarch64-apple-darwin\nnightly-2026-09-09-aarch64-apple-darwin\n";
+        assert_eq!(
+            pick_nightly(dated, host).as_deref(),
+            Some("nightly-2026-09-09-aarch64-apple-darwin")
+        );
+
+        assert_eq!(pick_nightly("stable-aarch64-apple-darwin\n", host), None);
+    }
 
     #[test]
     fn parse_rustc_version_accepts_prerelease() {

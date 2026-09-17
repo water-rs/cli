@@ -105,6 +105,55 @@ fn ndk_linker_path(ndk_path: &Path, abi: AndroidAbi, api_level: u32) -> PathBuf 
     ndk_clang_path(ndk_path, abi, false, api_level)
 }
 
+/// The NDK's prebuilt `libclang_rt.builtins-<arch>-android.a` for `abi`.
+///
+/// `-Zbuild-std` builds `compiler_builtins` with `compiler-builtins-c`, whose
+/// build script links the archive named by `LLVM_COMPILER_RT_LIB` instead of
+/// rebuilding compiler-rt from source (rust-src ships no compiler-rt C
+/// sources). On aarch64 that archive is what provides the LSE outline-atomics
+/// helpers (`__aarch64_ldadd4_acq_rel` & friends) NDK-compiled C objects
+/// reference — rustc links with `-nodefaultlibs`, so the clang driver's own
+/// copy never reaches the link.
+fn ndk_builtins_lib(ndk_path: &Path, abi: AndroidAbi) -> eyre::Result<PathBuf> {
+    let arch = match abi {
+        AndroidAbi::Arm64V8a => "aarch64",
+        AndroidAbi::X86_64 => "x86_64",
+        AndroidAbi::ArmeabiV7a => "arm",
+        AndroidAbi::X86 => "i686",
+    };
+    let clang_libs = ndk_path
+        .join("toolchains/llvm/prebuilt")
+        .join(ndk_host_tag(ndk_path))
+        .join("lib/clang");
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&clang_libs)
+        .map_err(|error| {
+            eyre::eyre!(
+                "Failed to read NDK clang libraries at {}: {error}",
+                clang_libs.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .map(|version_dir| {
+            version_dir.join(format!("lib/linux/libclang_rt.builtins-{arch}-android.a"))
+        })
+        .filter(|path| path.is_file())
+        .collect();
+    candidates.sort_unstable();
+    match candidates.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err(eyre::eyre!(
+            "The NDK at {} ships no libclang_rt.builtins-{arch}-android.a; \
+             a `-Zbuild-std` build needs it for the compiler-rt builtins",
+            ndk_path.display()
+        )),
+        _ => Err(eyre::eyre!(
+            "The NDK at {} ships multiple libclang_rt.builtins-{arch}-android.a \
+             copies: {candidates:?}",
+            ndk_path.display()
+        )),
+    }
+}
+
 /// Create a wrapper `CMake` toolchain file that sets `ANDROID_ABI` before including
 /// the NDK's toolchain. This is required because cmake-rs doesn't pass `ANDROID_ABI`
 /// as a -D define, causing the NDK toolchain to default to armeabi-v7a.
@@ -341,17 +390,18 @@ impl AndroidPlatform {
     /// # Errors
     /// Returns an error if the build fails.
     pub async fn build(&self, project: &Project, options: BuildOptions) -> eyre::Result<PathBuf> {
-        // Android cannot share the Rust runtime between the application and a
-        // loadable module. `-Cprefer-dynamic` links `std` from the toolchain's
-        // prebuilt dylib, and rustup ships that one with 4 KB-aligned LOAD
-        // segments; a device with 16 KB pages rejects it, and a debuggable build
-        // is told so in an "Android App Compatibility" dialog. Nothing here can
-        // realign a prebuilt, and giving the two objects a static copy each
-        // would give the process two allocators, two panic runtimes and two sets
-        // of thread-locals. So the runtime is linked in, which is what a
-        // packaged build already does — the `-z max-page-size=16384` below then
-        // covers everything the package ships.
-        let options = options.with_static_runtime();
+        // Only an app that will `dlopen` WaterUI modules — the preview support
+        // app — ships the shared Rust runtime. `-Cprefer-dynamic` on Android
+        // cannot resolve `std` to rustup's prebuilt `libstd.so` (its LOAD
+        // segments are 4 KB-aligned and 16 KB-page devices reject the whole
+        // package), so the shared-runtime path below builds `std` from source
+        // under the page-size link flag instead. Every other build links the
+        // runtime in, which is what a packaged build already does.
+        let options = if options.loads_dynamic_modules() {
+            options
+        } else {
+            options.with_static_runtime()
+        };
         // Resolve fonts BEFORE cargo build - this ensures icons.json is downloaded
         // for crates like fontawesome7 that need it during build.rs
         let font_declarations = crate::assets::scan_fonts(project).await?;
@@ -635,6 +685,23 @@ async fn configure_android_rust_build(
         // Devices with 16 KB pages (Pixel 9 class and Play's 2025 requirement)
         // refuse or warn on 4 KB-aligned LOAD segments.
         .with_rustc_flag("-Clink-arg=-Wl,-z,max-page-size=16384");
+    if options.linkage() == RustLinkage::SharedRuntime {
+        // The preview support app dlopens the pushed module, so the runtime is
+        // shared: the `dev` feature resolves `waterui-dylib`, `-Cprefer-dynamic`
+        // links `std` dynamically, and `-Zbuild-std` compiles that `libstd` from
+        // source — rustup's prebuilt one is 4 KB-aligned and a 16 KB-page device
+        // would reject the package for it. The `water` rustc wrapper Cargo runs
+        // under supplies the `dylib` crate type Cargo strips from `std`.
+        let nightly = crate::toolchain::rust::nightly_toolchain_with_rust_src(host).await?;
+        build = build
+            .with_feature("dev")
+            .with_preferred_dynamic_linking()
+            .with_build_std(nightly)
+            .with_env(
+                "LLVM_COMPILER_RT_LIB",
+                ndk_builtins_lib(&context.ndk_path, context.abi)?,
+            );
+    }
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
     }
@@ -642,53 +709,7 @@ async fn configure_android_rust_build(
         build = build.with_env(key.clone(), value.clone());
     }
 
-    build = build
-        .with_env(
-            format!("CARGO_TARGET_{}_LINKER", context.target_upper),
-            context.linker.as_os_str(),
-        )
-        .with_env(
-            format!("CARGO_TARGET_{}_AR", context.target_upper),
-            context.ar.as_os_str(),
-        )
-        .with_env(
-            format!("CC_{}", context.target_underscore),
-            context.linker.as_os_str(),
-        )
-        .with_env(
-            format!("CXX_{}", context.target_underscore),
-            context.cxx.as_os_str(),
-        )
-        .with_env(
-            format!("AR_{}", context.target_underscore),
-            context.ar.as_os_str(),
-        )
-        .with_env("ANDROID_NDK", context.ndk_path.as_os_str())
-        .with_env("ANDROID_NDK_HOME", context.ndk_path.as_os_str())
-        .with_env("ANDROID_NDK_ROOT", context.ndk_path.as_os_str())
-        .with_env("ANDROID_HOME", context.sdk_path.as_os_str())
-        .with_env("ANDROID_SDK_ROOT", context.sdk_path.as_os_str())
-        .with_env("ANDROID_JAR", context.android_jar.as_os_str())
-        .with_env("JAVA_HOME", context.java_home.as_os_str())
-        .with_env("KOTLIN_HOME", context.kotlin_home.as_os_str())
-        .with_env("KOTLINC", context.kotlin_compiler.as_os_str())
-        .with_env(
-            "CMAKE_TOOLCHAIN_FILE",
-            context.wrapper_toolchain.as_os_str(),
-        )
-        .with_env(
-            format!("CMAKE_TOOLCHAIN_FILE_{}", context.target_underscore),
-            context.wrapper_toolchain.as_os_str(),
-        )
-        .with_env("CMAKE_ASM_COMPILER", context.linker.as_os_str())
-        .with_env("ANDROID_ABI", context.abi.as_str())
-        .with_env("ANDROID_PLATFORM", &context.android_platform)
-        .with_env("PKG_CONFIG_ALLOW_CROSS", "1")
-        .with_env(
-            format!("PKG_CONFIG_ALLOW_CROSS_{}", context.target_underscore),
-            "1",
-        )
-        .with_env(format!("PKG_CONFIG_ALLOW_CROSS_{triple}"), "1");
+    build = build.with_envs(android_cargo_envs(context, triple));
 
     let current_path = host
         .env("PATH")
@@ -701,6 +722,130 @@ async fn configure_android_rust_build(
     })?;
 
     Ok(build.with_env("PATH", new_path))
+}
+
+/// The environment every Cargo invocation targeting an Android ABI needs:
+/// the NDK clang as linker and `cc`/`cxx`/`ar`, the SDK/NDK locations build
+/// scripts probe, the `CMake` toolchain file for native dependencies, and the
+/// `pkg-config` cross overrides.
+///
+/// The support app and the preview module it loads must compile their shared
+/// dependency graph identically, so both take their environment from this one
+/// list rather than each spelling it out.
+fn android_cargo_envs(
+    context: &AndroidBuildContext,
+    triple: &Triple,
+) -> Vec<(String, std::ffi::OsString)> {
+    [
+        (
+            format!("CARGO_TARGET_{}_LINKER", context.target_upper),
+            context.linker.as_os_str().to_os_string(),
+        ),
+        (
+            format!("CARGO_TARGET_{}_AR", context.target_upper),
+            context.ar.as_os_str().to_os_string(),
+        ),
+        (
+            format!("CC_{}", context.target_underscore),
+            context.linker.as_os_str().to_os_string(),
+        ),
+        (
+            format!("CXX_{}", context.target_underscore),
+            context.cxx.as_os_str().to_os_string(),
+        ),
+        (
+            format!("AR_{}", context.target_underscore),
+            context.ar.as_os_str().to_os_string(),
+        ),
+        (
+            "ANDROID_NDK".to_string(),
+            context.ndk_path.as_os_str().to_os_string(),
+        ),
+        (
+            "ANDROID_NDK_HOME".to_string(),
+            context.ndk_path.as_os_str().to_os_string(),
+        ),
+        (
+            "ANDROID_NDK_ROOT".to_string(),
+            context.ndk_path.as_os_str().to_os_string(),
+        ),
+        (
+            "ANDROID_HOME".to_string(),
+            context.sdk_path.as_os_str().to_os_string(),
+        ),
+        (
+            "ANDROID_SDK_ROOT".to_string(),
+            context.sdk_path.as_os_str().to_os_string(),
+        ),
+        (
+            "ANDROID_JAR".to_string(),
+            context.android_jar.as_os_str().to_os_string(),
+        ),
+        (
+            "JAVA_HOME".to_string(),
+            context.java_home.as_os_str().to_os_string(),
+        ),
+        (
+            "KOTLIN_HOME".to_string(),
+            context.kotlin_home.as_os_str().to_os_string(),
+        ),
+        (
+            "KOTLINC".to_string(),
+            context.kotlin_compiler.as_os_str().to_os_string(),
+        ),
+        (
+            "CMAKE_TOOLCHAIN_FILE".to_string(),
+            context.wrapper_toolchain.as_os_str().to_os_string(),
+        ),
+        (
+            format!("CMAKE_TOOLCHAIN_FILE_{}", context.target_underscore),
+            context.wrapper_toolchain.as_os_str().to_os_string(),
+        ),
+        (
+            "CMAKE_ASM_COMPILER".to_string(),
+            context.linker.as_os_str().to_os_string(),
+        ),
+        ("ANDROID_ABI".to_string(), context.abi.as_str().into()),
+        (
+            "ANDROID_PLATFORM".to_string(),
+            context.android_platform.clone().into(),
+        ),
+        ("PKG_CONFIG_ALLOW_CROSS".to_string(), "1".into()),
+        (
+            format!("PKG_CONFIG_ALLOW_CROSS_{}", context.target_underscore),
+            "1".into(),
+        ),
+        (format!("PKG_CONFIG_ALLOW_CROSS_{triple}"), "1".into()),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// The NDK/SDK toolchain environment a Rust build for `triple` on `abi`
+/// needs — shared between the app build and the preview module it `dlopen`s.
+///
+/// # Errors
+/// Returns an error when the NDK or the SDK-side tooling cannot be resolved.
+pub(crate) async fn android_rust_build_envs(
+    host: &Host,
+    project: &Project,
+    abi: AndroidAbi,
+    triple: &Triple,
+    build_std: bool,
+) -> eyre::Result<Vec<(String, std::ffi::OsString)>> {
+    let min_api_level = project
+        .resolved_framework()
+        .await?
+        .android_min_api_level()?;
+    let context = resolve_android_build_context(host, abi, triple, min_api_level).await?;
+    let mut envs = android_cargo_envs(&context, triple);
+    if build_std {
+        envs.push((
+            "LLVM_COMPILER_RT_LIB".to_string(),
+            ndk_builtins_lib(&context.ndk_path, abi)?.into_os_string(),
+        ));
+    }
+    Ok(envs)
 }
 
 async fn copy_android_build_outputs(
@@ -754,6 +899,11 @@ async fn copy_android_build_outputs(
         // Drop the copy an earlier build staged; nothing links it now.
         fs::remove_file(&libcxx_target).await?;
     }
+
+    // Every library about to ship must map its LOAD segments at the largest
+    // page size Android runs with; a 4 KB-aligned one is rejected at install
+    // time on 16 KB devices, so fail here naming the file instead.
+    crate::elf::require_aligned_shared_libraries(&output_dir).await?;
 
     Ok(())
 }

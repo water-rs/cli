@@ -6,6 +6,7 @@ use std::pin::Pin;
 use eyre::{Context as _, Result, bail};
 use tracing::info;
 
+use crate::build::{BuildOptions, BuildProfile};
 use crate::device::{Device, Local, RunOptions, Running};
 use crate::platform::TargetPlatform;
 use crate::project::Project;
@@ -143,7 +144,12 @@ pub async fn launch_inspector_session(
                 device.launch(&host).await?;
                 info!("Building and running inspector app on Android device...");
                 project
-                    .run_android_with_options(backend, device, run_options)
+                    .run_android_with_options(
+                        backend,
+                        device,
+                        run_options,
+                        BuildOptions::development(BuildProfile::Debug),
+                    )
                     .await
                     .map_err(|e| eyre::eyre!("Failed to run inspector app: {e}"))?
             } else {
@@ -157,7 +163,12 @@ pub async fn launch_inspector_session(
                 emulator.launch(&host).await?;
                 info!("Building and running inspector app on Android emulator...");
                 project
-                    .run_android_with_options(backend, emulator, run_options)
+                    .run_android_with_options(
+                        backend,
+                        emulator,
+                        run_options,
+                        BuildOptions::development(BuildProfile::Debug),
+                    )
                     .await
                     .map_err(|e| eyre::eyre!("Failed to run inspector app: {e}"))?
             }

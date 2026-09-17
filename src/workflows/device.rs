@@ -110,6 +110,16 @@ pub struct RunOptions {
     /// launching a new one. Preview support apps must disable this so multiple pooled instances
     /// can coexist across runtime fingerprints.
     replace_existing_macos_app_instances: bool,
+
+    /// TCP ports to forward from the host loopback to the device's loopback
+    /// (`adb forward`) for the lifetime of the run.
+    ///
+    /// Only Android honors this: the preview support app binds its TCP server
+    /// to the device's loopback, which the host cannot reach otherwise. The
+    /// mappings are removed when the [`Running`] is dropped, unless it is
+    /// detached — a detached preview app keeps serving future sessions through
+    /// the same ports.
+    forward_tcp_ports: Vec<u16>,
 }
 
 impl RunOptions {
@@ -121,6 +131,7 @@ impl RunOptions {
             log_level: None,
             native_logs: false,
             replace_existing_macos_app_instances: true,
+            forward_tcp_ports: Vec::new(),
         }
     }
 
@@ -189,6 +200,18 @@ impl RunOptions {
     #[must_use]
     pub const fn replace_existing_macos_app_instances(&self) -> bool {
         self.replace_existing_macos_app_instances
+    }
+
+    /// Forward the given TCP ports from the host loopback to the device's
+    /// loopback for the lifetime of the run.
+    pub fn set_forward_tcp_ports(&mut self, ports: impl IntoIterator<Item = u16>) {
+        self.forward_tcp_ports = ports.into_iter().collect();
+    }
+
+    /// The TCP ports to forward to the device's loopback, if any.
+    #[must_use]
+    pub fn forward_tcp_ports(&self) -> &[u16] {
+        &self.forward_tcp_ports
     }
 }
 

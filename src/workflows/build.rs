@@ -138,11 +138,27 @@ impl RustDynamicLibraries {
             )
         })?;
 
-        let target_libdir = rust_target_libdir(triple).await?;
+        // A `-Zbuild-std` build publishes its freshly compiled `libstd` into
+        // the profile's `deps/` directory via the rustc wrapper; that copy —
+        // not the toolchain's prebuilt one — is what the build linked against,
+        // so it is the one that has to ship. The prebuilt lookup below is the
+        // fallback for builds that never built `std` from source.
         let resolution_triple = triple.clone();
-        let standard_library =
-            unblock(move || resolve_rust_standard_library_in(&target_libdir, &resolution_triple))
-                .await?;
+        let deps_dir = lib_dir.join("deps");
+        let staged =
+            unblock(move || resolve_rust_standard_library_in(&deps_dir, &resolution_triple)).await;
+        let standard_library = match staged {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let target_libdir = rust_target_libdir(triple).await?;
+                let resolution_triple = triple.clone();
+                unblock(move || {
+                    resolve_rust_standard_library_in(&target_libdir, &resolution_triple)
+                })
+                .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         Ok(Self {
             waterui,
@@ -233,17 +249,29 @@ fn dynamic_library_file_name(crate_name: &str, triple: &Triple) -> String {
     }
 }
 
-fn resolve_rust_standard_library_in(libdir: &Path, triple: &Triple) -> eyre::Result<PathBuf> {
+/// Find the dynamic standard library a directory holds for `triple`.
+///
+/// A missing directory or an empty match set is `NotFound`; several
+/// candidates is an error — the caller cannot tell which `libstd` the build
+/// actually linked.
+fn resolve_rust_standard_library_in(libdir: &Path, triple: &Triple) -> std::io::Result<PathBuf> {
     let (prefix, extension) = if triple.operating_system == OperatingSystem::Windows {
         ("std-", "dll")
     } else {
         ("libstd-", lib_extension_for_triple(triple))
     };
-    let entries = std::fs::read_dir(libdir)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let entries = match std::fs::read_dir(libdir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} does not exist", libdir.display()),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     let mut matches = entries
-        .into_iter()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -257,23 +285,22 @@ fn resolve_rust_standard_library_in(libdir: &Path, triple: &Triple) -> eyre::Res
     matches.sort_unstable();
     match matches.as_slice() {
         [path] => Ok(path.clone()),
-        [] => {
-            bail!(
+        [] => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
                 "Rust target libdir {} contains no dynamic standard library for {triple}",
                 libdir.display()
-            );
-        }
-        _ => {
-            bail!(
-                "Rust target libdir {} contains multiple dynamic standard libraries for {triple}: {}",
-                libdir.display(),
-                matches
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+            ),
+        )),
+        _ => Err(std::io::Error::other(format!(
+            "Rust target libdir {} contains multiple dynamic standard libraries for {triple}: {}",
+            libdir.display(),
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
     }
 }
 
@@ -302,6 +329,15 @@ pub struct RustBuild {
     /// dependency graph. Trailing `cargo rustc` arguments reach only the selected
     /// target's own compilation and leave dependency fingerprints alone.
     final_rustc_args: Vec<String>,
+    /// rustup toolchain name (a nightly) when this build compiles the standard
+    /// library from source via `-Zbuild-std`.
+    ///
+    /// Cargo only ever emits the `rlib` half of a source-built `std`, so a
+    /// shared-runtime build on a target whose prebuilt `libstd` is unusable —
+    /// Android's is 4 KB-aligned, which 16 KB-page devices reject — runs Cargo
+    /// under the `water` rustc wrapper, which adds the `dylib` crate type to
+    /// the `std` unit and hands the produced `.so` to every dependent.
+    build_std_toolchain: Option<String>,
     /// Extra environment variables to set for the cargo build process.
     envs: Vec<(String, OsString)>,
 }
@@ -385,6 +421,11 @@ pub struct BuildOptions {
     target_triple: Option<Triple>,
     /// Rust runtime linkage used by the final native application.
     linkage: RustLinkage,
+    /// Whether the built app will `dlopen` `WaterUI` modules — a preview
+    /// support app — and therefore must package the shared Rust runtime
+    /// instead of linking it in, even on a platform that otherwise forces
+    /// static linkage.
+    dynamic_module_loading: bool,
     /// Whether `include_web!` mounts are dev-server-served and skipped when
     /// the build stages assets (Hydrolysis stages at build time).
     dev_server: bool,
@@ -407,6 +448,7 @@ impl BuildOptions {
             sccache_path: None,
             target_triple: None,
             linkage: RustLinkage::SharedRuntime,
+            dynamic_module_loading: false,
             dev_server: false,
             cargo_envs: profile.development_envs(),
         }
@@ -436,6 +478,7 @@ impl BuildOptions {
             sccache_path: None,
             target_triple: None,
             linkage: RustLinkage::Static,
+            dynamic_module_loading: false,
             dev_server: false,
             cargo_envs: Vec::new(),
         }
@@ -519,6 +562,23 @@ impl BuildOptions {
     pub const fn linkage(&self) -> RustLinkage {
         self.linkage
     }
+
+    /// Mark the built app as a host for `dlopen`'d `WaterUI` modules.
+    ///
+    /// A preview support app resolves a pushed module's framework symbols
+    /// against the runtime it already has open, so the shared runtime has to
+    /// ship in the package rather than be linked into the app alone.
+    #[must_use]
+    pub const fn with_dynamic_module_loading(mut self) -> Self {
+        self.dynamic_module_loading = true;
+        self
+    }
+
+    /// Whether the built app hosts dynamically loaded `WaterUI` modules.
+    #[must_use]
+    pub const fn loads_dynamic_modules(&self) -> bool {
+        self.dynamic_module_loading
+    }
 }
 
 /// Errors that can occur during the Rust build process.
@@ -546,6 +606,7 @@ impl RustBuild {
             crate_type_override: None,
             rustc_flags: Vec::new(),
             final_rustc_args: Vec::new(),
+            build_std_toolchain: None,
             envs: Vec::new(),
         }
     }
@@ -610,6 +671,24 @@ impl RustBuild {
     #[must_use]
     pub fn with_final_rustc_arg(mut self, flag: impl Into<String>) -> Self {
         self.final_rustc_args.push(flag.into());
+        self
+    }
+
+    /// Build the Rust standard library from source with `-Zbuild-std` on the
+    /// named toolchain (a nightly with `rust-src`), sharing one `libstd`
+    /// dylib across the graph.
+    ///
+    /// The build runs Cargo under the `water` rustc wrapper
+    /// ([`crate::rustc_wrapper`]): Cargo strips `dylib` from `std`'s crate
+    /// types under `-Zbuild-std`, and the wrapper restores it so the produced
+    /// `libstd-*.so` carries the same strict version hash as the rlib every
+    /// dependent is compiled against. The wrapper also publishes the dylib
+    /// into the profile's `deps/` directory, where
+    /// [`RustDynamicLibraries::resolve`] finds it before the toolchain's
+    /// prebuilt copy.
+    #[must_use]
+    pub fn with_build_std(mut self, toolchain: impl Into<String>) -> Self {
+        self.build_std_toolchain = Some(toolchain.into());
         self
     }
 
@@ -890,8 +969,19 @@ Automatic meson installation failed: {install_err}\n\n{combined}"
         } else {
             "build"
         };
-        let mut cmd = command(&mut cmd)
-            .arg(cargo_subcommand)
+        let mut cmd = command(&mut cmd).arg(cargo_subcommand);
+        if self.build_std_toolchain.is_some() {
+            // `-Zbuild-std-features` replaces Cargo's default std feature set
+            // (`panic-unwind`, `backtrace`), so both are listed back
+            // explicitly. `compiler-builtins-c` links the NDK's prebuilt
+            // compiler-rt archive — on aarch64 that provides the LSE
+            // outline-atomics helpers (`__aarch64_ldadd4_acq_rel` & friends)
+            // that NDK-compiled C objects reference, which otherwise stay
+            // undefined and make `dlopen` reject the libraries.
+            cmd = cmd.arg("-Zbuild-std=std,panic_abort");
+            cmd = cmd.arg("-Zbuild-std-features=panic-unwind,backtrace,compiler-builtins-c");
+        }
+        let mut cmd = cmd
             .args(cargo_target.cargo_args())
             .args(["--target", self.triple.to_string().as_str()])
             .current_dir(&self.path);
@@ -922,6 +1012,15 @@ Automatic meson installation failed: {install_err}\n\n{combined}"
         // Use sccache as rustc wrapper if configured
         if let Some(sccache_path) = &self.sccache_path {
             crate::toolchain::sccache::configure_compilation_cache(cmd, sccache_path);
+        }
+
+        // A `-Zbuild-std` build runs the `water` binary itself as
+        // `RUSTC_WRAPPER`, chained in front of sccache when one is configured,
+        // so the wrapper can add the `dylib` crate type Cargo strips from the
+        // `std` unit and publish the produced `libstd-*.so` into `deps/`.
+        // This must come after the sccache block above to win `RUSTC_WRAPPER`.
+        if self.build_std_toolchain.is_some() {
+            cmd = self.with_build_std_envs(cmd, release).await?;
         }
 
         // Set target-scoped bindgen clang args for simulator builds.
@@ -962,6 +1061,42 @@ Automatic meson installation failed: {install_err}\n\n{combined}"
             .await
             .map_err(RustBuildError::FailToExecuteCargoBuild)?;
         Ok(output)
+    }
+
+    /// Point a `-Zbuild-std` cargo invocation at the nightly toolchain and at
+    /// this binary as `RUSTC_WRAPPER`, chained in front of sccache when one is
+    /// configured.
+    async fn with_build_std_envs<'a>(
+        &self,
+        cmd: &'a mut Command,
+        release: bool,
+    ) -> Result<&'a mut Command, RustBuildError> {
+        let Some(toolchain) = &self.build_std_toolchain else {
+            return Ok(cmd);
+        };
+        let publish_dir = self.lib_output_dir(release).await?.join("deps");
+        let cmd = cmd
+            .env("RUSTUP_TOOLCHAIN", toolchain)
+            .env(
+                "RUSTC_WRAPPER",
+                std::env::current_exe().map_err(RustBuildError::FailToExecuteCargoBuild)?,
+            )
+            .env(crate::workflows::rustc_wrapper::WRAPPER_MODE_ENV, "1")
+            .env(
+                crate::workflows::rustc_wrapper::BUILD_STD_TARGET_ENV,
+                self.triple.to_string(),
+            )
+            .env(
+                crate::workflows::rustc_wrapper::BUILD_STD_DYLIB_DIR_ENV,
+                publish_dir,
+            );
+        if let Some(sccache_path) = &self.sccache_path {
+            cmd.env(
+                crate::workflows::rustc_wrapper::WRAPPER_CHAIN_ENV,
+                sccache_path,
+            );
+        }
+        Ok(cmd)
     }
 
     /// Resolve the Cargo library artifact directory for this build target and profile.
