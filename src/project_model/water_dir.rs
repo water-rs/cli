@@ -5,7 +5,13 @@
 //! scattering `.water` directories into user projects. Compiled Cargo artifacts
 //! live in the sibling `~/.water/build_cache/target/` — one directory shared by
 //! every project, so a machine compiles each dependency revision once no matter
-//! how many projects use it.
+//! how many projects use it. The price of that sharing is serialization: Cargo
+//! takes one build-directory lock per target, so concurrent `water` invocations
+//! on different projects build one at a time — the second reports `Blocking
+//! waiting for file lock on build directory`, which the piped progress render
+//! surfaces rather than swallowing — instead of each compiling the same
+//! dependency graph in parallel. Sharing wins overall for the workflows the
+//! CLI targets, where the alternative is N cold framework compiles.
 
 use std::{
     ffi::OsStr,
@@ -148,7 +154,10 @@ pub async fn build_cache_root() -> eyre::Result<PathBuf> {
 /// The directory is a first-class cache entry: it carries the same
 /// `metadata.toml` the per-project containers do, so the garbage collector
 /// reports it in usage surveys and reclaims it under the same unused-days
-/// policy once nothing has built for that long.
+/// policy once nothing has built for that long. One target also means one
+/// Cargo build-directory lock: builds of different projects serialize, and a
+/// waiting build prints `Blocking waiting for file lock on build directory` —
+/// visible through the piped progress render — for the holder's duration.
 ///
 /// # Errors
 /// Returns an error if the Water home cannot be determined, the global config
@@ -198,13 +207,14 @@ async fn ensure_shared_target_dir_in(cache_root: &Path) -> eyre::Result<PathBuf>
 ///
 /// The garbage collector only reclaims the directory once it has been unused
 /// for the configured window; this is the explicit drop, for when a user
-/// wants the space back now. A build in flight holds no lock against it —
-/// like `cargo clean`, dropping the cache under a live build is the caller's
-/// choice.
+/// wants the space back now. Unlike `cargo clean`, it refuses while a Cargo
+/// build is in flight — detected by the `.cargo-lock` every build holds in
+/// its profile directory — since deleting a target mid-build leaves the
+/// survivor's own project with a half-written graph.
 ///
 /// # Errors
-/// Returns an error if the cache root cannot be resolved or the directory
-/// cannot be removed.
+/// Returns an error if the cache root cannot be resolved, a Cargo build is
+/// using the directory, or the directory cannot be removed.
 pub async fn remove_shared_target_dir() -> eyre::Result<Option<u64>> {
     let water_home = water_home_dir()?;
     let (_, cache_root) = resolved_build_cache_root_in(&water_home).await?;
@@ -216,6 +226,7 @@ async fn remove_shared_target_dir_in(cache_root: &Path) -> eyre::Result<Option<u
     if !target_dir.exists() {
         return Ok(None);
     }
+    shared_target_in_use(&target_dir).await?;
     let bytes = directory_disk_usage(target_dir.clone()).await?;
     fs::remove_dir_all(&target_dir).await.wrap_err_with(|| {
         format!(
@@ -224,6 +235,61 @@ async fn remove_shared_target_dir_in(cache_root: &Path) -> eyre::Result<Option<u
         )
     })?;
     Ok(Some(bytes))
+}
+
+/// Refuse while a Cargo build holds a build-directory lock anywhere under
+/// `target_dir`.
+///
+/// Cargo locks `<triple>/<profile>/.cargo-lock` for the duration of a build,
+/// and those profile dirs sit at most three levels under the shared root —
+/// `<variant>/<triple>/<profile>` — so probing directories only, never
+/// listing profile contents, keeps the check bounded no matter how large the
+/// tree grows.
+async fn shared_target_in_use(target_dir: &Path) -> eyre::Result<()> {
+    let target_dir = target_dir.to_path_buf();
+    smol::unblock(move || -> eyre::Result<()> {
+        let mut profile_dirs = Vec::new();
+        let mut pending = vec![(target_dir.clone(), 0usize)];
+        while let Some((dir, depth)) = pending.pop() {
+            if depth == 3 {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let path = entry.path();
+                    if path.join(".cargo-lock").exists() {
+                        profile_dirs.push(path.clone());
+                    }
+                    pending.push((path, depth + 1));
+                }
+            }
+        }
+        for dir in &profile_dirs {
+            let lock_path = dir.join(".cargo-lock");
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .wrap_err_with(|| format!("Failed to open {}", lock_path.display()))?;
+            match FileExt::try_lock(&file) {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => {
+                    return Err(eyre::eyre!(
+                        "the shared Cargo target {} is in use by a running build \
+                         ({} is locked) — drop it once the build finishes",
+                        target_dir.display(),
+                        lock_path.display()
+                    ));
+                }
+                Err(TryLockError::Error(error)) => {
+                    return Err(eyre::Report::from(error))
+                        .wrap_err_with(|| format!("Failed to lock {}", lock_path.display()));
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Return the managed build-cache directory for a project.
@@ -794,28 +860,43 @@ async fn try_acquire_cleanup_lock(lock_path: &Path) -> eyre::Result<Option<std::
     .await
 }
 
+/// Every managed cache entry under `cache_root`.
+///
+/// Entries are per-project `managed_backends` containers plus the shared
+/// Cargo `target/` every project's builds write into. Neither interior is
+/// walked: the shared target's marker is read directly — descending into a
+/// cargo target costs as much as the GC itself — and a `managed_backends`
+/// marker is checked the moment its directory surfaces, so the walk only
+/// ever sees the container path hierarchy.
 async fn discover_managed_build_cache_dirs(cache_root: &Path) -> eyre::Result<Vec<PathBuf>> {
     let cache_root = cache_root.to_path_buf();
     smol::unblock(move || -> eyre::Result<Vec<PathBuf>> {
         let shared_target_dir = cache_root.join(SHARED_TARGET_DIR_NAME);
         let mut cache_dirs = Vec::new();
-        for entry in WalkDir::new(&cache_root).follow_links(false) {
-            let entry = entry.map_err(eyre::Report::from)?;
-            if !entry.file_type().is_file() || entry.file_name() != OsStr::new(METADATA_FILE_NAME) {
-                continue;
-            }
-
-            let cache_dir = entry.path().parent().ok_or_else(|| {
-                eyre::eyre!("Cache metadata {} has no parent", entry.path().display())
-            })?;
-            // Entries are per-project `managed_backends` containers and the
-            // shared Cargo target directory every project's builds write into.
-            if cache_dir != shared_target_dir
-                && cache_dir.file_name() != Some(OsStr::new(MANAGED_BACKENDS_DIR_NAME))
-            {
-                continue;
-            }
-            cache_dirs.push(cache_dir.to_path_buf());
+        if shared_target_dir.join(METADATA_FILE_NAME).is_file() {
+            cache_dirs.push(shared_target_dir.clone());
+        }
+        for entry in WalkDir::new(&cache_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                // A project path can itself end in `target`, so only the
+                // shared target at the root is pruned.
+                if entry.depth() == 1 && entry.path() == shared_target_dir {
+                    return false;
+                }
+                if entry.file_type().is_dir()
+                    && entry.file_name() == OsStr::new(MANAGED_BACKENDS_DIR_NAME)
+                {
+                    if entry.path().join(METADATA_FILE_NAME).is_file() {
+                        cache_dirs.push(entry.path().to_path_buf());
+                    }
+                    return false;
+                }
+                true
+            })
+        {
+            entry.map_err(eyre::Report::from)?;
         }
         Ok(cache_dirs)
     })
@@ -1165,6 +1246,79 @@ mod tests {
             assert_eq!(outcome, super::BuildCacheGcOutcome::SkippedAlreadyRunning);
 
             drop(held);
+        });
+    }
+
+    /// Discovery reads the shared target's marker directly and never descends
+    /// into the tree — a `managed_backends` directory inside `target/` is not
+    /// a cache entry and must not surface, while the real ones still do.
+    #[test]
+    fn discovery_never_walks_inside_the_shared_target() {
+        smol::block_on(async {
+            let cache_root = tempdir().expect("cache root");
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            // A marker-shaped dir buried in the target tree — the shape a
+            // recursive walk would wrongly report.
+            let buried = target_dir.join("debug/managed_backends");
+            smol::fs::create_dir_all(&buried)
+                .await
+                .expect("create buried dir");
+            smol::fs::write(
+                buried.join(super::METADATA_FILE_NAME),
+                "project_root = \"x\"",
+            )
+            .await
+            .expect("write buried marker");
+
+            let project = tempdir().expect("project dir");
+            let config = WaterConfig::default();
+            let managed =
+                super::ensure_project_build_cache_in(project.path(), cache_root.path(), &config)
+                    .await
+                    .expect("ensure managed cache");
+
+            let mut discovered = super::discover_managed_build_cache_dirs(cache_root.path())
+                .await
+                .expect("discover cache dirs");
+            let mut expected = vec![managed, target_dir];
+            discovered.sort();
+            expected.sort();
+            assert_eq!(discovered, expected);
+        });
+    }
+
+    /// Dropping the shared target while a Cargo build holds a profile
+    /// `.cargo-lock` refuses rather than deleting a live build's tree.
+    #[test]
+    fn shared_target_dir_refuses_while_a_build_lock_is_held() {
+        smol::block_on(async {
+            let cache_root = tempdir().expect("cache root");
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            let profile = target_dir.join("shared/aarch64-apple-darwin/debug");
+            smol::fs::create_dir_all(&profile)
+                .await
+                .expect("create profile dir");
+            let lock_file =
+                std::fs::File::create(profile.join(".cargo-lock")).expect("create cargo lock");
+            fs4::FileExt::lock(&lock_file).expect("hold the build lock");
+
+            let error = super::remove_shared_target_dir_in(cache_root.path())
+                .await
+                .expect_err("a held build lock must refuse the drop");
+            assert!(
+                error.to_string().contains("in use"),
+                "the error says why: {error}"
+            );
+
+            fs4::FileExt::unlock(&lock_file).expect("release the build lock");
+            super::remove_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("an unlocked target drops")
+                .expect("the target existed");
         });
     }
 
