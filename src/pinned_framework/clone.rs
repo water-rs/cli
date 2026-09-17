@@ -43,6 +43,26 @@ pub fn source() -> (String, String) {
         .expect("the length check leaves one source")
 }
 
+/// A materialized checkout of the pinned framework revision.
+///
+/// The guard holds a shared lock on `root/.in-use-<rev>` for as long as the
+/// caller works inside the tree: the pruner takes that lock exclusively
+/// before removing a superseded revision, so a checkout a stale process is
+/// still reading — an orphaned `cargo metadata` from before a pin bump —
+/// survives until the process exits instead of being deleted under it.
+pub struct PinnedCheckout {
+    directory: PathBuf,
+    _in_use: std::fs::File,
+}
+
+impl std::ops::Deref for PinnedCheckout {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.directory
+    }
+}
+
 /// A shallow clone of the pinned framework revision, submodules included —
 /// `cargo metadata` against a member needs the workspace tree complete, so
 /// the clone materializes whatever the pin carries.
@@ -54,7 +74,7 @@ pub fn source() -> (String, String) {
 /// once, and a blob-less checkout pays a lazy fetch per file — five of them
 /// racing did not finish inside the nightly job's per-test timeout on
 /// Windows.
-pub fn checkout() -> PathBuf {
+pub fn checkout() -> PinnedCheckout {
     let (git, rev) = source();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/pinned-framework");
     std::fs::create_dir_all(&root).expect("the pinned-framework directory is creatable");
@@ -74,13 +94,30 @@ pub fn checkout() -> PathBuf {
         std::fs::write(directory.join(".complete"), &rev)
             .expect("the completion marker is written");
     }
+    // Mark the checkout in use while still under the checkout lock, so no
+    // sibling's prune can remove it in between. The marker lives beside the
+    // tree, never inside it — deleting a directory that contains a file
+    // another process holds open fails outright on Windows.
+    let in_use = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(root.join(format!(".in-use-{rev}")))
+        .expect("the in-use marker is creatable");
+    fs4::FileExt::lock_shared(&in_use).expect("the in-use marker locks");
     drop(lock);
-    directory
+    PinnedCheckout {
+        directory,
+        _in_use: in_use,
+    }
 }
 
 /// Remove checkouts of revisions the pin has moved away from — one stale
 /// tree per pin bump otherwise accumulates under the root forever. Runs under
-/// the checkout lock, so no other process can be mid-clone on a removed tree.
+/// the checkout lock, so no other process can be mid-clone on a removed tree,
+/// and each candidate's `.in-use-<rev>` marker is try-locked exclusively
+/// first: a process still reading that revision holds it shared and the tree
+/// stays for the next prune.
 fn prune_superseded_checkouts(root: &Path, rev: &str) {
     for entry in std::fs::read_dir(root).expect("the pinned-framework directory is readable") {
         let entry = entry.expect("a pinned-framework entry is readable");
@@ -88,8 +125,31 @@ fn prune_superseded_checkouts(root: &Path, rev: &str) {
         if !path.is_dir() || entry.file_name() == std::ffi::OsStr::new(rev) {
             continue;
         }
-        std::fs::remove_dir_all(&path)
-            .expect("a superseded pinned-framework checkout is removable");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let marker_path = root.join(format!(".in-use-{name}"));
+        let marker = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&marker_path)
+            .expect("the in-use marker is creatable");
+        match fs4::FileExt::try_lock(&marker) {
+            Ok(()) => {
+                drop(marker);
+                std::fs::remove_dir_all(&path)
+                    .expect("a superseded pinned-framework checkout is removable");
+                // The marker outlives its tree only until this: nobody holds
+                // it (the exclusive lock proved that) and the next prune
+                // recreates it on demand.
+                let _ = std::fs::remove_file(&marker_path);
+            }
+            // A stale process still holds the shared lock — the tree stays
+            // for the next prune.
+            Err(fs4::TryLockError::WouldBlock) => {}
+            Err(fs4::TryLockError::Error(error)) => {
+                panic!("the in-use marker locks: {error}");
+            }
+        }
     }
 }
 
