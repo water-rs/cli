@@ -13,6 +13,7 @@ use cargo_metadata::TargetKind;
 use color_eyre::eyre::{Context as _, Result, bail};
 use object::read::archive::ArchiveFile;
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
+use waterui_assets_planner::BundleMountMeta;
 
 use crate::build::{BuildProgress, command_output_with_progress};
 
@@ -69,6 +70,28 @@ impl ArtifactSymbols {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    /// The bundle-mount metadata a `waterui_meta_bundle_*` static carries.
+    ///
+    /// The macro records the mount and project roots with
+    /// `std::fs::canonicalize`, which on Windows spells them as verbatim
+    /// `\\?\C:\...` paths. Those are valid for the standard library but not
+    /// for what the CLI hands them to — a frontend package manager's working
+    /// directory, Xcode and Gradle inputs, equality against paths the CLI
+    /// resolved itself — so both roots are simplified to their ordinary
+    /// spelling here, at the one place the payload enters the CLI.
+    ///
+    /// # Errors
+    /// Returns an error when the static is missing or its payload does not
+    /// decode.
+    pub fn bundle_mount_meta(&self, leaf: &str) -> Result<BundleMountMeta> {
+        let mut meta = BundleMountMeta::from_payload(&self.static_bytes(leaf)?)?;
+        meta.path = dunce::simplified(&meta.path).to_path_buf();
+        meta.project = meta
+            .project
+            .map(|project| dunce::simplified(&project).to_path_buf());
+        Ok(meta)
     }
 
     /// Bytes of a `#[used] static`.
@@ -475,12 +498,9 @@ mod tests {
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
-            let meta = waterui_assets_planner::BundleMountMeta::from_payload(
-                &symbols
-                    .static_bytes("waterui_meta_bundle_web")
-                    .expect("the web mount static should be present"),
-            )
-            .expect("payload should decode as BundleMountMeta");
+            let meta = symbols
+                .bundle_mount_meta("waterui_meta_bundle_web")
+                .expect("payload should decode as BundleMountMeta");
             assert_eq!(meta.mount, "web");
             assert!(
                 meta.path.ends_with("dist"),

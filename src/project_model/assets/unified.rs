@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use smol::fs;
 use waterui_assets_core::AssetKind;
 use waterui_assets_planner::{
-    AssetRole, BUNDLE_META_PREFIX, BundleManifest, BundleMount, BundleMountMeta, ColorScheme,
-    HexColor, LaunchPlan, PlannedAsset, ThemeConfig, plan_mount,
+    AssetRole, BUNDLE_META_PREFIX, BundleManifest, BundleMount, ColorScheme, HexColor, LaunchPlan,
+    PlannedAsset, ThemeConfig, plan_mount,
 };
 
 #[cfg(target_os = "macos")]
@@ -362,7 +362,7 @@ async fn build_manifest(
     let mut seen = BTreeSet::new();
     let mut mounts = Vec::new();
     for leaf in symbols.leaves_with_prefix(BUNDLE_META_PREFIX) {
-        let meta = BundleMountMeta::from_payload(&symbols.static_bytes(&leaf)?)?;
+        let meta = symbols.bundle_mount_meta(&leaf)?;
         // The `assets` mount is the main root, already planned above.
         if meta.mount == "assets" {
             continue;
