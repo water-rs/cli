@@ -322,9 +322,16 @@ impl Running {
     /// This is useful for long-running apps like the preview support app that should
     /// stay running after the CLI command completes.
     pub fn detach(self: Pin<&mut Self>) {
-        // SAFETY: `on_drop` is not structurally pinned and clearing the vector does not move the
-        // pinned `receiver` field.
-        unsafe { self.get_unchecked_mut() }.on_drop.clear();
+        // SAFETY: `on_drop` is not structurally pinned and draining the vector does
+        // not move the pinned `receiver` field.
+        let this = unsafe { self.get_unchecked_mut() };
+        // Detach keeps every retained resource alive, so the hooks are
+        // forgotten rather than dropped: dropping a retained RAII guard (like
+        // the `adb forward` teardown) fires its `Drop` here, which is exactly
+        // the cleanup detach exists to prevent.
+        for hook in this.on_drop.drain(..) {
+            std::mem::forget(hook);
+        }
     }
 }
 
@@ -1663,11 +1670,13 @@ fn parse_log_level(line: &str) -> tracing::Level {
 #[cfg(test)]
 mod tests {
     use std::process::ExitStatus;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use smol::channel::unbounded;
 
     use super::{
-        ApplicationExit, ApplicationExitReason, DeviceEvent, emit_process_exit_event,
+        ApplicationExit, ApplicationExitReason, DeviceEvent, Running, emit_process_exit_event,
         parse_log_level,
     };
     #[cfg(target_os = "macos")]
@@ -1822,5 +1831,36 @@ mod tests {
             "/tmp/My App.app/Contents/MacOS/my-app --flag",
             executable,
         ));
+    }
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dropping_a_running_fires_retained_guards() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let (mut running, _sender) = Running::new(|| {});
+        running.retain(DropProbe(fired.clone()));
+        drop(running);
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn detach_keeps_retained_guards_from_firing() {
+        // A retained RAII guard — the `adb forward` teardown is one — must
+        // survive detach: the detached app outlives the session and keeps
+        // serving through the forwarded ports.
+        let fired = Arc::new(AtomicBool::new(false));
+        let (mut running, _sender) = Running::new(|| {});
+        running.retain(DropProbe(fired.clone()));
+        let mut running = Box::pin(running);
+        running.as_mut().detach();
+        drop(running);
+        assert!(!fired.load(Ordering::SeqCst));
     }
 }
