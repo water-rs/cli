@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/water-rs/cli/compare/v0.3.1...v0.3.2) - 2026-09-17
+
+### Added
+
+- gate scaffolded backends on the channel's distributable packages
+- add experimental WinUI backend support ([#45](https://github.com/water-rs/cli/pull/45))
+- require confirmation for experimental backends ([#44](https://github.com/water-rs/cli/pull/44))
+
+### Fixed
+
+- *(ci)* stream fresh-user e2e output and timestamp phases
+- *(build)* default water build to the backend's development profile
+- *(build)* find fresh dylib dep-info on cargo's build-dir layout and skip proc-macro units ([#71](https://github.com/water-rs/cli/pull/71))
+- *(apple)* forward build-script link-search paths into OTHER_LDFLAGS ([#70](https://github.com/water-rs/cli/pull/70))
+- repair nightly fresh-user and ignored-test legs ([#65](https://github.com/water-rs/cli/pull/65))
+- *(android)* build the preview runtime's libstd from source at 16 KB alignment ([#66](https://github.com/water-rs/cli/pull/66))
+- *(preview)* keep pacing while in-flight work publishes progressive frames
+- *(preview)* hold the virtual clock while settling and stop on live producers
+- *(preview)* let real I/O finish before the hydrolysis preview captures
+- *(build)* keep a shared-runtime source that already sits in the stage directory
+- *(ci)* repair the nightly legs
+- canonicalize pinned checkout paths with dunce
+- *(esp32)* compare patch tables in the emitter's precedence
+- *(esp32)* flag manifests missing the framework patch tables stale
+- *(esp32)* carry the framework patch tables into the generated manifest
+- *(framework)* resolve declared git sources for scaffold packages
+- *(framework)* honor declared Apple backend revisions ([#32](https://github.com/water-rs/cli/pull/32))
+- *(ci)* keep publish/dist reachable on dispatch ([#29](https://github.com/water-rs/cli/pull/29))
+
+### Other
+
+- *(nightly)* give the fresh-user run a cold-build budget and a WARP adapter on Windows
+- *(terminal)* share the clap TargetBackend enum between commands
+- format create.rs
+- Merge remote-tracking branch 'origin/dev' into feat/experimental-scaffold-packages
+- Merge pull request #55 from water-rs/fix/892-preview-settle-real-time
+- *(apple)* remove dead simctl sample fixture and ignore .vscode
+- restore the trailing newline rustfmt requires
+
 ## [0.3.1](https://github.com/water-rs/cli/compare/v0.3.0...v0.3.1) - 2026-09-15
 
 ### Fixed
