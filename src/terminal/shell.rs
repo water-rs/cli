@@ -328,8 +328,10 @@ impl Shell {
         let units = Arc::new(AtomicUsize::new(0));
         // Every mode renders every event, so a build failure report can tail
         // the captured output instead of dumping it a second time.
-        BuildProgress::new(move |event| render_compile_event(mode, &bars, &units, &event))
-            .showing_all_lines()
+        BuildProgress::new(move |event| {
+            render_compile_event(mode, &bars, &units, &event, &mut anstream::stderr().lock());
+        })
+        .showing_all_lines()
     }
 
     /// Display a panic report from a platform crash message.
@@ -663,15 +665,15 @@ fn render_compile_event(
     bars: &MultiProgress,
     units: &AtomicUsize,
     event: &CompileEvent,
+    piped_out: &mut dyn io::Write,
 ) {
     match mode {
         CompileRender::Interactive => {
             let _ = bars.println(compile_event_text(units, event));
         }
         CompileRender::Piped => {
-            let mut stderr = anstream::stderr().lock();
-            let _ = writeln!(stderr, "{}", piped_event_line(units, event));
-            let _ = stderr.flush();
+            let _ = writeln!(piped_out, "{}", piped_event_line(units, event));
+            let _ = piped_out.flush();
         }
         CompileRender::Json => {
             let record = compile_event_record(units, event);
@@ -863,20 +865,33 @@ mod tests {
 
     use waterui_cli::build::CompileEvent;
 
-    use super::piped_event_line;
+    use indicatif::{MultiProgress, ProgressDrawTarget};
+
+    use super::{CompileRender, piped_event_line, render_compile_event};
 
     /// A `Line` event — cargo's `Updating` / `Blocking waiting for file lock`
     /// status text — is the only signal a piped build emits before the first
     /// unit compiles; dropping it is what left a nightly run log stuck at
-    /// `Building...` with nothing to diagnose.
+    /// `Building...` with nothing to diagnose. The test goes through
+    /// `render_compile_event`'s own dispatch, so reintroducing a `Line` drop
+    /// in the `Piped` arm — not just changing the formatter — turns it red.
     #[test]
     fn piped_render_keeps_cargo_status_lines() {
+        let bars = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
         let units = AtomicUsize::new(0);
-        let line = piped_event_line(
+        let mut piped = Vec::new();
+        render_compile_event(
+            CompileRender::Piped,
+            &bars,
             &units,
             &CompileEvent::Line("Blocking waiting for file lock on package cache".to_string()),
+            &mut piped,
         );
-        assert_eq!(line, "Blocking waiting for file lock on package cache");
+        let rendered = String::from_utf8(piped).expect("piped output is UTF-8");
+        assert_eq!(
+            rendered.trim_end(),
+            "Blocking waiting for file lock on package cache"
+        );
     }
 
     /// Piped output is plain text: a user-forced color setting wraps events
