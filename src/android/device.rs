@@ -277,6 +277,12 @@ async fn run_on_android(
         reverse_dev_server_port(host, &adb, device_id, port).await?;
     }
 
+    // The preview support app listens on the device's loopback; `adb forward`
+    // maps each candidate host port onto it so the CLI can reach the server.
+    for port in options.forward_tcp_ports() {
+        forward_device_port(host, &adb, device_id, *port).await?;
+    }
+
     install_android_artifact(host, &adb, device_id, artifact.path()).await?;
     launch_android_app(
         host,
@@ -293,7 +299,7 @@ async fn run_on_android(
     let device_id_for_kill = device_id.to_string();
     let bundle_id_for_kill = artifact.bundle_id().to_string();
 
-    let (running, sender) = Running::new(move || {
+    let (mut running, sender) = Running::new(move || {
         spawn_android_force_stop(
             &host_for_kill,
             adb_for_kill,
@@ -301,6 +307,14 @@ async fn run_on_android(
             bundle_id_for_kill,
         );
     });
+    if !options.forward_tcp_ports().is_empty() {
+        running.retain(RemoveForwardsOnDrop {
+            host: host.clone(),
+            adb: adb.clone(),
+            device_id: device_id.to_string(),
+            ports: options.forward_tcp_ports().to_vec(),
+        });
+    }
 
     spawn_android_runtime_tasks(AndroidRuntimeTaskContext {
         host,
@@ -368,6 +382,94 @@ fn build_android_start_args(
     }
 
     start_args
+}
+
+/// `adb -s <device> forward tcp:<port> tcp:<port>` maps a host loopback port
+/// onto the device's loopback, where a preview support app listens.
+async fn forward_device_port(
+    host: &Host,
+    adb: &Adb,
+    device_id: &str,
+    port: u16,
+) -> Result<(), FailToRun> {
+    // A previous session may have left a mapping behind; `adb forward` refuses
+    // to rebind a taken host port, so clear it first. Removing a mapping that
+    // does not exist is a reported error, which is expected and ignored.
+    let _ = host
+        .command(adb.path())
+        .args([
+            "-s",
+            device_id,
+            "forward",
+            "--remove",
+            &format!("tcp:{port}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+
+    let output = host
+        .command(adb.path())
+        .args([
+            "-s",
+            device_id,
+            "forward",
+            &format!("tcp:{port}"),
+            &format!("tcp:{port}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| FailToRun::Launch(eyre!("Failed to run `adb forward`: {error}")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(FailToRun::Launch(eyre!(
+        "`adb forward tcp:{port} tcp:{port}` failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    )))
+}
+
+/// Removes the `adb forward` mappings a run created when it is dropped.
+struct RemoveForwardsOnDrop {
+    host: Host,
+    adb: Adb,
+    device_id: String,
+    ports: Vec<u16>,
+}
+
+impl Drop for RemoveForwardsOnDrop {
+    fn drop(&mut self) {
+        let host = self.host.clone();
+        let adb = self.adb.clone();
+        let device_id = self.device_id.clone();
+        let ports = self.ports.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("waterui-android-forward-remove".to_string())
+            .spawn(move || {
+                for port in ports {
+                    let _ = host
+                        .std_command(adb.path())
+                        .args([
+                            "-s",
+                            &device_id,
+                            "forward",
+                            "--remove",
+                            &format!("tcp:{port}"),
+                        ])
+                        .output();
+                }
+            });
+
+        if let Err(error) = spawn_result {
+            error!("Failed to spawn adb forward cleanup thread: {error}");
+        }
+    }
 }
 
 /// `adb -s <device> reverse tcp:<port> tcp:<port>` before the app launches,
@@ -911,7 +1013,16 @@ fn android_log_line_looks_like_crash(line: &str) -> bool {
         || line.contains("SIGILL")
         || line.contains("SIGFPE")
         || line.contains("Abort message:")
-        || line.contains("backtrace:")
+        || contains_tombstone_backtrace_marker(line)
+}
+
+/// Match the `backtrace:` header a libc tombstone dumps under the `DEBUG` tag
+/// (`F DEBUG   : backtrace:`) without matching Rust symbol paths such as
+/// `std::backtrace::Backtrace`, which log lines legitimately contain.
+fn contains_tombstone_backtrace_marker(line: &str) -> bool {
+    const MARKER: &str = "backtrace:";
+    line.match_indices(MARKER)
+        .any(|(index, _)| line.as_bytes().get(index + MARKER.len()) != Some(&b':'))
 }
 
 /// Start log streaming from an Android process using logcat.
@@ -1704,6 +1815,23 @@ mod tests {
     fn detects_java_crash_for_app() {
         let log = "E AndroidRuntime: FATAL EXCEPTION: main\nE AndroidRuntime: Process: com.example.app, PID: 28184\n";
         assert!(android_log_looks_like_crash(log, "com.example.app", 28184));
+    }
+
+    #[test]
+    fn does_not_treat_rust_backtrace_symbols_as_native_crash() {
+        // A frame-budget warning prints a Rust backtrace whose symbol paths
+        // contain `backtrace::`; that substring must not satisfy the tombstone
+        // `backtrace:` marker.
+        let line = "09-17 02:01:52.199  6229  6229 W WaterUI : waterui::runtime_guard: \
+            Main-thread task poll reached frame-budget warning threshold\
+            backtrace=   0: <std::backtrace::Backtrace>::create";
+        assert!(android_runtime_event_from_log_line(line).is_none());
+
+        let tombstone = "09-17 02:01:52.199  6229  6229 F DEBUG   : backtrace:";
+        assert!(matches!(
+            android_runtime_event_from_log_line(tombstone),
+            Some(AndroidRuntimeEvent::NativeCrash(_))
+        ));
     }
 
     #[test]

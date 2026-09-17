@@ -105,15 +105,50 @@ pub struct ResolvedFramework {
         skip_serializing_if = "Option::is_none"
     )]
     minimum_cli_version: Option<cargo_toml::SemVer>,
+    /// The framework's own `rust-version` — `[workspace.package].rust-version`
+    /// of the manifest at the selected revision — persisted with the
+    /// selection so the project's Rust floor is known without a checkout.
+    #[serde(
+        default,
+        rename = "rust-version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    rust_version: Option<cargo_toml::SemVer>,
     /// The framework's `[package.metadata.waterui]` table at the selected
     /// revision, carried verbatim from its manifest.
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     metadata: toml::Table,
     scaffold: BTreeMap<String, String>,
+    /// The scaffold packages the selected channel withholds: a git-pinned
+    /// requirement has no registry release `stable` can resolve, so a stable
+    /// manifest omits its `scaffold` entries and records the pin under
+    /// `experimental-packages` instead. Empty on `dev`/`nightly` and on a
+    /// local checkout — they distribute every scaffold package.
+    #[serde(
+        default,
+        rename = "experimental-packages",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    experimental_packages: BTreeMap<String, ExperimentalPackage>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     packages: BTreeMap<String, DependencyDetail>,
     #[serde(default, skip_serializing_if = "PatchSet::is_empty")]
     patches: PatchSet,
+}
+
+/// A scaffold package a channel withholds.
+///
+/// Its workspace requirement pins a git revision because the package has no
+/// registry release, so the manifest records the pin — git URL, commit and
+/// declared version — by name instead of emitting `scaffold` entries for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExperimentalPackage {
+    /// The repository the framework pins the package to.
+    pub git: String,
+    /// The pinned commit.
+    pub rev: String,
+    /// The declared version requirement.
+    pub version: String,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +195,12 @@ struct Certification {
     #[serde(default)]
     submodules: BTreeMap<String, String>,
     scaffold: BTreeMap<String, String>,
+    /// The scaffold packages the certification withholds from `scaffold` —
+    /// `stable` records every git-pinned package here; `nightly` carries
+    /// them in `scaffold`, so this is empty. The manifest's record must equal
+    /// the set the framework manifest's own dependency shapes derive.
+    #[serde(default, rename = "experimental-packages")]
+    experimental_packages: BTreeMap<String, ExperimentalPackage>,
     /// The framework's `[package.metadata.waterui]` table, verbatim — the CLI
     /// floor and every future framework-owned fact ride inside it.
     metadata: toml::Table,
@@ -289,6 +330,7 @@ impl ResolvedFramework {
         )?;
         let metadata = framework_metadata(&manifest)?;
         let minimum_cli_version = minimum_cli_version(&metadata)?;
+        let rust_version = manifest_rust_version(&manifest)?;
         if let Some(minimum) = &minimum_cli_version {
             validate_installed_cli(minimum, &checkout_cli_update())?;
         }
@@ -316,9 +358,9 @@ impl ResolvedFramework {
             );
         }
         // A checkout from before the Apple backend left the tree still carries
-        // its `backends/apple` gitlink; a manifest declaring
-        // `apple-backend-version` has none to read.
-        if !scaffold.contains_key("apple-backend-version") {
+        // its `backends/apple` gitlink. A declared version or revision supplies
+        // the pin without a gitlink.
+        if !declares_apple_backend_pin(&scaffold) {
             submodules.insert(
                 "backends/apple".to_owned(),
                 local_submodule_revision(root, "backends/apple").await?,
@@ -330,8 +372,12 @@ impl ResolvedFramework {
                 root: root.to_path_buf(),
             },
             minimum_cli_version,
+            rust_version,
             metadata,
             scaffold,
+            // A local checkout is a filesystem source, not a channel: it
+            // withholds nothing.
+            experimental_packages: BTreeMap::new(),
             packages: BTreeMap::new(),
             patches: PatchSet::default(),
         }
@@ -342,8 +388,17 @@ impl ResolvedFramework {
     /// `Result` in hand — the scaffold's `minSdk` above all. A framework that
     /// reaches a template context has passed here, so a template accessor
     /// failing on it is an internal invariant, not an input error.
-    fn validated(self) -> Result<Self> {
+    fn validated(mut self) -> Result<Self> {
         self.android_min_api_level()?;
+        // The stable split is an invariant of the source, not of the writer:
+        // a selection persisted before `experimental-packages` existed keeps
+        // the withheld set inside `scaffold`, so re-derive it on load —
+        // `dependency` honoring a stale `-git` entry would resurrect a
+        // package the channel no longer distributes.
+        if matches!(self.source, Source::Stable { .. }) {
+            let withheld = split_experimental_packages(&mut self.scaffold);
+            self.experimental_packages.extend(withheld);
+        }
         Ok(self)
     }
 
@@ -380,6 +435,39 @@ impl ResolvedFramework {
         self.scaffold
             .get(key)
             .unwrap_or_else(|| panic!("resolved framework carries no `{key}` scaffold metadata"))
+    }
+
+    /// Assert the selected channel distributes `name` — a scaffold package a
+    /// generated crate links. The stable channel withholds every git-pinned
+    /// scaffold package, so scaffolding one must fail before anything is
+    /// written, naming the package, the channel and the fix.
+    ///
+    /// # Errors
+    /// Returns an error when the channel records `name` under
+    /// `experimental-packages`.
+    pub(crate) fn require_distributable(&self, name: &str) -> Result<()> {
+        let Some(package) = self.experimental_packages.get(name) else {
+            return Ok(());
+        };
+        let channel = self
+            .channel()
+            .map_or_else(|| "local".to_owned(), |channel| channel.to_string());
+        bail!(
+            "`{name}` is an experimental package the {channel} framework channel does not \
+             distribute — it is pinned to {} at {} with no registry release. \
+             Scaffold it on `--channel dev` or `--channel nightly`.",
+            package.git,
+            package.rev,
+        );
+    }
+
+    /// The Rust floor the selected framework declares — its
+    /// `[workspace.package].rust-version` at the resolved revision. A record
+    /// written before this key existed carries `None`; the caller falls back
+    /// to the CLI's own `rust-version`.
+    #[must_use]
+    pub const fn rust_version(&self) -> Option<&cargo_toml::SemVer> {
+        self.rust_version.as_ref()
     }
 
     /// The Apple backend release a scaffolded project pins, when the
@@ -548,6 +636,16 @@ impl ResolvedFramework {
         };
         let locked = self.cargo_lock(contents)?;
         let allowed = self.allowed_packages(&locked.packages);
+        // The names the framework contract knows: `Water.lock`'s packages and
+        // the scaffold's extracted crates. Anything else — an extracted
+        // crate's private dependencies, which can never enter `Water.lock` —
+        // is foreign to the check.
+        let ecosystem: BTreeSet<&str> = locked
+            .packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .chain(self.packages.keys().map(String::as_str))
+            .collect();
         let packages: BTreeMap<_, _> = metadata
             .packages
             .iter()
@@ -590,7 +688,10 @@ impl ResolvedFramework {
                 version: package.version.to_string(),
                 source: package.source.as_ref().map(|source| source.repr.clone()),
             };
-            if !allowed.contains(&identity) {
+            if !allowed.contains(&identity)
+                && ecosystem.contains(identity.name.as_str())
+                && !self.sanctioned_source(&identity)
+            {
                 bail!(
                     "framework dependency {} {} differs from Water.lock; select a compatible channel explicitly",
                     identity.name,
@@ -819,16 +920,54 @@ impl ResolvedFramework {
         allowed
     }
 
+    /// Whether `identity` resolves a scaffold package at the source its
+    /// declared requirement sanctions — the declared `git + rev`, or the
+    /// registry at the pinned `=version`. An extracted crate never enters
+    /// `Water.lock`; the declared pin is the certification of what it must
+    /// resolve to.
+    fn sanctioned_source(&self, identity: &LockedPackage) -> bool {
+        let Some(detail) = self.packages.get(identity.name.as_str()) else {
+            return false;
+        };
+        let Some(source) = &identity.source else {
+            return false;
+        };
+        if let (Some(git), Some(rev)) = (&detail.git, &detail.rev) {
+            let Ok(source) = source.parse::<cargo_lock::SourceId>() else {
+                return false;
+            };
+            let declared = cargo_lock::package::GitReference::Rev(rev.clone());
+            return source.is_git()
+                && source.git_reference() == Some(&declared)
+                && canonical_git_url(source.url().as_str()) == canonical_git_url(git);
+        }
+        source.as_str() == "registry+https://github.com/rust-lang/crates.io-index"
+            && detail.version.as_ref().is_some_and(|requirement| {
+                identity
+                    .version
+                    .parse::<cargo_toml::SemVer>()
+                    .is_ok_and(|version| requirement.matches(&version))
+            })
+    }
+
     pub(crate) fn dependency(&self, name: &str) -> DependencyDetail {
         match &self.source {
-            Source::Stable { .. } => DependencyDetail {
-                version: Some(
-                    format!("={}", self.scaffold_value(&format!("{name}-version")))
-                        .parse()
-                        .expect("resolved package version is valid"),
-                ),
-                ..Default::default()
-            },
+            Source::Stable { .. } => {
+                let requirement = self.scaffold_value(&format!("{name}-version"));
+                // The registry substitutes for a declared git pin only once
+                // the workspace names the crate by version alone.
+                let git = self.scaffold.get(&format!("{name}-git"));
+                DependencyDetail {
+                    version: Some(
+                        git.map_or_else(|| format!("={requirement}"), |_| requirement.to_owned())
+                            .parse()
+                            .expect("resolved package version is valid"),
+                    ),
+                    git: git.cloned(),
+                    rev: git.map(|_| self.scaffold_value(&format!("{name}-rev")).to_owned()),
+                    ..Default::default()
+                }
+            }
             Source::Dev { .. } | Source::Nightly { .. } => self.packages[name].clone(),
             Source::Local { .. } => {
                 unreachable!("a local checkout resolves framework crates by path")
@@ -885,6 +1024,7 @@ impl ResolvedFramework {
         let root: toml::Value = toml::from_str(std::str::from_utf8(&manifest_bytes)?)?;
         let metadata = framework_metadata(&root)?;
         let minimum_cli_version = minimum_cli_version(&metadata)?;
+        let rust_version = manifest_rust_version(&root)?;
         let mut scaffold = framework_scaffold(&root)?;
         let lock_bytes = fetch(&format!("{base}/Cargo.lock")).await?;
         let lock_sha256 = hex::encode(Sha256::digest(&lock_bytes));
@@ -893,6 +1033,16 @@ impl ResolvedFramework {
         let channel = certification
             .as_ref()
             .map_or(FrameworkChannel::Dev, |certification| certification.channel);
+        // A scaffold package pinned to a git revision has no registry
+        // release the stable channel could resolve: its scaffold entries are
+        // withheld and the pin recorded under `experimental-packages`, the
+        // same split `channel_scaffold` in `framework_manifest.py` makes for
+        // the manifest. `dev`/`nightly` distribute it through `scaffold`.
+        let experimental_packages = if channel == FrameworkChannel::Stable {
+            split_experimental_packages(&mut scaffold)
+        } else {
+            BTreeMap::new()
+        };
         if let Some(minimum) = &minimum_cli_version {
             let update = match channel {
                 FrameworkChannel::Stable => registry_cli_update(minimum),
@@ -924,6 +1074,7 @@ impl ResolvedFramework {
                     revision,
                     &metadata,
                     &scaffold,
+                    &experimental_packages,
                     &lock_sha256,
                 )?,
                 certification.submodules.clone(),
@@ -966,8 +1117,10 @@ impl ResolvedFramework {
             Self {
                 source,
                 minimum_cli_version,
+                rust_version,
                 metadata,
                 scaffold,
+                experimental_packages,
                 packages,
                 patches,
             }
@@ -1033,9 +1186,8 @@ async fn dev_submodules(
         );
     }
     // Revisions from before the Apple backend left the tree still carry its
-    // `backends/apple` gitlink; a manifest declaring `apple-backend-version`
-    // has none to read.
-    if !scaffold.contains_key("apple-backend-version") {
+    // `backends/apple` gitlink. A declared version or revision supplies the pin.
+    if !declares_apple_backend_pin(scaffold) {
         submodules.insert(
             "backends/apple".to_owned(),
             submodule_revision(slug, revision, "backends/apple").await?,
@@ -1087,6 +1239,7 @@ fn certified_source(
     revision: &str,
     metadata: &toml::Table,
     scaffold: &BTreeMap<String, String>,
+    experimental_packages: &BTreeMap<String, ExperimentalPackage>,
     lock_sha256: &str,
 ) -> Result<Source> {
     let channel = certification.channel;
@@ -1096,6 +1249,20 @@ fn certified_source(
     for (key, value) in scaffold {
         if certification.scaffold.get(key) != Some(value) {
             bail!("{channel} certification scaffold `{key}` does not match the framework manifest");
+        }
+    }
+    // The withheld set must agree too: a stable manifest may neither drop a
+    // git-pinned package silently nor leave it in `scaffold` while also
+    // recording it as experimental.
+    if certification.experimental_packages != *experimental_packages {
+        bail!("{channel} certification experimental packages do not match the framework manifest");
+    }
+    for name in experimental_packages.keys() {
+        if certification
+            .scaffold
+            .contains_key(&format!("{name}-version"))
+        {
+            bail!("{channel} certification scaffold `{name}-version` names a withheld package");
         }
     }
     let expected = certification
@@ -1131,6 +1298,11 @@ fn certified_source(
 /// `{name}-backend-version` (Apple, since #839) carries no gitlink, and the
 /// gitlink is read only for a revision from before that declaration.
 const BACKEND_SUBMODULES: &[&str] = &["backends/android"];
+
+fn declares_apple_backend_pin(scaffold: &BTreeMap<String, String>) -> bool {
+    scaffold.contains_key("apple-backend-version")
+        || declares_backend_revision(scaffold, "backends/apple")
+}
 
 /// Whether the scaffold already names `submodule_path`'s backend pin — a
 /// declared `{name}-backend-revision` — so no gitlink has to be read for it.
@@ -1198,9 +1370,10 @@ fn framework_metadata(manifest: &toml::Value) -> Result<toml::Table> {
 }
 
 /// The scaffold facts the framework manifest itself declares: each
-/// `scaffold-packages` entry's requirement from `[workspace.dependencies]`,
-/// and every backend coordinate — `{name}-backend-url`, plus the
-/// `{name}-backend-version` of a backend pinned by release or the
+/// `scaffold-packages` entry's requirement from `[workspace.dependencies]` —
+/// `{name}-version`, plus `{name}-git` and `{name}-rev` when the requirement
+/// pins a repository — and every backend coordinate — `{name}-backend-url`,
+/// plus the `{name}-backend-version` of a backend pinned by release or the
 /// `{name}-backend-revision` of one pinned by commit, rather than by
 /// gitlink — from `[package.metadata.waterui]`.
 ///
@@ -1232,6 +1405,21 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
             .or_else(|| dependency.get("version").and_then(toml::Value::as_str))
             .ok_or_else(|| eyre!("workspace.dependencies.{name} declares no version"))?;
         scaffold.insert(format!("{name}-version"), requirement.to_owned());
+        // A scaffold package pinned from git keeps that source: a bare
+        // `{name}-version` cannot express the commit the framework builds
+        // against, and the registry may not carry it at all.
+        if let Some(git) = dependency.get("git").and_then(toml::Value::as_str) {
+            let revision = dependency
+                .get("rev")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    eyre!("workspace.dependencies.{name} must pin an immutable Git revision")
+                })?;
+            validate_revision(revision)
+                .wrap_err_with(|| format!("workspace.dependencies.{name}.rev"))?;
+            scaffold.insert(format!("{name}-git"), git.to_owned());
+            scaffold.insert(format!("{name}-rev"), revision.to_owned());
+        }
     }
     for (key, value) in &metadata {
         if !(key.ends_with("-backend-url")
@@ -1249,6 +1437,67 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
         scaffold.insert(key.clone(), value.to_owned());
     }
     Ok(scaffold)
+}
+
+/// Move every git-pinned scaffold package out of `scaffold` — the split
+/// `channel_scaffold` in `framework_manifest.py` makes for `stable`: a
+/// package pinned to a git revision has no registry release the channel can
+/// resolve, so its `{name}-*` entries leave the scaffold table and the pin
+/// is recorded by name instead.
+fn split_experimental_packages(
+    scaffold: &mut BTreeMap<String, String>,
+) -> BTreeMap<String, ExperimentalPackage> {
+    let mut experimental = BTreeMap::new();
+    // `-git` is the marker: a `{name}-git` scaffold entry is a git pin with
+    // no registry release; its `-rev`/`-version` siblings are lifted out in
+    // the second pass.
+    for (key, value) in std::mem::take(scaffold) {
+        if let Some(name) = key.strip_suffix("-git") {
+            experimental.insert(
+                name.to_owned(),
+                ExperimentalPackage {
+                    version: String::new(),
+                    git: value,
+                    rev: String::new(),
+                },
+            );
+        } else {
+            scaffold.insert(key, value);
+        }
+    }
+    for (name, package) in &mut experimental {
+        package.rev = scaffold
+            .remove(&format!("{name}-rev"))
+            .expect("a `-git` scaffold entry carries `-rev`");
+        package.version = scaffold
+            .remove(&format!("{name}-version"))
+            .expect("a `-git` scaffold entry carries `-version`");
+    }
+    experimental
+}
+
+/// The Rust floor a root manifest declares — `[workspace.package].rust-version`,
+/// or `[package].rust-version` when the manifest is a plain package. Shared by
+/// framework resolution (the framework's own manifest at the selected
+/// revision) and the doctor (the project's and a local checkout's manifests).
+pub(crate) fn manifest_rust_version(manifest: &toml::Value) -> Result<Option<cargo_toml::SemVer>> {
+    let declared = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("rust-version"))
+        .or_else(|| {
+            manifest
+                .get("package")
+                .and_then(|package| package.get("rust-version"))
+        });
+    declared
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| eyre!("rust-version must be a string"))?;
+            crate::utils::parse_semver_version(text).wrap_err("invalid rust-version")
+        })
+        .transpose()
 }
 
 /// The CLI floor a `package.metadata.waterui` metadata table declares —
@@ -1355,21 +1604,55 @@ fn resolve_packages(
         if name.ends_with("-backend") {
             continue;
         }
+        // The scaffold value is a requirement, not the resolved version: a
+        // declaration that names an older but still-satisfied version
+        // (`"0.2.0"` where the lock carries 0.2.1) must still find the lock
+        // candidate and inherit its source. String equality would take the
+        // lock-absent arm and pin `=<requirement>` — a release the framework
+        // never certified. `sanctioned_source` matches the same way.
+        let requirement: cargo_toml::VersionReq = version.parse().wrap_err_with(|| {
+            eyre!(
+                "framework scaffold requirement {name} = {version:?} is not a version requirement"
+            )
+        })?;
         let candidates: Vec<_> = lock
             .packages
             .iter()
             .filter(|package| {
-                package.name.as_str() == name && package.version.to_string() == *version
+                package.name.as_str() == name && requirement.matches(&package.version)
             })
             .collect();
+        // A scaffold package the workspace pins from git resolves from that
+        // pin on every channel: an extracted crate never enters the framework
+        // lock, and for one built in-tree the lock only witnesses that the
+        // framework resolves the same commit.
+        if let Some(git) = scaffold.get(&format!("{name}-git")) {
+            let pinned = scaffold.get(&format!("{name}-rev")).ok_or_else(|| {
+                eyre!("framework scaffold declares {name}-git without {name}-rev")
+            })?;
+            match candidates.as_slice() {
+                [] => {}
+                [package] => assert_declared_git_source(name, package, git, pinned)?,
+                _ => bail!("framework lock has multiple sources for {name} {version}"),
+            }
+            packages.insert(
+                name.to_owned(),
+                DependencyDetail {
+                    version: Some(version.parse()?),
+                    git: Some(git.clone()),
+                    rev: Some(pinned.clone()),
+                    ..Default::default()
+                },
+            );
+            continue;
+        }
         let package = match candidates.as_slice() {
             [package] => *package,
             // An extracted crate the framework no longer builds never enters
-            // its lock — `waterui-dew` releases from water-rs/dew (#614) and
-            // `waterui-gtk` from water-rs/gtk-backend (#612), so the scaffold's
-            // declared requirement is the resolution, the same `=<version>` the
-            // registry-source arm below produces for a crate the framework
-            // still carries.
+            // its lock — `waterui-dew` releases from water-rs/dew (#614) — so
+            // the scaffold's declared requirement is the resolution, the same
+            // `=<version>` the registry-source arm below produces for a crate
+            // the framework still carries.
             [] => {
                 packages.insert(
                     name.to_owned(),
@@ -1412,6 +1695,29 @@ fn resolve_packages(
     Ok(packages)
 }
 
+/// Assert `package`'s lock source is the git repository a declared
+/// `{name}-git`/`{name}-rev` scaffold pair names — the witness that the
+/// framework builds the same commit a scaffolded project receives.
+fn assert_declared_git_source(
+    name: &str,
+    package: &cargo_lock::Package,
+    git: &str,
+    revision: &str,
+) -> Result<()> {
+    let Some(source) = &package.source else {
+        bail!("framework package {name} is a workspace member, not the declared {git}");
+    };
+    let declared = cargo_lock::package::GitReference::Rev(revision.to_owned());
+    if !(source.is_git()
+        && source.git_reference() == Some(&declared)
+        && source.precise() == Some(revision)
+        && canonical_git_url(source.url().as_str()) == canonical_git_url(git))
+    {
+        bail!("framework package {name} resolves {source}, not the declared {git}@{revision}");
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct SubmoduleEntry {
     sha: String,
@@ -1444,12 +1750,10 @@ fn complete_scaffold(
             commit.clone(),
         );
     }
-    // The Apple backend pin is declared: `framework_scaffold` already copied
-    // `apple-backend-version` from the manifest. Frameworks from before the
-    // submodule was dropped declare no version — their `backends/apple`
-    // gitlink is the pin record, surfaced as `apple-backend-revision` for the
-    // `kind = revision` requirement the template emits for it.
-    if !scaffold.contains_key("apple-backend-version") {
+    // `framework_scaffold` already copied declared Apple versions or revisions.
+    // Only a framework without either declaration needs its historical gitlink
+    // promoted to the revision requirement consumed by the package template.
+    if !declares_apple_backend_pin(scaffold) {
         let commit = submodules
             .get("backends/apple")
             .ok_or_else(|| eyre!("framework records no Apple backend pin"))?;
@@ -1606,7 +1910,9 @@ pub(crate) mod test_fixtures {
 
     /// A stable-channel resolution carrying every scaffold fact the templates
     /// may read — the shape `resolve` produces, built in place because the
-    /// real resolution lives on the network.
+    /// real resolution lives on the network. `stable` withholds the git-pinned
+    /// scaffold packages under `experimental-packages`, the split a published
+    /// `framework.json` makes for the channel.
     pub fn stable_framework() -> ResolvedFramework {
         let revision = |seed: char| seed.to_string().repeat(40);
         let scaffold = FRAMEWORK_PACKAGES
@@ -1615,8 +1921,6 @@ pub(crate) mod test_fixtures {
             .chain([
                 ("hydrolysis-version".to_owned(), "0.2.1".to_owned()),
                 ("hydrolysis-m3-version".to_owned(), "0.2.0".to_owned()),
-                ("waterui-dew-version".to_owned(), "0.2.1".to_owned()),
-                ("waterui-gtk-version".to_owned(), "0.1.2".to_owned()),
                 (
                     "apple-backend-url".to_owned(),
                     "https://github.com/water-rs/apple-backend.git".to_owned(),
@@ -1638,30 +1942,80 @@ pub(crate) mod test_fixtures {
                 }),
             },
             minimum_cli_version: None,
+            rust_version: None,
             metadata: toml::toml! {
                 android-min-api-level = 26
             },
             scaffold,
+            experimental_packages: experimental_scaffold_packages(),
             packages: BTreeMap::new(),
             patches: PatchSet::default(),
         }
     }
 
-    /// A `dev`-channel resolution: the manifest's scaffold facts plus the
-    /// `apple-backend-revision` `construct` resolves for the channel — the
-    /// backend's `dev` HEAD at selection time — beside the declared
-    /// `apple-backend-version` the channel must not follow.
+    /// The git-pinned scaffold packages the checkout fixture's
+    /// `[workspace.dependencies]` declares — `waterui-dew`, `waterui-gtk` and
+    /// `waterui-winui` have no registry release, so `stable` withholds them
+    /// under `experimental-packages` while `dev`/`nightly` distribute the
+    /// pins through `scaffold`.
+    fn experimental_scaffold_packages() -> BTreeMap<String, ExperimentalPackage> {
+        let experimental = |version: &str, git: &str, seed: char| ExperimentalPackage {
+            version: version.to_owned(),
+            git: git.to_owned(),
+            rev: seed.to_string().repeat(40),
+        };
+        BTreeMap::from([
+            (
+                "waterui-dew".to_owned(),
+                experimental("0.2.1", "https://github.com/water-rs/dew", 'b'),
+            ),
+            (
+                "waterui-gtk".to_owned(),
+                experimental("0.2.0", "https://github.com/water-rs/gtk-backend", 'g'),
+            ),
+            (
+                "waterui-winui".to_owned(),
+                experimental("0.1.0", "https://github.com/water-rs/waterui-winui", 'e'),
+            ),
+        ])
+    }
+
+    /// A `dev`-channel resolution: the manifest's scaffold facts — including
+    /// the git-pinned packages `stable` withholds, which `dev` distributes
+    /// through `scaffold` — plus the `apple-backend-revision` `construct`
+    /// resolves for the channel — the backend's `dev` HEAD at selection
+    /// time — beside the declared `apple-backend-version` the channel must
+    /// not follow.
     pub fn dev_framework() -> ResolvedFramework {
         let mut framework = stable_framework();
+        let revision = 'a'.to_string().repeat(40);
         framework.source = Source::Dev {
             repository: framework_repository().to_owned(),
-            revision: 'a'.to_string().repeat(40),
+            revision: revision.clone(),
             lock_sha256: 'f'.to_string().repeat(64),
         };
         framework.scaffold.insert(
             "apple-backend-revision".to_owned(),
             'd'.to_string().repeat(40),
         );
+        for (name, package) in std::mem::take(&mut framework.experimental_packages) {
+            framework
+                .scaffold
+                .insert(format!("{name}-version"), package.version);
+            framework
+                .scaffold
+                .insert(format!("{name}-git"), package.git);
+            framework
+                .scaffold
+                .insert(format!("{name}-rev"), package.rev);
+        }
+        framework.packages = resolve_packages(
+            &framework.scaffold,
+            &test_lock(),
+            framework_repository(),
+            &revision,
+        )
+        .expect("the fixture lock resolves every scaffold requirement");
         framework
     }
 
@@ -1716,6 +2070,22 @@ pub(crate) mod test_fixtures {
             "-qm".to_owned(),
             "init".to_owned(),
         ]);
+    }
+
+    pub fn write_apple_revision_checkout(root: &Path, revision: &str) {
+        write_local_checkout(root);
+        let manifest_path = root.join("Cargo.toml");
+        let mut manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let metadata = manifest["package"]["metadata"]["waterui"]
+            .as_table_mut()
+            .unwrap();
+        metadata.remove("apple-backend-version");
+        metadata.insert(
+            "apple-backend-revision".to_owned(),
+            toml::Value::String(revision.to_owned()),
+        );
+        std::fs::write(manifest_path, toml::to_string(&manifest).unwrap()).unwrap();
     }
 
     /// The same fixture as it existed while both backends still rode
@@ -1982,6 +2352,26 @@ fn newest_release(releases: Vec<Release>, channel: FrameworkChannel) -> Result<R
         })
 }
 
+/// The first stable framework release whose GitHub release publishes a
+/// `framework.json`. Manifest publishing began here; every earlier tag
+/// resolves nothing on the stable channel.
+const FIRST_STABLE_MANIFEST_RELEASE: &str = "0.5.0";
+
+/// The stable channel selected a release that predates manifest publishing:
+/// it has no `framework.json` to resolve. The diagnostic names the first
+/// manifest-carrying release and the channels that resolve today.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "stable release {tag} carries no framework.json — it predates manifest publishing. \
+     The first stable release carrying a manifest is {FIRST_STABLE_MANIFEST_RELEASE}; \
+     until it is published, use `water create <name> --channel dev` or, once a certified \
+     nightly exists, `--channel nightly`."
+)]
+struct StableReleaseWithoutManifest {
+    /// The tag of the release the stable channel resolved to.
+    tag: String,
+}
+
 /// The `framework.json` asset of the selected release.
 fn certification_asset(release: &Release, channel: FrameworkChannel) -> Result<&ReleaseAsset> {
     release
@@ -1992,10 +2382,10 @@ fn certification_asset(release: &Release, channel: FrameworkChannel) -> Result<&
             FrameworkChannel::Nightly => {
                 eyre!("nightly {} has no certification manifest", release.tag_name)
             }
-            FrameworkChannel::Stable => eyre!(
-                "stable release {} carries no framework.json — it predates manifest publishing",
-                release.tag_name
-            ),
+            FrameworkChannel::Stable => StableReleaseWithoutManifest {
+                tag: release.tag_name.clone(),
+            }
+            .into(),
             FrameworkChannel::Dev => unreachable!("dev releases are not certified"),
         })
 }
@@ -2127,7 +2517,8 @@ fn same_git_source(source: &str, repository: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use test_fixtures::{
-        package, stable_framework, test_lock, write_local_checkout, write_pre_decoupling_checkout,
+        dev_framework, nightly_framework, package, stable_framework, test_lock,
+        write_apple_revision_checkout, write_local_checkout, write_pre_decoupling_checkout,
     };
 
     use super::*;
@@ -2154,11 +2545,13 @@ mod tests {
                 lock_sha256: hex::encode(Sha256::digest(&bytes)),
             },
             minimum_cli_version: None,
+            rust_version: None,
             metadata: toml::toml! {
                 android-min-api-level = 26
             },
             packages: resolve_packages(&scaffold, lock, repository, &revision).unwrap(),
             scaffold,
+            experimental_packages: BTreeMap::new(),
             patches: PatchSet::default(),
         };
         (framework, bytes)
@@ -2273,7 +2666,8 @@ mod tests {
     fn extracted_crate_absent_from_the_lock_resolves_to_its_declared_requirement() {
         // A crate released from its own repository and not consumed by the
         // framework never enters the framework lock — the scaffold's declared
-        // requirement is the requirement a dev/nightly resolution pins.
+        // requirement is the requirement a dev/nightly resolution pins,
+        // whether the workspace names a version or a git revision.
         let lock = Lockfile {
             packages: vec![package("waterui", "0.3.0", None)],
             version: cargo_lock::ResolveVersion::V4,
@@ -2281,10 +2675,16 @@ mod tests {
             metadata: BTreeMap::default(),
             patch: cargo_lock::Patch::default(),
         };
+        let gtk_revision = "b".repeat(40);
         let scaffold = BTreeMap::from([
             ("waterui-version".to_string(), "0.3.0".to_string()),
             ("waterui-dew-version".to_string(), "0.2.1".to_string()),
-            ("waterui-gtk-version".to_string(), "0.1.2".to_string()),
+            ("waterui-gtk-version".to_string(), "0.2.0".to_string()),
+            (
+                "waterui-gtk-git".to_string(),
+                "https://github.com/water-rs/gtk-backend".to_string(),
+            ),
+            ("waterui-gtk-rev".to_string(), gtk_revision.clone()),
         ]);
         let packages =
             resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40)).unwrap();
@@ -2293,8 +2693,323 @@ mod tests {
         assert!(dew.git.is_none());
         assert_eq!(dew.version.as_ref().unwrap().to_string(), "=0.2.1");
         let gtk = &packages["waterui-gtk"];
-        assert!(gtk.git.is_none());
-        assert_eq!(gtk.version.as_ref().unwrap().to_string(), "=0.1.2");
+        assert_eq!(
+            gtk.git.as_deref(),
+            Some("https://github.com/water-rs/gtk-backend")
+        );
+        assert_eq!(gtk.rev.as_deref(), Some(gtk_revision.as_str()));
+        assert_eq!(gtk.version.as_ref().unwrap().to_string(), "^0.2.0");
+    }
+
+    #[test]
+    fn declared_git_source_must_agree_with_the_lock() {
+        // The declared pin is authoritative, but a framework that also builds
+        // the crate in-tree must not lock a different commit than it declares.
+        let locked_revision = "b".repeat(40);
+        let drifted_revision = "c".repeat(40);
+        for (lock_revision, expected) in [
+            (locked_revision.as_str(), true),
+            (drifted_revision.as_str(), false),
+        ] {
+            let source = format!(
+                "git+https://github.com/water-rs/gtk-backend?rev={lock_revision}#{lock_revision}"
+            );
+            let lock = Lockfile {
+                packages: vec![package("waterui-gtk", "0.2.0", Some(&source))],
+                version: cargo_lock::ResolveVersion::V4,
+                root: None,
+                metadata: BTreeMap::default(),
+                patch: cargo_lock::Patch::default(),
+            };
+            let scaffold = BTreeMap::from([
+                ("waterui-gtk-version".to_string(), "0.2.0".to_string()),
+                (
+                    "waterui-gtk-git".to_string(),
+                    "https://github.com/water-rs/gtk-backend".to_string(),
+                ),
+                ("waterui-gtk-rev".to_string(), locked_revision.clone()),
+            ]);
+            let result =
+                resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40));
+            assert_eq!(result.is_ok(), expected, "lock revision {lock_revision}");
+            if expected {
+                assert_eq!(
+                    result.unwrap()["waterui-gtk"].rev.as_deref(),
+                    Some(locked_revision.as_str())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_packages_matches_the_requirement_against_the_lock() {
+        // The scaffold value is a requirement: a declaration satisfied by a
+        // newer locked version — `hydrolysis-m3 = "0.2.0"` where the lock
+        // carries the pinned 0.2.1 — still resolves the lock candidate's git
+        // source instead of pinning `=0.2.0`, a registry release the patch
+        // table cannot rescue and the framework never certified.
+        let m3_revision = "14a35e3ef69ced36557a3c7ab11d52e0afb53ad5";
+        let m3_source = format!(
+            "git+https://github.com/water-rs/hydrolysis-m3?rev={m3_revision}#{m3_revision}"
+        );
+        let lock = Lockfile {
+            packages: vec![
+                package("waterui", "0.3.0", None),
+                package("hydrolysis-m3", "0.2.1", Some(&m3_source)),
+            ],
+            version: cargo_lock::ResolveVersion::V4,
+            root: None,
+            metadata: BTreeMap::default(),
+            patch: cargo_lock::Patch::default(),
+        };
+        let scaffold = BTreeMap::from([
+            ("waterui-version".to_string(), "0.3.0".to_string()),
+            ("hydrolysis-m3-version".to_string(), "0.2.0".to_string()),
+        ]);
+        let packages =
+            resolve_packages(&scaffold, &lock, framework_repository(), &"a".repeat(40)).unwrap();
+        let m3 = &packages["hydrolysis-m3"];
+        assert_eq!(
+            m3.git.as_deref(),
+            Some("https://github.com/water-rs/hydrolysis-m3")
+        );
+        assert_eq!(m3.rev.as_deref(), Some(m3_revision));
+    }
+
+    #[test]
+    fn stable_dependency_honors_a_declared_git_source() {
+        // A persisted stable selection written before `experimental-packages`
+        // existed can still carry a `{name}-git`/`{name}-rev` pair in
+        // `scaffold`; `dependency` keeps honoring the declared pin.
+        let mut framework = stable_framework();
+        let revision = "b".repeat(40);
+        framework
+            .scaffold
+            .insert("waterui-gtk-version".to_owned(), "0.1.2".to_owned());
+        framework.scaffold.insert(
+            "waterui-gtk-git".to_owned(),
+            "https://github.com/water-rs/gtk-backend".to_owned(),
+        );
+        framework
+            .scaffold
+            .insert("waterui-gtk-rev".to_owned(), revision.clone());
+        framework
+            .scaffold
+            .insert("waterui-dew-version".to_owned(), "0.2.1".to_owned());
+        let gtk = framework.dependency("waterui-gtk");
+        assert_eq!(
+            gtk.git.as_deref(),
+            Some("https://github.com/water-rs/gtk-backend")
+        );
+        assert_eq!(gtk.rev.as_deref(), Some(revision.as_str()));
+        assert_eq!(gtk.version.as_ref().unwrap().to_string(), "^0.1.2");
+        // A scaffold package declared by version alone still resolves the
+        // registry pin.
+        let dew = framework.dependency("waterui-dew");
+        assert!(dew.git.is_none());
+        assert_eq!(dew.version.as_ref().unwrap().to_string(), "=0.2.1");
+    }
+
+    #[test]
+    fn stable_withholds_the_git_pinned_scaffold_packages() {
+        // `waterui-dew`, `waterui-gtk` and `waterui-winui` have no registry
+        // release, so a stable manifest withholds them — recorded under
+        // `experimental-packages`, absent from `scaffold` — and scaffolding
+        // one fails naming the package, the channel and the fix.
+        let framework = stable_framework();
+        for name in ["waterui-dew", "waterui-gtk", "waterui-winui"] {
+            let package = &framework.experimental_packages[name];
+            assert_eq!(package.rev.len(), 40);
+            assert!(!framework.scaffold.contains_key(&format!("{name}-version")));
+            assert!(!framework.scaffold.contains_key(&format!("{name}-git")));
+            let error = framework
+                .require_distributable(name)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "{error}");
+            assert!(error.contains("stable"), "{error}");
+            assert!(error.contains(&package.git), "{error}");
+            assert!(error.contains("--channel dev"), "{error}");
+            assert!(error.contains("--channel nightly"), "{error}");
+        }
+        // Registry-backed scaffold packages stay distributable on stable.
+        for name in ["waterui", "hydrolysis", "hydrolysis-m3"] {
+            framework
+                .require_distributable(name)
+                .unwrap_or_else(|error| panic!("{name} must scaffold on stable: {error}"));
+        }
+    }
+
+    #[test]
+    fn dev_and_nightly_distribute_the_experimental_packages() {
+        for framework in [dev_framework(), nightly_framework(true)] {
+            for name in ["waterui-dew", "waterui-gtk", "waterui-winui"] {
+                framework
+                    .require_distributable(name)
+                    .unwrap_or_else(|error| panic!("{name} must scaffold off stable: {error}"));
+                let dependency = framework.dependency(name);
+                assert!(
+                    dependency.git.is_some(),
+                    "{name} must keep its declared git pin"
+                );
+                assert_eq!(dependency.rev.as_deref().map(str::len), Some(40));
+            }
+        }
+    }
+
+    #[test]
+    fn a_legacy_stable_selection_re_derives_the_withheld_set() {
+        // A `Water.toml` written before `experimental-packages` existed
+        // keeps the git pins inside `scaffold`; validation restores the
+        // split so the withheld packages stay unscaffoldable.
+        let mut framework = stable_framework();
+        for (name, package) in framework.experimental_packages.clone() {
+            framework
+                .scaffold
+                .insert(format!("{name}-version"), package.version);
+            framework
+                .scaffold
+                .insert(format!("{name}-git"), package.git);
+            framework
+                .scaffold
+                .insert(format!("{name}-rev"), package.rev);
+        }
+        framework.experimental_packages.clear();
+
+        let framework = framework.validated().expect("fixture validates");
+        assert_eq!(framework.experimental_packages.len(), 3);
+        assert!(
+            framework.require_distributable("waterui-winui").is_err(),
+            "a stale `waterui-winui-git` entry must not resurrect the package"
+        );
+    }
+
+    #[test]
+    fn a_stable_certification_must_agree_on_the_withheld_set() {
+        let repository = framework_repository();
+        let revision = "a".repeat(40);
+        let lock_sha256 = "f".repeat(64);
+        let metadata = toml::toml! { android-min-api-level = 26 };
+        let mut scaffold = BTreeMap::from([
+            ("waterui-version".to_owned(), "0.4.1".to_owned()),
+            ("waterui-winui-version".to_owned(), "0.1.0".to_owned()),
+            (
+                "waterui-winui-git".to_owned(),
+                "https://github.com/water-rs/waterui-winui".to_owned(),
+            ),
+            ("waterui-winui-rev".to_owned(), "e".repeat(40)),
+        ]);
+        let experimental_packages = split_experimental_packages(&mut scaffold);
+
+        let stable_certification = |experimental: BTreeMap<_, _>, scaffold| Certification {
+            schema_version: 2,
+            channel: FrameworkChannel::Stable,
+            repository: "water-rs/waterui".to_owned(),
+            revision: revision.clone(),
+            tag: "v0.4.1".to_owned(),
+            lockfiles: BTreeMap::from([("Cargo.lock".to_owned(), lock_sha256.clone())]),
+            submodules: BTreeMap::new(),
+            scaffold,
+            experimental_packages: experimental,
+            metadata: metadata.clone(),
+        };
+        let source = certified_source(
+            &stable_certification(experimental_packages.clone(), scaffold.clone()),
+            repository,
+            &revision,
+            &metadata,
+            &scaffold,
+            &experimental_packages,
+            &lock_sha256,
+        )
+        .expect("a manifest carrying the withheld set verifies");
+        assert!(matches!(source, Source::Stable { .. }));
+
+        // Dropping a git-pinned package without recording it is not a valid
+        // stable manifest.
+        let error = certified_source(
+            &stable_certification(BTreeMap::new(), scaffold.clone()),
+            repository,
+            &revision,
+            &metadata,
+            &scaffold,
+            &experimental_packages,
+            &lock_sha256,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("experimental packages"), "{error}");
+
+        // Neither is recording it while still scaffolding it.
+        let mut doubled = scaffold.clone();
+        doubled.insert("waterui-winui-version".to_owned(), "0.1.0".to_owned());
+        let error = certified_source(
+            &stable_certification(experimental_packages.clone(), doubled),
+            repository,
+            &revision,
+            &metadata,
+            &scaffold,
+            &experimental_packages,
+            &lock_sha256,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("waterui-winui-version"), "{error}");
+    }
+
+    #[test]
+    fn extracted_crate_validation_accepts_only_the_sanctioned_source() {
+        // `Water.lock` cannot record an extracted crate, so
+        // `validate_dependencies` holds it to its declared pin instead: the
+        // exact commit for a git source, the exact version for the registry.
+        let gtk_revision = "b".repeat(40);
+        let mut framework = stable_framework();
+        framework.packages.insert(
+            "waterui-gtk".to_owned(),
+            DependencyDetail {
+                version: Some("0.2.0".parse().unwrap()),
+                git: Some("https://github.com/water-rs/gtk-backend".to_owned()),
+                rev: Some(gtk_revision.clone()),
+                ..Default::default()
+            },
+        );
+        framework.packages.insert(
+            "waterui-dew".to_owned(),
+            DependencyDetail {
+                version: Some("=0.2.1".parse().unwrap()),
+                ..Default::default()
+            },
+        );
+        let identity = |name: &str, version: &str, source: String| LockedPackage {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source: Some(source),
+        };
+        let gtk_source = |revision: &str| {
+            format!("git+https://github.com/water-rs/gtk-backend?rev={revision}#{revision}")
+        };
+        assert!(framework.sanctioned_source(&identity(
+            "waterui-gtk",
+            "0.2.0",
+            gtk_source(&gtk_revision)
+        )));
+        // The pinned commit carries whatever version its manifest declares.
+        assert!(framework.sanctioned_source(&identity(
+            "waterui-gtk",
+            "0.2.1",
+            gtk_source(&gtk_revision)
+        )));
+        // A different commit is a different pin.
+        let drifted = "c".repeat(40);
+        assert!(!framework.sanctioned_source(&identity(
+            "waterui-gtk",
+            "0.2.0",
+            gtk_source(&drifted)
+        )));
+        // The registry pin holds only its exact version.
+        let registry = || "registry+https://github.com/rust-lang/crates.io-index".to_owned();
+        assert!(framework.sanctioned_source(&identity("waterui-dew", "0.2.1", registry())));
+        assert!(!framework.sanctioned_source(&identity("waterui-dew", "0.2.2", registry())));
     }
 
     /// The exact requirement a stable channel writes for one scaffold entry.
@@ -2695,6 +3410,14 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             .to_string();
         assert!(error.contains("v0.4.1"), "{error}");
         assert!(error.contains("predates manifest publishing"), "{error}");
+        assert!(
+            error.contains(FIRST_STABLE_MANIFEST_RELEASE),
+            "{error} must name the first manifest-carrying stable release"
+        );
+        assert!(
+            error.contains("--channel dev") && error.contains("--channel nightly"),
+            "{error} must name the channels that resolve today"
+        );
     }
 
     fn certification(channel: FrameworkChannel, tag: &str) -> Certification {
@@ -2707,6 +3430,7 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             lockfiles: BTreeMap::from([("Cargo.lock".to_owned(), "f".repeat(64))]),
             submodules: BTreeMap::new(),
             scaffold: BTreeMap::new(),
+            experimental_packages: BTreeMap::new(),
             metadata: toml::toml! {
                 android-min-api-level = 26
             },
@@ -2845,7 +3569,35 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                     workspace("hydrolysis-m3")
                 ),
                 ("waterui-dew-version".to_owned(), workspace("waterui-dew")),
+                (
+                    "waterui-dew-git".to_owned(),
+                    "https://github.com/water-rs/dew".to_owned()
+                ),
+                (
+                    "waterui-dew-rev".to_owned(),
+                    "b64f6759a3ebe7ac621bad84be00fe431f978119".to_owned()
+                ),
                 ("waterui-gtk-version".to_owned(), workspace("waterui-gtk")),
+                (
+                    "waterui-gtk-git".to_owned(),
+                    "https://github.com/water-rs/gtk-backend".to_owned()
+                ),
+                (
+                    "waterui-gtk-rev".to_owned(),
+                    "3162043e618e759bea6d6e52ec75c6ee1273c080".to_owned()
+                ),
+                (
+                    "waterui-winui-version".to_owned(),
+                    workspace("waterui-winui")
+                ),
+                (
+                    "waterui-winui-git".to_owned(),
+                    "https://github.com/water-rs/waterui-winui".to_owned()
+                ),
+                (
+                    "waterui-winui-rev".to_owned(),
+                    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned()
+                ),
                 (
                     "apple-backend-url".to_owned(),
                     "https://github.com/water-rs/apple-backend.git".to_owned()
@@ -2861,6 +3613,21 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
     }
 
     #[test]
+    fn framework_scaffold_rejects_a_git_package_without_a_revision() {
+        let mut root: toml::Value = toml::from_str(include_str!(
+            "../../tests/fixtures/framework_checkout_manifest.toml"
+        ))
+        .unwrap();
+        let gtk = &mut root["workspace"]["dependencies"]["waterui-gtk"];
+        gtk.as_table_mut()
+            .unwrap()
+            .insert("branch".to_owned(), toml::Value::String("dev".to_owned()));
+        gtk.as_table_mut().unwrap().remove("rev");
+        let error = framework_scaffold(&root).unwrap_err();
+        assert!(error.to_string().contains("waterui-gtk"), "{error:?}");
+    }
+
+    #[test]
     fn framework_scaffold_rejects_a_backend_revision_that_is_not_a_commit() {
         let mut root: toml::Value = toml::from_str(include_str!(
             "../../tests/fixtures/framework_checkout_manifest.toml"
@@ -2873,6 +3640,19 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             error.to_string().contains("android-backend-revision"),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn declared_apple_revision_resolves_without_a_gitlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("waterui");
+        let revision = "d".repeat(40);
+        write_apple_revision_checkout(&root, &revision);
+
+        let framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
+        assert_eq!(framework.apple_backend_revision(), Some(revision.as_str()));
+        assert!(framework.apple_backend_version().is_none());
+        assert!(framework.git_source().is_none());
     }
 
     #[test]

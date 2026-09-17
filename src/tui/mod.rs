@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    build::{RustBuild, RustLinkage},
+    build::{BuildProgress, RustBuild, RustLinkage},
     project::Project,
     templates::{self, TemplateContext},
     water_dir,
@@ -98,12 +98,16 @@ pub async fn build(
     project: &Project,
     launcher_dir: &Path,
     sccache_path: Option<PathBuf>,
+    progress: Option<BuildProgress>,
 ) -> eyre::Result<PathBuf> {
     let mut build = RustBuild::new(launcher_dir, target_lexicon::Triple::host())
         .with_project(project)
         .with_target_dir(project.water_target_dir(RustLinkage::Static).await?);
     if let Some(sccache_path) = sccache_path {
         build = build.with_sccache(sccache_path);
+    }
+    if let Some(progress) = progress {
+        build = build.with_progress(progress);
     }
     build
         .build_binary(project.tui_backend_crate_name().as_str(), false)

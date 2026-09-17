@@ -51,6 +51,17 @@ pub struct MacOsUsageDescription {
     pub description: String,
 }
 
+/// The two names a macOS `.app` bundle carries.
+#[derive(Debug, Clone, Copy)]
+pub struct MacOsAppNames<'a> {
+    /// Human-readable bundle name — `<app_name>.app` and `CFBundleName`.
+    pub app_name: &'a str,
+    /// Shipped `Contents/MacOS` and `CFBundleExecutable` name — the product
+    /// name, not the artifact's file name, which may carry a build-internal
+    /// tag.
+    pub executable_name: &'a str,
+}
+
 /// Package a compiled binary as a macOS `.app` bundle.
 ///
 /// `resources_dir` is optional and copied to `Contents/Resources` when
@@ -62,7 +73,7 @@ pub struct MacOsUsageDescription {
 pub async fn package_binary_as_app(
     binary_path: &Path,
     bundle_id: &str,
-    app_name: &str,
+    names: MacOsAppNames<'_>,
     usage_descriptions: &[MacOsUsageDescription],
     resources_dir: Option<&Path>,
     icns: &[u8],
@@ -75,7 +86,7 @@ pub async fn package_binary_as_app(
         );
     }
 
-    let app_dir = output_root.join(format!("{app_name}.app"));
+    let app_dir = output_root.join(format!("{}.app", names.app_name));
     let contents_dir = app_dir.join("Contents");
     let macos_dir = contents_dir.join("MacOS");
     let bundle_resources_dir = contents_dir.join("Resources");
@@ -85,11 +96,7 @@ pub async fn package_binary_as_app(
     fs::create_dir_all(&macos_dir).await?;
     fs::create_dir_all(&bundle_resources_dir).await?;
 
-    let executable_name = binary_path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .ok_or_else(|| eyre::eyre!("Binary path has no valid executable name"))?;
-    let executable_dest = macos_dir.join(executable_name);
+    let executable_dest = macos_dir.join(names.executable_name);
     copy_file(binary_path, &executable_dest).await?;
     #[cfg(unix)]
     {
@@ -109,8 +116,8 @@ pub async fn package_binary_as_app(
 
     let plist = InfoPlistTemplate {
         bundle_identifier: bundle_id,
-        app_name,
-        executable_name,
+        app_name: names.app_name,
+        executable_name: names.executable_name,
         usage_descriptions,
     }
     .render()
@@ -417,7 +424,9 @@ mod tests {
     fn packaged_app_carries_icon_and_plist_references() {
         smol::block_on(async {
             let temporary = tempfile::tempdir().expect("temporary directory must be available");
-            let binary = temporary.path().join("demo");
+            // The built binary carries the generated crate's project-root
+            // tag; the bundle ships it under the product name.
+            let binary = temporary.path().join("demo-hydrolysis-deadbeef");
             std::fs::write(&binary, b"demo").expect("fake executable must be written");
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
                 .expect("fake executable must be executable");
@@ -425,7 +434,10 @@ mod tests {
             let app = super::package_binary_as_app(
                 &binary,
                 "dev.waterui.demo",
-                "Demo",
+                super::MacOsAppNames {
+                    app_name: "Demo",
+                    executable_name: "demo-hydrolysis",
+                },
                 &[],
                 None,
                 b"fake-icns-bytes",
@@ -439,10 +451,14 @@ mod tests {
                     .expect("bundle must contain the icon family"),
                 b"fake-icns-bytes"
             );
+            assert!(app.join("Contents/MacOS/demo-hydrolysis").is_file());
+            assert!(!app.join("Contents/MacOS/demo-hydrolysis-deadbeef").exists());
             let plist = std::fs::read_to_string(app.join("Contents/Info.plist"))
                 .expect("bundle plist must be readable");
             assert!(plist.contains("<key>CFBundleIconFile</key>"));
             assert!(plist.contains("<key>CFBundleIconName</key>"));
+            assert!(plist.contains("<string>demo-hydrolysis</string>"));
+            assert!(!plist.contains("deadbeef"));
         });
     }
 

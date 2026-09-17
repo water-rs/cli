@@ -5,7 +5,7 @@ use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Shared};
 use tracing::info;
 
-use crate::build::RustLinkage;
+use crate::build::{BuildProgress, RustLinkage};
 use crate::framework::{
     FrameworkChannel, ResolvedFramework, validate_local_cli, validate_resolved_cli,
 };
@@ -92,6 +92,24 @@ impl Project {
         )
         .map_err(|error| eyre::eyre!(error))?;
         let (framework, lockfile) = ResolvedFramework::resolve(channel).await?;
+        // A configured backend whose scaffold packages the target channel
+        // withholds could never be regenerated — refuse the switch before a
+        // manifest is rewritten.
+        for (configured, backend) in [
+            (previous.backends.gtk4().is_some(), TargetBackend::Gtk4),
+            (
+                previous.backends.hydrolysis().is_some(),
+                TargetBackend::Hydrolysis,
+            ),
+            (previous.backends.winui().is_some(), TargetBackend::WinUi),
+            (previous.backends.esp32().is_some(), TargetBackend::Dew),
+        ] {
+            if configured {
+                for package in backend.scaffold_packages() {
+                    framework.require_distributable(package)?;
+                }
+            }
+        }
         let mut next = previous.clone();
         next.waterui_path = None;
         next.framework = Some(framework.clone());
@@ -143,13 +161,15 @@ impl Project {
         platform: TargetPlatform,
         device: D,
     ) -> Result<Running, FailToRun> {
-        self.run_with_options(backend, platform, device, RunOptions::new())
+        self.run_with_options(backend, platform, device, RunOptions::new(), None)
             .await
     }
 
     /// Run the `WaterUI` project with explicit run options.
     ///
     /// This allows callers (like preview) to inject extra environment variables.
+    /// `progress`, when given, receives cargo compile events from both the
+    /// library build and the packaging pass's asset-manifest compile.
     ///
     /// # Errors
     /// Returns an error if building, packaging, or launching the app fails.
@@ -159,20 +179,25 @@ impl Project {
         platform: TargetPlatform,
         device: D,
         run_options: RunOptions,
+        progress: Option<BuildProgress>,
     ) -> Result<Running, FailToRun> {
+        let mut build_options = BuildOptions::development(BuildProfile::Debug);
+        if let Some(progress) = &progress {
+            build_options = build_options.with_progress(progress.clone());
+        }
         // Build rust library for the target platform
         backend
-            .build(
-                self,
-                platform,
-                BuildOptions::development(BuildProfile::Debug),
-            )
+            .build(self, platform, build_options)
             .await
             .map_err(FailToRun::Build)?;
 
+        let mut package_options = PackageOptions::development();
+        if let Some(progress) = progress {
+            package_options = package_options.with_progress(progress);
+        }
         // Package the build artifacts for the target platform
         let artifact = backend
-            .package(self, platform, PackageOptions::development())
+            .package(self, platform, package_options)
             .await
             .map_err(FailToRun::Package)?;
 
@@ -184,6 +209,11 @@ impl Project {
     /// This is required because Android packaging is ABI-dependent (e.g., `x86_64` emulator vs
     /// `arm64-v8a` physical device).
     ///
+    /// `build_options` decides the Rust runtime linkage: a support app that
+    /// `dlopen`s `WaterUI` modules (the preview app) must pass
+    /// [`BuildOptions::with_dynamic_module_loading`] so the shared runtime is
+    /// built and packaged; a standalone app links it in.
+    ///
     /// # Errors
     /// Returns an error if building, packaging, or launching the Android app fails.
     pub async fn run_android_with_options<D: Device + AndroidAbiProvider>(
@@ -191,6 +221,8 @@ impl Project {
         _backend: &AndroidBackend,
         device: D,
         run_options: RunOptions,
+        build_options: BuildOptions,
+        progress: Option<BuildProgress>,
     ) -> Result<Running, FailToRun> {
         let abi = device.android_abi();
 
@@ -202,15 +234,22 @@ impl Project {
             .await
             .map_err(FailToRun::Build)?;
 
+        let mut build_options = build_options;
+        if let Some(progress) = &progress {
+            build_options = build_options.with_progress(progress.clone());
+        }
         AndroidPlatform::new(abi)
-            .build(self, BuildOptions::development(BuildProfile::Debug))
+            .build(self, build_options)
             .await
             .map_err(FailToRun::Build)?;
 
-        let artifact =
-            AndroidPlatform::package_with_abis(self, PackageOptions::development(), &[abi])
-                .await
-                .map_err(FailToRun::Package)?;
+        let mut package_options = PackageOptions::development();
+        if let Some(progress) = progress {
+            package_options = package_options.with_progress(progress);
+        }
+        let artifact = AndroidPlatform::package_with_abis(self, package_options, &[abi])
+            .await
+            .map_err(FailToRun::Package)?;
 
         Self::run_packaged(device, artifact, run_options).await
     }
@@ -267,22 +306,27 @@ impl Project {
 
     /// Resolve the Cargo target directory every generated backend crate builds into.
     ///
-    /// Generated backends need an explicit target directory, because the default one
-    /// would land inside the managed build cache next to the generated sources — and
-    /// those sources are deleted and regenerated whenever the CLI's scaffold templates
-    /// change. Compiled artifacts do not become stale for that reason, so keeping them
-    /// there meant one CLI upgrade discarded the compiled dependency graph of every
-    /// project on the machine.
+    /// The directory is shared by every project on the machine — one
+    /// `~/.water/build_cache/target` subtree — because Cargo already keys each
+    /// compiled unit by target triple, resolved features, and profile: a second
+    /// project's build reuses the dependency graph the first one compiled
+    /// instead of cold-building it, the way sccache-equipped machines behave.
+    /// The shared root sits beside the per-project managed containers rather
+    /// than inside one: generated backend sources are deleted and regenerated
+    /// whenever the CLI's scaffold templates change, while compiled artifacts
+    /// do not become stale for that reason — keeping them together meant one
+    /// CLI upgrade discarded the compiled dependency graph of every project on
+    /// the machine.
     ///
-    /// One directory serves every backend, platform, and feature set of a linkage:
-    /// Cargo already keys each compiled unit by target triple, resolved features, and
-    /// profile, so switching backends only rebuilds the units the two graphs do not
-    /// share — measured on an example app, over 80% of the Apple FFI graph resolves
-    /// identically to the Hydrolysis graph and is reused as-is. Builds must therefore
-    /// agree on everything Cargo hashes into every unit — pass an explicit `--target`
-    /// and keep final-artifact link flags out of `RUSTFLAGS` (see
-    /// `RustBuild::with_final_rustc_arg`) — or two variants sharing this directory
-    /// re-fingerprint each other's entire dependency graph on every switch.
+    /// One directory serves every backend, platform, and feature set of a
+    /// linkage: switching backends only rebuilds the units the two graphs do
+    /// not share — measured on an example app, over 80% of the Apple FFI graph
+    /// resolves identically to the Hydrolysis graph and is reused as-is.
+    /// Builds must therefore agree on everything Cargo hashes into every unit —
+    /// pass an explicit `--target` and keep final-artifact link flags out of
+    /// `RUSTFLAGS` (see `RustBuild::with_final_rustc_arg`) — or two variants
+    /// sharing this directory re-fingerprint each other's entire dependency
+    /// graph on every switch.
     ///
     /// Linkage is the one axis Cargo cannot separate: shared-runtime development
     /// builds carry `-Cprefer-dynamic -Crpath` in `RUSTFLAGS` and static packaging
@@ -292,17 +336,13 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// Returns an error when Cargo metadata cannot resolve the project target directory.
+    /// Returns an error when the shared build-cache directory cannot be resolved.
     pub async fn water_target_dir(&self, linkage: RustLinkage) -> eyre::Result<PathBuf> {
         let variant = match linkage {
             RustLinkage::SharedRuntime => "shared",
             RustLinkage::Static => "static",
         };
-        Ok(self
-            .target_dir()
-            .await?
-            .join("water-backends")
-            .join(variant))
+        Ok(crate::water_dir::shared_target_dir().await?.join(variant))
     }
 
     /// Resolve an isolated target directory for a backend built by a different Rust
@@ -314,13 +354,26 @@ impl Project {
     ///
     /// # Errors
     ///
-    /// Returns an error when Cargo metadata cannot resolve the project target directory.
+    /// Returns an error when the shared build-cache directory cannot be resolved.
     pub async fn toolchain_target_dir(&self, toolchain: &str) -> eyre::Result<PathBuf> {
-        Ok(self
-            .target_dir()
+        Ok(crate::water_dir::shared_target_dir()
             .await?
-            .join("water-backends")
-            .join(toolchain))
+            .join(format!("toolchain-{toolchain}")))
+    }
+
+    /// Resolve the target directory the project's host-side rlib builds into.
+    ///
+    /// `build_host_rlib` compiles the user crate for the host to read its
+    /// `waterui_meta_*` symbols. That compile shares the dependency graph with
+    /// every other project's host build, so it lives beside the backend
+    /// variants in the shared target root rather than in the project's own
+    /// `target/`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared build-cache directory cannot be resolved.
+    pub async fn host_target_dir(&self) -> eyre::Result<PathBuf> {
+        crate::water_dir::shared_host_target_dir().await
     }
 
     /// Get the backends configured for the project.
@@ -336,17 +389,20 @@ impl Project {
     }
 
     /// Get configured or default FFI crate name for app mode.
+    ///
+    /// The default is tagged with this project's root — see
+    /// [`generated_crate_name`]; an explicit `[crates]` override is verbatim.
     #[must_use]
     pub fn ffi_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
             .and_then(|crates| crates.ffi.clone())
-            .unwrap_or_else(|| self.crate_name.with_suffix("ffi"))
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "ffi", &self.root))
     }
 
     /// Get configured preview wrapper crate name for preview dylib builds.
     #[must_use]
     pub fn preview_ffi_crate_name(&self) -> CrateName {
-        self.crate_name.with_suffix("preview-ffi")
+        generated_crate_name(&self.crate_name, "preview-ffi", &self.root)
     }
 
     /// Get the crate root path used to build preview dylibs.
@@ -366,7 +422,7 @@ impl Project {
     pub fn gtk_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
             .and_then(|crates| crates.gtk.clone())
-            .unwrap_or_else(|| self.crate_name.with_suffix("gtk4"))
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "gtk4", &self.root))
     }
 
     /// Get configured or default hydrolysis backend crate name for app mode.
@@ -374,19 +430,80 @@ impl Project {
     pub fn hydrolysis_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
             .and_then(|crates| crates.hydrolysis.clone())
-            .unwrap_or_else(|| self.crate_name.with_suffix("hydrolysis"))
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "hydrolysis", &self.root))
+    }
+
+    /// Get configured or default `WinUI` backend crate name for app mode.
+    #[must_use]
+    pub fn winui_backend_crate_name(&self) -> CrateName {
+        self.app_crate_overrides()
+            .and_then(|crates| crates.winui.clone())
+            .unwrap_or_else(|| generated_crate_name(&self.crate_name, "winui", &self.root))
     }
 
     /// Get the generated ESP32 firmware harness crate name.
     #[must_use]
     pub fn esp32_backend_crate_name(&self) -> CrateName {
-        self.crate_name.with_suffix("esp32")
+        generated_crate_name(&self.crate_name, "esp32", &self.root)
     }
 
     /// Get the crate name of the generated experimental TUI launcher.
     #[must_use]
     pub fn tui_backend_crate_name(&self) -> CrateName {
-        self.crate_name.with_suffix("tui")
+        generated_crate_name(&self.crate_name, "tui", &self.root)
+    }
+
+    /// The executable name a packaged backend binary ships under: the
+    /// configured `[crates]` override verbatim, or `<crate>-<suffix>` when
+    /// the crate is generated.
+    ///
+    /// [`generated_crate_name`]'s project-root tag exists to keep a shared
+    /// Cargo target directory unambiguous; it is internal to the build and
+    /// must never name a shipped executable.
+    fn shipped_backend_binary_name(
+        &self,
+        suffix: &str,
+        configured: Option<&CrateName>,
+    ) -> CrateName {
+        configured
+            .cloned()
+            .unwrap_or_else(|| self.crate_name.with_suffix(suffix))
+    }
+
+    /// The executable name the packaged GTK4 binary ships under.
+    #[must_use]
+    pub fn gtk4_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name(
+            "gtk4",
+            self.app_crate_overrides()
+                .and_then(|crates| crates.gtk.as_ref()),
+        )
+    }
+
+    /// The executable name the packaged hydrolysis binary ships under.
+    #[must_use]
+    pub fn hydrolysis_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name(
+            "hydrolysis",
+            self.app_crate_overrides()
+                .and_then(|crates| crates.hydrolysis.as_ref()),
+        )
+    }
+
+    /// The executable name the packaged `WinUI` binary ships under.
+    #[must_use]
+    pub fn winui_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name(
+            "winui",
+            self.app_crate_overrides()
+                .and_then(|crates| crates.winui.as_ref()),
+        )
+    }
+
+    /// The name the packaged ESP32 firmware image ships under.
+    #[must_use]
+    pub fn esp32_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name("esp32", None)
     }
 
     /// Get package type declared in `Water.toml`.
@@ -473,6 +590,12 @@ impl Project {
         self.manifest.backends.hydrolysis()
     }
 
+    /// Get the `WinUI` backend configuration if available.
+    #[must_use]
+    pub const fn winui_backend(&self) -> Option<&crate::winui::backend::WinUiBackend> {
+        self.manifest.backends.winui()
+    }
+
     /// Get the ESP32 backend configuration if available.
     #[must_use]
     pub const fn esp32_backend(&self) -> Option<&crate::esp32::backend::Esp32Backend> {
@@ -497,6 +620,31 @@ impl Project {
         ResolvedFramework::for_manifest(self.manifest(), &self.root).await
     }
 
+    /// Assert the selected framework channel distributes every scaffold
+    /// package `backend` links — the git-pinned experimental set `stable`
+    /// withholds. Runs before the backend writes a file, so a withheld
+    /// package fails the init with the channel fix rather than partway
+    /// through the generated tree.
+    async fn require_distributable_backend(
+        &self,
+        backend: TargetBackend,
+    ) -> Result<(), crate::backend::FailToInitBackend> {
+        let packages = backend.scaffold_packages();
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let framework = self
+            .resolved_framework()
+            .await
+            .map_err(crate::backend::FailToInitBackend::Config)?;
+        for package in packages {
+            framework
+                .require_distributable(package)
+                .map_err(crate::backend::FailToInitBackend::Config)?;
+        }
+        Ok(())
+    }
+
     /// Returns whether the packaged application links `package_name`.
     ///
     /// Development-only and build-only dependencies are excluded because they
@@ -515,7 +663,7 @@ impl Project {
             .linked_packages
             .get_or_init(|| async move {
                 cargo_layout.await?;
-                resolve_linked_runtime_packages(project_root)
+                resolve_linked_runtime_packages(project_root, false)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -547,7 +695,7 @@ impl Project {
             .enabled_features
             .get_or_init(|| async move {
                 cargo_layout.await?;
-                resolve_enabled_features(project_root)
+                resolve_enabled_features(project_root, false)
                     .await
                     .map_err(|error| error.to_string())
             })
@@ -611,6 +759,27 @@ impl Project {
             (false, true) => Ok(Some(ResolvedWebViewBackend::Wpe)),
             (false, false) => Ok(None),
         }
+    }
+
+    /// Whether the generated backend manifests declare the CEF subprocess
+    /// helper `[[bin]]`.
+    ///
+    /// This is the manifest's own predicate: the helper exists only when the
+    /// application links the CEF engine crate, while a `waterui-chromium`
+    /// link alone does not declare it. Builds and packaging that touch the
+    /// helper must gate on this rather than
+    /// [`BrowserRuntimePlan::requires_cef`], which is wider — it also turns
+    /// on for chromium — and would request a bin target Cargo never
+    /// received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Cargo metadata cannot be resolved or the
+    /// application links two engines at once.
+    pub async fn declares_cef_helper(&self) -> eyre::Result<bool> {
+        Ok(crate::project_types::declares_cef_helper(
+            self.linked_browser_engine().await?,
+        ))
     }
 
     /// Resolves and validates every embedded browser runtime linked by the application.
@@ -681,15 +850,16 @@ impl Project {
         use crate::{
             android::platform::clean_android, apple::platform::clean_apple,
             esp32::platform::clean_esp32, gtk4::platform::clean_gtk4,
-            hydrolysis::platform::clean_hydrolysis,
+            hydrolysis::platform::clean_hydrolysis, winui::platform::clean_winui,
         };
 
         if self.is_playground() {
             crate::water_dir::remove_project_build_cache(self.root()).await?;
-            // A playground's Cargo target directory is the user's own (often a
-            // workspace-wide one), so only the CLI-owned `water-backends` subtree
-            // is removed — including target directories older CLI layouts left
-            // behind — never the user's other compiled artifacts.
+            // Compiled artifacts live in the per-user shared target directory
+            // and outlive any single project, so they stay. What remains to
+            // sweep here is the `water-backends` subtree older CLI layouts
+            // left under the project's own Cargo target directory — never the
+            // user's other compiled artifacts.
             let water_backends_root = self.target_dir().await?.join("water-backends");
             if water_backends_root.exists() {
                 smol::fs::remove_dir_all(&water_backends_root).await?;
@@ -721,6 +891,11 @@ impl Project {
         // Clean hydrolysis backend if configured
         if self.hydrolysis_backend().is_some() || self.is_playground() {
             clean_hydrolysis(self).await?;
+        }
+
+        // Clean `WinUI` backend if configured
+        if self.winui_backend().is_some() || (self.is_playground() && cfg!(target_os = "windows")) {
+            clean_winui(self).await?;
         }
 
         // Clean ESP32 backend if configured
@@ -873,6 +1048,11 @@ pub struct CreateOptions {
     pub framework: Option<ResolvedFramework>,
     /// Author name for Cargo.toml.
     pub author: String,
+    /// The backends the caller will scaffold after creation: each one's
+    /// scaffold packages are held against the resolved channel before a
+    /// file is written, so a package the channel withholds — the git-pinned
+    /// experimental set — fails the create rather than the backend init.
+    pub backends: Vec<TargetBackend>,
     /// The declared web frontend: `Some` generates the `include_web!` root
     /// view and writes `[web] package_manager`.
     pub web: Option<WebScaffold>,
@@ -931,7 +1111,12 @@ impl CreateOptions {
             );
         }
         if let Some(path) = &self.waterui_path {
-            let root = smol::fs::canonicalize(path).await?;
+            // `dunce`, not `std`'s canonicalize: on Windows the standard one
+            // returns an extended-length path (`\\?\C:\…`), and a scaffolded
+            // manifest that carries it as a dependency `path` is one Cargo
+            // refuses to parse ("invalid path url").
+            let path = path.clone();
+            let root = unblock(move || dunce::canonicalize(path)).await?;
             self.waterui_path = Some(root.clone());
             return Ok((ResolvedFramework::for_local_checkout(&root).await?, None));
         }
@@ -1102,6 +1287,16 @@ impl Project {
             .resolve_framework()
             .await
             .map_err(FailToCreateProject::Framework)?;
+
+        // A backend whose scaffold packages the channel withholds cannot be
+        // scaffolded at all — reject before a single file lands.
+        for backend in &options.backends {
+            for package in backend.scaffold_packages() {
+                framework
+                    .require_distributable(package)
+                    .map_err(FailToCreateProject::Framework)?;
+            }
+        }
 
         // Framework validation precedes directory creation so a rejected
         // local checkout leaves nothing behind; on `init` the directory
@@ -1287,6 +1482,8 @@ impl Project {
     pub async fn init_gtk4_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
         use crate::{backend::Backend, gtk4::backend::Gtk4Backend};
 
+        self.require_distributable_backend(TargetBackend::Gtk4)
+            .await?;
         if !cfg!(target_os = "linux") {
             return Err(crate::backend::FailToInitBackend::Io(
                 std::io::Error::other("GTK4 backend is only supported on Linux hosts"),
@@ -1314,6 +1511,8 @@ impl Project {
     ) -> Result<(), crate::backend::FailToInitBackend> {
         use crate::{backend::Backend, hydrolysis::backend::HydrolysisBackend};
 
+        self.require_distributable_backend(TargetBackend::Hydrolysis)
+            .await?;
         let backend = HydrolysisBackend::init(self).await?;
         self.manifest.backends.set_hydrolysis(backend);
         self.manifest
@@ -1328,6 +1527,32 @@ impl Project {
         Ok(())
     }
 
+    /// Initialize the `WinUI` backend for an existing project.
+    ///
+    /// Creates necessary files/folders for the `WinUI` backend under `backend_path::<WinUiBackend>()`.
+    ///
+    /// # Errors
+    /// Returns an error if scaffolding fails.
+    pub async fn init_winui_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
+        use crate::{backend::Backend, winui::backend::WinUiBackend};
+
+        self.require_distributable_backend(TargetBackend::WinUi)
+            .await?;
+        if !cfg!(target_os = "windows") {
+            return Err(crate::backend::FailToInitBackend::Io(
+                std::io::Error::other("WinUI backend is only supported on Windows hosts"),
+            ));
+        }
+
+        let backend = WinUiBackend::init(self).await?;
+        self.manifest.backends.set_winui(backend);
+        self.manifest
+            .save(&self.root)
+            .await
+            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
+        Ok(())
+    }
+
     /// Initialize the ESP32 backend for an existing project.
     ///
     /// Creates necessary files/folders for the ESP32 firmware harness under
@@ -1338,6 +1563,8 @@ impl Project {
     pub async fn init_esp32_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
         use crate::{backend::Backend, esp32::backend::Esp32Backend};
 
+        self.require_distributable_backend(TargetBackend::Dew)
+            .await?;
         let backend = Esp32Backend::init(self).await?;
         self.manifest.backends.set_esp32(backend);
         self.manifest
@@ -1407,6 +1634,19 @@ impl Project {
             self.remove_backend_relative_dir(&path).await?;
         }
         self.manifest.backends.clear_gtk4();
+        self.save_manifest().await
+    }
+
+    /// Remove `WinUI` backend configuration and generated files.
+    ///
+    /// # Errors
+    /// Returns an error if deleting files or saving manifest fails.
+    pub async fn remove_winui_backend(&mut self) -> eyre::Result<()> {
+        if let Some(backend) = self.winui_backend() {
+            let path = backend.project_path().clone();
+            self.remove_backend_relative_dir(&path).await?;
+        }
+        self.manifest.backends.clear_winui();
         self.save_manifest().await
     }
 
@@ -1801,7 +2041,11 @@ async fn resolve_cargo_layout(
 
 /// Run `cargo tree` for the application package rooted at `project_root`'s
 /// manifest, over the given edge kinds, and return the `{p}`-formatted tree.
-async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
+///
+/// `locked` passes `--locked` to the resolve: trees that are read-only input —
+/// the shared pinned-framework checkout — must fail loudly on a stale
+/// committed lockfile instead of letting cargo rewrite it in place.
+async fn cargo_tree(project_root: &Path, edges: &str, locked: bool) -> eyre::Result<String> {
     // `dunce`, not `std::fs::canonicalize`: on Windows the standard one returns
     // an extended-length path (`\\?\D:\...`), while `cargo metadata` reports the
     // plain one, so comparing the two never matched and the package below was
@@ -1812,10 +2056,12 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
     let application_manifest = dunce::canonicalize(project_root.join("Cargo.toml"))?;
     let metadata_manifest = application_manifest.clone();
     let metadata = unblock(move || {
-        cargo_metadata::MetadataCommand::new()
-            .no_deps()
-            .manifest_path(metadata_manifest)
-            .exec()
+        let mut command = cargo_metadata::MetadataCommand::new();
+        command.no_deps().manifest_path(metadata_manifest);
+        if locked {
+            command.other_options(vec!["--locked".to_string()]);
+        }
+        command.exec()
     })
     .await?;
     let root = metadata
@@ -1829,8 +2075,8 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
             )
         })?;
     let package_spec = root.id.to_string();
-    let output = Command::new("cargo")
-        .arg("tree")
+    let mut tree = Command::new("cargo");
+    tree.arg("tree")
         .arg("--manifest-path")
         .arg(&application_manifest)
         .arg("--package")
@@ -1841,9 +2087,11 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
         .arg("none")
         .arg("--format")
         .arg("{p}")
-        .current_dir(project_root)
-        .output()
-        .await?;
+        .current_dir(project_root);
+    if locked {
+        tree.arg("--locked");
+    }
+    let output = tree.output().await?;
     if !output.status.success() {
         return Err(eyre::eyre!(
             "failed to resolve runtime dependency graph for {}: {}",
@@ -1858,8 +2106,9 @@ async fn cargo_tree(project_root: &Path, edges: &str) -> eyre::Result<String> {
 
 async fn resolve_linked_runtime_packages(
     project_root: PathBuf,
+    locked: bool,
 ) -> eyre::Result<BTreeMap<String, String>> {
-    let tree = cargo_tree(&project_root, "normal").await?;
+    let tree = cargo_tree(&project_root, "normal", locked).await?;
     let mut linked = BTreeMap::new();
     for package in tree.lines() {
         let name = package
@@ -1876,8 +2125,11 @@ async fn resolve_linked_runtime_packages(
 /// features`, `cargo tree` reports each enabled feature as a
 /// `<package> feature "<name>"` node; only the names are kept, since the
 /// question asked of this set is always "is a feature named X enabled".
-async fn resolve_enabled_features(project_root: PathBuf) -> eyre::Result<BTreeSet<String>> {
-    let tree = cargo_tree(&project_root, "features").await?;
+async fn resolve_enabled_features(
+    project_root: PathBuf,
+    locked: bool,
+) -> eyre::Result<BTreeSet<String>> {
+    let tree = cargo_tree(&project_root, "features", locked).await?;
     let mut features = BTreeSet::new();
     for node in tree.lines() {
         if let Some(feature) = node
@@ -1907,7 +2159,7 @@ use crate::{
     build::{BuildOptions, BuildProfile},
     device::{Artifact, Device, FailToRun, RunOptions, Running},
     platform::{PackageOptions, TargetBackend, TargetPlatform},
-    project_types::{BundleIdentifier, CrateName, PermissionKey},
+    project_types::{BundleIdentifier, CrateName, PermissionKey, generated_crate_name},
     templates::{self, TemplateContext},
     utils::command,
     web,
@@ -1955,6 +2207,15 @@ pub struct PermissionEntry {
 }
 
 impl PermissionEntry {
+    /// Create an enabled permission entry with the given rationale.
+    #[must_use]
+    pub fn enabled(description: impl Into<String>) -> Self {
+        Self {
+            enable: true,
+            description: description.into(),
+        }
+    }
+
     /// Check if this permission is enabled.
     #[must_use]
     pub const fn is_enabled(&self) -> bool {
@@ -2173,6 +2434,9 @@ pub struct AppCrates {
     /// Optional override crate name for generated hydrolysis backend crate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hydrolysis: Option<CrateName>,
+    /// Optional override crate name for generated `WinUI` backend crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winui: Option<CrateName>,
 }
 
 /// `[package]` section in `Water.toml`.
@@ -2289,6 +2553,7 @@ mod channel_tests {
                 framework_manifest: None,
                 framework: None,
                 author: String::new(),
+                backends: Vec::new(),
                 web: None,
             };
             let error = Project::create(&project_root, options)
@@ -2469,10 +2734,10 @@ mod webview_backend_tests {
     #[test]
     #[ignore = "clones the pinned framework revision"]
     fn runtime_graph_is_scoped_to_the_selected_application() {
-        let checkout = crate::pinned_framework::checkout();
-        let repository = checkout.path();
+        let repository = crate::pinned_framework::checkout();
         let chromium = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/chromium"),
+            true,
         ))
         .expect("Chromium example runtime graph must resolve");
         assert!(
@@ -2501,6 +2766,7 @@ mod webview_backend_tests {
         );
         let chromium_features = smol::block_on(resolve_enabled_features(
             repository.join("examples/chromium"),
+            true,
         ))
         .expect("Chromium example feature graph must resolve");
         assert!(
@@ -2511,6 +2777,7 @@ mod webview_backend_tests {
 
         let webview = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/webview"),
+            true,
         ))
         .expect("WebView example runtime graph must resolve");
         assert!(
@@ -2519,6 +2786,7 @@ mod webview_backend_tests {
         );
         let webview_features = smol::block_on(resolve_enabled_features(
             repository.join("examples/webview"),
+            true,
         ))
         .expect("WebView example feature graph must resolve");
         assert!(
@@ -2536,6 +2804,7 @@ mod webview_backend_tests {
 
         let cef_webview = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/webview-cef"),
+            true,
         ))
         .expect("CEF WebView example runtime graph must resolve");
         assert!(
@@ -2558,11 +2827,11 @@ mod webview_backend_tests {
     #[test]
     #[ignore = "clones the pinned framework revision"]
     fn the_map_capability_is_read_from_the_application_graph() {
-        let checkout = crate::pinned_framework::checkout();
-        let repository = checkout.path();
+        let repository = crate::pinned_framework::checkout();
 
         let map = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/map"),
+            true,
         ))
         .expect("map example runtime graph must resolve");
         assert!(
@@ -2572,6 +2841,7 @@ mod webview_backend_tests {
 
         let webview = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/webview"),
+            true,
         ))
         .expect("WebView example runtime graph must resolve");
         assert!(
@@ -2583,7 +2853,9 @@ mod webview_backend_tests {
 
 #[cfg(test)]
 mod scaffold_tests {
-    use super::{BundleIdentifier, CreateOptions, PackageType, Project};
+    use std::path::Path;
+
+    use super::{BundleIdentifier, CreateOptions, PackageType, Project, TargetBackend};
 
     /// The documented `assets!` workflow requires the assets root to exist: the
     /// planner walks it recursively, so a missing directory fails the first
@@ -2608,6 +2880,7 @@ mod scaffold_tests {
                 // GitHub; a unit test resolves a fixture in place instead.
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
                 author: "Lexo Liu".to_string(),
+                backends: Vec::new(),
                 web: None,
             },
         ))
@@ -2628,6 +2901,158 @@ mod scaffold_tests {
             assets.join("README.md").is_file(),
             "a tracked file keeps the assets directory present in git"
         );
+    }
+
+    /// `stable` withholds the git-pinned experimental scaffold packages, so a
+    /// backend whose generated crate links one — GTK4, `WinUI`, Dew — must fail
+    /// `create` before a file lands, naming the package and the channel fix
+    /// rather than dying partway through the backend's own scaffold.
+    #[test]
+    fn create_rejects_backends_whose_packages_stable_withholds() {
+        for backend in [
+            TargetBackend::Gtk4,
+            TargetBackend::WinUi,
+            TargetBackend::Dew,
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().join("water-example");
+            let error = smol::block_on(Project::create(
+                &root,
+                CreateOptions {
+                    name: "Water Example".to_string(),
+                    bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                        .expect("bundle identifier"),
+                    package_type: PackageType::App,
+                    waterui_path: None,
+                    channel: None,
+                    framework_manifest: None,
+                    framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    author: "Lexo Liu".to_string(),
+                    backends: vec![backend],
+                    web: None,
+                },
+            ))
+            .expect_err("a withheld scaffold package must reject create");
+            let error = error.to_string();
+            for package in backend.scaffold_packages() {
+                assert!(error.contains(package), "{error}");
+            }
+            assert!(error.contains("stable"), "{error}");
+            assert!(error.contains("--channel dev"), "{error}");
+            assert!(
+                !root.exists(),
+                "the rejection precedes any file write: {error}"
+            );
+        }
+    }
+
+    /// Generated crate names carry the project-root tag that keeps a shared
+    /// Cargo target directory unambiguous; the names packaged binaries ship
+    /// under drop it — a checkout path must never appear in a shipped
+    /// executable name.
+    #[test]
+    fn shipped_binary_names_drop_the_project_root_tag() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("water-example");
+        let project = smol::block_on(Project::create(
+            &root,
+            CreateOptions {
+                name: "Water Example".to_string(),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                    .expect("bundle identifier"),
+                package_type: PackageType::Playground,
+                waterui_path: None,
+                channel: None,
+                framework_manifest: None,
+                framework: Some(crate::framework::test_fixtures::stable_framework()),
+                author: "Lexo Liu".to_string(),
+                backends: Vec::new(),
+                web: None,
+            },
+        ))
+        .expect("project creation must succeed");
+
+        for (shipped, tagged) in [
+            (project.gtk4_binary_name(), project.gtk_backend_crate_name()),
+            (
+                project.hydrolysis_binary_name(),
+                project.hydrolysis_backend_crate_name(),
+            ),
+            (
+                project.winui_binary_name(),
+                project.winui_backend_crate_name(),
+            ),
+            (
+                project.esp32_binary_name(),
+                project.esp32_backend_crate_name(),
+            ),
+        ] {
+            assert!(
+                tagged.as_str().starts_with(&format!("{shipped}-")),
+                "the build name must be the shipped name plus the tag: {tagged}"
+            );
+            assert_eq!(
+                tagged.as_str().len() - shipped.as_str().len(),
+                9,
+                "the tag is a dash plus eight hex digits: {tagged}"
+            );
+        }
+    }
+
+    /// Packaged executables stage under the project's own managed backend
+    /// directory — `dist/<platform>/<profile>` below `backend_path` — so
+    /// two projects sharing a crate name, most often two worktrees of one
+    /// project, never write the same shipped path the way the shared Cargo
+    /// profile directory made them.
+    #[test]
+    fn same_named_projects_stage_packaged_binaries_under_their_own_backends() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let create = |root: &Path| {
+            smol::block_on(Project::create(
+                root,
+                CreateOptions {
+                    name: "Water Example".to_string(),
+                    bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                        .expect("bundle identifier"),
+                    package_type: PackageType::App,
+                    waterui_path: None,
+                    channel: None,
+                    framework_manifest: None,
+                    framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    author: "Lexo Liu".to_string(),
+                    backends: Vec::new(),
+                    web: None,
+                },
+            ))
+            .expect("project creation must succeed")
+        };
+        let first = create(&dir.path().join("one/demo"));
+        let second = create(&dir.path().join("two/demo"));
+
+        let staged = |project: &Project| {
+            crate::platforming::packaging::dist_dir(
+                &project.backend_path::<crate::hydrolysis::backend::HydrolysisBackend>(),
+                "linux",
+                Some("release"),
+            )
+            .join(project.hydrolysis_binary_name().as_str())
+        };
+        let first_staged = staged(&first);
+        let second_staged = staged(&second);
+
+        assert_ne!(
+            first_staged, second_staged,
+            "same-named projects must not stage the same shipped path"
+        );
+        for (project, staged) in [(&first, &first_staged), (&second, &second_staged)] {
+            assert!(
+                staged.starts_with(
+                    project.backend_path::<crate::hydrolysis::backend::HydrolysisBackend>()
+                ),
+                "{} must live under the project's own managed backend directory",
+                staged.display()
+            );
+        }
     }
 }
 

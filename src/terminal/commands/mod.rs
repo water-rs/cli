@@ -2,12 +2,58 @@
 
 use std::path::PathBuf;
 
+use clap::ValueEnum;
+use dialoguer::{Confirm, theme::ColorfulTheme};
+
 use crate::shell::Shell;
 use crate::{note, warn};
 use waterui_cli::{
+    platform::TargetBackend as LibTargetBackend,
     toolchain::{Host, sccache::Sccache},
     utils::sccache_install_hint,
 };
+
+/// Target backend (how the app is built and rendered).
+///
+/// Shared by every command that takes `--backend`; commands accepting a
+/// narrower or wider set (`water package` has no ESP32 firmware backend,
+/// `water clean` adds `all`) define their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TargetBackend {
+    /// Apple backend (UIKit/AppKit).
+    Apple,
+    /// Android backend (Android Views).
+    Android,
+    /// GTK4 backend (Linux only, experimental).
+    Gtk4,
+    /// Hydrolysis backend (self-drawn renderer).
+    Hydrolysis,
+    /// `WinUI` backend (Windows only, experimental).
+    #[value(name = "winui")]
+    WinUi,
+    /// Dew backend (ESP32 firmware).
+    Dew,
+}
+
+impl TargetBackend {
+    /// Whether the backend is experimental — shipped without full testing
+    /// ahead of milestone releases — so selecting it asks for confirmation.
+    pub const fn is_experimental(self) -> bool {
+        matches!(self, Self::Gtk4 | Self::WinUi)
+    }
+
+    /// The library backend enum this CLI value selects.
+    pub const fn lib_backend(self) -> LibTargetBackend {
+        match self {
+            Self::Apple => LibTargetBackend::Apple,
+            Self::Android => LibTargetBackend::Android,
+            Self::Gtk4 => LibTargetBackend::Gtk4,
+            Self::Hydrolysis => LibTargetBackend::Hydrolysis,
+            Self::WinUi => LibTargetBackend::WinUi,
+            Self::Dew => LibTargetBackend::Dew,
+        }
+    }
+}
 
 /// Whether the host environment permits routing builds through `sccache`.
 fn sccache_allowed(host: &Host) -> bool {
@@ -44,6 +90,43 @@ async fn detect_sccache_path(shell: &Shell, host: &Host) -> Option<PathBuf> {
         },
         Some,
     )
+}
+
+/// Confirm that the user accepts running an experimental backend.
+///
+/// Experimental backends are not fully tested ahead of milestone releases, so
+/// every use warns once and requires an explicit second confirmation: the
+/// command's `--yes` flag in scripts and CI, or a prompt everywhere else.
+/// Returns `Ok(false)` when the user declines at the prompt so the caller can
+/// exit quietly; a non-interactive invocation without `yes` is an error.
+fn confirm_experimental_backend(
+    shell: &Shell,
+    backend_name: &str,
+    yes: bool,
+) -> eyre::Result<bool> {
+    warn!(
+        shell,
+        "The {backend_name} backend is experimental and is not fully tested ahead of milestone releases"
+    );
+    if yes {
+        return Ok(true);
+    }
+    if !shell.is_interactive() {
+        eyre::bail!(
+            "the {backend_name} backend is experimental; pass --yes to confirm it in non-interactive environments"
+        );
+    }
+    let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Continue with the experimental {backend_name} backend?"
+        ))
+        .default(false)
+        .interact()?;
+    if !confirmed {
+        warn!(shell, "Cancelled");
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub mod backend;
@@ -86,4 +169,28 @@ fn parse_viewport(s: &str) -> eyre::Result<(u32, u32)> {
     }
 
     Ok((width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirm_experimental_backend;
+    use crate::shell::Shell;
+
+    #[test]
+    fn experimental_backend_yes_flag_confirms_without_prompt() {
+        // A non-interactive shell never prompts; --yes must still pass.
+        let shell = Shell::new(false);
+        assert!(!shell.is_interactive());
+        assert!(
+            confirm_experimental_backend(&shell, "GTK4", true).expect("--yes confirms the gate")
+        );
+    }
+
+    #[test]
+    fn experimental_backend_non_interactive_without_yes_is_an_error() {
+        let shell = Shell::new(false);
+        let err = confirm_experimental_backend(&shell, "GTK4", false)
+            .expect_err("non-interactive use without --yes must fail");
+        assert!(err.to_string().contains("--yes"));
+    }
 }

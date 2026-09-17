@@ -21,7 +21,7 @@ use crate::{
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
     assets::{self, ResolvedFont},
-    build::{BuildOptions, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
@@ -196,6 +196,9 @@ pub async fn build_rust_lib(
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
     }
+    if let Some(progress) = options.progress() {
+        build = build.with_progress(progress.clone());
+    }
     build = build
         .with_env("PKG_CONFIG_ALLOW_CROSS", "1")
         .with_env(format!("PKG_CONFIG_ALLOW_CROSS_{target_underscore}"), "1")
@@ -207,31 +210,29 @@ pub async fn build_rust_lib(
         build = build.with_preferred_dynamic_linking();
     }
     build = build.with_target_dir(project.water_target_dir(options.linkage()).await?);
-    let lib_dir = build.build_lib(options.is_release()).await?;
-    if browser_runtime_plan.requires_cef() {
+    let built_target = build.build_lib(options.is_release()).await?;
+    let lib_dir = built_target.profile_dir.clone();
+    // The helper `[[bin]]` exists only when the manifest declared it — the
+    // application's linked engine, not chromium alone — so the build gates
+    // on the manifest's own predicate or Cargo reports `no bin target`.
+    if project.declares_cef_helper().await? {
         build
             .clone()
             .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
-            .build_binary("waterui-cef-helper", options.is_release())
+            .build_binary(
+                &crate::project_model::project_types::cef_helper_binary_name(
+                    project.ffi_crate_name().as_str(),
+                ),
+                options.is_release(),
+            )
             .await?;
     }
 
     // If output_dir is specified, copy the library there
     if let Some(output_dir) = options.output_dir() {
-        let lib_name = project.ffi_crate_name().replace('-', "_");
-        let source_lib = lib_dir.join(format!("lib{lib_name}.{}", host_library.built_extension()));
-
-        if !source_lib.exists() {
-            bail!(
-                "Built library not found at {} (expected {} for Apple target {})",
-                source_lib.display(),
-                host_library.crate_type(),
-                triple
-            );
-        }
         fs::create_dir_all(output_dir).await?;
         let dest_lib = output_dir.join(host_library.linked_file_name());
-        copy_file(&source_lib, &dest_lib).await?;
+        copy_file(&built_target.artifact, &dest_lib).await?;
         remove_superseded_host_library(output_dir, host_library).await?;
         if options.linkage() == RustLinkage::SharedRuntime {
             let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple).await?;
@@ -528,6 +529,22 @@ fn apple_linker_flags_from_build_output(output: &str) -> Vec<String> {
             push_unique_flag(&mut flags, format!("-framework {framework}"));
         } else if let Some(arg) = line.strip_prefix("cargo:rustc-link-arg=") {
             push_unique_flag(&mut flags, arg.to_string());
+        } else if let Some(search) = line.strip_prefix("cargo:rustc-link-search=") {
+            // A `-l<lib>` link arg a build script emits (waterkit-build's
+            // `-lclang_rt.osx`, resolved from the toolchain's
+            // `lib/clang/<ver>/lib/darwin`) only resolves at Xcode's link
+            // alongside the search path the same script declared for it.
+            // `native=`/`all=`/bare paths are `-L`, `framework=` is `-F`.
+            let (kind, dir) = search
+                .split_once('=')
+                .map_or(("all", search), |(kind, dir)| (kind, dir));
+            match kind {
+                "framework" => push_unique_flag(&mut flags, format!("-F{dir}")),
+                "native" | "all" => push_unique_flag(&mut flags, format!("-L{dir}")),
+                // `crate=` and `dependency=` name rustc's own artifact lookups,
+                // which Xcode's clang never performs.
+                _ => {}
+            }
         }
     }
     flags
@@ -611,7 +628,14 @@ pub async fn package_apple(
 
     // Copy project assets and fonts
     let app_resources_dir = project_path.join(&backend.scheme);
-    copy_assets_and_fonts(project, &app_resources_dir, None, options.uses_dev_server()).await?;
+    copy_assets_and_fonts(
+        project,
+        &app_resources_dir,
+        None,
+        options.uses_dev_server(),
+        options.progress(),
+    )
+    .await?;
 
     let configuration = if options.is_debug() {
         "Debug"
@@ -815,15 +839,23 @@ pub async fn package_apple(
             &app_path.join("Contents"),
         )
         .await?;
-        let main_binary = app_path.join("Contents/MacOS").join(product_name);
-        let helper_binary = lib_dir.join("waterui-cef-helper");
-        package_cef_helper_app(
-            &app_path,
-            &main_binary,
-            &helper_binary,
-            project.bundle_identifier(),
-        )
-        .await?;
+        // Helper bundles wrap the helper `[[bin]]`, which the manifest
+        // declares only when the application links the CEF engine crate —
+        // chromium alone stages the runtime but builds no helper.
+        if project.declares_cef_helper().await? {
+            let main_binary = app_path.join("Contents/MacOS").join(product_name);
+            let helper_binary =
+                lib_dir.join(crate::project_model::project_types::cef_helper_binary_name(
+                    project.ffi_crate_name().as_str(),
+                ));
+            package_cef_helper_app(
+                &app_path,
+                &main_binary,
+                &helper_binary,
+                project.bundle_identifier(),
+            )
+            .await?;
+        }
         let requires_stable_identity = project.manifest().permissions.iter().any(|(key, entry)| {
             entry.is_enabled() && !key.macos_usage_description_keys().is_empty()
         });
@@ -859,10 +891,17 @@ async fn copy_assets_and_fonts(
     dest_dir: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     // Stage project assets using platform-native conventions.
-    let manifest =
-        assets::stage_project_assets_for_apple(project, dest_dir, sccache_path, dev_server).await?;
+    let manifest = assets::stage_project_assets_for_apple(
+        project,
+        dest_dir,
+        sccache_path,
+        dev_server,
+        progress,
+    )
+    .await?;
 
     // Scan and resolve dependency fonts
     let font_declarations = assets::scan_fonts(project).await?;
@@ -1072,6 +1111,24 @@ mod tests {
                 "-rpath".to_string(),
                 "/usr/lib/swift".to_string(),
                 "-framework Foundation".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn forwards_link_search_dirs_that_link_args_depend_on() {
+        // waterkit-build 0.1.3 declares the compiler-rt builtins this way; the
+        // `-l` alone made Xcode's link fail with "library 'clang_rt.osx' not
+        // found" on every macOS and iOS package in the Apple nightly.
+        let output = "cargo:rustc-link-search=native=/Xcode/lib/clang/17/lib/darwin\ncargo:rustc-link-arg=-lclang_rt.osx\ncargo:rustc-link-search=framework=/Frameworks\ncargo:rustc-link-search=/plain\ncargo:rustc-link-search=crate=/target/deps\ncargo:rustc-link-search=native=/Xcode/lib/clang/17/lib/darwin\n";
+        let flags = apple_linker_flags_from_build_output(output);
+        assert_eq!(
+            flags,
+            vec![
+                "-L/Xcode/lib/clang/17/lib/darwin".to_string(),
+                "-lclang_rt.osx".to_string(),
+                "-F/Frameworks".to_string(),
+                "-L/plain".to_string(),
             ]
         );
     }

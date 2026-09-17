@@ -52,22 +52,64 @@ fn new_runtime(width: f32, height: f32) -> HeadlessRuntime {
     .with_scale_factor(PREVIEW_SCALE_FACTOR)
 }
 
-/// Pumps until the frame stops changing.
+/// Pumps until the frame stops changing and no `spawn_local` work is parked
+/// on a wall-clock wake.
 ///
 /// A `GpuView`'s `setup` is an async future spawned onto the local executor, so
 /// its pipelines do not exist during the first frame. Capturing immediately
 /// yields a snapshot of the surface before any GPU content was drawn — the
 /// window background and nothing else. `rebuilt` is the real readiness signal
 /// here, so pump on it rather than waiting a fixed amount of time.
+///
+/// Quiescence alone is not the whole story: a `spawn_local` task parked on a
+/// timer or in-flight I/O — a `Photo` fetch, an `avatar` image — holds no
+/// queued runnable, so the runtime cannot see it and reports the frame
+/// settled while the placeholder is still on screen. While
+/// [`waterui::task::outstanding_local_tasks`] reports such work, settling
+/// paces real time — each pump runs whatever the last wake re-queued — until
+/// the task publishes its result or the wall-clock cap elapses.
+///
+/// The virtual instant never moves while pacing: the scene is quiescent, so
+/// nothing it scheduled needs a frame, and advancing the clock would carry
+/// every animation past the phase the capture asked for. Once a paced pump
+/// changes the tree, settling returns to the rebuild loop so whatever the
+/// change scheduled can run before pacing resumes.
 fn settle(runtime: &mut HeadlessRuntime, at: Instant) {
+    /// Pump budget for a frame that never stops rebuilding — a perpetual
+    /// animation; bounds pump work, not wall clock.
     const MAX_PUMPS: usize = 64;
+    /// One frame of wall-clock time: the pacing step while local tasks are
+    /// parked.
+    const FRAME: Duration = Duration::from_millis(16);
+    /// Wall-clock budget for work parked on real I/O — mirrors
+    /// `waterui-testing`'s settle cap: long enough for a remote fetch on a
+    /// slow link, bounded so a permanently parked task cannot hang the
+    /// preview.
+    const SETTLE_WALL_CAP: Duration = Duration::from_secs(5);
 
-    for _ in 0..MAX_PUMPS {
-        if !runtime.pump_at(false, at).rebuilt {
-            return;
+    let wall_deadline = Instant::now() + SETTLE_WALL_CAP;
+    let mut pumps = 0usize;
+    loop {
+        if runtime.pump_at(false, at).rebuilt {
+            pumps += 1;
+            assert!(
+                pumps < MAX_PUMPS,
+                "hydrolysis preview: frame never settled after {MAX_PUMPS} pumps"
+            );
+            continue;
+        }
+        // Quiescent but a local task may be parked on a wall-clock wake: give
+        // it real time, then run what it re-queued at the same instant.
+        loop {
+            if waterui::task::outstanding_local_tasks() == 0 || Instant::now() >= wall_deadline {
+                return;
+            }
+            std::thread::sleep(FRAME);
+            if runtime.pump_at(false, at).rebuilt {
+                break;
+            }
         }
     }
-    panic!("hydrolysis preview: frame never settled after {MAX_PUMPS} pumps");
 }
 
 fn run_image(output_path: &Path, width: f32, height: f32) {
@@ -111,6 +153,11 @@ fn run_scenario(
             event_index += 1;
         }
         let capture_at = started_at + Duration::from_millis(*capture_ms);
+        // Work an interaction spawned — a tap that kicks off a fetch — parks
+        // on wall-clock I/O exactly like mount-time work does, so a capture
+        // settles by the same rule: the tree quiet *and* no parked task
+        // waiting to publish.
+        settle(&mut runtime, capture_at);
         let result = runtime.pump_at(true, capture_at);
         let Some(snapshot) = result.snapshot else {
             panic!("hydrolysis preview: scenario capture at {capture_ms}ms produced no snapshot");

@@ -19,6 +19,7 @@ mod runtime;
 pub mod toolchain;
 pub mod toolchain_checks;
 pub mod tui;
+pub mod winui;
 mod workflows;
 
 pub use dependencies::brew;
@@ -27,4 +28,4 @@ pub(crate) use project_model::{assets, support_app, templates};
 pub use project_model::{framework, project, project_types, water_dir, web};
 pub use runtime::{build_info, utils};
 pub(crate) use runtime::{runtime_compat, runtime_fingerprint};
-pub use workflows::{build, capture, debug, device, diff, gesture, inspector};
+pub use workflows::{build, capture, debug, device, diff, elf, gesture, inspector, rustc_wrapper};

@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use smol::fs;
 use waterui_assets_core::AssetKind;
 use waterui_assets_planner::{
-    AssetRole, BUNDLE_META_PREFIX, BundleManifest, BundleMount, BundleMountMeta, ColorScheme,
-    HexColor, LaunchPlan, PlannedAsset, ThemeConfig, plan_mount,
+    AssetRole, BUNDLE_META_PREFIX, BundleManifest, BundleMount, ColorScheme, HexColor, LaunchPlan,
+    PlannedAsset, ThemeConfig, plan_mount,
 };
 
 #[cfg(target_os = "macos")]
@@ -21,6 +21,7 @@ use super::icon::{
     render_apple_icon,
 };
 use crate::artifact_symbols::{ArtifactSymbols, build_host_rlib};
+use crate::build::BuildProgress;
 use crate::project::Project;
 
 const ASSET_ROOT_DIR: &str = "waterui_assets";
@@ -47,8 +48,9 @@ pub async fn stage_for_apple(
     dest_dir: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    let manifest = build_manifest(project, sccache_path, dev_server).await?;
+    let manifest = build_manifest(project, sccache_path, dev_server, progress).await?;
     let assets_dest = dest_dir.join(ASSET_ROOT_DIR);
     reset_dir(&assets_dest).await?;
     copy_manifest_assets(&manifest, &assets_dest).await?;
@@ -187,8 +189,9 @@ pub async fn stage_for_android(
     backend_path: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    let manifest = build_manifest(project, sccache_path, dev_server).await?;
+    let manifest = build_manifest(project, sccache_path, dev_server, progress).await?;
     let assets_dest = backend_path
         .join("app/src/main/assets")
         .join(ASSET_ROOT_DIR);
@@ -250,8 +253,9 @@ pub async fn stage_for_gtk(
     resources_dir: &Path,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    let manifest = build_manifest(project, sccache_path, dev_server).await?;
+    let manifest = build_manifest(project, sccache_path, dev_server, progress).await?;
     let assets_dest = resources_dir.join(ASSET_ROOT_DIR);
     reset_dir(&assets_dest).await?;
     copy_manifest_assets(&manifest, &assets_dest).await?;
@@ -332,10 +336,17 @@ async fn build_manifest(
     project: &Project,
     sccache_path: Option<&Path>,
     dev_server: bool,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
     let mut assets = plan_main_assets(project)?;
 
-    let rlib = build_host_rlib(project.root(), sccache_path).await?;
+    let rlib = build_host_rlib(
+        project.root(),
+        &project.host_target_dir().await?,
+        sccache_path,
+        progress,
+    )
+    .await?;
     let symbols = ArtifactSymbols::read(&rlib)?;
     // The declared frontend toolchain is a manifest concern: `[web]` absent
     // means bun, and the declared manager is never substituted.
@@ -351,7 +362,7 @@ async fn build_manifest(
     let mut seen = BTreeSet::new();
     let mut mounts = Vec::new();
     for leaf in symbols.leaves_with_prefix(BUNDLE_META_PREFIX) {
-        let meta = BundleMountMeta::from_payload(&symbols.static_bytes(&leaf)?)?;
+        let meta = symbols.bundle_mount_meta(&leaf)?;
         // The `assets` mount is the main root, already planned above.
         if meta.mount == "assets" {
             continue;

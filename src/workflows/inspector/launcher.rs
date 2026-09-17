@@ -6,6 +6,7 @@ use std::pin::Pin;
 use eyre::{Context as _, Result, bail};
 use tracing::info;
 
+use crate::build::{BuildOptions, BuildProfile, BuildProgress};
 use crate::device::{Device, Local, RunOptions, Running};
 use crate::platform::TargetPlatform;
 use crate::project::Project;
@@ -83,6 +84,7 @@ pub async fn launch_inspector_session(
     project_path: &Path,
     platform: InspectorPlatform,
     options: InspectorLaunchOptions,
+    progress: Option<BuildProgress>,
 ) -> Result<InspectorSession> {
     let requirements = resolve_inspector_requirements(project_path).await?;
 
@@ -110,7 +112,13 @@ pub async fn launch_inspector_session(
             device.launch(&host).await?;
             info!("Building and running inspector app on macOS...");
             project
-                .run_with_options(backend, TargetPlatform::MacOS, device, run_options)
+                .run_with_options(
+                    backend,
+                    TargetPlatform::MacOS,
+                    device,
+                    run_options,
+                    progress.clone(),
+                )
                 .await
                 .map_err(|e| eyre::eyre!("Failed to run inspector app: {e}"))?
         }
@@ -129,6 +137,7 @@ pub async fn launch_inspector_session(
                     TargetPlatform::IOSSimulator,
                     simulator,
                     run_options,
+                    progress.clone(),
                 )
                 .await
                 .map_err(|e| eyre::eyre!("Failed to run inspector app: {e}"))?
@@ -143,7 +152,13 @@ pub async fn launch_inspector_session(
                 device.launch(&host).await?;
                 info!("Building and running inspector app on Android device...");
                 project
-                    .run_android_with_options(backend, device, run_options)
+                    .run_android_with_options(
+                        backend,
+                        device,
+                        run_options,
+                        BuildOptions::development(BuildProfile::Debug),
+                        progress.clone(),
+                    )
                     .await
                     .map_err(|e| eyre::eyre!("Failed to run inspector app: {e}"))?
             } else {
@@ -157,7 +172,13 @@ pub async fn launch_inspector_session(
                 emulator.launch(&host).await?;
                 info!("Building and running inspector app on Android emulator...");
                 project
-                    .run_android_with_options(backend, emulator, run_options)
+                    .run_android_with_options(
+                        backend,
+                        emulator,
+                        run_options,
+                        BuildOptions::development(BuildProfile::Debug),
+                        progress.clone(),
+                    )
                     .await
                     .map_err(|e| eyre::eyre!("Failed to run inspector app: {e}"))?
             }
@@ -209,6 +230,7 @@ async fn scaffold_inspector_app(path: &Path, requirements: &InspectorRequirement
         framework_manifest: None,
         framework: None,
         author: String::new(),
+        backends: Vec::new(),
         web: None,
     };
 

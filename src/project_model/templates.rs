@@ -96,6 +96,7 @@ pub mod embedded {
     pub static PREVIEW_FFI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/preview_ffi");
     pub static INSPECTOR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/inspector");
     pub static TUI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/tui");
+    pub static WINUI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/winui");
     pub static ROOT: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates");
 }
 
@@ -489,7 +490,7 @@ impl TemplateContext {
     }
 
     const fn cef_runtime_enabled(&self) -> bool {
-        matches!(self.browser.engine, Some(ResolvedWebViewBackend::Cef))
+        crate::project_model::project_types::declares_cef_helper(self.browser.engine)
     }
 
     /// Set the exact `WaterUI` feature set used by a preview support runtime.
@@ -870,6 +871,7 @@ enum TemplateNamespace {
     Preview,
     PreviewFfi,
     Tui,
+    WinUi,
     Root,
 }
 
@@ -886,6 +888,7 @@ impl TemplateNamespace {
             Self::Preview => "src/templates/preview",
             Self::PreviewFfi => "src/templates/preview_ffi",
             Self::Tui => "src/templates/tui",
+            Self::WinUi => "src/templates/winui",
             Self::Root => "src/templates",
         }
     }
@@ -973,6 +976,25 @@ macro_rules! define_scaffold_templates {
                                 format!("Failed to render template {display_path}: {error}"),
                             )
                         })
+                    })
+                    .and_then(|rendered| {
+                        // The esp32 manifest renders through askama to carry
+                        // the Xtensa profile note, so it bypasses the
+                        // serialized-manifest path that assigns
+                        // `manifest.patch`; without the same tables the
+                        // generated workspace resolves `waterui-dew`'s
+                        // registry `waterui-*` requirements beside the path
+                        // copies and `View` splits across the two.
+                        let mut document = rendered
+                            .parse::<toml_edit::DocumentMut>()
+                            .map_err(io::Error::other)?;
+                        crate::framework::rewrite_patch_tables(
+                            &mut document,
+                            &cargo_toml::PatchSet::default(),
+                            &generated_crate_patches(ctx)?,
+                        )
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                        Ok(document.to_string())
                     }),
                 $(
                     $path => $name { ctx }
@@ -1050,7 +1072,14 @@ impl Esp32CargoTomlTemplate {
         .inline_toml();
 
         Ok(Self {
-            package_name: ctx.crate_name.with_suffix("esp32").to_string(),
+            package_name: crate::project_model::project_types::generated_crate_name(
+                &ctx.crate_name,
+                "esp32",
+                ctx.project_root_path
+                    .as_deref()
+                    .expect("ESP32 manifests are rendered for a project"),
+            )
+            .to_string(),
             app_crate_name: ctx.crate_name.to_string(),
             app_crate_path: ctx.project_root_relative_path(),
             dew_dependency,
@@ -1103,6 +1132,8 @@ define_scaffold_templates! {
     PreviewFfiLibTemplate => (PreviewFfi, "src/templates/preview_ffi/src/lib.rs.tpl"),
     TuiBuildScriptTemplate => (Tui, "src/templates/tui/build.rs.tpl"),
     TuiMainTemplate => (Tui, "src/templates/tui/src/main.rs.tpl"),
+    WinUiBuildScriptTemplate => (WinUi, "src/templates/winui/build.rs.tpl"),
+    WinUiMainTemplate => (WinUi, "src/templates/winui/src/main.rs.tpl"),
 }
 
 #[cfg(test)]
@@ -1113,7 +1144,9 @@ mod tests {
         jitpack_dependency_coordinate, normalize_path_for_config, preview_ffi,
         render_scaffold_template,
     };
-    use crate::framework::test_fixtures::{dev_framework, nightly_framework, stable_framework};
+    use crate::framework::test_fixtures::{
+        dev_framework, nightly_framework, stable_framework, write_apple_revision_checkout,
+    };
     use crate::project_types::{BundleIdentifier, CrateName};
     use include_dir::Dir;
     use std::path::PathBuf;
@@ -1155,7 +1188,14 @@ mod tests {
     }
 
     fn app_ctx() -> TemplateContext {
-        ctx(None, None, None, crate::project::PackageType::App)
+        // Generated crate names tag the project root, so any template that
+        // renders one needs a root even when nothing else consumes it.
+        ctx(
+            None,
+            None,
+            Some(PathBuf::from("/tmp/test-app")),
+            crate::project::PackageType::App,
+        )
     }
 
     /// A local checkout without a `backends/android` Gradle project — the
@@ -1239,9 +1279,13 @@ mod tests {
     fn esp32_templates_are_chip_architecture_aware() {
         use crate::esp32::chip::Esp32Chip;
 
+        // `waterui-dew` is git-pinned — `stable` withholds it, so the
+        // firmware templates render against a `dev` resolution.
         let mut s3 = app_ctx();
+        s3.framework = dev_framework();
         s3.esp32 = Esp32TemplateEntry::new(Esp32Chip::Esp32S3, 410, 502, 16);
         let mut c3 = app_ctx();
+        c3.framework = dev_framework();
         c3.esp32 = Esp32TemplateEntry::new(Esp32Chip::Esp32C3, 200, 240, 16);
 
         // .cargo/config.toml: Xtensa per-chip triple vs RISC-V architecture triple.
@@ -1315,7 +1359,11 @@ mod tests {
         // `configure_environment!` installs, so every environment boundary the
         // CLI generates must go through it — previews, preview tests and
         // firmware alike.
-        let ctx = app_ctx().with_backend_project_path(PathBuf::from("managed_backends/hydrolysis"));
+        let mut ctx =
+            app_ctx().with_backend_project_path(PathBuf::from("managed_backends/hydrolysis"));
+        // The esp32 and gtk4 manifests resolve git-pinned scaffold packages
+        // `stable` withholds — the assertions below render them on `dev`.
+        ctx.framework = dev_framework();
 
         for relative in [
             "src/main.rs.tpl",
@@ -1462,6 +1510,45 @@ mod tests {
 
         let core_path = checkout.join("core");
         let manifest: toml::Value = toml::from_str(&manifest).expect("generated manifest parses");
+        let patched_path = |source: &str| {
+            manifest["patch"][source]["waterui-core"]["path"]
+                .as_str()
+                .map_or_else(
+                    || panic!("no waterui-core path patch under [patch.{source:?}]:\n{manifest}"),
+                    std::path::PathBuf::from,
+                )
+        };
+        assert_eq!(patched_path("crates-io"), core_path);
+        assert_eq!(
+            patched_path("https://github.com/water-rs/waterui"),
+            core_path
+        );
+    }
+
+    #[test]
+    fn esp32_manifest_carries_the_checkout_patch_tables() {
+        let tempdir = tempdir().expect("temporary checkout dir");
+        let checkout = tempdir.path().join("waterui");
+        std::fs::create_dir_all(&checkout).expect("checkout dir");
+        std::fs::write(
+            checkout.join("Cargo.toml"),
+            include_str!("../../tests/fixtures/local_checkout_patches.toml"),
+        )
+        .expect("checkout manifest");
+
+        let ctx = ctx(
+            Some(checkout.clone()),
+            None,
+            Some(tempdir.path().join("app")),
+            crate::project::PackageType::App,
+        );
+        let manifest = render_esp32("Cargo.toml.tpl", &ctx);
+        let manifest: toml::Value = toml::from_str(&manifest).expect("esp32 manifest parses");
+
+        // The askama-rendered manifest must carry the same patch tables the
+        // serialized native manifests get — `waterui-dew`'s registry
+        // `waterui-*` requirements resolve to the checkout, not a second copy.
+        let core_path = checkout.join("core");
         let patched_path = |source: &str| {
             manifest["patch"][source]["waterui-core"]["path"]
                 .as_str()
@@ -1723,6 +1810,21 @@ mod tests {
     }
 
     #[test]
+    fn declared_apple_revision_becomes_an_exact_package_requirement() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("waterui");
+        let revision = "dddddddddddddddddddddddddddddddddddddddd";
+        write_apple_revision_checkout(&root, revision);
+        let mut context = app_ctx();
+        context.framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
+
+        assert_eq!(
+            context.apple_backend_requirement(),
+            "kind = revision;\n\t\t\t\trevision = \"dddddddddddddddddddddddddddddddddddddddd\";"
+        );
+    }
+
+    #[test]
     fn apple_project_names_only_the_launch_assets_that_were_staged() {
         let render = |ctx: &TemplateContext, file: &str| {
             let template = embedded::APPLE
@@ -1961,8 +2063,11 @@ mod tests {
     }
 
     #[test]
-    fn gtk4_scaffold_uses_embedded_workspace_version() {
-        let ctx = app_ctx();
+    fn gtk4_scaffold_pins_the_declared_git_source() {
+        // `waterui-gtk` is git-pinned in the workspace manifest — `stable`
+        // withholds it, so the scaffold resolves the pin `dev` carries.
+        let mut ctx = app_ctx();
+        ctx.framework = dev_framework();
         let tempdir = tempdir().expect("temporary gtk scaffold dir");
 
         smol::block_on(crate::templates::gtk4::scaffold(
@@ -1975,18 +2080,73 @@ mod tests {
         let cargo_toml = std::fs::read_to_string(tempdir.path().join("Cargo.toml"))
             .expect("gtk4 Cargo.toml should be written");
         let manifest: toml::Value = toml::from_str(&cargo_toml).unwrap();
+        let gtk = &manifest["dependencies"]["waterui-gtk"];
         assert_eq!(
-            manifest["dependencies"]["waterui-gtk"]["version"].as_str(),
-            Some(pinned("waterui-gtk-version").as_str())
+            gtk["git"].as_str(),
+            Some(ctx.framework.scaffold_value("waterui-gtk-git"))
+        );
+        assert_eq!(
+            gtk["rev"].as_str(),
+            Some(ctx.framework.scaffold_value("waterui-gtk-rev"))
         );
         assert!(!cargo_toml.contains("webview-default"));
     }
 
     #[test]
+    fn winui_scaffold_pins_the_backend_and_its_vendored_patch_to_one_source() {
+        // `waterui-winui` has no registry release — `stable` withholds it —
+        // so the scaffold resolves the pin `dev` carries.
+        let mut ctx = app_ctx();
+        ctx.framework = dev_framework();
+        let manifest = crate::templates::winui::rendered_outputs(&ctx, "waterui-test-winui")
+            .expect("winui outputs should render")
+            .into_iter()
+            .find_map(|(path, content)| {
+                (path == std::path::Path::new("Cargo.toml"))
+                    .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
+            })
+            .expect("winui Cargo.toml output should exist");
+        let manifest: toml::Value = toml::from_str(&manifest).expect("winui manifest must parse");
+
+        let framework = dev_framework();
+        let backend = &manifest["dependencies"]["waterui-winui"];
+        assert_eq!(
+            backend["git"].as_str(),
+            Some(framework.scaffold_value("waterui-winui-git")),
+            "the backend pins the repository the framework declares"
+        );
+        assert_eq!(
+            backend["rev"].as_str(),
+            Some(framework.scaffold_value("waterui-winui-rev")),
+            "the backend pins the revision the framework declares"
+        );
+
+        // The vendored `gpu-allocator` member narrows an upstream `windows`
+        // range; it must resolve from the same commit `waterui-winui` does.
+        let gpu_allocator = &manifest["patch"]["crates-io"]["gpu-allocator"];
+        assert_eq!(gpu_allocator["git"].as_str(), backend["git"].as_str());
+        assert_eq!(gpu_allocator["rev"].as_str(), backend["rev"].as_str());
+
+        // The generated crate is its own workspace root and carries the
+        // Windows runtime build tools as build-dependencies.
+        assert!(manifest["workspace"].is_table());
+        assert_eq!(
+            manifest["build-dependencies"]["windows-reactor-setup"].as_str(),
+            Some("^0.100")
+        );
+        assert_eq!(
+            manifest["build-dependencies"]["winresource"].as_str(),
+            Some("^0.1")
+        );
+    }
+
+    #[test]
     fn generated_native_backends_only_bridge_the_platform_engine_when_no_engine_is_linked() {
         // No engine crate in the graph: the backend bridges what the platform
-        // gives it.
-        let gtk_ctx = app_ctx().with_webview_enabled(true);
+        // gives it. `waterui-gtk` is git-pinned — `stable` withholds it — so
+        // the GTK scaffolds render against a `dev` resolution.
+        let mut gtk_ctx = app_ctx().with_webview_enabled(true);
+        gtk_ctx.framework = dev_framework();
         let tempdir = tempdir().expect("temporary gtk webview scaffold dir");
         smol::block_on(crate::templates::gtk4::scaffold(
             tempdir.path(),
@@ -2000,9 +2160,10 @@ mod tests {
 
         // An application that linked its own engine draws through that, so the
         // backend compiles no web engine at all.
-        let gtk_wpe_ctx = app_ctx()
+        let mut gtk_wpe_ctx = app_ctx()
             .with_webview_enabled(true)
             .with_browser_engine(Some(ResolvedWebViewBackend::Wpe));
+        gtk_wpe_ctx.framework = dev_framework();
         let gtk_wpe_manifest =
             crate::templates::gtk4::rendered_outputs(&gtk_wpe_ctx, "waterui-test-gtk-wpe")
                 .expect("GTK WPE outputs should render")
@@ -2070,7 +2231,7 @@ mod tests {
             .as_array()
             .expect("CEF Hydrolysis manifest should declare binaries");
         assert!(bins.iter().any(|bin| {
-            bin["name"].as_str() == Some("waterui-cef-helper")
+            bin["name"].as_str() == Some("waterui-test-hydrolysis-cef-helper")
                 && bin["path"].as_str() == Some("src/bin/waterui-cef-helper.rs")
         }));
     }
@@ -2286,7 +2447,7 @@ mod tests {
             .as_array()
             .expect("CEF FFI companion should declare a helper binary");
         assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0]["name"].as_str(), Some("waterui-cef-helper"));
+        assert_eq!(bins[0]["name"].as_str(), Some("chromium-ffi-cef-helper"));
         assert_eq!(
             bins[0]["path"].as_str(),
             Some("src/bin/waterui-cef-helper.rs")
@@ -2780,6 +2941,10 @@ pub async fn framework_updates(
             .backends
             .esp32()
             .map(|backend| base.join(backend.path())),
+        previous
+            .backends
+            .winui()
+            .map(|backend| base.join(backend.path())),
     ];
     let previous_patches = project_patches(root, previous)?;
     for directory in rust.into_iter().flatten() {
@@ -2883,6 +3048,10 @@ async fn native_backend_updates(
         previous
             .backends
             .esp32()
+            .map(|backend| base.join(backend.path())),
+        previous
+            .backends
+            .winui()
             .map(|backend| base.join(backend.path())),
     ];
     let framework = next
@@ -3349,9 +3518,16 @@ impl GeneratedDependencyDetail {
         }
     }
 
-    fn framework(ctx: &TemplateContext, name: &str) -> Self {
+    /// The dependency `name` — a scaffold package — resolves to on the
+    /// selected channel. A package the channel withholds (`stable`'s
+    /// git-pinned experimental set) is an error, not a panic: the check must
+    /// fire wherever a generated crate is rendered, not only at `create`.
+    fn framework(ctx: &TemplateContext, name: &str) -> io::Result<Self> {
+        ctx.framework
+            .require_distributable(name)
+            .map_err(io::Error::other)?;
         let dependency = ctx.framework.dependency(name);
-        Self {
+        Ok(Self {
             version: dependency.version.map(|version| version.to_string()),
             path: dependency.path,
             git: dependency.git,
@@ -3362,7 +3538,7 @@ impl GeneratedDependencyDetail {
             default_features: None,
             features: Vec::new(),
             optional: false,
-        }
+        })
     }
 
     fn path(path: &Path) -> Self {
@@ -3442,7 +3618,7 @@ fn generated_dependency_from_spec(
                 ..GeneratedDependencyDetail::default()
             }
         }
-        (None, _) => GeneratedDependencyDetail::framework(ctx, spec.crate_name),
+        (None, _) => GeneratedDependencyDetail::framework(ctx, spec.crate_name)?,
     };
 
     // Features the checkout's declared entry carries resolve exactly like a
@@ -3633,6 +3809,211 @@ pub mod gtk4 {
     }
 }
 
+/// `WinUI` backend templates.
+pub mod winui {
+    use super::{
+        NativeBackendDependencySource, NativeBackendDependencySpec, Path, TemplateContext,
+        TemplateNamespace, embedded, io, scaffold_dir,
+    };
+    use cargo_toml::{Dependency, DependencyDetail};
+
+    /// Write all `WinUI` templates to the given directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file operations fail.
+    pub async fn scaffold(
+        base_dir: &Path,
+        ctx: &TemplateContext,
+        package_name: &str,
+    ) -> io::Result<()> {
+        generate_cargo_toml(base_dir, ctx, package_name).await?;
+        scaffold_dir(TemplateNamespace::WinUi, &embedded::WINUI, base_dir, ctx).await
+    }
+
+    /// Every file `scaffold` would write, as backend-relative path and
+    /// content, without touching the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if template or Cargo manifest rendering fails.
+    pub fn rendered_outputs(
+        ctx: &TemplateContext,
+        package_name: &str,
+    ) -> io::Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
+        let mut outputs =
+            super::render_dir_outputs(TemplateNamespace::WinUi, &embedded::WINUI, ctx)?;
+        outputs.push((
+            std::path::PathBuf::from("Cargo.toml"),
+            render_cargo_toml(ctx, package_name)?.into_bytes(),
+        ));
+        Ok(outputs)
+    }
+
+    async fn generate_cargo_toml(
+        base_dir: &Path,
+        ctx: &TemplateContext,
+        package_name: &str,
+    ) -> io::Result<()> {
+        super::write_generated_cargo_toml(base_dir, render_cargo_toml(ctx, package_name)?).await
+    }
+
+    /// Generated `Cargo.toml` for the `WinUI` launcher crate.
+    ///
+    /// Serialized through `cargo_toml` like the other simple binary backends,
+    /// but assembled here because the manifest carries `[build-dependencies]`
+    /// (`winresource` embeds the staged icon, `windows-reactor-setup` stages
+    /// the self-contained runtime) and the `gpu-allocator` patch that tracks
+    /// wherever `waterui-winui` itself resolved from.
+    fn render_cargo_toml(ctx: &TemplateContext, package_name: &str) -> io::Result<String> {
+        use cargo_toml::{Manifest, Package, Workspace};
+
+        let (backend, gpu_allocator_patch) = winui_backend_dependency(ctx)?;
+
+        let mut manifest = Manifest::<()>::default();
+        let mut package = Package::new(package_name.to_string(), super::cargo_semver("0.1.0"));
+        package.edition = cargo_toml::Inheritable::Set(cargo_toml::Edition::E2024);
+        manifest.package = Some(package);
+        manifest.profile = super::generated_profiles();
+
+        manifest.dependencies.insert(
+            ctx.crate_name.to_string(),
+            Dependency::Detailed(Box::new(DependencyDetail {
+                path: Some(ctx.project_root_relative_path()),
+                ..Default::default()
+            })),
+        );
+        manifest.dependencies.insert(
+            "waterui".to_string(),
+            Dependency::Detailed(Box::new(
+                super::generated_dependency_from_spec(
+                    ctx,
+                    NativeBackendDependencySpec::new(
+                        "waterui",
+                        &[],
+                        NativeBackendDependencySource::WateruiRoot,
+                    ),
+                )?
+                .into_cargo(),
+            )),
+        );
+        manifest
+            .dependencies
+            .insert("waterui-winui".to_string(), backend);
+
+        // `winresource` embeds the staged `app-icon.ico`; `windows-reactor-setup`
+        // stages the Windows App Runtime next to the produced binary and emits
+        // the `rustc-link-arg-bins` that embed the marker manifest `bootstrap`
+        // reads — both must be build-dependencies of the bin crate itself.
+        manifest.build_dependencies.insert(
+            "winresource".to_string(),
+            Dependency::Simple(super::cargo_version_req("0.1")),
+        );
+        manifest.build_dependencies.insert(
+            "windows-reactor-setup".to_string(),
+            Dependency::Simple(super::cargo_version_req("0.100")),
+        );
+
+        manifest.workspace = Some(Workspace::default());
+        manifest.patch = winui_patch_set(ctx, gpu_allocator_patch)?;
+
+        toml::to_string_pretty(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// The `waterui-winui` dependency the launcher resolves, paired with the
+    /// `gpu-allocator` patch entry the same source carries:
+    /// `WATERUI_WINUI_PATH` when set (the escape hatch for developing the
+    /// backend itself), a `water-rs/waterui-winui` checkout beside a local
+    /// `waterui_path`, and the framework-declared backend coordinate otherwise.
+    ///
+    /// `waterui-winui` keeps a vendored `gpu-allocator` workspace member that
+    /// narrows an upstream `windows` version range; a consumer can only reach
+    /// it by patching `gpu-allocator` to the same git revision or checkout the
+    /// backend dependency itself resolved to, so both come out of one source.
+    fn winui_backend_dependency(ctx: &TemplateContext) -> io::Result<(Dependency, Dependency)> {
+        if let Some(path) = std::env::var_os("WATERUI_WINUI_PATH") {
+            let path = dunce::canonicalize(path)?;
+            return Ok((
+                path_dependency(&path),
+                path_dependency(&path.join("vendor/gpu-allocator")),
+            ));
+        }
+        if let Some(root) = ctx
+            .waterui_workspace_root()
+            .and_then(|root| dunce::canonicalize(root).ok())
+            && let Some(sibling) = root
+                .parent()
+                .map(|parent| parent.join("water-rs/waterui-winui"))
+            && sibling.join("Cargo.toml").is_file()
+        {
+            return Ok((
+                path_dependency(&sibling),
+                path_dependency(&sibling.join("vendor/gpu-allocator")),
+            ));
+        }
+        let detail = super::generated_dependency_from_spec(
+            ctx,
+            NativeBackendDependencySpec::new(
+                "waterui-winui",
+                &[],
+                NativeBackendDependencySource::WorkspaceDependency,
+            ),
+        )?;
+        let patch = gpu_allocator_patch(&detail)?;
+        Ok((Dependency::Detailed(Box::new(detail.into_cargo())), patch))
+    }
+
+    fn path_dependency(path: &Path) -> Dependency {
+        Dependency::Detailed(Box::new(DependencyDetail {
+            path: Some(super::normalize_path_for_config(path)),
+            ..Default::default()
+        }))
+    }
+
+    /// The `[patch.crates-io]` entry for the vendored `gpu-allocator` member of
+    /// the `waterui-winui` source `detail` resolved to. A registry-sourced
+    /// `waterui-winui` has no vendored member to pin — the workspace-member
+    /// patch only exists inside the backend's own repository.
+    fn gpu_allocator_patch(detail: &super::GeneratedDependencyDetail) -> io::Result<Dependency> {
+        if let Some(git) = &detail.git {
+            return Ok(Dependency::Detailed(Box::new(DependencyDetail {
+                git: Some(git.clone()),
+                rev: detail.rev.clone(),
+                ..Default::default()
+            })));
+        }
+        if let Some(path) = &detail.path {
+            return Ok(Dependency::Detailed(Box::new(DependencyDetail {
+                path: Some(super::normalize_path_for_config(
+                    &Path::new(path).join("vendor/gpu-allocator"),
+                )),
+                ..Default::default()
+            })));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "`waterui-winui` resolved to a registry dependency, but its `gpu-allocator` \
+             patch can only pin a git revision or a checkout carrying the vendored member",
+        ))
+    }
+
+    /// The `[patch]` table the launcher needs as its own workspace root: the
+    /// checkout's or channel's set every generated crate gets, plus the
+    /// `gpu-allocator` entry only `waterui-winui` requires.
+    fn winui_patch_set(
+        ctx: &TemplateContext,
+        gpu_allocator_patch: Dependency,
+    ) -> io::Result<cargo_toml::PatchSet> {
+        let mut patch = super::generated_crate_patches(ctx)?;
+        patch
+            .entry("crates-io".to_string())
+            .or_default()
+            .insert("gpu-allocator".to_string(), gpu_allocator_patch);
+        Ok(patch)
+    }
+}
+
 /// Hydrolysis backend templates.
 pub mod hydrolysis {
     use super::{
@@ -3675,23 +4056,13 @@ pub mod hydrolysis {
     ) -> io::Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
         let mut outputs =
             super::render_dir_outputs(TemplateNamespace::Hydrolysis, &embedded::HYDROLYSIS, ctx)?;
-        let patch = collect_runtime_patches(ctx)?;
+        let patch = super::generated_crate_patches(ctx)?;
         outputs.push((
             std::path::PathBuf::from("Cargo.toml"),
             super::render_generated_cargo_toml(&generated_manifest(ctx, package_name, patch)?)?
                 .into_bytes(),
         ));
         Ok(outputs)
-    }
-
-    /// `[patch]` tables of the workspace the backend builds against, so the
-    /// generated crate resolves forked dependencies exactly like the
-    /// runtime's own workspace does.
-    fn collect_runtime_patches(ctx: &TemplateContext) -> io::Result<cargo_toml::PatchSet> {
-        ctx.waterui_workspace_root().map_or_else(
-            || Ok(ctx.framework.patches()),
-            |root| super::collect_workspace_patches(&root),
-        )
     }
 
     fn generated_manifest(
@@ -3707,7 +4078,7 @@ pub mod hydrolysis {
         }];
         if requires_cef(ctx) {
             bins.push(GeneratedBinSection {
-                name: "waterui-cef-helper".to_string(),
+                name: crate::project_model::project_types::cef_helper_binary_name(package_name),
                 path: "src/bin/waterui-cef-helper.rs".to_string(),
             });
         }
@@ -4221,7 +4592,7 @@ async fn propagate_workspace_patches(
 
 /// Reads the `[patch]` tables from the workspace root that governs a build
 /// rooted at `project_root`, with path patches made absolute.
-fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::PatchSet> {
+pub fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::PatchSet> {
     let Some((workspace_dir, source)) = find_workspace_manifest(project_root)? else {
         return Ok(cargo_toml::PatchSet::default());
     };
@@ -4609,7 +4980,9 @@ pub mod ffi {
         });
         if ctx.cef_runtime_enabled() {
             manifest.bin.push(Product {
-                name: Some("waterui-cef-helper".to_string()),
+                name: Some(crate::project_model::project_types::cef_helper_binary_name(
+                    package_name,
+                )),
                 path: Some("src/bin/waterui-cef-helper.rs".to_string()),
                 ..Default::default()
             });
@@ -4813,7 +5186,7 @@ pub mod root {
 
     /// Generate Cargo.toml programmatically using serde-compatible structs for type safety.
     async fn generate_cargo_toml(base_dir: &Path, ctx: &TemplateContext) -> io::Result<()> {
-        let waterui_dependency = waterui_dependency(ctx);
+        let waterui_dependency = waterui_dependency(ctx)?;
         let manifest = GeneratedCargoManifest {
             package: super::generated_package(ctx.crate_name.as_str(), vec![ctx.author.clone()]),
             lib: super::generated_lib(&["lib"]),
@@ -4843,14 +5216,12 @@ pub mod root {
         write_generated_cargo_toml(base_dir, super::render_generated_cargo_toml(&manifest)?).await
     }
 
-    fn waterui_dependency(ctx: &TemplateContext) -> GeneratedDependencyDetail {
-        ctx.waterui_path
-            .as_ref()
-            .map_or_else(
-                || GeneratedDependencyDetail::framework(ctx, "waterui"),
-                |waterui_path| GeneratedDependencyDetail::path(waterui_path),
-            )
-            .with_default_features(false)
+    fn waterui_dependency(ctx: &TemplateContext) -> io::Result<GeneratedDependencyDetail> {
+        let detail = ctx.waterui_path.as_ref().map_or_else(
+            || GeneratedDependencyDetail::framework(ctx, "waterui"),
+            |waterui_path| Ok(GeneratedDependencyDetail::path(waterui_path)),
+        )?;
+        Ok(detail.with_default_features(false))
     }
 
     fn native_target_section(
@@ -5008,7 +5379,7 @@ pub mod preview {
             dependencies.insert(
                 "waterui".to_string(),
                 SupportDependencyValue::Detailed(
-                    super::GeneratedDependencyDetail::framework(ctx, "waterui")
+                    super::GeneratedDependencyDetail::framework(ctx, "waterui")?
                         .with_default_features(false)
                         .into(),
                 ),
@@ -5016,7 +5387,7 @@ pub mod preview {
             dependencies.insert(
                 "waterui-preview".to_string(),
                 SupportDependencyValue::Detailed(
-                    super::GeneratedDependencyDetail::framework(ctx, "waterui-preview").into(),
+                    super::GeneratedDependencyDetail::framework(ctx, "waterui-preview")?.into(),
                 ),
             );
         }
@@ -5322,7 +5693,7 @@ pub mod inspector {
         #[ignore = "clones the pinned framework revision"]
         fn the_inspector_app_crate_path_exists() {
             let checkout = crate::pinned_framework::checkout();
-            let crate_path = checkout.path().join(super::INSPECTOR_APP_CRATE);
+            let crate_path = checkout.join(super::INSPECTOR_APP_CRATE);
             assert!(
                 crate_path.join("Cargo.toml").is_file(),
                 "inspector app crate is not at {}",

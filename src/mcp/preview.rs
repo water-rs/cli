@@ -167,6 +167,9 @@ impl PreviewTool {
                         width: request.width,
                         height: request.height,
                         sccache_path: self.sccache_path.clone(),
+                        // MCP serves JSON-RPC over stdio — there is no
+                        // terminal sink to render compile progress into.
+                        progress: None,
                     },
                     &output_path,
                     None,
@@ -207,6 +210,7 @@ impl PreviewTool {
             &self.project_path,
             request.platform.into(),
             self.sccache_path.clone(),
+            None,
         )
         .await?;
 

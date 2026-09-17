@@ -24,6 +24,7 @@ use crate::{
             LinuxPackageManagerError, has_supported_package_manager, install_java_jdk,
             install_named_packages,
         },
+        rust::{RustTargetAdditions, SelectedToolchainTargets},
         winget::{WingetInstallError, ensure_package_installed},
     },
     utils::{CommandError, command},
@@ -1331,33 +1332,6 @@ fn required_android_rust_targets_for_abis(abis: &[AndroidAbi]) -> Vec<String> {
     targets
 }
 
-async fn installed_rustup_targets(host: &Host) -> Result<Vec<String>, CommandError> {
-    let installed = host
-        .run("rustup", ["target", "list", "--installed"])
-        .await?;
-    Ok(installed
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
-
-fn missing_android_rust_targets(
-    installed_targets: &[String],
-    required_targets: &[String],
-) -> Vec<String> {
-    required_targets
-        .iter()
-        .filter(|target| {
-            !installed_targets
-                .iter()
-                .any(|installed| installed == *target)
-        })
-        .cloned()
-        .collect()
-}
-
 impl AndroidSdk {
     /// Detect the path to the Android SDK installation on `host`.
     #[must_use]
@@ -1810,101 +1784,15 @@ impl Installation for AndroidBuildToolsInstallation {
     }
 }
 
-/// Installation procedure for Rust Android targets.
-#[derive(Debug, Clone)]
-pub struct AndroidRustTargetsInstallation {
-    missing_targets: Vec<String>,
-}
-
-impl AndroidRustTargetsInstallation {
-    fn new(missing_targets: Vec<String>) -> Self {
-        assert!(
-            !missing_targets.is_empty(),
-            "AndroidRustTargetsInstallation requires at least one missing target"
-        );
-        Self { missing_targets }
-    }
-}
-
-/// Errors that can occur when installing Rust Android targets.
-#[derive(Debug, thiserror::Error)]
-pub enum FailToInstallAndroidRustTargets {
-    #[error("rustup is required to install Android Rust targets but was not found in PATH.")]
-    RustupNotFound,
-    #[error("Failed to install Rust Android target `{target}`: {source}")]
-    AddTarget {
-        /// Target triple that failed to install.
-        target: String,
-        /// Underlying command error.
-        source: CommandError,
-    },
-    #[error("Failed to list installed Rust targets after installation: {0}")]
-    QueryTargets(CommandError),
-    #[error("Android Rust targets are still missing after installation: {missing_targets}")]
-    StillMissing {
-        /// Comma-separated missing targets.
-        missing_targets: String,
-    },
-}
-
 impl Toolchain for AndroidRustTargets {
-    type Installation = AndroidRustTargetsInstallation;
+    type Installation = RustTargetAdditions;
 
     async fn check(&self, host: &Host) -> Result<(), ToolchainError<Self::Installation>> {
-        if host.which("rustup").await.is_err() {
-            return Err(ToolchainError::unfixable(
-                "rustup is not available, so Android Rust targets cannot be managed automatically",
-                "Install rustup from https://rustup.rs, then run `water doctor --fix`.",
-            ));
-        }
-
-        let installed_targets = installed_rustup_targets(host).await.map_err(|error| {
-            ToolchainError::unfixable(
-                format!("Failed to query installed Rust targets: {error}"),
-                "Run `rustup target list --installed`; if it fails, repair rustup with `rustup self update` or reinstall rustup.",
-            )
-        })?;
-
-        let missing_targets =
-            missing_android_rust_targets(&installed_targets, &self.required_targets);
-        if missing_targets.is_empty() {
-            Ok(())
-        } else {
-            Err(ToolchainError::fixable(
-                AndroidRustTargetsInstallation::new(missing_targets),
-            ))
-        }
-    }
-}
-
-impl Installation for AndroidRustTargetsInstallation {
-    type Error = FailToInstallAndroidRustTargets;
-
-    async fn install(&self, host: &Host) -> Result<(), Self::Error> {
-        if host.which("rustup").await.is_err() {
-            return Err(FailToInstallAndroidRustTargets::RustupNotFound);
-        }
-
-        for target in &self.missing_targets {
-            host.run("rustup", ["target", "add", target.as_str()])
-                .await
-                .map_err(|source| FailToInstallAndroidRustTargets::AddTarget {
-                    target: target.clone(),
-                    source,
-                })?;
-        }
-
-        let installed_targets = installed_rustup_targets(host)
+        // The targets live on the toolchain the project's `rust-toolchain`
+        // pin (or the rustup default) selects — never a different default.
+        SelectedToolchainTargets::new(self.required_targets.clone())
+            .check(host)
             .await
-            .map_err(FailToInstallAndroidRustTargets::QueryTargets)?;
-        let still_missing = missing_android_rust_targets(&installed_targets, &self.missing_targets);
-        if still_missing.is_empty() {
-            Ok(())
-        } else {
-            Err(FailToInstallAndroidRustTargets::StillMissing {
-                missing_targets: still_missing.join(", "),
-            })
-        }
     }
 }
 
@@ -1925,31 +1813,6 @@ mod tests {
                 "aarch64-linux-android".to_string(),
                 "x86_64-linux-android".to_string()
             ]
-        );
-    }
-
-    #[test]
-    fn missing_android_targets_only_consider_requested_abis() {
-        let required = required_android_rust_targets_for_abis(&[AndroidAbi::Arm64V8a]);
-        let installed = vec![
-            "aarch64-linux-android".to_string(),
-            "armv7-linux-androideabi".to_string(),
-            "x86_64-linux-android".to_string(),
-        ];
-        assert_eq!(
-            missing_android_rust_targets(&installed, &required),
-            [] as [String; 0]
-        );
-    }
-
-    #[test]
-    fn missing_android_targets_report_only_requested_missing_entries() {
-        let required =
-            required_android_rust_targets_for_abis(&[AndroidAbi::Arm64V8a, AndroidAbi::X86]);
-        let installed = vec!["aarch64-linux-android".to_string()];
-        assert_eq!(
-            missing_android_rust_targets(&installed, &required),
-            vec!["i686-linux-android".to_string()]
         );
     }
 
@@ -3065,6 +2928,10 @@ mod host_tests {
     fn rust_targets_ok_when_all_installed() {
         let machine = TestMachine::new();
         machine.install("rustup");
+        machine.respond(
+            "RUSTUP_ACTIVE_TOOLCHAIN",
+            "stable-x86_64-unknown-fake (default)",
+        );
         // `rustup target list --installed` emits one target per line.
         machine.respond(
             "RUSTUP_INSTALLED_TARGETS",
@@ -3085,6 +2952,10 @@ mod host_tests {
     fn rust_targets_fixable_lists_missing_targets() {
         let machine = TestMachine::new();
         machine.install("rustup");
+        machine.respond(
+            "RUSTUP_ACTIVE_TOOLCHAIN",
+            "stable-x86_64-unknown-fake (default)",
+        );
         let host = machine.host([(
             String::from("WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS"),
             String::from("aarch64-linux-android"),

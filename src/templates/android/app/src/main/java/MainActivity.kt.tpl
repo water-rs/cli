@@ -165,6 +165,11 @@ class MainActivity : AppCompatActivity() {
 
         val assetsRoot = syncBundledAssets(this)
         Os.setenv("WATERUI_ASSETS_ROOT", assetsRoot.absolutePath, true)
+        // Rust code that wants a cache directory (preview registry, pushed
+        // dylibs) resolves WATER_CACHE_DIR first; the platform dirs crate has
+        // no usable location inside an app sandbox. The intent extras below
+        // still override this default.
+        Os.setenv("WATER_CACHE_DIR", cacheDir.absolutePath, true)
 
         setupEnvironmentFromIntent(intent)
         setupEnvironmentFromProperties()

@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 #[cfg(target_os = "macos")]
 use jiff::Timestamp;
 
-use super::detect_sccache_path;
+use super::{TargetBackend, detect_sccache_path};
 use crate::shell::Shell;
 use crate::{error, header, line, note, success, warn};
 use waterui_cli::toolchain_checks;
@@ -25,7 +25,7 @@ use waterui_cli::{
         toolchain::AppleSdk,
     },
     backend::reinit_backend,
-    build::{BuildOptions, BuildProfile},
+    build::{BuildOptions, BuildProfile, BuildProgress},
     device::{Artifact, Device, DeviceEvent, Local, LogLevel, RunOptions, Running},
     esp32::{backend::Esp32Backend, platform::run_esp32},
     gtk4::{
@@ -42,6 +42,10 @@ use waterui_cli::{
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
     project::Project,
     web,
+    winui::{
+        backend::WinUiBackend,
+        platform::{build_winui, package_winui},
+    },
 };
 
 #[cfg(target_os = "macos")]
@@ -105,7 +109,7 @@ async fn find_latest_ips_report(
 
 #[derive(Debug, Clone, Copy)]
 struct BackendAvailability {
-    available: [bool; 5],
+    available: [bool; 6],
 }
 
 impl BackendAvailability {
@@ -115,7 +119,8 @@ impl BackendAvailability {
             TargetBackend::Android => 1,
             TargetBackend::Gtk4 => 2,
             TargetBackend::Hydrolysis => 3,
-            TargetBackend::Dew => 4,
+            TargetBackend::WinUi => 4,
+            TargetBackend::Dew => 5,
         }]
     }
 }
@@ -170,21 +175,6 @@ impl TargetPlatform {
             _ => None,
         }
     }
-}
-
-/// Target backend for running (how the app is built and rendered).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TargetBackend {
-    /// Apple backend (UIKit/AppKit).
-    Apple,
-    /// Android backend (Android Views).
-    Android,
-    /// GTK4 backend (Linux only, experimental).
-    Gtk4,
-    /// Hydrolysis backend (self-drawn renderer).
-    Hydrolysis,
-    /// Dew backend (ESP32 firmware).
-    Dew,
 }
 
 /// Arguments for the run command.
@@ -261,6 +251,11 @@ pub struct Args {
     /// does.
     #[arg(long)]
     no_dev_server: bool,
+
+    /// Skip the confirmation prompt required by experimental backends
+    /// (needed in non-interactive environments).
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 /// Parses one `--env KEY=VALUE` argument into its key and value.
@@ -339,9 +334,10 @@ fn resolve_backend(
                 TargetBackend::Gtk4 | TargetBackend::Hydrolysis
             )
             | (
-                TargetPlatform::Windows | TargetPlatform::Web,
-                TargetBackend::Hydrolysis
+                TargetPlatform::Windows,
+                TargetBackend::Hydrolysis | TargetBackend::WinUi
             )
+            | (TargetPlatform::Web, TargetBackend::Hydrolysis)
             | (
                 TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4,
                 TargetBackend::Dew
@@ -356,7 +352,7 @@ fn resolve_backend(
              - macOS: apple, hydrolysis\n  \
              - Android: android\n  \
              - Linux: gtk4, hydrolysis\n  \
-             - Windows: hydrolysis\n  \
+             - Windows: hydrolysis, winui\n  \
              - Web: hydrolysis\n  \
              - ESP32-S3: dew\n  \
              - ESP32-C3: dew\n  \
@@ -375,7 +371,8 @@ const fn default_backend_priority(platform: TargetPlatform) -> &'static [TargetB
         TargetPlatform::Android => &[TargetBackend::Android],
         TargetPlatform::Macos => &[TargetBackend::Apple, TargetBackend::Hydrolysis],
         TargetPlatform::Linux => &[TargetBackend::Hydrolysis, TargetBackend::Gtk4],
-        TargetPlatform::Windows | TargetPlatform::Web => &[TargetBackend::Hydrolysis],
+        TargetPlatform::Windows => &[TargetBackend::Hydrolysis, TargetBackend::WinUi],
+        TargetPlatform::Web => &[TargetBackend::Hydrolysis],
         TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4 => {
             &[TargetBackend::Dew]
         }
@@ -437,7 +434,9 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // The run context carries the opened project, the resolved device, backend
     // and build options; on Windows that future crosses clippy's `large_futures`
     // threshold (16 KiB), so it is pinned on the heap instead of the caller's stack.
-    let context = Box::pin(prepare_run_context(shell, &args)).await?;
+    let Some(context) = Box::pin(prepare_run_context(shell, &args)).await? else {
+        return Ok(());
+    };
     print_run_header(shell, &context);
     check_run_toolchain(shell, &host, context.platform, context.backend).await?;
 
@@ -513,6 +512,9 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("the TUI backend requires an interactive terminal");
     }
+    if !super::confirm_experimental_backend(shell, "TUI", args.yes)? {
+        return Ok(());
+    }
 
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let project = Project::open(&project_path).await?;
@@ -524,6 +526,7 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
             &project,
             &launcher_dir,
             sccache_path,
+            Some(shell.build_progress()),
         ))
         .await?;
 
@@ -535,23 +538,22 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
     waterui_cli::tui::exec(&binary)
 }
 
-async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<RunContext> {
+async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let mut project = Project::open(&project_path).await?;
     let platform = resolve_platform(args.platform);
     let backend = resolve_run_backend(&project, platform, args.backend)?;
 
-    if backend == TargetBackend::Gtk4 {
-        warn!(
-            shell,
-            "The GTK4 backend is experimental — hydrolysis is the default"
-        );
-    }
-
     validate_desktop_backend_platform_on_host(platform, backend)?;
     validate_device_arg(platform, backend, args.device.as_deref())?;
     validate_log_pipeline_args(platform, args.logs, args.native_logs)?;
     ensure_run_backend_ready(&project, backend)?;
+
+    if backend.is_experimental()
+        && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
+    {
+        return Ok(None);
+    }
 
     // Selecting an ESP32 platform pins the chip so the generated harness and
     // build target follow the platform (the chip drives the target triple,
@@ -562,11 +564,11 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<RunContext> {
 
     let project = ensure_generated_run_backend(shell, &project_path, project, backend).await?;
 
-    Ok(RunContext {
+    Ok(Some(RunContext {
         project,
         platform,
         backend,
-    })
+    }))
 }
 
 fn resolve_run_backend(
@@ -593,6 +595,7 @@ const fn backend_availability(project: &Project) -> BackendAvailability {
             project.android_backend().is_some(),
             project.gtk4_backend().is_some(),
             project.hydrolysis_backend().is_some(),
+            project.winui_backend().is_some(),
             project.esp32_backend().is_some(),
         ],
     }
@@ -615,6 +618,9 @@ fn ensure_run_backend_ready(project: &Project, backend: TargetBackend) -> Result
         }
         TargetBackend::Hydrolysis if project.hydrolysis_backend().is_none() => {
             bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
+        }
+        TargetBackend::WinUi if project.winui_backend().is_none() => {
+            bail!("WinUI backend is not configured. Run `water backend add winui`.");
         }
         TargetBackend::Dew if project.esp32_backend().is_none() => {
             bail!("ESP32 backend is not configured. Run `water backend add esp32`.");
@@ -651,6 +657,18 @@ async fn ensure_generated_run_backend(
                 needs_reinit,
                 "Initializing hydrolysis backend...",
                 "Hydrolysis backend initialized",
+            )
+            .await
+        }
+        TargetBackend::WinUi if project.is_playground() => {
+            let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
+            ensure_generated_run_backend_impl::<WinUiBackend>(
+                shell,
+                project_path,
+                project,
+                needs_reinit,
+                "Initializing WinUI backend...",
+                "WinUI backend initialized",
             )
             .await
         }
@@ -740,10 +758,12 @@ async fn run_web_app(shell: &Shell, project: &Project) -> Result<()> {
 
 async fn run_esp32_app(shell: &Shell, project: &Project, device: Option<&str>) -> Result<()> {
     let sccache_path = detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await;
-    let build_options = sccache_path.map_or_else(
-        || BuildOptions::development(BuildProfile::Debug),
-        |sccache| BuildOptions::development(BuildProfile::Debug).with_sccache(sccache),
-    );
+    let build_options = sccache_path
+        .map_or_else(
+            || BuildOptions::development(BuildProfile::Debug),
+            |sccache| BuildOptions::development(BuildProfile::Debug).with_sccache(sccache),
+        )
+        .with_progress(shell.build_progress());
 
     let _ = shell.status(">", "Building ESP32 firmware...");
     shell
@@ -804,11 +824,11 @@ async fn build_run_config(
 
 /// Resolve the Cargo profile `water run` builds under.
 ///
-/// Self-drawn backends (Hydrolysis) spend their per-frame budget in the
-/// rendering stack, so a plain `water run` lifts the dev profile to a light
-/// optimization level rather than paying debug-code frame times. `--debug`
-/// opts back into a fully unoptimized build; `--release` and `--profiling`
-/// select the release profile without and with debug info.
+/// With no profile flag the backend's default development profile applies —
+/// the same default `water build` uses, so a run reuses the units an earlier
+/// build compiled into the shared target directory. `--debug` opts back into
+/// a fully unoptimized build; `--release` and `--profiling` select the
+/// release profile without and with debug info.
 const fn run_profile(args: &Args, backend: TargetBackend) -> BuildProfile {
     if args.release {
         BuildProfile::Release
@@ -816,10 +836,8 @@ const fn run_profile(args: &Args, backend: TargetBackend) -> BuildProfile {
         BuildProfile::Profiling
     } else if args.debug {
         BuildProfile::Debug
-    } else if matches!(backend, TargetBackend::Hydrolysis) {
-        BuildProfile::Optimized
     } else {
-        BuildProfile::Debug
+        backend.lib_backend().default_development_profile()
     }
 }
 
@@ -920,7 +938,13 @@ async fn build_and_run(
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
     let _ = shell.status(">", "Building...");
-    build_for_backend(project, backend, &build_plan, build_options(&config)).await?;
+    build_for_backend(
+        project,
+        backend,
+        &build_plan,
+        build_options(&config).with_progress(shell.build_progress()),
+    )
+    .await?;
 
     // A declared `include_web!` mount is served by the bundler's own dev
     // server in debug runs — spawn it after the Rust build (its root comes
@@ -939,6 +963,7 @@ async fn build_and_run(
         &build_plan,
         config.profile.is_release(),
         dev_server.is_some(),
+        Some(shell.build_progress()),
     )
     .await?;
 
@@ -966,7 +991,8 @@ async fn start_web_dev_server(
     sccache_path: Option<&std::path::Path>,
     expose_on_lan: bool,
 ) -> Result<Option<web::WebDevServer>> {
-    let Some(meta) = web::web_mount(project, sccache_path).await? else {
+    let Some(meta) = web::web_mount(project, sccache_path, Some(&shell.build_progress())).await?
+    else {
         return Ok(None);
     };
     let root = meta
@@ -1122,6 +1148,9 @@ async fn build_for_backend(
         TargetBackend::Hydrolysis => {
             build_hydrolysis(project, plan.lib_platform, build_options).await?;
         }
+        TargetBackend::WinUi => {
+            build_winui(project, build_options).await?;
+        }
         TargetBackend::Dew => {
             panic!("esp32 run should not enter build_and_run")
         }
@@ -1135,10 +1164,14 @@ async fn package_for_backend(
     plan: &BuildPlan,
     release: bool,
     dev_server: bool,
+    progress: Option<BuildProgress>,
 ) -> Result<Artifact> {
-    let package_options = PackageOptions::development()
+    let mut package_options = PackageOptions::development()
         .with_debug(!release)
         .with_dev_server(dev_server);
+    if let Some(progress) = progress {
+        package_options = package_options.with_progress(progress);
+    }
     match backend {
         TargetBackend::Apple => package_apple(project, plan.lib_platform, package_options).await,
         TargetBackend::Android => {
@@ -1151,6 +1184,7 @@ async fn package_for_backend(
         TargetBackend::Hydrolysis => {
             package_hydrolysis(project, plan.lib_platform, package_options).await
         }
+        TargetBackend::WinUi => package_winui(project, package_options).await,
         TargetBackend::Dew => panic!("esp32 run should not enter build_and_run"),
     }
 }
@@ -1592,6 +1626,12 @@ async fn check_toolchain_for_backend(
                 toolchain_checks::check_hydrolysis(host).await?;
             }
         }
+        TargetBackend::WinUi => {
+            if platform != TargetPlatform::Windows {
+                bail!("Internal error: WinUI backend is not supported on {platform:?}");
+            }
+            toolchain_checks::check_winui(host).await?;
+        }
         TargetBackend::Dew => {
             if platform.esp32_chip().is_none() {
                 bail!("Internal error: dew backend is not supported on {platform:?}");
@@ -1610,7 +1650,10 @@ async fn find_device(
     device_id: Option<&str>,
 ) -> Result<SelectedDevice> {
     // For native desktop Rust backends, always use Local device regardless of platform.
-    if backend == TargetBackend::Gtk4 || backend == TargetBackend::Hydrolysis {
+    if backend == TargetBackend::Gtk4
+        || backend == TargetBackend::Hydrolysis
+        || backend == TargetBackend::WinUi
+    {
         return Ok(SelectedDevice::Local(Local));
     }
 
@@ -1726,6 +1769,7 @@ const fn backend_name(backend: TargetBackend) -> &'static str {
         TargetBackend::Android => "Android",
         TargetBackend::Gtk4 => "GTK4",
         TargetBackend::Hydrolysis => "Hydrolysis",
+        TargetBackend::WinUi => "WinUI",
         TargetBackend::Dew => "Dew",
     }
 }
@@ -1820,6 +1864,15 @@ fn validate_desktop_backend_platform_on_host(
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
         }
+        TargetBackend::WinUi => {
+            #[cfg(target_os = "windows")]
+            if platform != TargetPlatform::Windows {
+                bail!("WinUI backend on Windows host requires --platform windows");
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            bail!("WinUI backend is only supported on Windows hosts");
+        }
         TargetBackend::Apple => {
             #[cfg(not(target_os = "macos"))]
             bail!("Apple backend requires a macOS host");
@@ -1880,12 +1933,81 @@ fn handle_device_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendAvailability, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend,
+        Args, BackendAvailability, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend,
         TargetPlatform, device_choice, handle_device_event, parse_env_assignment,
         prompt_for_device, resolve_backend, resolve_default_backend_for_project, resolve_platform,
-        validate_desktop_backend_platform_on_host, validate_device_arg,
+        run_profile, validate_desktop_backend_platform_on_host, validate_device_arg,
     };
+    use clap::Parser as _;
+    use waterui_cli::build::BuildProfile;
     use waterui_cli::device::{ApplicationExit, DeviceEvent, Local};
+
+    /// The run `Args` wrapped in a `Parser` so tests can exercise the real
+    /// flag surface instead of constructing the clap struct field by field.
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn run_args(argv: &[&str]) -> Args {
+        let mut full = vec!["water-run"];
+        full.extend_from_slice(argv);
+        TestCli::try_parse_from(full).expect("run args parse").args
+    }
+
+    #[test]
+    fn run_profile_defaults_to_backend_development_profile() {
+        // `water run` and `water build` share the generated crates' Cargo
+        // target directory; if their flag-free defaults ever disagree, every
+        // dependency unit re-fingerprints and the run cold-compiles the whole
+        // graph (nightly "Fresh user / Windows" timeout).
+        use clap::ValueEnum;
+        let args = run_args(&[]);
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                run_profile(&args, *backend),
+                backend.lib_backend().default_development_profile(),
+                "{backend:?} flag-free profile drifted from the backend default"
+            );
+        }
+        assert_eq!(
+            run_profile(&args, TargetBackend::Hydrolysis),
+            BuildProfile::Optimized
+        );
+        assert_eq!(
+            run_profile(&args, TargetBackend::Apple),
+            BuildProfile::Debug
+        );
+    }
+
+    #[test]
+    fn run_profile_flags_override_the_default() {
+        assert_eq!(
+            run_profile(&run_args(&["--debug"]), TargetBackend::Hydrolysis),
+            BuildProfile::Debug
+        );
+        assert_eq!(
+            run_profile(&run_args(&["--release"]), TargetBackend::Hydrolysis),
+            BuildProfile::Release
+        );
+        assert_eq!(
+            run_profile(&run_args(&["--profiling"]), TargetBackend::Hydrolysis),
+            BuildProfile::Profiling
+        );
+    }
+
+    #[test]
+    fn only_gtk4_and_winui_are_experimental() {
+        use clap::ValueEnum;
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                backend.is_experimental(),
+                matches!(backend, TargetBackend::Gtk4 | TargetBackend::WinUi),
+                "{backend:?} experimental flag drifted"
+            );
+        }
+    }
 
     #[test]
     fn env_assignment_splits_on_first_equals() {
@@ -2044,7 +2166,7 @@ mod tests {
                 TargetPlatform::Linux,
                 false,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Hydrolysis
@@ -2054,7 +2176,7 @@ mod tests {
                 TargetPlatform::Macos,
                 false,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Hydrolysis
@@ -2066,7 +2188,7 @@ mod tests {
                 TargetPlatform::Linux,
                 false,
                 BackendAvailability {
-                    available: [false, false, false, false, false],
+                    available: [false, false, false, false, false, false],
                 }
             ),
             TargetBackend::Hydrolysis
@@ -2077,7 +2199,7 @@ mod tests {
                 TargetPlatform::Linux,
                 false,
                 BackendAvailability {
-                    available: [false, false, true, false, false],
+                    available: [false, false, true, false, false, false],
                 }
             ),
             TargetBackend::Gtk4
@@ -2091,7 +2213,7 @@ mod tests {
                 TargetPlatform::Macos,
                 true,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Apple
@@ -2101,7 +2223,7 @@ mod tests {
                 TargetPlatform::Linux,
                 true,
                 BackendAvailability {
-                    available: [false, false, false, true, false],
+                    available: [false, false, false, true, false, false],
                 }
             ),
             TargetBackend::Hydrolysis

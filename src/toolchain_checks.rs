@@ -17,7 +17,7 @@ use crate::{
         Host, Installation, Toolchain, ToolchainError,
         cmake::Cmake,
         doctor::{CheckStatus, doctor, ids},
-        web::WebToolchain,
+        web::web_toolchain,
         windows_arm64_llvm::WindowsArm64LlvmToolchain,
     },
 };
@@ -265,6 +265,18 @@ pub async fn check_gtk4(host: &Host) -> Result<()> {
     Ok(())
 }
 
+/// Verify the `WinUI` toolchain is installed.
+///
+/// # Errors
+/// Returns an error describing any missing toolchain component and the `water doctor --fix` remedy.
+pub async fn check_winui(host: &Host) -> Result<()> {
+    let toolchain = crate::winui::toolchain::WinUiToolchain;
+    if let Err(e) = toolchain.check(host).await {
+        bail!("{}", toolchain_check_message("WinUI", &e));
+    }
+    Ok(())
+}
+
 /// Verify the host toolchain components Hydrolysis builds need.
 ///
 /// # Errors
@@ -285,8 +297,7 @@ pub async fn check_hydrolysis(host: &Host) -> Result<()> {
 /// # Errors
 /// Returns an error describing any missing toolchain component and the `water doctor --fix` remedy.
 pub async fn check_web(host: &Host) -> Result<()> {
-    let toolchain: WebToolchain = Default::default();
-    if let Err(error) = toolchain.check(host).await {
+    if let Err(error) = web_toolchain().check(host).await {
         bail!(
             "Web toolchain check failed: {error}. Run `water doctor --fix` to install fixable components."
         );

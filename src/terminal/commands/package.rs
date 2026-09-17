@@ -25,6 +25,10 @@ use waterui_cli::{
     },
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
     project::Project,
+    winui::{
+        backend::WinUiBackend,
+        platform::{build_winui, package_winui},
+    },
 };
 
 /// Target platform for packaging.
@@ -57,6 +61,17 @@ pub enum TargetBackend {
     Gtk4,
     /// Hydrolysis backend.
     Hydrolysis,
+    /// `WinUI` backend.
+    #[value(name = "winui")]
+    WinUi,
+}
+
+impl TargetBackend {
+    /// Whether the backend is experimental — shipped without full testing
+    /// ahead of milestone releases — so selecting it asks for confirmation.
+    const fn is_experimental(self) -> bool {
+        matches!(self, Self::Gtk4 | Self::WinUi)
+    }
 }
 
 /// Target architecture for Android builds.
@@ -113,6 +128,11 @@ pub struct Args {
     /// Required when packaging Android backend.
     #[arg(long, value_enum, value_delimiter = ',')]
     arch: Vec<AndroidArch>,
+
+    /// Skip the confirmation prompt required by experimental backends
+    /// (needed in non-interactive environments).
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 struct PackagingContext {
@@ -126,7 +146,9 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // The packaging context carries the opened project, the resolved backend and
     // the build options; on Windows that future crosses clippy's `large_futures`
     // threshold (16 KiB), so it is pinned on the heap instead of the caller's stack.
-    let context = Box::pin(prepare_packaging_context(shell, &args)).await?;
+    let Some(context) = Box::pin(prepare_packaging_context(shell, &args)).await? else {
+        return Ok(());
+    };
     print_packaging_header(
         shell,
         &context.project,
@@ -140,7 +162,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     package_artifact(shell, &args, &context).await
 }
 
-async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<PackagingContext> {
+async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<PackagingContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let project = Project::open(&project_path).await?;
     let backend = resolve_backend(args.platform, args.backend)?;
@@ -148,6 +170,12 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Packagi
     validate_arch_args(backend, &args.arch)?;
     validate_desktop_backend_platform_on_host(args.platform, backend)?;
     ensure_packaging_backend_ready(&project, backend)?;
+
+    if backend.is_experimental()
+        && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
+    {
+        return Ok(None);
+    }
     let project =
         ensure_packaging_backend_generated(shell, &project_path, project, backend).await?;
 
@@ -155,18 +183,19 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Packagi
         BuildProfile::Release
     } else {
         BuildProfile::Debug
-    });
+    })
+    .with_progress(shell.build_progress());
     if let Some(sccache_path) =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await
     {
         build_options = build_options.with_sccache(sccache_path);
     }
 
-    Ok(PackagingContext {
+    Ok(Some(PackagingContext {
         project,
         backend,
         build_options,
-    })
+    }))
 }
 
 fn ensure_packaging_backend_ready(project: &Project, backend: TargetBackend) -> Result<()> {
@@ -186,6 +215,9 @@ fn ensure_packaging_backend_ready(project: &Project, backend: TargetBackend) -> 
         }
         TargetBackend::Hydrolysis if project.hydrolysis_backend().is_none() => {
             bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
+        }
+        TargetBackend::WinUi if project.winui_backend().is_none() => {
+            bail!("WinUI backend is not configured. Run `water backend add winui`.");
         }
         _ => Ok(()),
     }
@@ -219,6 +251,18 @@ async fn ensure_packaging_backend_generated(
                 needs_reinit,
                 "Initializing hydrolysis backend...",
                 "Hydrolysis backend initialized",
+            )
+            .await
+        }
+        TargetBackend::WinUi if project.is_playground() => {
+            let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
+            ensure_packaging_generated_backend::<WinUiBackend>(
+                shell,
+                project_path,
+                project,
+                needs_reinit,
+                "Initializing WinUI backend...",
+                "WinUI backend initialized",
             )
             .await
         }
@@ -330,6 +374,10 @@ async fn build_packaging_artifacts(
             )
             .await
         }
+        TargetBackend::WinUi => {
+            build_winui_packaging_artifacts(shell, &context.project, context.build_options.clone())
+                .await
+        }
     }
 }
 
@@ -391,6 +439,22 @@ async fn build_gtk4_packaging_artifacts(
     Ok(())
 }
 
+async fn build_winui_packaging_artifacts(
+    shell: &Shell,
+    project: &Project,
+    build_options: BuildOptions,
+) -> Result<()> {
+    let spinner = shell.spinner("Building WinUI app...");
+    shell
+        .display_output(build_winui(project, build_options))
+        .await?;
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+    success!(shell, "Built WinUI app");
+    Ok(())
+}
+
 async fn build_hydrolysis_packaging_artifacts(
     shell: &Shell,
     project: &Project,
@@ -419,7 +483,7 @@ async fn build_hydrolysis_packaging_artifacts(
 async fn package_artifact(shell: &Shell, args: &Args, context: &PackagingContext) -> Result<()> {
     let spinner = shell.spinner("Packaging application...");
     let artifact = shell
-        .display_output(package_artifact_inner(args, context))
+        .display_output(package_artifact_inner(shell, args, context))
         .await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
@@ -428,8 +492,13 @@ async fn package_artifact(shell: &Shell, args: &Args, context: &PackagingContext
     Ok(())
 }
 
-async fn package_artifact_inner(args: &Args, context: &PackagingContext) -> Result<Artifact> {
-    let package_options = PackageOptions::packaging(args.distribution, !args.release);
+async fn package_artifact_inner(
+    shell: &Shell,
+    args: &Args,
+    context: &PackagingContext,
+) -> Result<Artifact> {
+    let package_options = PackageOptions::packaging(args.distribution, !args.release)
+        .with_progress(shell.build_progress());
     match context.backend {
         TargetBackend::Android => {
             let abis: Vec<AndroidAbi> = args.arch.iter().map(|arch| arch.to_abi()).collect();
@@ -444,6 +513,7 @@ async fn package_artifact_inner(args: &Args, context: &PackagingContext) -> Resu
             .await
         }
         TargetBackend::Gtk4 => package_gtk4(&context.project, package_options).await,
+        TargetBackend::WinUi => package_winui(&context.project, package_options).await,
         TargetBackend::Hydrolysis => {
             package_hydrolysis(
                 &context.project,
@@ -470,9 +540,10 @@ fn resolve_backend(platform: TargetPlatform, backend: TargetBackend) -> Result<T
                 TargetBackend::Gtk4 | TargetBackend::Hydrolysis
             )
             | (
-                TargetPlatform::Windows | TargetPlatform::Web,
-                TargetBackend::Hydrolysis
+                TargetPlatform::Windows,
+                TargetBackend::Hydrolysis | TargetBackend::WinUi
             )
+            | (TargetPlatform::Web, TargetBackend::Hydrolysis)
     );
 
     if !supported {
@@ -483,7 +554,7 @@ fn resolve_backend(platform: TargetPlatform, backend: TargetBackend) -> Result<T
              - Android: android\n  \
              - macOS: apple, hydrolysis\n  \
              - Linux: gtk4, hydrolysis\n  \
-             - Windows: hydrolysis\n  \
+             - Windows: hydrolysis, winui\n  \
              - Web: hydrolysis",
             backend,
             platform
@@ -558,6 +629,12 @@ async fn check_toolchain_for_backend(
                 toolchain_checks::check_hydrolysis(host).await?;
             }
         }
+        TargetBackend::WinUi => {
+            if platform != TargetPlatform::Windows {
+                bail!("Internal error: WinUI backend is not supported on {platform:?}");
+            }
+            toolchain_checks::check_winui(host).await?;
+        }
     }
     Ok(())
 }
@@ -602,6 +679,15 @@ fn validate_desktop_backend_platform_on_host(
 
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
             bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
+        }
+        TargetBackend::WinUi => {
+            #[cfg(target_os = "windows")]
+            if platform != TargetPlatform::Windows {
+                bail!("WinUI backend on Windows host requires --platform windows");
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            bail!("WinUI backend is only supported on Windows hosts");
         }
         TargetBackend::Apple => {
             #[cfg(not(target_os = "macos"))]
@@ -655,12 +741,25 @@ const fn backend_name(backend: TargetBackend) -> &'static str {
         TargetBackend::Android => "Android",
         TargetBackend::Gtk4 => "GTK4",
         TargetBackend::Hydrolysis => "Hydrolysis",
+        TargetBackend::WinUi => "WinUI",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AndroidArch, TargetBackend, TargetPlatform, resolve_backend, validate_arch_args};
+
+    #[test]
+    fn only_gtk4_and_winui_are_experimental() {
+        use clap::ValueEnum;
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                backend.is_experimental(),
+                matches!(backend, TargetBackend::Gtk4 | TargetBackend::WinUi),
+                "{backend:?} experimental flag drifted"
+            );
+        }
+    }
 
     #[test]
     fn rejects_empty_arch_for_android_backend() {
@@ -692,6 +791,12 @@ mod tests {
             TargetBackend::Hydrolysis
         );
         assert!(resolve_backend(TargetPlatform::Windows, TargetBackend::Gtk4).is_err());
+        assert_eq!(
+            resolve_backend(TargetPlatform::Windows, TargetBackend::WinUi)
+                .expect("windows winui backend"),
+            TargetBackend::WinUi
+        );
+        assert!(resolve_backend(TargetPlatform::Linux, TargetBackend::WinUi).is_err());
         assert_eq!(
             resolve_backend(TargetPlatform::Web, TargetBackend::Hydrolysis).expect("web backend"),
             TargetBackend::Hydrolysis

@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 
+use crate::build::{BuildProfile, BuildProgress};
 use target_lexicon::{
     Aarch64Architecture, Architecture, DefaultToHost, Environment, OperatingSystem,
     Riscv32Architecture, Triple, Vendor,
@@ -65,8 +66,46 @@ pub enum TargetBackend {
     Gtk4,
     /// Hydrolysis backend (self-drawn renderer)
     Hydrolysis,
+    /// `WinUI` backend (Windows App SDK / `WinUI` 3, pure Rust binary)
+    WinUi,
     /// Dew backend (embedded-first CPU renderer for ESP32-class chips)
     Dew,
+}
+
+impl TargetBackend {
+    /// The framework scaffold packages the backend's generated crate links —
+    /// the names a `framework.json` `scaffold` (or `experimental-packages`)
+    /// table keys on. A withheld package means the selected channel cannot
+    /// scaffold the backend at all.
+    #[must_use]
+    pub const fn scaffold_packages(&self) -> &'static [&'static str] {
+        match self {
+            Self::Apple | Self::Android => &[],
+            Self::Gtk4 => &["waterui-gtk"],
+            Self::Hydrolysis => &["hydrolysis", "hydrolysis-m3"],
+            Self::WinUi => &["waterui-winui"],
+            Self::Dew => &["waterui-dew"],
+        }
+    }
+
+    /// The [`BuildProfile`] a development `water build` or `water run` uses
+    /// for this backend when the user passes no profile flag.
+    ///
+    /// Self-drawn backends spend their per-frame budget in the rendering
+    /// stack, so a Hydrolysis development build lifts the `dev` profile to a
+    /// light optimization level rather than paying debug-code frame times;
+    /// every other backend builds the declared `dev` profile. The two
+    /// commands must agree on this default: generated backend crates share
+    /// one Cargo target directory, and a profile mismatch re-fingerprints
+    /// every dependency unit — the build's artifacts then warm nothing the
+    /// run reuses.
+    #[must_use]
+    pub const fn default_development_profile(&self) -> BuildProfile {
+        match self {
+            Self::Hydrolysis => BuildProfile::Optimized,
+            _ => BuildProfile::Debug,
+        }
+    }
 }
 
 impl TargetPlatform {
@@ -181,7 +220,8 @@ impl TargetPlatform {
             | Self::VisionOSSimulator => &[TargetBackend::Apple],
             Self::Android => &[TargetBackend::Android],
             Self::Linux => &[TargetBackend::Gtk4, TargetBackend::Hydrolysis],
-            Self::Windows | Self::Web => &[TargetBackend::Hydrolysis],
+            Self::Windows => &[TargetBackend::Hydrolysis, TargetBackend::WinUi],
+            Self::Web => &[TargetBackend::Hydrolysis],
             Self::Esp32S3 | Self::Esp32C3 | Self::Esp32P4 => &[TargetBackend::Dew],
         }
     }
@@ -304,6 +344,10 @@ pub struct PackageOptions {
 
     /// How `include_web!` mounts reach the packaged app.
     web_frontend: WebFrontendMode,
+
+    /// Sink compile progress is reported to while packaging runs cargo —
+    /// asset-manifest planning compiles the project rlib for its symbol table.
+    progress: Option<BuildProgress>,
 }
 
 /// Whether an `include_web!` mount is staged from a frontend build or served
@@ -331,6 +375,7 @@ impl PackageOptions {
             debug: true,
             shared_rust_runtime: true,
             web_frontend: WebFrontendMode::Stage,
+            progress: None,
         }
     }
 
@@ -342,6 +387,7 @@ impl PackageOptions {
             debug,
             shared_rust_runtime: false,
             web_frontend: WebFrontendMode::Stage,
+            progress: None,
         }
     }
 
@@ -385,6 +431,20 @@ impl PackageOptions {
     #[must_use]
     pub const fn uses_dev_server(&self) -> bool {
         matches!(self.web_frontend, WebFrontendMode::DevServer)
+    }
+
+    /// Attach a compile-progress sink the cargo invocations this packaging
+    /// pass performs report to.
+    #[must_use]
+    pub fn with_progress(mut self, progress: BuildProgress) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// The compile-progress sink, when one is attached.
+    #[must_use]
+    pub const fn progress(&self) -> Option<&BuildProgress> {
+        self.progress.as_ref()
     }
 }
 

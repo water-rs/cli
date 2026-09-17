@@ -32,6 +32,10 @@ enum BackendCommand {
 struct AddArgs {
     /// Backend to add.
     backend: BackendName,
+    /// Skip the confirmation prompt required by experimental backends
+    /// (needed in non-interactive environments).
+    #[arg(short = 'y', long)]
+    yes: bool,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -49,6 +53,8 @@ enum BackendName {
     Android,
     Gtk4,
     Hydrolysis,
+    #[value(name = "winui")]
+    WinUi,
     Esp32,
 }
 
@@ -65,7 +71,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     }
 
     match args.command {
-        BackendCommand::Add(add) => add_backend(shell, &mut project, add.backend).await,
+        BackendCommand::Add(add) => add_backend(shell, &mut project, add.backend, add.yes).await,
         BackendCommand::Remove(remove) => {
             remove_backend(shell, &mut project, remove.backend, remove.yes).await
         }
@@ -76,7 +82,12 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     }
 }
 
-async fn add_backend(shell: &Shell, project: &mut Project, backend: BackendName) -> Result<()> {
+async fn add_backend(
+    shell: &Shell,
+    project: &mut Project,
+    backend: BackendName,
+    yes: bool,
+) -> Result<()> {
     header!(shell, "Adding backend: {}", backend_name(backend));
     validate_backend_add_on_host(backend)?;
 
@@ -110,6 +121,9 @@ async fn add_backend(shell: &Shell, project: &mut Project, backend: BackendName)
                 note!(shell, "GTK4 backend already configured");
                 return Ok(());
             }
+            if !super::confirm_experimental_backend(shell, "GTK4", yes)? {
+                return Ok(());
+            }
             let spinner = shell.spinner("Scaffolding GTK4 backend...");
             project.init_gtk4_backend().await?;
             if let Some(pb) = spinner {
@@ -128,6 +142,21 @@ async fn add_backend(shell: &Shell, project: &mut Project, backend: BackendName)
                 pb.finish_and_clear();
             }
             success!(shell, "Added hydrolysis backend");
+        }
+        BackendName::WinUi => {
+            if project.winui_backend().is_some() {
+                note!(shell, "WinUI backend already configured");
+                return Ok(());
+            }
+            if !super::confirm_experimental_backend(shell, "WinUI", yes)? {
+                return Ok(());
+            }
+            let spinner = shell.spinner("Scaffolding WinUI backend...");
+            project.init_winui_backend().await?;
+            if let Some(pb) = spinner {
+                pb.finish_and_clear();
+            }
+            success!(shell, "Added WinUI backend");
         }
         BackendName::Esp32 => {
             if project.esp32_backend().is_some() {
@@ -160,6 +189,11 @@ fn validate_backend_add_on_host(backend: BackendName) -> Result<()> {
                 target_os = "windows"
             )) {
                 bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
+            }
+        }
+        BackendName::WinUi => {
+            if !cfg!(target_os = "windows") {
+                bail!("WinUI backend is only supported on Windows hosts");
             }
         }
         // The ESP32 firmware cross-compiles from any host with espup installed.
@@ -204,6 +238,7 @@ async fn remove_backend(
         BackendName::Android => project.remove_android_backend().await?,
         BackendName::Gtk4 => project.remove_gtk4_backend().await?,
         BackendName::Hydrolysis => project.remove_hydrolysis_backend().await?,
+        BackendName::WinUi => project.remove_winui_backend().await?,
         BackendName::Esp32 => project.remove_esp32_backend().await?,
     }
 
@@ -231,6 +266,10 @@ fn list_backends(shell: &Shell, project: &Project) {
         line!(shell, "  - hydrolysis");
         configured += 1;
     }
+    if project.winui_backend().is_some() {
+        line!(shell, "  - winui");
+        configured += 1;
+    }
     if project.esp32_backend().is_some() {
         line!(shell, "  - esp32");
         configured += 1;
@@ -247,6 +286,7 @@ const fn is_backend_configured(project: &Project, backend: BackendName) -> bool 
         BackendName::Android => project.android_backend().is_some(),
         BackendName::Gtk4 => project.gtk4_backend().is_some(),
         BackendName::Hydrolysis => project.hydrolysis_backend().is_some(),
+        BackendName::WinUi => project.winui_backend().is_some(),
         BackendName::Esp32 => project.esp32_backend().is_some(),
     }
 }
@@ -257,6 +297,7 @@ const fn backend_name(backend: BackendName) -> &'static str {
         BackendName::Android => "android",
         BackendName::Gtk4 => "gtk4",
         BackendName::Hydrolysis => "hydrolysis",
+        BackendName::WinUi => "winui",
         BackendName::Esp32 => "esp32",
     }
 }

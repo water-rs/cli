@@ -129,7 +129,9 @@ jobs:
     needs: release
     # crates.io trusted publishing rejects OIDC tokens issued under
     # `workflow_run`, so the publish leg only ever runs on dispatch.
-    if: github.event_name == 'workflow_dispatch'
+    # `always()` because a skipped `release` (every dispatch) would
+    # otherwise cascade-skip this job too.
+    if: always() && github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       id-token: write
@@ -170,8 +172,9 @@ jobs:
     needs: release
     # Binaries belong to the same dispatch as the publish leg: building
     # them on `workflow_run` would only produce artifacts that
-    # `release-assets` cannot attach while publish is skipped.
-    if: github.event_name == 'workflow_dispatch'
+    # `release-assets` cannot attach while publish is skipped. `always()`
+    # because a skipped `release` would otherwise cascade-skip this job.
+    if: always() && github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
     env:

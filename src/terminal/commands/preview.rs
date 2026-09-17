@@ -11,6 +11,7 @@ use serde::Deserialize;
 use crate::shell::Shell;
 use crate::{error, header, note, success};
 use waterui_cli::artifact_symbols::{ArtifactSymbols, build_host_rlib};
+use waterui_cli::build::BuildProgress;
 use waterui_cli::mcp::preview::PreviewArgs;
 use waterui_cli::preview::request::{
     self, CliHydrolysisPreviewTheme, CliPreviewBackend, CliPreviewPlatform, PreviewTarget,
@@ -37,6 +38,7 @@ async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
         args.expr,
         args.all,
         sccache_path.as_deref(),
+        Some(&shell.build_progress()),
     )
     .await?;
     let automation_body = load_automation_body(
@@ -57,6 +59,7 @@ async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
                 width,
                 height,
                 sccache_path: sccache_path.clone(),
+                progress: Some(shell.build_progress()),
             },
             &automation_body,
         )
@@ -231,6 +234,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
                 width: request.width,
                 height: request.height,
                 sccache_path,
+                progress: Some(shell.build_progress()),
             },
             &args.output,
             scenario.as_ref(),
@@ -266,8 +270,13 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // Launch preview session (connects to existing app or launches new one)
     let spinner = shell.spinner("Connecting to preview app...");
     let preview_platform: PreviewPlatform = request.platform.into();
-    let mut session =
-        launch_preview_session(&project_path, preview_platform, sccache_path.clone()).await?;
+    let mut session = launch_preview_session(
+        &project_path,
+        preview_platform,
+        sccache_path.clone(),
+        Some(shell.build_progress()),
+    )
+    .await?;
     if let Some(s) = spinner {
         s.finish_and_clear();
     }
@@ -447,6 +456,7 @@ async fn resolve_test_targets(
     force_expression: bool,
     all: bool,
     sccache_path: Option<&Path>,
+    progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
     match (all, target) {
         (true, Some(_)) => {
@@ -455,7 +465,9 @@ async fn resolve_test_targets(
         (true, None) if force_expression => {
             bail!("`--all` cannot be combined with `--expr`.");
         }
-        (true, None) => discover_preview_targets(project_path, crate_name, sccache_path).await,
+        (true, None) => {
+            discover_preview_targets(project_path, crate_name, sccache_path, progress).await
+        }
         (false, Some(target)) => {
             if force_expression {
                 Ok(vec![PreviewTarget::Expression {
@@ -477,8 +489,15 @@ async fn discover_preview_targets(
     project_path: &Path,
     crate_name: &str,
     sccache_path: Option<&Path>,
+    progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
-    let rlib = build_host_rlib(project_path, sccache_path).await?;
+    let rlib = build_host_rlib(
+        project_path,
+        &waterui_cli::water_dir::shared_host_target_dir().await?,
+        sccache_path,
+        progress,
+    )
+    .await?;
     let symbols = ArtifactSymbols::read(&rlib)?;
     // `#[preview]` exports `waterui_preview_<crate>_<fn>`; crate names are
     // normalized like `function_path_to_symbol` does (dashes become

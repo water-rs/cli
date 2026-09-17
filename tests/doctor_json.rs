@@ -96,10 +96,23 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
                     | ids::MACOS_SDK
             );
             let linux_item = matches!(*id, ids::LINUX_SYSTEM_PACKAGES | ids::GTK4);
+            let windows_item = matches!(*id, ids::WINUI);
+            // The fixture manifest selects no backends, so every
+            // project-gated item reports skipped on every host.
+            let unselected_project_item = matches!(
+                *id,
+                ids::APPLE_RUST_TARGETS
+                    | ids::ANDROID_RUST_TARGETS
+                    | ids::WASM32_TARGET
+                    | ids::WASM_PACK
+                    | ids::ESP32_TOOLCHAIN
+            );
             (apple_item && !cfg!(target_os = "macos"))
                 || (linux_item && !cfg!(target_os = "linux"))
+                || (windows_item && !cfg!(target_os = "windows"))
                 || (*id == ids::WINDOWS_ARM64_LLVM
                     && !cfg!(all(target_os = "windows", target_arch = "aarch64")))
+                || unselected_project_item
         })
         .collect();
     assert_eq!(skipped_ids, expected_skipped);

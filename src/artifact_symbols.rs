@@ -8,12 +8,14 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
-use cargo_metadata::{Message, TargetKind};
+use cargo_metadata::TargetKind;
 use color_eyre::eyre::{Context as _, Result, bail};
 use object::read::archive::ArchiveFile;
 use object::{File, FileKind, Object, ObjectSection, ObjectSymbol};
+use waterui_assets_planner::BundleMountMeta;
+
+use crate::build::{BuildProgress, command_output_with_progress};
 
 /// Symbols of one compiled Rust artifact: an rlib/staticlib archive (every
 /// member parsed) or a single object/dylib.
@@ -68,6 +70,28 @@ impl ArtifactSymbols {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    /// The bundle-mount metadata a `waterui_meta_bundle_*` static carries.
+    ///
+    /// The macro records the mount and project roots with
+    /// `std::fs::canonicalize`, which on Windows spells them as verbatim
+    /// `\\?\C:\...` paths. Those are valid for the standard library but not
+    /// for what the CLI hands them to — a frontend package manager's working
+    /// directory, Xcode and Gradle inputs, equality against paths the CLI
+    /// resolved itself — so both roots are simplified to their ordinary
+    /// spelling here, at the one place the payload enters the CLI.
+    ///
+    /// # Errors
+    /// Returns an error when the static is missing or its payload does not
+    /// decode.
+    pub fn bundle_mount_meta(&self, leaf: &str) -> Result<BundleMountMeta> {
+        let mut meta = BundleMountMeta::from_payload(&self.static_bytes(leaf)?)?;
+        meta.path = dunce::simplified(&meta.path).to_path_buf();
+        meta.project = meta
+            .project
+            .map(|project| dunce::simplified(&project).to_path_buf());
+        Ok(meta)
     }
 
     /// Bytes of a `#[used] static`.
@@ -173,28 +197,38 @@ fn leaf_of(name: &str) -> Option<&str> {
 /// of the produced `.rlib`.
 ///
 /// Runs `cargo build --lib --message-format=json-render-diagnostics` with
-/// `project_path` as the working directory. `sccache_path`, when given, is
-/// installed as `RUSTC_WRAPPER` through the same helper every other CLI build
-/// uses.
+/// `project_path` as the working directory and `target_dir` as the explicit
+/// Cargo target directory — callers pass the CLI's shared per-user target so
+/// the dependency graph compiles once per machine rather than once per
+/// project. `sccache_path`, when given, is installed as `RUSTC_WRAPPER`
+/// through the same helper every other CLI build uses. `progress`, when
+/// given, receives cargo's compile events — the same streaming a
+/// [`crate::build::RustBuild`] reports — because this compile is often the
+/// first thing `water run` does and a cold one takes minutes.
 ///
 /// # Errors
 /// Returns an error when cargo fails or the project produces no rlib.
-pub async fn build_host_rlib(project_path: &Path, sccache_path: Option<&Path>) -> Result<PathBuf> {
+pub async fn build_host_rlib(
+    project_path: &Path,
+    target_dir: &Path,
+    sccache_path: Option<&Path>,
+    progress: Option<&BuildProgress>,
+) -> Result<PathBuf> {
     let manifest_path = dunce::canonicalize(project_path.join("Cargo.toml"))
         .wrap_err_with(|| format!("no Cargo.toml under {}", project_path.display()))?;
 
     let mut cargo = smol::process::Command::new("cargo");
     cargo
         .args(["build", "--lib", "--message-format=json-render-diagnostics"])
-        .current_dir(project_path)
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .arg("--target-dir")
+        .arg(target_dir)
+        .current_dir(project_path);
     if let Some(sccache_path) = sccache_path {
-        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path);
+        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path)?;
     }
-    let output = cargo
-        .output()
+    // Stdout stays collected-only: it carries the JSON message stream parsed
+    // below, so a progress sink must never mirror it to the terminal.
+    let output = command_output_with_progress(&mut cargo, progress.cloned())
         .await
         .wrap_err("failed to execute `cargo build --lib`")?;
     if !output.status.success() {
@@ -205,13 +239,10 @@ pub async fn build_host_rlib(project_path: &Path, sccache_path: Option<&Path>) -
         );
     }
 
-    for message in Message::parse_stream(output.stdout.as_slice()) {
-        let Message::CompilerArtifact(artifact) =
-            message.wrap_err("failed to parse cargo build message")?
-        else {
-            continue;
-        };
-        if artifact.manifest_path.as_std_path() != manifest_path
+    for artifact in crate::build::compiler_artifacts(&output.stdout)
+        .wrap_err("failed to parse cargo build messages")?
+    {
+        if !crate::build::same_manifest_path(artifact.manifest_path.as_std_path(), &manifest_path)
             || !artifact
                 .target
                 .kind
@@ -243,7 +274,7 @@ mod tests {
     fn reads_meta_statics_and_exports_from_built_rlib() {
         futures_lite::future::block_on(async {
             let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/meta_static");
-            let rlib = build_host_rlib(&fixture, None)
+            let rlib = build_host_rlib(&fixture, &fixture.join("target"), None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
@@ -282,13 +313,86 @@ mod tests {
     /// The `web_meta` fixture staged against the pinned framework: its sources
     /// copied beside a manifest whose `waterui` dependency is the git pin this
     /// crate's own manifest carries, so the revision lives in one place.
-    fn web_meta_fixture() -> tempfile::TempDir {
+    ///
+    /// The fixture lives under `target/test-fixtures/` rather than a tempdir:
+    /// its `cargo build --lib` compiles the pinned framework's graph, which is
+    /// the expensive part, and a persistent target dir lets a nextest retry —
+    /// and the next cached CI run — resume that compile instead of restarting
+    /// it cold every attempt. Sources stage into a wiped `crate/` beside the
+    /// persistent `target/` so a file deleted from `tests/fixtures/web_meta`
+    /// cannot survive in the staged tree.
+    ///
+    /// The returned file handle is a held lock covering the fixture for the
+    /// whole test: a second caller's restage waits rather than wiping `crate/`
+    /// under this one's build. `crate/Cargo.lock` survives the wipe on
+    /// purpose — it is a build artifact, not fixture content, and regenerating
+    /// it re-resolves the pinned git dependency on every retry.
+    fn web_meta_fixture() -> (PathBuf, std::fs::File) {
+        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures/web-meta");
+        std::fs::create_dir_all(&fixture).expect("the fixture directory is creatable");
+        let lock_path = fixture.join(".restage.lock");
+        let restage_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("the restage lock opens");
+        fs4::FileExt::lock(&restage_lock).expect("the restage lock acquires");
+
+        let staged = fixture.join("crate");
+        for entry in std::fs::read_dir(&fixture).expect("the fixture directory is readable") {
+            let path = entry.expect("a fixture entry is readable").path();
+            if path == fixture.join("target") || path == staged || path == lock_path {
+                continue;
+            }
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .expect("a stale fixture entry is removable");
+        }
+        // `crate/` itself is wiped too, except `Cargo.lock` — the one build
+        // artifact worth keeping across a restage.
+        if staged.is_dir() {
+            for entry in std::fs::read_dir(&staged).expect("the staged crate is readable") {
+                let path = entry.expect("a staged entry is readable").path();
+                if path == staged.join("Cargo.lock") {
+                    continue;
+                }
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                }
+                .expect("a stale staged entry is removable");
+            }
+        }
+        fs_extra::dir::copy(
+            &sources,
+            &staged,
+            &fs_extra::dir::CopyOptions::new()
+                .content_only(true)
+                .overwrite(true),
+        )
+        .expect("the fixture sources copy");
+        std::fs::write(staged.join("Cargo.toml"), web_meta_manifest())
+            .expect("the manifest is written");
+        (fixture, restage_lock)
+    }
+
+    /// The staged fixture's `Cargo.toml`, with the `waterui` dependency pinned
+    /// to the revision this crate's own manifest carries — the revision lives
+    /// in one place.
+    fn web_meta_manifest() -> String {
         #[derive(serde::Serialize)]
         struct Manifest {
             package: Package,
             workspace: toml::Table,
             dependencies: std::collections::BTreeMap<&'static str, Dependency>,
             patch: Patch,
+            profile: Profile,
         }
         #[derive(serde::Serialize)]
         struct Patch {
@@ -314,15 +418,19 @@ mod tests {
             default_features: bool,
             features: Vec<&'static str>,
         }
+        #[derive(serde::Serialize)]
+        struct Profile {
+            dev: DevProfile,
+        }
+        /// The rlib is read for `waterui_meta_*` statics, which live behind
+        /// `debug_assertions` — debug info itself buys the test nothing, and
+        /// emitting it for the whole framework graph is a real slice of a cold
+        /// build's time.
+        #[derive(serde::Serialize)]
+        struct DevProfile {
+            debug: u8,
+        }
 
-        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
-        let fixture = tempfile::tempdir().expect("fixture directory");
-        fs_extra::dir::copy(
-            &sources,
-            fixture.path(),
-            &fs_extra::dir::CopyOptions::new().content_only(true),
-        )
-        .expect("the fixture sources copy");
         let (git, rev) = crate::pinned_framework::source();
         // The lean facade: `include_web!` expands against `waterui::webview`
         // and `waterui::Bundle`, nothing else of the framework is needed.
@@ -366,13 +474,11 @@ mod tests {
                 })
                 .collect(),
             },
+            profile: Profile {
+                dev: DevProfile { debug: 0 },
+            },
         };
-        std::fs::write(
-            fixture.path().join("Cargo.toml"),
-            toml::to_string(&manifest).expect("the manifest serializes"),
-        )
-        .expect("the manifest is written");
-        fixture
+        toml::to_string(&manifest).expect("the manifest serializes")
     }
 
     /// `include_web!` is the one web mount an application declares; its
@@ -386,17 +492,15 @@ mod tests {
     #[ignore = "fetches the pinned framework revision"]
     fn reads_include_web_mount_meta_from_built_rlib() {
         futures_lite::future::block_on(async {
-            let fixture = web_meta_fixture();
-            let rlib = build_host_rlib(fixture.path(), None)
+            let (fixture, _restage_guard) = web_meta_fixture();
+            let project = fixture.join("crate");
+            let rlib = build_host_rlib(&project, &fixture.join("target"), None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
-            let meta = waterui_assets_planner::BundleMountMeta::from_payload(
-                &symbols
-                    .static_bytes("waterui_meta_bundle_web")
-                    .expect("the web mount static should be present"),
-            )
-            .expect("payload should decode as BundleMountMeta");
+            let meta = symbols
+                .bundle_mount_meta("waterui_meta_bundle_web")
+                .expect("payload should decode as BundleMountMeta");
             assert_eq!(meta.mount, "web");
             assert!(
                 meta.path.ends_with("dist"),
@@ -406,7 +510,7 @@ mod tests {
             assert_eq!(
                 meta.project.as_deref(),
                 Some(
-                    dunce::canonicalize(fixture.path().join("web"))
+                    dunce::canonicalize(project.join("web"))
                         .as_deref()
                         .expect("web root")
                 )

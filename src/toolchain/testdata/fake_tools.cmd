@@ -12,16 +12,24 @@ rem drain stdin here - cmd has no builtin way to read stdin to EOF (`set /p`
 rem reads one line and cannot test EOF) - so this script returns immediately
 rem while the .sh consumes piped license confirmations first. Tests must not
 rem rely on stdin being drained on Windows.
+rem
+rem Mutable state (`rustup toolchain install`/`default`/`target add`/
+rem `component add`, `rustup update`, `cargo install`, `espup install`) lives
+rem in files under the fake %HOME% so a `--fix` run mutates the fixture and a
+rem re-check observes the repair. `mkdir`/`copy`/`type`/`for /f` are cmd
+rem builtins, so the restricted PATH is still honored.
 setlocal EnableDelayedExpansion
 set "tool=%~n0"
 
 rem Defaults matching the .sh `${VAR:-default}` expansions; a declared value
 rem always wins.
 if not defined WATERUI_FAKE_RUSTC_VERSION set "WATERUI_FAKE_RUSTC_VERSION=1.0.0"
+if not defined WATERUI_FAKE_RUSTC_UPDATED_VERSION set "WATERUI_FAKE_RUSTC_UPDATED_VERSION=99.0.0"
 if not defined WATERUI_FAKE_CARGO_VERSION set "WATERUI_FAKE_CARGO_VERSION=1.95.0"
 if not defined WATERUI_FAKE_XCODE_VERSION set "WATERUI_FAKE_XCODE_VERSION=16.4"
 if not defined WATERUI_FAKE_ADB_VERSION set "WATERUI_FAKE_ADB_VERSION=36.0.0-test"
 if not defined WATERUI_FAKE_KOTLINC_VERSION set "WATERUI_FAKE_KOTLINC_VERSION=0.0.0"
+if not defined WATERUI_FAKE_SCCACHE_VERSION set "WATERUI_FAKE_SCCACHE_VERSION=1.0.0"
 if not defined WATERUI_FAKE_UNAME_MACHINE set "WATERUI_FAKE_UNAME_MACHINE=x86_64"
 goto :dispatch
 
@@ -74,6 +82,7 @@ if not "!hay:%~2=!"=="!hay!" (exit /b 0) else (exit /b 1)
 if /i "%tool%"=="rustup" goto :rustup
 if /i "%tool%"=="rustc" goto :rustc
 if /i "%tool%"=="cargo" goto :cargo
+if /i "%tool%"=="espup" goto :espup
 if /i "%tool%"=="xcodebuild" goto :xcodebuild
 if /i "%tool%"=="xcode-select" goto :xcode_select
 if /i "%tool%"=="xcrun" goto :xcrun
@@ -85,7 +94,7 @@ if /i "%tool%"=="javac" goto :exit_ok
 if /i "%tool%"=="kotlinc" goto :kotlinc
 if /i "%tool%"=="cmake" goto :simple_version
 if /i "%tool%"=="meson" goto :simple_version
-if /i "%tool%"=="sccache" goto :simple_version
+if /i "%tool%"=="sccache" goto :sccache
 if /i "%tool%"=="wasm-pack" goto :simple_version
 if /i "%tool%"=="sh" goto :simple_version
 if /i "%tool%"=="bash" goto :simple_version
@@ -111,34 +120,125 @@ goto :exit_ok
 exit /b 0
 
 :rustup
+rem Mutable rustup state - one channel/target/component per line in the
+rem state files, plus a directory per installed toolchain under
+rem %RUSTUP_HOME%\toolchains, the same layout a real rustup produces.
+set "state_toolchains=%HOME%\.fake-rustup-toolchains"
+set "state_default=%HOME%\.fake-rustup-default"
+set "state_targets=%HOME%\.fake-rustup-targets"
+set "state_components=%HOME%\.fake-rustup-components"
+if defined RUSTUP_HOME (set "rustup_home=%RUSTUP_HOME%") else (set "rustup_home=%HOME%\.rustup")
+if not defined WATERUI_FAKE_RUSTC_HOST set "WATERUI_FAKE_RUSTC_HOST=x86_64-unknown-fake"
 if "%*"=="show active-toolchain" goto :rustup_active_toolchain
-if "%*"=="target list --installed" (call :respond_or_empty RUSTUP_INSTALLED_TARGETS & exit /b 0)
 set "args=%*"
-if "!args:~0,17!"=="toolchain install" exit /b 0
-if "!args:~0,7!"=="update " exit /b 0
-if "!args:~0,10!"=="target add" exit /b 0
+if not defined args exit /b 2
+for %%a in (%*) do set "last_arg=%%a"
+rem Prefix matches below mirror the .sh globs: `rustup <verb> ...` qualified
+rem with `--toolchain <name>` must match the same branch as the bare form.
+if "!args:~0,17!"=="toolchain install" goto :rustup_install
+if "!args:~0,13!"=="toolchain add" goto :rustup_install
+if "!args:~0,14!"=="toolchain list" (
+    if defined WATERUI_FAKE_RUSTUP_TOOLCHAINS echo !WATERUI_FAKE_RUSTUP_TOOLCHAINS!
+    if exist "%WATERUI_FAKE_RESPONSES%\RUSTUP_TOOLCHAINS" type "%WATERUI_FAKE_RESPONSES%\RUSTUP_TOOLCHAINS"
+    if exist "%state_toolchains%" type "%state_toolchains%"
+    exit /b 0
+)
+if "!args:~0,7!"=="default" goto :rustup_default
+if "!args:~0,6!"=="update" (>"%HOME%\.fake-rustc-version" echo %WATERUI_FAKE_RUSTC_UPDATED_VERSION% & exit /b 0)
+if "!args:~0,23!"=="target list --installed" (
+    if defined WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS echo !WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS!
+    if exist "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_TARGETS" type "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_TARGETS"
+    if exist "%state_targets%" type "%state_targets%"
+    exit /b 0
+)
+if "!args:~0,10!"=="target add" (>>"%state_targets%" echo !last_arg! & exit /b 0)
+if "!args:~0,14!"=="component list" (
+    if defined WATERUI_FAKE_RUSTUP_INSTALLED_COMPONENTS echo !WATERUI_FAKE_RUSTUP_INSTALLED_COMPONENTS!
+    if exist "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_COMPONENTS" type "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_COMPONENTS"
+    if exist "%state_components%" type "%state_components%"
+    exit /b 0
+)
+if "!args:~0,13!"=="component add" (>>"%state_components%" echo !last_arg! & exit /b 0)
+if "!args:~0,3!"=="run" goto :rustup_run
 if "%1"=="--version" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 if "%1"=="-V" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 exit /b 2
+
+rem `rustup toolchain install`/`add` records the channel and lays down its
+rem toolchain directory, like rustup itself.
+:rustup_install
+>>"%state_toolchains%" echo !last_arg!
+mkdir "!rustup_home!\toolchains\!last_arg!" 2>nul
+exit /b 0
+
+rem `rustup run <toolchain> <tool> <args...>` proxies to the named tool —
+rem dispatch to the sibling fake in this directory, like a real rustup proxy.
+rem cmd's `shift` rewrites %0, so the sibling path must be resolved first.
+:rustup_run
+set "run_tool=%~dp0%~3.cmd"
+shift
+shift
+set "run_args="
+:rustup_run_args
+if not "%~2"=="" (set "run_args=!run_args! %~2" & shift & goto :rustup_run_args)
+call "%run_tool%" %run_args%
+exit /b %errorlevel%
+
+rem `rustup default <channel>` installs it if absent and records the default.
+:rustup_default
+>>"%state_toolchains%" echo !last_arg!
+>"%state_default%" echo !last_arg!
+mkdir "!rustup_home!\toolchains\!last_arg!" 2>nul
+exit /b 0
 
 rem `exit /b` inside a nested parenthesized block does not reach the process
 rem exit code through `cmd /c`, so the no-toolchain branch lives at top level.
 :rustup_active_toolchain
 if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN echo error: no active toolchain 1>&2
 if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN exit /b 1
+if defined WATERUI_FAKE_RUSTUP_TOOLCHAIN_NOT_INSTALLED goto :rustup_pinned_toolchain
+set "def_channel="
+if exist "%state_default%" for /f "usebackq delims=" %%l in ("%state_default%") do set "def_channel=%%l"
+if defined def_channel (echo !def_channel!-%WATERUI_FAKE_RUSTC_HOST% (default) & exit /b 0)
 call :respond RUSTUP_ACTIVE_TOOLCHAIN
 exit /b %errorlevel%
 
+rem A test's `rust-toolchain.toml` pin names this channel; it resolves once
+rem `rustup toolchain install`/`default` recorded it, or a toolchain
+rem directory exists (linked/esp-style toolchains live under
+rem %RUSTUP_HOME%\toolchains). stable/beta/nightly and version-prefixed
+rem channels carry the `-<host>` suffix rustup appends; custom/linked
+rem toolchain names (esp, stage0) print bare - the same split as the .sh.
+:rustup_pinned_toolchain
+set "pin=%WATERUI_FAKE_RUSTUP_TOOLCHAIN_NOT_INSTALLED%"
+set "pin_installed="
+if exist "%state_toolchains%" for /f "usebackq delims=" %%l in ("%state_toolchains%") do if "%%l"=="!pin!" set "pin_installed=file"
+if exist "!rustup_home!\toolchains\!pin!" set "pin_installed=dir"
+if not defined pin_installed (
+    echo error: toolchain '!pin!' is not installed 1>&2
+    exit /b 1
+)
+set "pin_suffixed="
+if /i "!pin!"=="stable" set "pin_suffixed=1"
+if /i "!pin!"=="beta" set "pin_suffixed=1"
+if /i "!pin!"=="nightly" set "pin_suffixed=1"
+for %%d in (0 1 2 3 4 5 6 7 8 9) do if "!pin:~0,1!"=="%%d" set "pin_suffixed=1"
+if defined pin_suffixed (echo !pin!-%WATERUI_FAKE_RUSTC_HOST% (overridden by rust-toolchain.toml) & exit /b 0)
+echo !pin! (overridden by rust-toolchain.toml)
+exit /b 0
+
 :rustc
-if "%1"=="--version" (echo rustc %WATERUI_FAKE_RUSTC_VERSION% (waterui-test 2026-01-01) & exit /b 0)
+set "rustc_version=%WATERUI_FAKE_RUSTC_VERSION%"
+if exist "%HOME%\.fake-rustc-version" for /f "usebackq delims=" %%v in ("%HOME%\.fake-rustc-version") do set "rustc_version=%%v"
+if "%1"=="--version" (echo rustc %rustc_version% (waterui-test 2026-01-01) & exit /b 0)
 if "%1"=="-vV" (
     if defined WATERUI_FAKE_RUSTC_HOST (
-        echo rustc %WATERUI_FAKE_RUSTC_VERSION% (waterui-test)
+        echo rustc %rustc_version% (waterui-test)
         echo binary: rustc
         echo commit-hash: fake
         echo commit-date: 2026-01-01
         echo host: %WATERUI_FAKE_RUSTC_HOST%
-        echo release: %WATERUI_FAKE_RUSTC_VERSION%
+        echo release: %rustc_version%
         echo LLVM version: 20.1.0
         exit /b 0
     )
@@ -147,7 +247,35 @@ if "%1"=="-vV" (
 exit /b 2
 
 :cargo
-if "%1"=="--version" echo cargo %WATERUI_FAKE_CARGO_VERSION% (waterui-test)
+if not defined WATERUI_FAKE_CARGO_VERSION set "WATERUI_FAKE_CARGO_VERSION=1.95.0"
+if "%1"=="--version" (echo cargo %WATERUI_FAKE_CARGO_VERSION% (waterui-test) & exit /b 0)
+if "%1"=="install" goto :cargo_install
+if "%1"=="binstall" goto :cargo_install
+exit /b 0
+
+rem `cargo install <crate>` drops the crate's binary beside cargo - model that
+rem by copying this dispatcher under the crate's name.
+:cargo_install
+set "krate="
+for %%a in (%*) do (
+    if not defined krate (
+        set "arg=%%a"
+        if not "!arg:~0,1!"=="-" if not /i "%%a"=="install" if not /i "%%a"=="binstall" set "krate=%%a"
+    )
+)
+if defined krate if not exist "%~dp0!krate!.cmd" copy /y "%~f0" "%~dp0!krate!.cmd" >nul
+exit /b 0
+
+rem `espup install` lays down the `esp` toolchain's pieces; the RISC-V GCC
+rem lands under %HOME%\.espressif only with --esp-riscv-gcc.
+:espup
+if not "%1"=="install" exit /b 0
+if defined RUSTUP_HOME (set "esp=%RUSTUP_HOME%\toolchains\esp") else (set "esp=%HOME%\.rustup\toolchains\esp")
+mkdir "%esp%\xtensa-esp32-elf-clang\1.0\esp-clang\lib" 2>nul
+mkdir "%esp%\xtensa-esp-elf\1.0\xtensa-esp-elf\bin" 2>nul
+mkdir "%esp%\lib\rustlib\src\rust" 2>nul
+set "args=%*"
+call :contains args --esp-riscv-gcc && (mkdir "%HOME%\.espressif\tools\riscv32-esp-elf\1.0\riscv32-esp-elf\bin" 2>nul)
 exit /b 0
 
 :xcodebuild
@@ -194,6 +322,12 @@ exit /b 0
 
 :kotlinc
 if "%1"=="-version" (echo info: kotlinc-jvm %WATERUI_FAKE_KOTLINC_VERSION% (JRE 17.0.0) & exit /b 0)
+exit /b 0
+
+:sccache
+if "%1"=="--version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
+if "%1"=="-version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
+if "%1"=="-v" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
 exit /b 0
 
 :simple_version

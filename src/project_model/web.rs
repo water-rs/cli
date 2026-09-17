@@ -16,6 +16,7 @@ use smol::process::Command;
 use waterui_assets_planner::{BUNDLE_META_PREFIX, BundleMountMeta};
 
 use crate::artifact_symbols::{ArtifactSymbols, build_host_rlib};
+use crate::build::BuildProgress;
 use crate::project::Project;
 use crate::project_model::templates::embedded;
 
@@ -135,8 +136,15 @@ pub struct WebConfig {
 pub async fn web_mount(
     project: &Project,
     sccache_path: Option<&Path>,
+    progress: Option<&BuildProgress>,
 ) -> eyre::Result<Option<BundleMountMeta>> {
-    let rlib = build_host_rlib(project.root(), sccache_path).await?;
+    let rlib = build_host_rlib(
+        project.root(),
+        &project.host_target_dir().await?,
+        sccache_path,
+        progress,
+    )
+    .await?;
     let symbols = ArtifactSymbols::read(&rlib)?;
     decode_web_mount(&symbols)
 }
@@ -151,7 +159,7 @@ pub async fn web_mount(
 pub fn decode_web_mount(symbols: &ArtifactSymbols) -> eyre::Result<Option<BundleMountMeta>> {
     let mut frontend = None;
     for leaf in symbols.leaves_with_prefix(BUNDLE_META_PREFIX) {
-        let meta = BundleMountMeta::from_payload(&symbols.static_bytes(&leaf)?)?;
+        let meta = symbols.bundle_mount_meta(&leaf)?;
         if meta.project.is_none() {
             continue;
         }

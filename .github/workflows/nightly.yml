@@ -47,8 +47,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   E2E_USER: watere2e
-  # Windows rejects a password containing the account name; keep them disjoint.
-  E2E_PASS: 'hQ9$vM2#zL8!tR4'
 
 jobs:
   ignored:
@@ -65,8 +63,16 @@ jobs:
           shared-key: ignored-${{ runner.os }}
           # One writer per OS cache key: the schedule.
           save-if: ${{ github.event_name == 'schedule' }}
-      - uses: ./.github/actions/setup-linux-deps
+      # The ignored tests compile the pinned framework's own crates — the
+      # scaffolded web app links the GTK/VA-API/PipeWire stack — so they need
+      # the framework's native dependency set, not the trimmed list the CLI's
+      # own graph builds against.
+      - uses: water-rs/waterui/.github/actions/setup-linux-deps@dev
         if: runner.os == 'Linux'
+      # `filtrate`'s `shaderloom` build script needs `dxc` to compile WGSL to
+      # DXIL; the Windows image does not ship it.
+      - uses: ./.github/actions/install-dxc
+        if: runner.os == 'Windows'
       - uses: taiki-e/install-action@nextest
       # The `create --template web` tests scaffold and build a Vite frontend.
       - uses: oven-sh/setup-bun@v2
@@ -128,23 +134,28 @@ jobs:
 
       # The fresh user scaffolds against the framework revision this crate's
       # git dependencies pin — the nightly signal is this pin, not a released
-      # framework or a moving branch. The revision is read out of
-      # `Cargo.toml` so the pin stays declared exactly once. The clone lands
-      # inside the workspace so the provisioning steps' `chmod -R a+rX`
-      # reaches it; `waterui/` is gitignored.
+      # framework or a moving branch. The revision is read out of the resolved
+      # dependency graph — a `waterui-*` package's `source` is
+      # `git+https://github.com/water-rs/waterui?rev=<sha>#<sha>`, where the
+      # fragment is the commit Cargo resolved regardless of how the manifest
+      # spells the pin — so the pin stays declared exactly once. The clone
+      # lands inside the workspace so the provisioning steps' `chmod -R a+rX`
+      # reaches it; `waterui/` is gitignored. The pinned tree carries no
+      # gitlinks, so there is nothing to recurse into.
       - name: Check out the pinned framework revision
         shell: bash
         run: |
           set -euo pipefail
-          rev="$(sed -n 's/.*water-rs\/waterui[^"]*",[[:space:]]*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml | head -n1)"
-          if [ -z "$rev" ]; then
-            echo "::error::no water-rs/waterui rev pin found in Cargo.toml"
+          src="$(cargo metadata --format-version 1 --locked \
+            | jq -r '[.packages[].source | strings | select(startswith("git+https://github.com/water-rs/waterui"))] | first // empty')"
+          rev="${src##*#}"
+          if [[ ! "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::no water-rs/waterui rev pin found in the dependency graph"
             exit 1
           fi
           echo "Pinned framework revision: $rev"
           git clone --filter=blob:none https://github.com/water-rs/waterui waterui
           git -C waterui -c advice.detachedHead=false checkout "$rev"
-          git -C waterui submodule update --init --recursive
 
       # `shaderloom` — reached through the scaffolded hydrolysis app's normal
       # dependency graph — compiles WGSL to DXIL through `dxc`, which the
@@ -155,6 +166,21 @@ jobs:
       - name: Install DirectX Shader Compiler
         if: runner.os == 'Windows'
         uses: ./.github/actions/install-dxc
+
+      # The fresh user's password is generated per run: a literal in this
+      # file would print in every step's environment block of the public
+      # job log. The mask is registered before the value can appear
+      # anywhere, and $GITHUB_ENV carries it to the provisioning steps —
+      # the `env:` block never sees it. The fixed tail guarantees the
+      # Windows complexity rule (upper, lower, digit, symbol) that a bare
+      # base64 draw can miss.
+      - name: Generate the fresh user's password
+        shell: bash
+        run: |
+          set -euo pipefail
+          pass="$(openssl rand -base64 24)Zx9!"
+          echo "::add-mask::$pass"
+          echo "E2E_PASS=$pass" >> "$GITHUB_ENV"
 
       - name: Provision fresh user + rustup bootstrap (macOS)
         if: runner.os == 'macOS'
@@ -259,15 +285,19 @@ jobs:
           mkdir -p "$HOME/e2e-logs"
           cd "$HOME"
           fail() { echo "::error::$*"; exit 1; }
+          phase() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"; }
 
+          phase "water --version"
           water --version 2>&1 | tee e2e-logs/version.log || fail "water --version failed"
 
           # Baseline: a fresh account must leave doctor something to repair.
+          phase "water doctor (baseline)"
           water doctor 2>&1 | tee e2e-logs/doctor-before.log
           grep -q '\[fixable\]' e2e-logs/doctor-before.log \
             || fail "doctor found nothing fixable — the environment did not exercise the repair path"
 
           # The auto-repair loop (three passes, non-interactive auto-install).
+          phase "water doctor --fix"
           water doctor --fix 2>&1 | tee e2e-logs/doctor-fix.log
           if grep -q 'Failed to install' e2e-logs/doctor-fix.log; then
             fail "doctor --fix reported failed installs"
@@ -275,6 +305,7 @@ jobs:
 
           # Post-fix report. Informational: legitimately unfixable items (no
           # Android device, no AVD) may remain missing.
+          phase "water doctor (post-fix)"
           water doctor 2>&1 | tee e2e-logs/doctor-after.log
 
           # Scaffold against the pinned framework checkout — the nightly
@@ -283,16 +314,22 @@ jobs:
           # or git refuses to read the submodule pins `water create`
           # resolves through.
           git config --global --add safe.directory '*'
-          water create e2eapp --mode app --backends "$E2E_BACKEND" --waterui-path "$WATERUI_SRC" \
+          # `--yes` answers the experimental-backend confirmation (GTK4 on the
+          # Ubuntu leg); non-interactive runs cannot be prompted.
+          phase "water create e2eapp"
+          water create e2eapp --mode app --backends "$E2E_BACKEND" --waterui-path "$WATERUI_SRC" --yes \
             2>&1 | tee e2e-logs/create-app.log || fail "water create app failed"
           [ -f e2eapp/Water.toml ] || fail "e2eapp scaffold has no Water.toml"
+          phase "water create e2eplay"
           water create e2eplay --mode playground --waterui-path "$WATERUI_SRC" \
             2>&1 | tee e2e-logs/create-play.log || fail "water create playground failed"
           [ -f e2eplay/Water.toml ] || fail "e2eplay scaffold has no Water.toml"
 
-          (cd e2eapp && water build --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+          phase "water build e2eapp"
+          (cd e2eapp && water build --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" --yes \
             2>&1 | tee ../e2e-logs/build-app.log) || fail "water build failed"
-          (cd e2eapp && water package --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+          phase "water package e2eapp"
+          (cd e2eapp && water package --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" --yes \
             2>&1 | tee ../e2e-logs/package-app.log) || fail "water package failed"
           grep -q 'Packaged at' e2e-logs/package-app.log \
             || fail "water package produced no artifact line"
@@ -325,20 +362,25 @@ jobs:
           New-Item -ItemType Directory -Force $logs | Out-Null
           Set-Location $env:USERPROFILE
           function Fail($msg) { Write-Output "::error::$msg"; exit 1 }
+          function Phase($msg) { Write-Output "[$(Get-Date -Format o)] $msg" }
 
+          Phase "water --version"
           water --version 2>&1 | Tee-Object "$logs\version.log"
           if ($LASTEXITCODE) { Fail "water --version failed" }
 
+          Phase "water doctor (baseline)"
           water doctor 2>&1 | Tee-Object "$logs\doctor-before.log"
           if (-not (Select-String "$logs\doctor-before.log" -Pattern '\[fixable\]' -Quiet)) {
             Fail "doctor found nothing fixable — the environment did not exercise the repair path"
           }
 
+          Phase "water doctor --fix"
           water doctor --fix 2>&1 | Tee-Object "$logs\doctor-fix.log"
           if (Select-String "$logs\doctor-fix.log" -Pattern 'Failed to install' -Quiet) {
             Fail "doctor --fix reported failed installs"
           }
 
+          Phase "water doctor (post-fix)"
           water doctor 2>&1 | Tee-Object "$logs\doctor-after.log"
 
           # Scaffold against the pinned framework checkout — the nightly
@@ -347,17 +389,21 @@ jobs:
           # refuses to read the submodule pins `water create` resolves
           # through.
           git config --global --add safe.directory '*'
+          Phase "water create e2eapp"
           water create e2eapp --mode app --backends $env:E2E_BACKEND --waterui-path $wateruiSrc 2>&1 |
             Tee-Object "$logs\create-app.log"
           if ($LASTEXITCODE -or -not (Test-Path "e2eapp\Water.toml")) { Fail "water create app failed" }
+          Phase "water create e2eplay"
           water create e2eplay --mode playground --waterui-path $wateruiSrc 2>&1 |
             Tee-Object "$logs\create-play.log"
           if ($LASTEXITCODE -or -not (Test-Path "e2eplay\Water.toml")) { Fail "water create playground failed" }
 
           Push-Location e2eapp
+          Phase "water build e2eapp"
           water build --platform $env:E2E_PLATFORM --backend $env:E2E_BACKEND 2>&1 |
             Tee-Object "$logs\build-app.log"
           if ($LASTEXITCODE) { Pop-Location; Fail "water build failed" }
+          Phase "water package e2eapp"
           water package --platform $env:E2E_PLATFORM --backend $env:E2E_BACKEND 2>&1 |
             Tee-Object "$logs\package-app.log"
           $pkgExit = $LASTEXITCODE
@@ -367,12 +413,38 @@ jobs:
             Fail "water package produced no artifact line"
           }
 
-          $p = Start-Process -FilePath water -ArgumentList 'run' -PassThru `
+          Phase "water run e2eplay"
+          # windows-latest has no GPU: the only surface-compatible adapter is
+          # the D3D12 WARP software device, which Hydrolysis refuses in
+          # production selection unless the diagnostic switch is set. WARP
+          # still runs the full compute pipeline, so the launch is the real
+          # one; the switch only widens adapter selection.
+          $env:WATER_HYDROLYSIS_FORCE_FALLBACK_ADAPTER = "1"
+          $p = Start-Process -FilePath water -ArgumentList "run --platform $env:E2E_PLATFORM --backend $env:E2E_BACKEND" -PassThru `
             -WorkingDirectory "$env:USERPROFILE\e2eplay" `
             -RedirectStandardOutput "$logs\run-play.out" -RedirectStandardError "$logs\run-play.err"
+          $runStart = Get-Date
           $started = $false
-          $deadline = (Get-Date).AddMinutes(20)
+          # A fresh user pays a cold build of the whole graph here; the
+          # macOS leg has measured over 20 minutes for it, so the budget is
+          # an hour and the notice line below records the real number.
+          $deadline = (Get-Date).AddMinutes(60)
+          # The run's own output lands in the redirect files; echo new lines
+          # as they appear so this phase is visible in the job log instead of
+          # a silence that hides which unit is compiling.
+          $script:runLogSeen = @{}
+          function Sync-RunLog($file) {
+            $lines = @(Get-Content $file -ErrorAction SilentlyContinue)
+            $at = 0
+            if ($script:runLogSeen.ContainsKey($file)) { $at = $script:runLogSeen[$file] }
+            if ($lines.Count -gt $at) {
+              $lines[$at..($lines.Count - 1)] | ForEach-Object { Write-Output "[$(Get-Date -Format o)] $_" }
+              $script:runLogSeen[$file] = $lines.Count
+            }
+          }
           while ((Get-Date) -lt $deadline) {
+            Sync-RunLog "$logs\run-play.out"
+            Sync-RunLog "$logs\run-play.err"
             if ((Select-String "$logs\run-play.out" -Pattern 'Application started' -Quiet -ErrorAction SilentlyContinue) -or
                 (Select-String "$logs\run-play.err" -Pattern 'Application started' -Quiet -ErrorAction SilentlyContinue)) {
               $started = $true; break
@@ -380,28 +452,55 @@ jobs:
             if ($p.HasExited) { break }
             Start-Sleep -Seconds 4
           }
+          Sync-RunLog "$logs\run-play.out"
+          Sync-RunLog "$logs\run-play.err"
           # A process that reports Started but crashes immediately is not a
           # passing launch; give it a short grace window before teardown.
-          if ($started) { Start-Sleep -Seconds 10 }
+          if ($started) {
+            $runElapsed = [int]((Get-Date) - $runStart).TotalSeconds
+            Write-Output "::notice::cold water run reached 'Application started' in ${runElapsed}s"
+            Set-Content "$logs\run-play-time.log" "cold water run to 'Application started': ${runElapsed}s"
+            Start-Sleep -Seconds 10
+          }
           taskkill /T /F /PID $p.Id 2>$null | Out-Null
           Get-Process e2eplay -ErrorAction SilentlyContinue | Stop-Process -Force
-          if (-not $started) { Fail "water run never reported 'Application started'" }
+          if (-not $started) {
+            Write-Output "---- run-play.out (tail) ----"
+            Get-Content "$logs\run-play.out" -Tail 60 -ErrorAction SilentlyContinue
+            Write-Output "---- run-play.err (tail) ----"
+            Get-Content "$logs\run-play.err" -Tail 60 -ErrorAction SilentlyContinue
+            Fail "water run never reported 'Application started'"
+          }
           if ((Select-String "$logs\run-play.out" -Pattern 'Application crashed|Application exited' -Quiet -ErrorAction SilentlyContinue) -or
               (Select-String "$logs\run-play.err" -Pattern 'Application crashed|Application exited' -Quiet -ErrorAction SilentlyContinue)) {
             Fail "water run launched but the app died within the grace window"
           }
           '@
           Set-Content -Path 'C:\Windows\Temp\cli-e2e\cli-e2e.ps1' -Value ($header + "`n" + $e2e) -Encoding UTF8
-          # The child's console output is not attached to this step — capture
-          # it and echo it back so ::error:: lines and crash output surface.
+          # The child's console output is not attached to this step — it is
+          # redirected to files that the tail jobs below stream back into this
+          # step's output, so the job log shows progress while the child runs
+          # instead of going silent for the leg's whole duration.
+          $e2eOut = 'C:\Windows\Temp\cli-e2e\e2e.out'
+          $e2eErr = 'C:\Windows\Temp\cli-e2e\e2e.err'
+          New-Item -ItemType File -Force $e2eOut, $e2eErr | Out-Null
           $p = Start-Process -FilePath pwsh `
             -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\Windows\Temp\cli-e2e\cli-e2e.ps1' `
             -Credential (Import-Clixml "$env:RUNNER_TEMP\e2e-cred.xml") `
             -UseNewEnvironment -LoadUserProfile `
-            -WorkingDirectory "C:\Users\$env:E2E_USER" -Wait -PassThru `
-            -RedirectStandardOutput 'C:\Windows\Temp\cli-e2e\e2e.out' `
-            -RedirectStandardError 'C:\Windows\Temp\cli-e2e\e2e.err'
-          Get-Content 'C:\Windows\Temp\cli-e2e\e2e.out','C:\Windows\Temp\cli-e2e\e2e.err' -ErrorAction SilentlyContinue
+            -WorkingDirectory "C:\Users\$env:E2E_USER" -PassThru `
+            -RedirectStandardOutput $e2eOut -RedirectStandardError $e2eErr
+          $tails = @(
+            Start-Job -ScriptBlock { param($f) Get-Content $f -Wait } -ArgumentList $e2eOut
+            Start-Job -ScriptBlock { param($f) Get-Content $f -Wait } -ArgumentList $e2eErr
+          )
+          while (-not $p.HasExited) {
+            $tails | Receive-Job
+            Start-Sleep -Seconds 5
+          }
+          $p.WaitForExit()
+          $tails | Receive-Job
+          $tails | Remove-Job -Force
           if ($null -eq $p.ExitCode -or $p.ExitCode -ne 0) {
             Write-Output "::error::fresh-user e2e script exited $($p.ExitCode)"
             exit 1
@@ -418,12 +517,33 @@ jobs:
           # The fresh user's home itself is not traversable by default — the
           # console user needs +x on it to reach the project inside.
           sudo chmod a+x "/Users/$E2E_USER"
-          sudo chmod -R a+rwX "/Users/$E2E_USER/e2eplay" "/Users/$E2E_USER/e2e-logs"
+          # Hand the project and log dirs to the console user through an
+          # inherited ACL: entries stay owned by the fresh user, anything
+          # created beneath later takes the grant, and no other account gains
+          # access — a recursive a+rwX would open the whole tree instead.
+          sudo chmod -R +a \
+            "$(id -un) allow read,write,execute,delete,append,delete_child,file_inherit,directory_inherit" \
+            "/Users/$E2E_USER/e2eplay" "/Users/$E2E_USER/e2e-logs"
           cd "/Users/$E2E_USER/e2eplay" || exit 1
-          water run > "$RUNNER_TEMP/run-play.log" 2>&1 &
+          echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] water run e2eplay"
+          water run --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+            > "$RUNNER_TEMP/run-play.log" 2>&1 &
           run_pid=$!
+          run_start=$SECONDS
           started=1
-          for _ in $(seq 1 300); do
+          # Stream new log lines as they land so a long cold compile is
+          # visible in the job log instead of a silence. The budget is an
+          # hour: a fresh user pays a cold build of the whole graph here and
+          # the macOS leg has measured over 20 minutes for it.
+          seen=0
+          for _ in $(seq 1 900); do
+            if [ -f "$RUNNER_TEMP/run-play.log" ]; then
+              total=$(wc -l < "$RUNNER_TEMP/run-play.log" | tr -d ' ')
+              if [ "$total" -gt "$seen" ]; then
+                sed -n "$((seen + 1)),${total}p" "$RUNNER_TEMP/run-play.log"
+                seen=$total
+              fi
+            fi
             if grep -q 'Application started' "$RUNNER_TEMP/run-play.log" 2>/dev/null; then
               started=0; break
             fi
@@ -431,13 +551,22 @@ jobs:
             sleep 4
           done
           if [ "$started" -eq 0 ]; then
+            run_elapsed=$((SECONDS - run_start))
+            echo "::notice::cold water run reached 'Application started' in ${run_elapsed}s"
+            echo "cold water run to 'Application started': ${run_elapsed}s" \
+              > "$RUNNER_TEMP/run-play-time.log"
             sleep 10
             grep -q 'Application crashed\|Application exited' "$RUNNER_TEMP/run-play.log" \
               && { echo "::error::water run launched but the app died within the grace window"; started=2; }
           fi
-          kill "$run_pid" 2>/dev/null; sleep 2; kill -9 "$run_pid" 2>/dev/null
+          # `kill` on an already-exited `water run` fails, and the step's shell
+          # runs with `-e`: unguarded, that aborted the leg before the log was
+          # collected and the failure annotated.
+          kill "$run_pid" 2>/dev/null || true; sleep 2; kill -9 "$run_pid" 2>/dev/null || true
           pkill -f 'e2eplay' 2>/dev/null || true
           cp "$RUNNER_TEMP/run-play.log" "/Users/$E2E_USER/e2e-logs/run-play.log" || true
+          cp "$RUNNER_TEMP/run-play-time.log" "/Users/$E2E_USER/e2e-logs/run-play-time.log" \
+            2>/dev/null || true
           if [ "$started" -ne 0 ]; then
             tail -30 "$RUNNER_TEMP/run-play.log" 2>/dev/null || true
           fi
@@ -451,14 +580,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo -u "$E2E_USER" -H bash -s <<'SCRIPT'
+          sudo -u "$E2E_USER" -H env E2E_PLATFORM="$E2E_PLATFORM" E2E_BACKEND="$E2E_BACKEND" \
+            bash -s <<'SCRIPT'
           set -uo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
           cd "$HOME/e2eplay"
-          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a water run > "$HOME/e2e-logs/run-play.log" 2>&1 &
+          # `--yes` answers the GTK4 experimental-backend confirmation, and the
+          # backend must be named: the project default on Linux is hydrolysis.
+          echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] water run e2eplay"
+          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a \
+            water run --yes --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+            > "$HOME/e2e-logs/run-play.log" 2>&1 &
           run_pid=$!
+          run_start=$SECONDS
           started=1
-          for _ in $(seq 1 300); do
+          # Stream new log lines as they land so a long cold compile is
+          # visible in the job log instead of a silence. The budget is an
+          # hour: a fresh user pays a cold build of the whole graph here and
+          # the macOS leg has measured over 20 minutes for it.
+          seen=0
+          for _ in $(seq 1 900); do
+            if [ -f "$HOME/e2e-logs/run-play.log" ]; then
+              total=$(wc -l < "$HOME/e2e-logs/run-play.log" | tr -d ' ')
+              if [ "$total" -gt "$seen" ]; then
+                sed -n "$((seen + 1)),${total}p" "$HOME/e2e-logs/run-play.log"
+                seen=$total
+              fi
+            fi
             if grep -q 'Application started' "$HOME/e2e-logs/run-play.log" 2>/dev/null; then
               started=0; break
             fi
@@ -466,12 +614,19 @@ jobs:
             sleep 4
           done
           if [ "$started" -eq 0 ]; then
+            run_elapsed=$((SECONDS - run_start))
+            echo "::notice::cold water run reached 'Application started' in ${run_elapsed}s"
+            echo "cold water run to 'Application started': ${run_elapsed}s" \
+              > "$HOME/e2e-logs/run-play-time.log"
             sleep 10
             grep -q 'Application crashed\|Application exited' "$HOME/e2e-logs/run-play.log" \
               && { echo "::error::water run launched but the app died within the grace window"; started=2; }
           fi
           kill "$run_pid" 2>/dev/null; sleep 2; kill -9 "$run_pid" 2>/dev/null
           pkill -f 'water run' 2>/dev/null; pkill -f 'e2eplay' 2>/dev/null; pkill Xvfb 2>/dev/null
+          if [ "$started" -ne 0 ]; then
+            tail -30 "$HOME/e2e-logs/run-play.log" 2>/dev/null || true
+          fi
           if [ "$started" -eq 1 ]; then
             echo "::error::water run never reported 'Application started'"
           fi
