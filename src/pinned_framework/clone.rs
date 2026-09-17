@@ -63,15 +63,34 @@ pub fn checkout() -> PathBuf {
     // The lock is released by dropping it: a process that dies mid-clone frees
     // it, and the absent `.complete` marker makes the next caller rebuild.
     lock.lock().expect("the checkout lock is taken");
+    prune_superseded_checkouts(&root, &rev);
     let directory = root.join(&rev);
     if !directory.join(".complete").is_file() {
-        let _ = std::fs::remove_dir_all(&directory);
+        if directory.exists() {
+            std::fs::remove_dir_all(&directory)
+                .expect("a stale pinned-framework checkout is removable");
+        }
         clone_revision(&git, &rev, &directory);
         std::fs::write(directory.join(".complete"), &rev)
             .expect("the completion marker is written");
     }
     drop(lock);
     directory
+}
+
+/// Remove checkouts of revisions the pin has moved away from — one stale
+/// tree per pin bump otherwise accumulates under the root forever. Runs under
+/// the checkout lock, so no other process can be mid-clone on a removed tree.
+fn prune_superseded_checkouts(root: &Path, rev: &str) {
+    for entry in std::fs::read_dir(root).expect("the pinned-framework directory is readable") {
+        let entry = entry.expect("a pinned-framework entry is readable");
+        let path = entry.path();
+        if !path.is_dir() || entry.file_name() == std::ffi::OsStr::new(rev) {
+            continue;
+        }
+        std::fs::remove_dir_all(&path)
+            .expect("a superseded pinned-framework checkout is removable");
+    }
 }
 
 /// Fetch exactly `rev` and expand it, submodules included. A depth-1 fetch of
