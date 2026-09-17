@@ -1623,9 +1623,10 @@ mod tests {
 
         let dir = tempdir().expect("target dir");
         let toolchain = "nightly-2026-09-09-aarch64-apple-darwin";
+        let target_dir = dir.path().join("target");
         let build = RustBuild::new(dir.path(), triple("aarch64-linux-android"))
             .with_build_std(toolchain)
-            .with_target_dir(dir.path().join("target"))
+            .with_target_dir(target_dir.clone())
             .with_sccache(std::path::PathBuf::from("/fake/sccache"));
         let mut cmd = smol::process::Command::new("cargo");
         smol::block_on(build.with_build_std_envs(&mut cmd, false)).expect("build-std envs apply");
@@ -1656,13 +1657,13 @@ mod tests {
             env(crate::workflows::rustc_wrapper::BUILD_STD_TARGET_ENV),
             Some(Some(OsString::from("aarch64-linux-android")))
         );
+        let expected_dylib_dir = target_dir
+            .join("aarch64-linux-android")
+            .join("debug")
+            .join("deps");
         assert_eq!(
             env(crate::workflows::rustc_wrapper::BUILD_STD_DYLIB_DIR_ENV),
-            Some(Some(
-                dir.path()
-                    .join("target/aarch64-linux-android/debug/deps")
-                    .into_os_string()
-            ))
+            Some(Some(expected_dylib_dir.into_os_string()))
         );
         assert_eq!(
             env(crate::workflows::rustc_wrapper::WRAPPER_CHAIN_ENV),
