@@ -66,6 +66,15 @@ const fn hydrolysis_loader_search_path(platform: TargetPlatform) -> Option<&'sta
     }
 }
 
+/// The CEF subprocess helper binary the generated hydrolysis crate declares.
+///
+/// `templates::hydrolysis` emits the helper `[[bin]]` under exactly this name
+/// — [`cef_helper_binary_name`] of the generated package — so the build and
+/// the packaging lookup must both resolve it through here.
+fn hydrolysis_cef_helper_name(backend_crate_name: &str) -> String {
+    crate::project_model::project_types::cef_helper_binary_name(backend_crate_name)
+}
+
 /// Build hydrolysis binary for the host platform.
 ///
 /// # Errors
@@ -164,6 +173,23 @@ pub async fn build_hydrolysis_with_envs_and_features(
         )
         .await
         .wrap_err("Failed to build hydrolysis backend with cargo")?;
+
+    // The generated manifest declares the CEF helper as a second `[[bin]]`
+    // when the application graph selects CEF; a `--bin <main>` build never
+    // emits it, so it needs its own build before packaging can bundle it.
+    if project
+        .browser_runtime_plan(platform, crate::platform::TargetBackend::Hydrolysis)
+        .await?
+        .requires_cef()
+    {
+        build
+            .build_binary(
+                &hydrolysis_cef_helper_name(project.hydrolysis_backend_crate_name().as_str()),
+                options.is_release(),
+            )
+            .await
+            .wrap_err("Failed to build the hydrolysis CEF helper with cargo")?;
+    }
 
     build
         .lib_output_dir(options.is_release())
@@ -450,7 +476,9 @@ async fn package_hydrolysis_macos(
         let helper_binary = binary_path
             .parent()
             .expect("Hydrolysis application binary must have a profile directory")
-            .join("waterui-cef-helper");
+            .join(hydrolysis_cef_helper_name(
+                project.hydrolysis_backend_crate_name().as_str(),
+            ));
         let _helper_apps = package_cef_helper_app(
             &app_path,
             binary_path,
@@ -846,5 +874,64 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         Some("ico") => "image/x-icon",
         Some("txt") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::{
+        framework::test_fixtures::stable_framework,
+        project::ResolvedWebViewBackend,
+        project_types::{BundleIdentifier, CrateName},
+        templates::TemplateContext,
+    };
+
+    /// `package_hydrolysis_macos` locates the built helper under the name
+    /// [`super::hydrolysis_cef_helper_name`] returns; the generated manifest
+    /// declares the helper `[[bin]]` under `cef_helper_binary_name` of the
+    /// package. Pin the two together so a rename on either side fails here
+    /// instead of at packaging time on a user's machine.
+    #[test]
+    fn cef_helper_lookup_name_is_a_bin_the_manifest_declares() {
+        let ctx = TemplateContext::for_support_playground(
+            "Demo",
+            CrateName::try_from("demo").expect("crate name must be valid"),
+            BundleIdentifier::try_from("dev.waterui.demo").expect("bundle id must be valid"),
+            None,
+            &stable_framework(),
+            false,
+            None,
+        )
+        .with_webview_enabled(true)
+        .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
+        let package_name = "demo-hydrolysis-deadbeef";
+        let cargo_toml = crate::templates::hydrolysis::rendered_outputs(&ctx, package_name)
+            .expect("hydrolysis outputs should render")
+            .into_iter()
+            .find_map(|(path, content)| {
+                (path == Path::new("Cargo.toml"))
+                    .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
+            })
+            .expect("hydrolysis Cargo.toml output should exist");
+        let manifest = cargo_toml
+            .parse::<toml::Table>()
+            .expect("hydrolysis Cargo.toml should parse");
+        let bin_names = manifest["bin"]
+            .as_array()
+            .expect("a CEF hydrolysis manifest should declare binaries")
+            .iter()
+            .filter_map(|bin| bin["name"].as_str())
+            .collect::<Vec<_>>();
+        let helper_name = super::hydrolysis_cef_helper_name(package_name);
+        assert!(
+            bin_names.contains(&helper_name.as_str()),
+            "the helper the packager looks up must be a declared bin: {bin_names:?}"
+        );
+        assert!(
+            bin_names.contains(&package_name),
+            "the main binary must remain declared too: {bin_names:?}"
+        );
     }
 }
