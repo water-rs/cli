@@ -1164,8 +1164,10 @@ fn is_no_active_toolchain_error(error: &str) -> bool {
 /// separate Cargo invocations that must land on the same `libstd-<hash>.so`.
 ///
 /// # Errors
-/// Returns an error when no nightly toolchain is installed, or when
-/// `rust-src` is missing and cannot be added to the selected toolchain.
+/// Returns an error when no nightly toolchain is installed, or when the
+/// selected toolchain lacks `rust-src` — the error names the exact
+/// `rustup component add` command rather than mutating the toolchain
+/// silently.
 pub async fn nightly_toolchain_with_rust_src(host: &Host) -> eyre::Result<String> {
     let list = host
         .run("rustup", ["toolchain", "list"])
@@ -1204,17 +1206,10 @@ pub async fn nightly_toolchain_with_rust_src(host: &Host) -> eyre::Result<String
         .map(str::trim)
         .any(|line| line == "rust-src" || line.starts_with("rust-src "));
     if !has_rust_src {
-        host.run(
-            "rustup",
-            ["component", "add", "--toolchain", &toolchain, "rust-src"],
-        )
-        .await
-        .map_err(|error| {
-            eyre::eyre!(
-                "Android preview needs the `rust-src` component on `{toolchain}` \
-                 (`rustup component add --toolchain {toolchain} rust-src`): {error}"
-            )
-        })?;
+        eyre::bail!(
+            "Android preview needs the `rust-src` component on `{toolchain}` to build `std` from source. \
+             Install it with `rustup component add --toolchain {toolchain} rust-src`."
+        );
     }
     Ok(toolchain)
 }
@@ -1362,7 +1357,8 @@ mod tests {
 #[cfg(test)]
 mod host_tests {
     use super::{
-        CLI_MINIMUM_RUST_VERSION, RustToolchain, rustc_verbose_version, tool_binary_name,
+        CLI_MINIMUM_RUST_VERSION, RustToolchain, nightly_toolchain_with_rust_src,
+        rustc_verbose_version, tool_binary_name,
     };
     use crate::toolchain::testing::TestMachine;
     use crate::toolchain::{Installation, Toolchain, ToolchainError};
@@ -1557,6 +1553,46 @@ mod host_tests {
             }
             other => panic!("a version pin below the floor must be manual: {other:?}"),
         }
+    }
+
+    #[test]
+    fn nightly_with_rust_src_returns_the_selected_toolchain() {
+        let machine = TestMachine::new();
+        machine.install("rustup");
+        let host_triple = target_lexicon::Triple::host().to_string();
+        let nightly = format!("nightly-{host_triple}");
+        machine.file(
+            "home/.fake-rustup-toolchains",
+            &format!("stable-{host_triple}\n{nightly}\n"),
+        );
+        machine.respond("RUSTUP_INSTALLED_COMPONENTS", "cargo\nrust-src\n");
+        let host = machine.host(Vec::<(String, String)>::new());
+        let toolchain = smol::block_on(nightly_toolchain_with_rust_src(&host))
+            .expect("a nightly carrying rust-src must be selected");
+        assert_eq!(toolchain, nightly);
+    }
+
+    #[test]
+    fn nightly_without_rust_src_fails_with_the_exact_component_command() {
+        let machine = TestMachine::new();
+        machine.install("rustup");
+        let host_triple = target_lexicon::Triple::host().to_string();
+        let nightly = format!("nightly-{host_triple}");
+        machine.file(
+            "home/.fake-rustup-toolchains",
+            &format!("stable-{host_triple}\n{nightly}\n"),
+        );
+        // `component list` prints nothing — `rust-src` is absent, and the
+        // check must refuse rather than mutate the toolchain silently.
+        let host = machine.host(Vec::<(String, String)>::new());
+        let error = smol::block_on(nightly_toolchain_with_rust_src(&host))
+            .expect_err("missing rust-src must fail");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("rustup component add --toolchain {nightly} rust-src")),
+            "the error must name the exact install command: {error}"
+        );
     }
 
     #[test]
