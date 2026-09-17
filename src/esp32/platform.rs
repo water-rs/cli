@@ -111,7 +111,7 @@ fn home_dir() -> eyre::Result<PathBuf> {
 }
 
 /// Find the newest versioned subdirectory of `base` containing `relative`.
-fn newest_toolchain_subpath(base: &Path, relative: &Path) -> Option<PathBuf> {
+pub(crate) fn newest_toolchain_subpath(base: &Path, relative: &Path) -> Option<PathBuf> {
     let mut versions: Vec<PathBuf> = std::fs::read_dir(base)
         .ok()?
         .filter_map(Result::ok)

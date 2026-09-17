@@ -7,7 +7,10 @@
 
 use std::borrow::Cow;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
+
+use semver::Version;
 
 use crate::{
     android::{
@@ -23,19 +26,24 @@ use crate::{
         toolchain::{AppleSdk, Xcode},
     },
     device::Device,
+    esp32::{chip::Esp32Chip, toolchain::Esp32Toolchain},
+    framework::manifest_rust_version,
     gtk4::toolchain::Gtk4Toolchain,
+    platform::TargetPlatform,
+    project::{Manifest, PackageType},
     toolchain::{
         Host, Installation, Toolchain, ToolchainError, UnfixableToolchain,
+        cargo_helpers::CargoHelpers,
         cmake::Cmake,
         linux::LinuxSystemToolchain,
-        rust::RustToolchain,
+        rust::{CLI_MINIMUM_RUST_VERSION, RustToolchain},
         sccache::Sccache,
-        web::{PackageManagerToolchain, Wasm32UnknownUnknownTarget, WasmPack},
+        web::{PackageManagerToolchain, WasmPack, wasm32_target},
         windows_arm64_llvm::WindowsArm64LlvmToolchain,
     },
+    utils::parse_semver_version,
     winui::toolchain::WinUiToolchain,
 };
-use eyre;
 use serde::{Deserialize, Serialize};
 
 /// Status of a toolchain check.
@@ -216,6 +224,8 @@ pub mod ids {
     pub const MACOS_SDK: &str = "macos-sdk";
     /// rustup-managed Rust toolchain, version floor, and host target.
     pub const RUST: &str = "rust";
+    /// iOS device and simulator rustup targets on the selected toolchain.
+    pub const APPLE_RUST_TARGETS: &str = "apple-rust-targets";
     /// Android SDK root + `sdkmanager`.
     pub const ANDROID_SDK: &str = "android-sdk";
     /// `platform-tools` (`adb`).
@@ -242,6 +252,12 @@ pub mod ids {
     pub const WASM32_TARGET: &str = "wasm32-target";
     /// `wasm-pack` binary.
     pub const WASM_PACK: &str = "wasm-pack";
+    /// The Espressif `esp` toolchain, its clang/GCC/`rust-src` pieces, and the
+    /// `espflash`/`ldproxy` helpers an ESP32 build drives.
+    pub const ESP32_TOOLCHAIN: &str = "esp32-toolchain";
+    /// Cargo-installed helper binaries the CLI's workflows invoke
+    /// (`cargo-nextest` for `water bench`).
+    pub const CARGO_HELPERS: &str = "cargo-helpers";
     /// Distribution packages the Linux backends build against.
     pub const LINUX_SYSTEM_PACKAGES: &str = "linux-system-packages";
     /// GTK4/pango pkg-config probes.
@@ -265,6 +281,7 @@ pub mod ids {
         IOS_SIMULATORS,
         MACOS_SDK,
         RUST,
+        APPLE_RUST_TARGETS,
         ANDROID_SDK,
         ANDROID_PLATFORM_TOOLS,
         ANDROID_SDK_PLATFORMS,
@@ -278,6 +295,8 @@ pub mod ids {
         KOTLIN,
         WASM32_TARGET,
         WASM_PACK,
+        ESP32_TOOLCHAIN,
+        CARGO_HELPERS,
         LINUX_SYSTEM_PACKAGES,
         GTK4,
         WINUI,
@@ -292,6 +311,83 @@ fn unfixable_message(error: &UnfixableToolchain) -> String {
         error.message(),
         error.suggestion()
     )
+}
+
+/// What `host.cwd()` tells doctor about the surrounding project: the
+/// `Water.toml` manifest when the working directory is a project, and the
+/// Rust floor the `rust` item enforces — the maximum of the CLI's own
+/// `rust-version`, the project's `Cargo.toml` `rust-version`, and the
+/// selected framework's.
+struct ProjectContext {
+    manifest: Option<Manifest>,
+    rust_floor: Version,
+}
+
+impl ProjectContext {
+    /// Whether the project selects a backend — always true for a playground,
+    /// whose platform projects the CLI manages on demand.
+    fn selects(&self, selected: impl Fn(&crate::backend::Backends) -> bool) -> bool {
+        self.manifest.as_ref().is_some_and(|manifest| {
+            manifest.package.package_type == PackageType::Playground || selected(&manifest.backends)
+        })
+    }
+
+    /// The chips the project's ESP32 (Dew) backend can target: the chip
+    /// `[backends.esp32]` declares, or every supported chip for a playground.
+    /// `None` when no project is present or no ESP32 backend is selected.
+    fn esp32_chips(&self) -> Option<eyre::Result<Vec<Esp32Chip>>> {
+        let manifest = self.manifest.as_ref()?;
+        if let Some(backend) = manifest.backends.esp32() {
+            return Some(backend.resolved_chip().map(|chip| vec![chip]));
+        }
+        (manifest.package.package_type == PackageType::Playground).then(|| {
+            Ok(vec![
+                Esp32Chip::Esp32S3,
+                Esp32Chip::Esp32C3,
+                Esp32Chip::Esp32P4,
+            ])
+        })
+    }
+}
+
+/// The `rust-version` a `Cargo.toml` root manifest declares, when it parses.
+async fn cargo_manifest_rust_version(path: &Path) -> Option<Version> {
+    let manifest: toml::Value = toml::from_str(&smol::fs::read_to_string(path).await.ok()?).ok()?;
+    manifest_rust_version(&manifest).ok().flatten()
+}
+
+async fn project_context(host: &Host) -> ProjectContext {
+    let manifest = Manifest::open(host.cwd().join("Water.toml")).await.ok();
+    let mut rust_floor = parse_semver_version(CLI_MINIMUM_RUST_VERSION)
+        .unwrap_or_else(|_| unreachable!("CARGO_PKG_RUST_VERSION is valid semver"));
+    if let Some(manifest) = &manifest {
+        // The project's own `rust-version` and the selected framework's both
+        // raise the floor; a `waterui_path` checkout's root manifest carries
+        // the framework's.
+        if let Some(floor) = cargo_manifest_rust_version(&host.cwd().join("Cargo.toml")).await {
+            rust_floor = rust_floor.max(floor);
+        }
+        let framework_floor = match (&manifest.framework, &manifest.waterui_path) {
+            (Some(framework), _) => framework.rust_version().cloned(),
+            (None, Some(waterui_path)) => {
+                let path = Path::new(waterui_path);
+                let root = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    host.cwd().join(path)
+                };
+                cargo_manifest_rust_version(&root.join("Cargo.toml")).await
+            }
+            (None, None) => None,
+        };
+        if let Some(floor) = framework_floor {
+            rust_floor = rust_floor.max(floor);
+        }
+    }
+    ProjectContext {
+        manifest,
+        rust_floor,
+    }
 }
 
 async fn push_toolchain_check<T>(
@@ -429,68 +525,84 @@ async fn push_android_sdk_checks(host: &Host, items: &mut Vec<DoctorItem>) -> bo
     AndroidSdk::sdkmanager_path(host).await.is_some()
 }
 
-async fn push_android_component_checks(host: &Host, items: &mut Vec<DoctorItem>, sdk_ready: bool) {
-    if !sdk_ready {
+async fn push_android_component_checks(
+    host: &Host,
+    items: &mut Vec<DoctorItem>,
+    sdk_ready: bool,
+    project: &ProjectContext,
+) {
+    if sdk_ready {
+        push_toolchain_check(
+            host,
+            items,
+            ids::ANDROID_PLATFORM_TOOLS,
+            "Android Platform-Tools (adb)",
+            "Required for `water run --platform android`",
+            AndroidPlatformTools,
+        )
+        .await;
+        push_toolchain_check(
+            host,
+            items,
+            ids::ANDROID_SDK_PLATFORMS,
+            "Android SDK Platforms",
+            "Required for Android build/package workflows",
+            AndroidSdkPlatforms,
+        )
+        .await;
+        push_toolchain_check(
+            host,
+            items,
+            ids::ANDROID_BUILD_TOOLS,
+            "Android SDK Build-Tools (d8)",
+            "Required for Android build/package workflows",
+            AndroidBuildTools,
+        )
+        .await;
+        push_toolchain_check(
+            host,
+            items,
+            ids::ANDROID_NDK,
+            "Android NDK",
+            "Required for Android build/package workflows",
+            AndroidNdk,
+        )
+        .await;
+    } else {
         push_blocked_android_component_checks(items);
-        return;
     }
 
-    push_toolchain_check(
-        host,
-        items,
-        ids::ANDROID_PLATFORM_TOOLS,
-        "Android Platform-Tools (adb)",
-        "Required for `water run --platform android`",
-        AndroidPlatformTools,
-    )
-    .await;
-    push_toolchain_check(
-        host,
-        items,
-        ids::ANDROID_SDK_PLATFORMS,
-        "Android SDK Platforms",
-        "Required for Android build/package workflows",
-        AndroidSdkPlatforms,
-    )
-    .await;
-    push_toolchain_check(
-        host,
-        items,
-        ids::ANDROID_BUILD_TOOLS,
-        "Android SDK Build-Tools (d8)",
-        "Required for Android build/package workflows",
-        AndroidBuildTools,
-    )
-    .await;
-    push_toolchain_check(
-        host,
-        items,
-        ids::ANDROID_NDK,
-        "Android NDK",
-        "Required for Android build/package workflows",
-        AndroidNdk,
-    )
-    .await;
-    push_toolchain_check(
-        host,
-        items,
-        ids::ANDROID_RUST_TARGETS,
-        "Android Rust Targets",
-        "Required for Android Rust cross-compilation",
-        AndroidRustTargets::default(),
-    )
-    .await;
+    // The rustup targets only need rustup — they are probed regardless of
+    // SDK state, and only when the project actually builds for Android.
+    if project.selects(|backends| backends.android().is_some()) {
+        push_toolchain_check(
+            host,
+            items,
+            ids::ANDROID_RUST_TARGETS,
+            "Android Rust Targets",
+            "Required for Android Rust cross-compilation",
+            AndroidRustTargets::default(),
+        )
+        .await;
+    } else {
+        items.push(DoctorItem::skipped_with_message(
+            ids::ANDROID_RUST_TARGETS,
+            "Android Rust Targets",
+            "No Android backend is selected in this project's Water.toml.",
+        ));
+    }
 }
 
 /// Items emitted when the SDK is missing, in the same order as the probed
 /// branch above so `--json` ordering does not depend on the diagnosis path.
+/// `android-rust-targets` is deliberately absent: it needs only rustup, so it
+/// is probed (or skipped) independently of the SDK.
 fn push_blocked_android_component_checks(items: &mut Vec<DoctorItem>) {
     for (id, name) in [
         (ids::ANDROID_PLATFORM_TOOLS, "Android Platform-Tools (adb)"),
         (ids::ANDROID_SDK_PLATFORMS, "Android SDK Platforms"),
         (ids::ANDROID_BUILD_TOOLS, "Android SDK Build-Tools (d8)"),
         (ids::ANDROID_NDK, "Android NDK"),
-        (ids::ANDROID_RUST_TARGETS, "Android Rust Targets"),
     ] {
         items.push(DoctorItem::missing(
             id,
@@ -539,7 +651,11 @@ async fn push_android_run_target_check(host: &Host, items: &mut Vec<DoctorItem>)
     }
 }
 
-async fn push_desktop_and_web_checks(host: &Host, items: &mut Vec<DoctorItem>) {
+async fn push_desktop_and_web_checks(
+    host: &Host,
+    items: &mut Vec<DoctorItem>,
+    project: &ProjectContext,
+) {
     push_toolchain_check(
         host,
         items,
@@ -586,26 +702,103 @@ async fn push_desktop_and_web_checks(host: &Host, items: &mut Vec<DoctorItem>) {
         Kotlin,
     )
     .await;
-    push_toolchain_check_with_unfixable(
-        host,
-        items,
-        ids::WASM32_TARGET,
-        "Rust wasm32 target",
-        "wasm32-unknown-unknown target not installed",
-        Wasm32UnknownUnknownTarget,
-        ToString::to_string,
-    )
-    .await;
-    push_toolchain_check_with_unfixable(
-        host,
-        items,
-        ids::WASM_PACK,
-        "wasm-pack",
-        "wasm-pack not found (required for web packaging)",
-        WasmPack,
-        ToString::to_string,
-    )
-    .await;
+
+    if project.selects(|backends| backends.hydrolysis().is_some()) {
+        push_toolchain_check_with_unfixable(
+            host,
+            items,
+            ids::WASM32_TARGET,
+            "Rust wasm32 target",
+            "wasm32-unknown-unknown target not installed",
+            wasm32_target(),
+            ToString::to_string,
+        )
+        .await;
+        push_toolchain_check_with_unfixable(
+            host,
+            items,
+            ids::WASM_PACK,
+            "wasm-pack",
+            "wasm-pack not found (required for web packaging)",
+            WasmPack,
+            ToString::to_string,
+        )
+        .await;
+    } else {
+        items.push(DoctorItem::skipped_with_message(
+            ids::WASM32_TARGET,
+            "Rust wasm32 target",
+            "No hydrolysis (web) backend is selected in this project's Water.toml.",
+        ));
+        items.push(DoctorItem::skipped_with_message(
+            ids::WASM_PACK,
+            "wasm-pack",
+            "No hydrolysis (web) backend is selected in this project's Water.toml.",
+        ));
+    }
+}
+
+/// The Espressif-side toolchain — `esp` Rust fork, clang/GCC, `rust-src`,
+/// `espflash`/`ldproxy`, QEMU — when the project selects a Dew/ESP32 backend.
+async fn push_esp32_check(host: &Host, items: &mut Vec<DoctorItem>, project: &ProjectContext) {
+    const NAME: &str = "ESP32 toolchain";
+    let Some(chips) = project.esp32_chips() else {
+        items.push(DoctorItem::skipped_with_message(
+            ids::ESP32_TOOLCHAIN,
+            NAME,
+            "No ESP32 backend is selected in this project's Water.toml.",
+        ));
+        return;
+    };
+    let chips = match chips {
+        Ok(chips) => chips,
+        Err(error) => {
+            items.push(DoctorItem::missing(
+                ids::ESP32_TOOLCHAIN,
+                NAME,
+                format!("Invalid `[backends.esp32]` configuration: {error}"),
+            ));
+            return;
+        }
+    };
+    match Esp32Toolchain::new(chips).check(host).await {
+        Ok(()) => items.push(DoctorItem::ok(ids::ESP32_TOOLCHAIN, NAME)),
+        Err(ToolchainError::Fixable(installation)) => items.push(DoctorItem::fixable(
+            ids::ESP32_TOOLCHAIN,
+            NAME,
+            installation.describe(),
+            installation,
+            host,
+        )),
+        Err(ToolchainError::Unfixable(error)) => items.push(DoctorItem::missing(
+            ids::ESP32_TOOLCHAIN,
+            NAME,
+            unfixable_message(&error),
+        )),
+    }
+}
+
+/// The cargo-installed helper binaries a project's workflows invoke —
+/// `cargo-nextest` for `water bench`. Platform helpers that are also cargo
+/// installs (`wasm-pack`, `espflash`/`ldproxy`) are covered by their own
+/// platform items.
+async fn push_cargo_helpers_check(host: &Host, items: &mut Vec<DoctorItem>) {
+    const NAME: &str = "Cargo helpers";
+    match CargoHelpers::new(["cargo-nextest"]).check(host).await {
+        Ok(()) => items.push(DoctorItem::ok(ids::CARGO_HELPERS, NAME)),
+        Err(ToolchainError::Fixable(installation)) => items.push(DoctorItem::fixable(
+            ids::CARGO_HELPERS,
+            NAME,
+            installation.describe(),
+            installation,
+            host,
+        )),
+        Err(ToolchainError::Unfixable(error)) => items.push(DoctorItem::missing(
+            ids::CARGO_HELPERS,
+            NAME,
+            unfixable_message(&error),
+        )),
+    }
 }
 
 async fn push_linux_checks(host: &Host, items: &mut Vec<DoctorItem>) {
@@ -700,17 +893,24 @@ async fn push_windows_checks(host: &Host, items: &mut Vec<DoctorItem>) {
 
 /// Run diagnostics on all toolchains on `host` and return a report.
 ///
-/// Item order is fixed and platform branching is driven by `cfg!`, so two runs
-/// on equal hosts produce identical item sequences — the property the
-/// orchestration tests and `--json` consumers rely on.
+/// Item order is fixed and platform branching is driven by `cfg!` plus the
+/// project context `host.cwd()` resolves, so two runs on equal hosts in equal
+/// projects produce identical item sequences — the property the
+/// orchestration tests and `--json` consumers rely on. Without a `Water.toml`
+/// the host-level checks still run and every project-gated item reports
+/// `skipped`.
 pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
+    let project = project_context(host).await;
     let mut items = Vec::new();
     push_apple_checks(host, &mut items).await;
-    push_rust_toolchain_check(host, &mut items).await;
+    push_rust_toolchain_check(host, &mut items, &project).await;
+    push_apple_rust_targets(host, &mut items, &project).await;
     let sdk_ready = push_android_sdk_checks(host, &mut items).await;
-    push_android_component_checks(host, &mut items, sdk_ready).await;
+    push_android_component_checks(host, &mut items, sdk_ready, &project).await;
     push_android_run_target_check(host, &mut items).await;
-    push_desktop_and_web_checks(host, &mut items).await;
+    push_desktop_and_web_checks(host, &mut items, &project).await;
+    push_esp32_check(host, &mut items, &project).await;
+    push_cargo_helpers_check(host, &mut items).await;
     push_linux_checks(host, &mut items).await;
     push_windows_checks(host, &mut items).await;
     push_toolchain_check(
@@ -722,25 +922,63 @@ pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
         Sccache,
     )
     .await;
-    push_web_package_manager_check(host, &mut items).await;
+    push_web_package_manager_check(host, &mut items, &project).await;
 
     items
 }
 
-/// Checks the `[web] package_manager` the current directory's `Water.toml`
-/// declares. Only the declared manager is probed — a project on `pnpm` is
-/// never reported healthy because `bun` happens to be installed.
-async fn push_web_package_manager_check(host: &Host, items: &mut Vec<DoctorItem>) {
-    let Ok(cwd) = std::env::current_dir() else {
+/// The iOS device and simulator rustup targets an Apple-backend project
+/// needs on its selected toolchain. (The macOS target is the host triple the
+/// `rust` item already requires.)
+async fn push_apple_rust_targets(
+    host: &Host,
+    items: &mut Vec<DoctorItem>,
+    project: &ProjectContext,
+) {
+    const NAME: &str = "Apple Rust targets";
+    if !cfg!(target_os = "macos") {
+        items.push(DoctorItem::skipped_with_message(
+            ids::APPLE_RUST_TARGETS,
+            NAME,
+            "Apple platforms can only be built on macOS.",
+        ));
         return;
-    };
-    let Ok(manifest_text) = smol::fs::read_to_string(cwd.join("Water.toml")).await else {
+    }
+    if !project.selects(|backends| backends.apple().is_some()) {
+        items.push(DoctorItem::skipped_with_message(
+            ids::APPLE_RUST_TARGETS,
+            NAME,
+            "No Apple backend is selected in this project's Water.toml.",
+        ));
         return;
-    };
-    let Ok(manifest) = toml::from_str::<crate::project::Manifest>(&manifest_text) else {
-        return;
-    };
-    let Some(web) = manifest.web else {
+    }
+    push_toolchain_check(
+        host,
+        items,
+        ids::APPLE_RUST_TARGETS,
+        NAME,
+        "Required iOS targets are missing on the selected Rust toolchain",
+        crate::toolchain::rust::SelectedToolchainTargets::new(vec![
+            TargetPlatform::IOS.triple().to_string(),
+            TargetPlatform::IOSSimulator.triple().to_string(),
+        ]),
+    )
+    .await;
+}
+
+/// Checks the `[web] package_manager` the project's `Water.toml` declares.
+/// Only the declared manager is probed — a project on `pnpm` is never
+/// reported healthy because `bun` happens to be installed.
+async fn push_web_package_manager_check(
+    host: &Host,
+    items: &mut Vec<DoctorItem>,
+    project: &ProjectContext,
+) {
+    let Some(web) = project
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.web.as_ref())
+    else {
         return;
     };
     let package_manager = web.package_manager;
@@ -761,8 +999,12 @@ async fn push_web_package_manager_check(host: &Host, items: &mut Vec<DoctorItem>
     .await;
 }
 
-async fn push_rust_toolchain_check(host: &Host, items: &mut Vec<DoctorItem>) {
-    match RustToolchain.check(host).await {
+async fn push_rust_toolchain_check(
+    host: &Host,
+    items: &mut Vec<DoctorItem>,
+    project: &ProjectContext,
+) {
+    match RustToolchain::new(&project.rust_floor).check(host).await {
         Ok(()) => items.push(DoctorItem::ok(ids::RUST, "Rust toolchain")),
         Err(ToolchainError::Fixable(installation)) => {
             items.push(DoctorItem::fixable(
@@ -793,8 +1035,15 @@ mod tests {
         ids::ANDROID_SDK_PLATFORMS,
         ids::ANDROID_BUILD_TOOLS,
         ids::ANDROID_NDK,
-        ids::ANDROID_RUST_TARGETS,
     ];
+
+    /// A minimal `Water.toml` app manifest; `extra` is appended verbatim
+    /// (`[backends.*]`, `[web]`, ...).
+    fn manifest(extra: &str) -> String {
+        format!(
+            "[package]\ntype = \"app\"\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n\n{extra}"
+        )
+    }
 
     fn ids_of(items: &[super::DoctorItem]) -> Vec<&'static str> {
         items.iter().map(|item| item.id).collect()
@@ -846,6 +1095,13 @@ mod tests {
             );
         }
 
+        // Without a manifest the Android rust targets are not required, so
+        // the item is skipped rather than blocked or probed.
+        assert_eq!(
+            item(&items, ids::ANDROID_RUST_TARGETS).status,
+            CheckStatus::Skipped
+        );
+
         let run_targets = item(&items, ids::ANDROID_RUN_TARGETS);
         assert_eq!(run_targets.status, CheckStatus::Missing);
         assert!(
@@ -859,6 +1115,7 @@ mod tests {
     #[test]
     fn doctor_probes_android_components_when_sdk_ready() {
         let machine = TestMachine::new();
+        machine.file("Water.toml", &manifest("[backends.android]\n"));
         let sdk = machine.install_android_sdk();
         let host = machine.host([(
             String::from("ANDROID_SDK_ROOT"),
@@ -889,8 +1146,11 @@ mod tests {
         ] {
             assert!(item(&items, id).is_fixable(), "{id} must be fixable");
         }
-        // No rustup on the fake PATH → Android Rust targets are unfixable.
-        assert!(!item(&items, ids::ANDROID_RUST_TARGETS).is_fixable());
+        // The manifest selects the Android backend, so the rustup targets are
+        // probed; with no rustup on the fake PATH they are unfixable.
+        let rust_targets = item(&items, ids::ANDROID_RUST_TARGETS);
+        assert_eq!(rust_targets.status, CheckStatus::Missing);
+        assert!(!rust_targets.is_fixable());
     }
 
     #[test]
@@ -994,14 +1254,157 @@ mod tests {
         assert_eq!(rust.status, CheckStatus::Missing);
         assert!(!rust.is_fixable());
 
-        // wasm-pack installs via `cargo install` → always fixable.
-        let wasm_pack = item(&items, ids::WASM_PACK);
-        assert_eq!(wasm_pack.status, CheckStatus::Missing);
-        assert!(wasm_pack.is_fixable());
+        // The cargo helpers need `cargo` to install → manual without it.
+        let cargo_helpers = item(&items, ids::CARGO_HELPERS);
+        assert_eq!(cargo_helpers.status, CheckStatus::Missing);
+        assert!(!cargo_helpers.is_fixable());
 
         // On Linux a bare host still plans an SDK install into ~/Android/Sdk.
         #[cfg(target_os = "linux")]
         assert!(item(&items, ids::ANDROID_SDK).is_fixable());
+    }
+
+    /// With a hydrolysis backend selected and `cargo` on PATH, a missing
+    /// `wasm-pack` is a `cargo install` away → fixable.
+    #[test]
+    fn doctor_wasm_pack_fixable_when_hydrolysis_selected() {
+        let machine = TestMachine::new();
+        machine.file("Water.toml", &manifest("[backends.hydrolysis]\n"));
+        machine.install("cargo");
+        let host = machine.host(Vec::<(String, String)>::new());
+        let items = smol::block_on(doctor(&host));
+
+        let wasm_pack = item(&items, ids::WASM_PACK);
+        assert_eq!(wasm_pack.status, CheckStatus::Missing);
+        assert!(wasm_pack.is_fixable());
+    }
+
+    /// Project-gated items must not report failures for projects that do not
+    /// select the platform.
+    #[test]
+    fn doctor_skips_platform_items_no_project_selects() {
+        let machine = TestMachine::new();
+        let host = machine.host(Vec::<(String, String)>::new());
+        let items = smol::block_on(doctor(&host));
+
+        for id in [
+            ids::ANDROID_RUST_TARGETS,
+            ids::WASM32_TARGET,
+            ids::WASM_PACK,
+            ids::ESP32_TOOLCHAIN,
+            ids::APPLE_RUST_TARGETS,
+        ] {
+            assert_eq!(
+                item(&items, id).status,
+                CheckStatus::Skipped,
+                "{id} must be skipped on a project-less host"
+            );
+        }
+    }
+
+    /// Every platform the manifest selects is probed, even on a bare host.
+    #[test]
+    fn doctor_probes_the_backends_a_manifest_selects() {
+        let machine = TestMachine::new();
+        machine.file(
+            "Water.toml",
+            &manifest(
+                "[backends.android]\n\n[backends.hydrolysis]\n\n[backends.esp32]\nchip = \"esp32c3\"\n\n[backends.apple]\nscheme = \"Fixture\"\n",
+            ),
+        );
+        let host = machine.host(Vec::<(String, String)>::new());
+        let items = smol::block_on(doctor(&host));
+
+        for id in [
+            ids::ANDROID_RUST_TARGETS,
+            ids::WASM32_TARGET,
+            ids::WASM_PACK,
+            ids::ESP32_TOOLCHAIN,
+        ] {
+            assert_eq!(
+                item(&items, id).status,
+                CheckStatus::Missing,
+                "selected {id} must be probed on a bare host"
+            );
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                item(&items, ids::APPLE_RUST_TARGETS).status,
+                CheckStatus::Missing
+            );
+        }
+    }
+
+    /// An `[backends.esp32]` chip the CLI does not support is a diagnostic,
+    /// not a skipped item.
+    #[test]
+    fn doctor_reports_invalid_esp32_chip() {
+        let machine = TestMachine::new();
+        machine.file(
+            "Water.toml",
+            &manifest("[backends.esp32]\nchip = \"atmega328p\"\n"),
+        );
+        let host = machine.host(Vec::<(String, String)>::new());
+        let items = smol::block_on(doctor(&host));
+
+        let esp32 = item(&items, ids::ESP32_TOOLCHAIN);
+        assert_eq!(esp32.status, CheckStatus::Missing);
+        assert!(
+            esp32
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("Invalid")),
+            "the invalid chip must be diagnosed: {:?}",
+            esp32.message
+        );
+    }
+
+    /// A `--fix` pass runs each fixable item's install; a re-diagnosis must
+    /// then observe the repair — the fix-loop property `water doctor --fix`
+    /// relies on.
+    #[test]
+    #[cfg(unix)]
+    fn doctor_fix_loop_repairs_pinned_toolchain() {
+        let machine = TestMachine::new();
+        machine.file("Water.toml", &manifest(""));
+        machine.file("rust-toolchain.toml", "[toolchain]\nchannel = \"1.90\"\n");
+        for tool in ["rustup", "cargo", "rustc"] {
+            machine.install(tool);
+        }
+        let host = machine.host([
+            (
+                String::from("WATERUI_FAKE_RUSTUP_TOOLCHAIN_NOT_INSTALLED"),
+                String::from("1.90"),
+            ),
+            (
+                String::from("WATERUI_FAKE_RUSTC_VERSION"),
+                String::from("99.0.0"),
+            ),
+            (
+                String::from("WATERUI_FAKE_RUSTC_HOST"),
+                String::from("x86_64-unknown-fake"),
+            ),
+            (
+                String::from("WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS"),
+                String::from("x86_64-unknown-fake"),
+            ),
+        ]);
+
+        let items = smol::block_on(doctor(&host));
+        let rust = items
+            .into_iter()
+            .find(|item| item.id == ids::RUST)
+            .expect("rust item");
+        assert_eq!(rust.status, CheckStatus::Missing);
+        let install = rust.install_fn.expect("the pin repair must be fixable");
+        smol::block_on(install()).expect("install must succeed on the fake host");
+
+        let items = smol::block_on(doctor(&host));
+        assert_eq!(
+            item(&items, ids::RUST).status,
+            CheckStatus::Ok,
+            "after `rustup toolchain install 1.90` the rust item must be ok"
+        );
     }
 
     #[test]
@@ -1015,7 +1418,12 @@ mod tests {
         machine.install_android_ndk("29.0.14206865");
         machine.install_android_emulator();
         machine.install("rustup");
+        machine.file("Water.toml", &manifest("[backends.android]\n"));
         machine.respond("EMULATOR_AVDS", "Medium_Phone_API_37\n");
+        machine.respond(
+            "RUSTUP_ACTIVE_TOOLCHAIN",
+            "stable-x86_64-unknown-fake (default)",
+        );
         machine.respond(
             "RUSTUP_INSTALLED_TARGETS",
             &[
