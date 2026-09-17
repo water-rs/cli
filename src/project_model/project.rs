@@ -447,6 +447,59 @@ impl Project {
         generated_crate_name(&self.crate_name, "tui", &self.root)
     }
 
+    /// The executable name a packaged backend binary ships under: the
+    /// configured `[crates]` override verbatim, or `<crate>-<suffix>` when
+    /// the crate is generated.
+    ///
+    /// [`generated_crate_name`]'s project-root tag exists to keep a shared
+    /// Cargo target directory unambiguous; it is internal to the build and
+    /// must never name a shipped executable.
+    fn shipped_backend_binary_name(
+        &self,
+        suffix: &str,
+        configured: Option<&CrateName>,
+    ) -> CrateName {
+        configured
+            .cloned()
+            .unwrap_or_else(|| self.crate_name.with_suffix(suffix))
+    }
+
+    /// The executable name the packaged GTK4 binary ships under.
+    #[must_use]
+    pub fn gtk4_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name(
+            "gtk4",
+            self.app_crate_overrides()
+                .and_then(|crates| crates.gtk.as_ref()),
+        )
+    }
+
+    /// The executable name the packaged hydrolysis binary ships under.
+    #[must_use]
+    pub fn hydrolysis_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name(
+            "hydrolysis",
+            self.app_crate_overrides()
+                .and_then(|crates| crates.hydrolysis.as_ref()),
+        )
+    }
+
+    /// The executable name the packaged `WinUI` binary ships under.
+    #[must_use]
+    pub fn winui_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name(
+            "winui",
+            self.app_crate_overrides()
+                .and_then(|crates| crates.winui.as_ref()),
+        )
+    }
+
+    /// The name the packaged ESP32 firmware image ships under.
+    #[must_use]
+    pub fn esp32_binary_name(&self) -> CrateName {
+        self.shipped_backend_binary_name("esp32", None)
+    }
+
     /// Get package type declared in `Water.toml`.
     #[must_use]
     pub const fn package_type(&self) -> PackageType {
@@ -2851,6 +2904,59 @@ mod scaffold_tests {
             assert!(
                 !root.exists(),
                 "the rejection precedes any file write: {error}"
+            );
+        }
+    }
+
+    /// Generated crate names carry the project-root tag that keeps a shared
+    /// Cargo target directory unambiguous; the names packaged binaries ship
+    /// under drop it — a checkout path must never appear in a shipped
+    /// executable name.
+    #[test]
+    fn shipped_binary_names_drop_the_project_root_tag() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("water-example");
+        let project = smol::block_on(Project::create(
+            &root,
+            CreateOptions {
+                name: "Water Example".to_string(),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                    .expect("bundle identifier"),
+                package_type: PackageType::Playground,
+                waterui_path: None,
+                channel: None,
+                framework_manifest: None,
+                framework: Some(crate::framework::test_fixtures::stable_framework()),
+                author: "Lexo Liu".to_string(),
+                backends: Vec::new(),
+                web: None,
+            },
+        ))
+        .expect("project creation must succeed");
+
+        for (shipped, tagged) in [
+            (project.gtk4_binary_name(), project.gtk_backend_crate_name()),
+            (
+                project.hydrolysis_binary_name(),
+                project.hydrolysis_backend_crate_name(),
+            ),
+            (
+                project.winui_binary_name(),
+                project.winui_backend_crate_name(),
+            ),
+            (
+                project.esp32_binary_name(),
+                project.esp32_backend_crate_name(),
+            ),
+        ] {
+            assert!(
+                tagged.as_str().starts_with(&format!("{shipped}-")),
+                "the build name must be the shipped name plus the tag: {tagged}"
+            );
+            assert_eq!(
+                tagged.as_str().len() - shipped.as_str().len(),
+                9,
+                "the tag is a dash plus eight hex digits: {tagged}"
             );
         }
     }

@@ -221,10 +221,16 @@ pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::
         RustDynamicLibraries::remove_staged(runtime_dir, &TargetPlatform::Windows.triple()).await?;
     }
 
-    Ok(Artifact::new(
-        project.bundle_identifier(),
-        final_binary_path,
-    ))
+    // Ship the binary under the product name; the tagged Cargo artifact name
+    // is internal to the shared target directory.
+    let packaged_binary = crate::platforming::packaging::stage_binary_as(
+        &final_binary_path,
+        runtime_dir,
+        &format!("{}.exe", project.winui_binary_name()),
+    )
+    .await?;
+
+    Ok(Artifact::new(project.bundle_identifier(), packaged_binary))
 }
 
 // ============================================================================

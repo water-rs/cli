@@ -28,7 +28,7 @@ use crate::{
 #[cfg(target_os = "macos")]
 use crate::{
     macos_bundle::{
-        MacOsUsageDescription, package_binary_as_app, package_cef_helper_app,
+        MacOsAppNames, MacOsUsageDescription, package_binary_as_app, package_cef_helper_app,
         sign_macos_app as sign_app,
     },
     project::BrowserRuntimePlan,
@@ -395,24 +395,32 @@ pub async fn package_hydrolysis(
     synchronize_shared_runtime(runtime_dir, shared_libraries.as_ref(), &platform.triple()).await?;
     browser_runtime::stage(runtime_plan, platform, profile_directory, runtime_dir).await?;
 
+    // Ship the binary under the product name; the tagged Cargo artifact name
+    // is internal to the shared target directory.
+    let binary_name = project.hydrolysis_binary_name();
+    let shipped_name = if platform == TargetPlatform::Windows {
+        format!("{binary_name}.exe")
+    } else {
+        binary_name.to_string()
+    };
+    let packaged_binary = crate::platforming::packaging::stage_binary_as(
+        &final_binary_path,
+        runtime_dir,
+        &shipped_name,
+    )
+    .await?;
+
     if platform == TargetPlatform::Linux {
-        let executable_name = final_binary_path
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .ok_or_else(|| eyre::eyre!("Hydrolysis binary has no valid executable name"))?;
         crate::platforming::linux_share::write_linux_share_material(
             project,
             &project.manifest().package.name,
-            executable_name,
+            binary_name.as_str(),
             &backend_path.join("dist/share"),
         )
         .await?;
     }
 
-    Ok(Artifact::new(
-        project.bundle_identifier(),
-        final_binary_path,
-    ))
+    Ok(Artifact::new(project.bundle_identifier(), packaged_binary))
 }
 
 #[cfg(target_os = "macos")]
@@ -457,7 +465,10 @@ async fn package_hydrolysis_macos(
     let app_path = package_binary_as_app(
         binary_path,
         project.bundle_identifier(),
-        &app_name,
+        MacOsAppNames {
+            app_name: &app_name,
+            executable_name: project.hydrolysis_binary_name().as_str(),
+        },
         &usage_descriptions,
         Some(&backend_path.join("resources")),
         &icns,
@@ -479,9 +490,14 @@ async fn package_hydrolysis_macos(
             .join(hydrolysis_cef_helper_name(
                 project.hydrolysis_backend_crate_name().as_str(),
             ));
+        // The helper apps are named after the shipped executable, so they
+        // derive from the packaged copy — not the tagged Cargo artifact.
+        let main_binary = app_path
+            .join("Contents/MacOS")
+            .join(project.hydrolysis_binary_name().as_str());
         let _helper_apps = package_cef_helper_app(
             &app_path,
-            binary_path,
+            &main_binary,
             &helper_binary,
             project.bundle_identifier(),
         )

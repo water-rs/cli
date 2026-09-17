@@ -540,7 +540,9 @@ pub async fn package_esp32(project: &Project, options: PackageOptions) -> eyre::
 
     let dist_dir = backend_path.join("dist");
     fs::create_dir_all(&dist_dir).await?;
-    let image_path = dist_dir.join(format!("{}.bin", project.esp32_backend_crate_name()));
+    // The image ships under the product name; the tagged crate name is
+    // internal to the shared Cargo target directory.
+    let image_path = dist_dir.join(format!("{}.bin", project.esp32_binary_name()));
     save_flash_image(&backend_path, chip, &elf, &image_path).await?;
 
     Ok(Artifact::new(project.bundle_identifier(), image_path))

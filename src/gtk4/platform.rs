@@ -213,10 +213,16 @@ pub async fn package_gtk4(project: &Project, options: PackageOptions) -> eyre::R
         RustDynamicLibraries::remove_staged(runtime_dir, &TargetPlatform::Linux.triple()).await?;
     }
 
-    Ok(Artifact::new(
-        project.bundle_identifier(),
-        final_binary_path,
-    ))
+    // Ship the binary under the product name; the tagged Cargo artifact name
+    // is internal to the shared target directory.
+    let packaged_binary = crate::platforming::packaging::stage_binary_as(
+        &final_binary_path,
+        runtime_dir,
+        project.gtk4_binary_name().as_str(),
+    )
+    .await?;
+
+    Ok(Artifact::new(project.bundle_identifier(), packaged_binary))
 }
 
 // ============================================================================
