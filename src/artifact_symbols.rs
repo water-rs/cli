@@ -201,7 +201,7 @@ pub async fn build_host_rlib(
         .arg(target_dir)
         .current_dir(project_path);
     if let Some(sccache_path) = sccache_path {
-        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path);
+        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path)?;
     }
     // Stdout stays collected-only: it carries the JSON message stream parsed
     // below, so a progress sink must never mirror it to the terminal.
@@ -301,17 +301,29 @@ mod tests {
     /// it cold every attempt. Sources stage into a wiped `crate/` beside the
     /// persistent `target/` so a file deleted from `tests/fixtures/web_meta`
     /// cannot survive in the staged tree.
-    fn web_meta_fixture() -> PathBuf {
+    ///
+    /// The returned file handle is a held lock covering the fixture for the
+    /// whole test: a second caller's restage waits rather than wiping `crate/`
+    /// under this one's build. `crate/Cargo.lock` survives the wipe on
+    /// purpose — it is a build artifact, not fixture content, and regenerating
+    /// it re-resolves the pinned git dependency on every retry.
+    fn web_meta_fixture() -> (PathBuf, std::fs::File) {
         let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures/web-meta");
-        // Sources stage into a wiped `crate/`: copying over an existing tree
-        // keeps files the fixture deleted, so the staged crate must start
-        // empty — and anything beside it that is not the persistent `target/`
-        // is a leftover from an older layout.
         std::fs::create_dir_all(&fixture).expect("the fixture directory is creatable");
+        let lock_path = fixture.join(".restage.lock");
+        let restage_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("the restage lock opens");
+        fs4::FileExt::lock(&restage_lock).expect("the restage lock acquires");
+
+        let staged = fixture.join("crate");
         for entry in std::fs::read_dir(&fixture).expect("the fixture directory is readable") {
             let path = entry.expect("a fixture entry is readable").path();
-            if path == fixture.join("target") {
+            if path == fixture.join("target") || path == staged || path == lock_path {
                 continue;
             }
             if path.is_dir() {
@@ -321,7 +333,22 @@ mod tests {
             }
             .expect("a stale fixture entry is removable");
         }
-        let staged = fixture.join("crate");
+        // `crate/` itself is wiped too, except `Cargo.lock` — the one build
+        // artifact worth keeping across a restage.
+        if staged.is_dir() {
+            for entry in std::fs::read_dir(&staged).expect("the staged crate is readable") {
+                let path = entry.expect("a staged entry is readable").path();
+                if path == staged.join("Cargo.lock") {
+                    continue;
+                }
+                if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                }
+                .expect("a stale staged entry is removable");
+            }
+        }
         fs_extra::dir::copy(
             &sources,
             &staged,
@@ -332,7 +359,7 @@ mod tests {
         .expect("the fixture sources copy");
         std::fs::write(staged.join("Cargo.toml"), web_meta_manifest())
             .expect("the manifest is written");
-        fixture
+        (fixture, restage_lock)
     }
 
     /// The staged fixture's `Cargo.toml`, with the `waterui` dependency pinned
@@ -445,7 +472,7 @@ mod tests {
     #[ignore = "fetches the pinned framework revision"]
     fn reads_include_web_mount_meta_from_built_rlib() {
         futures_lite::future::block_on(async {
-            let fixture = web_meta_fixture();
+            let (fixture, _restage_guard) = web_meta_fixture();
             let project = fixture.join("crate");
             let rlib = build_host_rlib(&project, &fixture.join("target"), None, None)
                 .await
