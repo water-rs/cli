@@ -172,10 +172,11 @@ exit /b 0
 
 rem `rustup run <toolchain> <tool> <args...>` proxies to the named tool —
 rem dispatch to the sibling fake in this directory, like a real rustup proxy.
+rem cmd's `shift` rewrites %0, so the sibling path must be resolved first.
 :rustup_run
+set "run_tool=%~dp0%~3.cmd"
 shift
 shift
-set "run_tool=%~dp0%1.cmd"
 set "run_args="
 :rustup_run_args
 if not "%~2"=="" (set "run_args=!run_args! %~2" & shift & goto :rustup_run_args)
