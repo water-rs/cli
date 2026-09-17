@@ -652,7 +652,7 @@ impl Shell {
 enum CompileRender {
     /// Every line, above the multi-progress area.
     Interactive,
-    /// One phase line per crate unit, on stderr.
+    /// Every event as a plain line on stderr, ANSI-stripped.
     Piped,
     /// A `build-progress` JSON record per event, on stdout.
     Json,
@@ -669,15 +669,8 @@ fn render_compile_event(
             let _ = bars.println(compile_event_text(units, event));
         }
         CompileRender::Piped => {
-            // Events carry cargo's raw line, which a user-forced color
-            // setting leaves ANSI-wrapped; plain piped output strips it.
-            // `Line` events must render too: they carry cargo's `Updating` /
-            // `Downloaded` / `Blocking waiting for file lock` status text —
-            // the only signal a piped build's resolve phase emits, and the
-            // difference between a stalled log and a diagnosable one.
-            let text = compile_event_text(units, event);
             let mut stderr = anstream::stderr().lock();
-            let _ = writeln!(stderr, "{}", console::strip_ansi_codes(&text));
+            let _ = writeln!(stderr, "{}", piped_event_line(units, event));
             let _ = stderr.flush();
         }
         CompileRender::Json => {
@@ -689,6 +682,16 @@ fn render_compile_event(
             }
         }
     }
+}
+
+/// The line a piped terminal sees for one event: cargo's raw text with any
+/// ANSI decoration stripped — a user-forced color setting leaves it wrapped,
+/// and plain piped output strips it. `Line` events render too: they carry
+/// cargo's `Updating` / `Downloaded` / `Blocking waiting for file lock`
+/// status text — the only signal a piped build's resolve phase emits, and
+/// the difference between a stalled log and a diagnosable one.
+fn piped_event_line(units: &AtomicUsize, event: &CompileEvent) -> String {
+    console::strip_ansi_codes(&compile_event_text(units, event)).into_owned()
 }
 
 /// One cargo status line rendered the way cargo itself renders it, with the
@@ -852,4 +855,50 @@ macro_rules! header {
     ($shell:expr, $($arg:tt)*) => {{
         let _ = $shell.header(format!($($arg)*));
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use waterui_cli::build::CompileEvent;
+
+    use super::piped_event_line;
+
+    /// A `Line` event — cargo's `Updating` / `Blocking waiting for file lock`
+    /// status text — is the only signal a piped build emits before the first
+    /// unit compiles; dropping it is what left a nightly run log stuck at
+    /// `Building...` with nothing to diagnose.
+    #[test]
+    fn piped_render_keeps_cargo_status_lines() {
+        let units = AtomicUsize::new(0);
+        let line = piped_event_line(
+            &units,
+            &CompileEvent::Line("Blocking waiting for file lock on package cache".to_string()),
+        );
+        assert_eq!(line, "Blocking waiting for file lock on package cache");
+    }
+
+    /// Piped output is plain text: a user-forced color setting wraps events
+    /// in ANSI, which the render strips, and a unit still counts up.
+    #[test]
+    fn piped_render_strips_ansi_and_counts_units() {
+        let units = AtomicUsize::new(0);
+        let line = piped_event_line(
+            &units,
+            &CompileEvent::Line("\u{1b}[32mUpdating\u{1b}[0m index".to_string()),
+        );
+        assert_eq!(line, "Updating index");
+
+        let line = piped_event_line(
+            &units,
+            &CompileEvent::Unit {
+                phase: "Compiling",
+                name: "waterui".to_string(),
+                version: Some("0.1.0".to_string()),
+            },
+        );
+        assert!(line.contains("Compiling waterui v0.1.0"), "{line}");
+        assert!(line.ends_with("(1)"), "{line}");
+    }
 }
