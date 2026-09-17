@@ -26,6 +26,13 @@
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long a rewritten unit may wait on a sibling artifact — the produced
+/// `libstd` dylib or a pipelined dep rlib — before the wait is declared
+/// failed. `-Zbuild-std` codegen can run for minutes; the bound only keeps
+/// a genuinely missing artifact from hanging the build forever.
+const ARTIFACT_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Marks the `water` process as a Cargo rustc wrapper rather than a CLI.
 pub const WRAPPER_MODE_ENV: &str = "WATERUI_INTERNAL_RUSTC_WRAPPER";
@@ -61,7 +68,14 @@ fn run_wrapper() -> i32 {
     };
     let args: Vec<OsString> = invocation.collect();
     let target = std::env::var_os(BUILD_STD_TARGET_ENV).unwrap_or_default();
-    let rewritten = rewrite_args(&args, &target);
+    let rewritten = rewrite_args(&args, &target, ARTIFACT_WAIT_TIMEOUT);
+    // A unit that needed the shared `std` dylib and never saw it complete
+    // fails here: invoking rustc would produce a statically linked artifact
+    // that shares no runtime with the app.
+    if let Some(error) = rewritten.error {
+        eprintln!("water: {error}");
+        return 1;
+    }
 
     let status = match std::env::var_os(WRAPPER_CHAIN_ENV) {
         Some(chain) => std::process::Command::new(chain)
@@ -101,13 +115,17 @@ struct Rewrite {
     /// This invocation is the configured target's `std` unit with `dylib`
     /// added — on success a `libstd-*.so` exists under its `--out-dir`.
     emits_std_dylib: bool,
+    /// A link-emitting unit's `std` dylib never completed; the unit must
+    /// fail rather than fall back to a static `std` link.
+    error: Option<DylibTimeout>,
 }
 
-fn rewrite_args(args: &[OsString], target: &OsStr) -> Rewrite {
+fn rewrite_args(args: &[OsString], target: &OsStr, wait_timeout: Duration) -> Rewrite {
     if target.is_empty() || arg_value(args, "--target") != target {
         return Rewrite {
             args: args.to_vec(),
             emits_std_dylib: false,
+            error: None,
         };
     }
 
@@ -120,14 +138,23 @@ fn rewrite_args(args: &[OsString], target: &OsStr) -> Rewrite {
     // the rlib's `libstd-*.rmeta` with a second SVH.
     if is_std_rlib && emits_linked_output(args) {
         return Rewrite {
-            args: rewrite_std_unit(args),
+            args: rewrite_std_unit(args, wait_timeout),
             emits_std_dylib: true,
+            error: None,
         };
     }
 
-    Rewrite {
-        args: add_std_dylib_extern(args),
-        emits_std_dylib: false,
+    match add_std_dylib_extern(args, wait_timeout) {
+        Ok(args) => Rewrite {
+            args,
+            emits_std_dylib: false,
+            error: None,
+        },
+        Err(error) => Rewrite {
+            args: args.to_vec(),
+            emits_std_dylib: false,
+            error: Some(error),
+        },
     }
 }
 
@@ -136,7 +163,7 @@ fn rewrite_args(args: &[OsString], target: &OsStr) -> Rewrite {
 /// The dylib emits the dep `rlib`s' machine code, so each rmeta-only extern
 /// Cargo hands the unit gains its rlib sibling as a second location for the
 /// same crate — one candidate per artifact kind, one hash.
-fn rewrite_std_unit(args: &[OsString]) -> Vec<OsString> {
+fn rewrite_std_unit(args: &[OsString], wait_timeout: Duration) -> Vec<OsString> {
     let is_rlib_type = |value: &OsStr| value == "rlib" || value == "lib";
     let mut rewritten = Vec::with_capacity(args.len() + 8);
     let mut index = 0;
@@ -173,7 +200,7 @@ fn rewrite_std_unit(args: &[OsString]) -> Vec<OsString> {
         // rlibs, which the still-running dep units have not written yet. The
         // rlib appears when that unit finishes; waiting for the file — never
         // for a fixed delay — is the only ordering the shim can impose.
-        if !wait_for_file(Path::new(path)) {
+        if !wait_for_file(Path::new(path), wait_timeout) {
             eprintln!(
                 "water: build-std dependency rlib never appeared: {path}; \
                  compiling std without it will fail"
@@ -186,14 +213,12 @@ fn rewrite_std_unit(args: &[OsString]) -> Vec<OsString> {
     rewritten
 }
 
-/// Poll until `ready` holds, up to a bound far beyond any dependency's
-/// codegen time. Returns `false` on timeout so a genuinely missing artifact
-/// surfaces as rustc's own error rather than a silent drop.
-fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    while !ready() && std::time::Instant::now() < deadline {
+/// Poll until `ready` holds, up to `timeout`. Returns `false` on timeout
+/// so the caller can fail the unit instead of silently degrading.
+fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    const POLL: Duration = Duration::from_millis(20);
+    let deadline = Instant::now() + timeout;
+    while !ready() && Instant::now() < deadline {
         std::thread::sleep(POLL);
     }
     ready()
@@ -201,8 +226,35 @@ fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
 
 /// Poll until `path` exists — safe only for artifacts rustc renames into
 /// place (rlibs, rmeta), where presence already means complete.
-fn wait_for_file(path: &Path) -> bool {
-    wait_until(|| path.is_file())
+fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    wait_until(timeout, || path.is_file())
+}
+
+/// A link-emitting unit's wait for the shared `libstd` dylib expired — the
+/// unit fails with this diagnostic instead of linking `std` statically.
+struct DylibTimeout {
+    dylib: PathBuf,
+    dep_info: Option<PathBuf>,
+    timeout: Duration,
+}
+
+impl std::fmt::Display for DylibTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "build-std libstd dylib never completed at {}; waited {:?} for ",
+            self.dylib.display(),
+            self.timeout
+        )?;
+        match &self.dep_info {
+            Some(dep) => write!(
+                f,
+                "the post-link dep-info {} or a fully written, parseable ELF",
+                dep.display()
+            ),
+            None => write!(f, "a fully written, parseable ELF"),
+        }
+    }
 }
 
 /// Wait for the produced `libstd-*.so` to be *complete*, not merely present:
@@ -211,16 +263,31 @@ fn wait_for_file(path: &Path) -> bool {
 /// read. The real completion signal is the unit's dep-info `std-<hash>.d`,
 /// which rustc writes only after linking returns; when no dep-info is
 /// emitted, the `.so` must instead parse as a complete ELF before use.
-fn wait_for_std_dylib(dylib: &Path) -> bool {
-    let dep_info = dylib
+fn wait_for_std_dylib(dylib: &Path, timeout: Duration) -> Result<(), DylibTimeout> {
+    let dep_info = dylib_dep_info(dylib);
+    let ready = || {
+        dep_info.as_ref().is_some_and(|dep| dep.is_file())
+            || dylib.is_file() && elf_file_is_parseable(dylib)
+    };
+    if wait_until(timeout, ready) {
+        Ok(())
+    } else {
+        Err(DylibTimeout {
+            dylib: dylib.to_path_buf(),
+            dep_info,
+            timeout,
+        })
+    }
+}
+
+/// The dep-info path rustc writes next to the `libstd-*.so` once its link
+/// returns — `libstd-<hash>.so` ⇒ `std-<hash>.d`.
+fn dylib_dep_info(dylib: &Path) -> Option<PathBuf> {
+    dylib
         .file_stem()
         .and_then(OsStr::to_str)
         .and_then(|stem| stem.strip_prefix("lib"))
-        .map(|stem| dylib.with_file_name(format!("{stem}.d")));
-    wait_until(|| {
-        dep_info.as_ref().is_some_and(|dep| dep.is_file())
-            || dylib.is_file() && elf_file_is_parseable(dylib)
-    })
+        .map(|stem| dylib.with_file_name(format!("{stem}.d")))
 }
 
 /// Whether `path` currently holds a completely written, parseable ELF — the
@@ -280,9 +347,12 @@ fn links_native_artifact(args: &[OsString]) -> bool {
 /// `--emit` sets containing `link` *and* `--crate-type`s that link natively
 /// are rewritten — and only those wait for the dylib, since Cargo starts
 /// them no earlier than the unit producing it.
-fn add_std_dylib_extern(args: &[OsString]) -> Vec<OsString> {
+fn add_std_dylib_extern(
+    args: &[OsString],
+    wait_timeout: Duration,
+) -> Result<Vec<OsString>, DylibTimeout> {
     if !emits_linked_output(args) || !links_native_artifact(args) {
-        return args.to_vec();
+        return Ok(args.to_vec());
     }
     let mut rewritten = args.to_vec();
     for spec in extern_values(args) {
@@ -301,20 +371,14 @@ fn add_std_dylib_extern(args: &[OsString]) -> Vec<OsString> {
         // The `std` unit emits the dylib at the end of the same invocation
         // that wrote the rmeta/rlib this extern points at; if pipelining let
         // this unit start early, the dylib is on its way — wait for the
-        // post-link completion signal, and let rustc's own error surface if
-        // it never arrives.
-        if wait_for_std_dylib(&dylib) {
-            rewritten.push(OsString::from("--extern"));
-            rewritten.push(OsString::from(format!("{}={}", name, dylib.display())));
-        } else {
-            eprintln!(
-                "water: build-std libstd dylib never completed at {}; \
-                 this unit will link `std` statically",
-                dylib.display()
-            );
-        }
+        // post-link completion signal. A dylib that never completes fails
+        // the unit: continuing would link `std` statically and silently
+        // produce a module that shares no runtime with the app.
+        wait_for_std_dylib(&dylib, wait_timeout)?;
+        rewritten.push(OsString::from("--extern"));
+        rewritten.push(OsString::from(format!("{}={}", name, dylib.display())));
     }
-    rewritten
+    Ok(rewritten)
 }
 
 /// Every `--extern` spec in the invocation, covering both the split
@@ -401,6 +465,7 @@ fn is_std_dylib_file_name(file_name: Option<&OsStr>) -> bool {
 #[cfg(test)]
 mod tests {
     use std::ffi::{OsStr, OsString};
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
@@ -408,6 +473,14 @@ mod tests {
 
     fn os(strings: &[&str]) -> Vec<OsString> {
         strings.iter().map(OsString::from).collect()
+    }
+
+    fn rewrite(args: &[OsString]) -> super::Rewrite {
+        rewrite_args(
+            args,
+            OsString::from("aarch64-linux-android").as_os_str(),
+            Duration::ZERO,
+        )
     }
 
     #[test]
@@ -420,7 +493,7 @@ mod tests {
             "--target",
             "x86_64-linux-android",
         ]);
-        let rewritten = rewrite_args(&args, OsString::from("aarch64-linux-android").as_os_str());
+        let rewritten = rewrite(&args);
         assert_eq!(rewritten.args, args);
         assert!(!rewritten.emits_std_dylib);
     }
@@ -428,7 +501,7 @@ mod tests {
     #[test]
     fn leaves_host_units_alone() {
         let args = os(&["--crate-name", "std", "--crate-type", "rlib"]);
-        let rewritten = rewrite_args(&args, OsString::from("aarch64-linux-android").as_os_str());
+        let rewritten = rewrite(&args);
         assert_eq!(rewritten.args, args);
         assert!(!rewritten.emits_std_dylib);
     }
@@ -451,7 +524,7 @@ mod tests {
             "--extern",
             &format!("noprelude:core={}", rmeta.display()),
         ]);
-        let rewritten = rewrite_args(&args, OsString::from("aarch64-linux-android").as_os_str());
+        let rewritten = rewrite(&args);
         assert!(rewritten.emits_std_dylib);
         assert!(
             rewritten
@@ -497,7 +570,7 @@ mod tests {
             "--extern",
             &format!("std_detect={}/libstd_detect-zz.rlib", dir.path().display()),
         ]);
-        let rewritten = rewrite_args(&args, OsString::from("aarch64-linux-android").as_os_str());
+        let rewritten = rewrite(&args);
         for expected in [
             format!("noprelude,nounused:std={}", dylib_rlib.display()),
             format!("std={}", dylib_rmeta.display()),
@@ -536,8 +609,47 @@ mod tests {
             "--extern",
             &format!("std={}", rlib.display()),
         ]);
-        let rewritten = rewrite_args(&args, OsString::from("aarch64-linux-android").as_os_str());
+        let rewritten = rewrite(&args);
         assert_eq!(rewritten.args, args);
+        assert!(rewritten.error.is_none());
+    }
+
+    #[test]
+    fn a_dylib_that_never_completes_fails_the_unit() {
+        let dir = tempdir().expect("std out dir");
+        let rlib = dir.path().join("libstd-abc123.rlib");
+        std::fs::write(&rlib, []).expect("rlib");
+        // Neither the `.so` nor its post-link `std-*.d` dep-info appears —
+        // the unit must fail rather than link `std` statically.
+        let args = os(&[
+            "--crate-name",
+            "waterui_preview",
+            "--crate-type",
+            "cdylib",
+            "--target",
+            "aarch64-linux-android",
+            "--emit=dep-info,metadata,link",
+            "--extern",
+            &format!("std={}", rlib.display()),
+        ]);
+        let rewritten = rewrite(&args);
+        let error = rewritten
+            .error
+            .expect("a missing dylib must fail the unit, not link `std` statically");
+        let message = error.to_string();
+        let dylib = dir.path().join("libstd-abc123.so");
+        assert!(
+            message.contains(&dylib.display().to_string()),
+            "names the dylib it waited for: {message}"
+        );
+        assert!(
+            message.contains("std-abc123.d"),
+            "names the dep-info completion signal: {message}"
+        );
+        assert!(
+            message.contains("0ns"),
+            "names the wait deadline: {message}"
+        );
     }
 
     #[test]
@@ -557,7 +669,7 @@ mod tests {
             "--extern",
             &format!("std={}", rmeta.display()),
         ]);
-        let rewritten = rewrite_args(&args, OsString::from("aarch64-linux-android").as_os_str());
+        let rewritten = rewrite(&args);
         assert_eq!(rewritten.args, args);
     }
 
