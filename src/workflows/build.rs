@@ -1629,7 +1629,7 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
         let Some(manifest_dir) = artifact.manifest_path.as_std_path().parent() else {
             continue;
         };
-        let manifest_root = format!("{}/", manifest_dir.display().to_string().replace('\\', "/"));
+        let manifest_root = dunce::simplified(manifest_dir);
         let mut package_stale = false;
         for filename in &artifact.filenames {
             let file = filename.as_std_path();
@@ -1639,22 +1639,24 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
             let Some(dep_info) = dep_info_path(file) else {
                 continue;
             };
-            // Dep-info escapes `\` and ` ` in paths; a normalized
-            // forward-slash scan still matches every root the CLI builds
-            // from, and a rare miss costs one package rebuild — never a
-            // wrong artifact.
-            let contents = smol::fs::read_to_string(&dep_info)
-                .await
-                .map_err(|error| {
-                    RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
-                        "Cargo reported {} fresh but its dep-info {} is unreadable: {error}",
-                        file.display(),
-                        dep_info.display()
-                    )))
-                })?
-                .replace("\\\\", "/")
-                .replace('\\', "/");
-            if !contents.contains(&manifest_root) {
+            let contents = smol::fs::read_to_string(&dep_info).await.map_err(|error| {
+                RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
+                    "Cargo reported {} fresh but its dep-info {} is unreadable: {error}",
+                    file.display(),
+                    dep_info.display()
+                )))
+            })?;
+            // A dep-info that names no prerequisite under this unit's own
+            // manifest root was written by a different source's build; a rare
+            // miss costs one package rebuild — never a wrong artifact.
+            if !dep_info_prerequisites(&contents).iter().any(|source| {
+                let source = if source.is_absolute() {
+                    source.clone()
+                } else {
+                    manifest_dir.join(source)
+                };
+                dunce::simplified(&source).starts_with(manifest_root)
+            }) {
                 package_stale = true;
             }
         }
@@ -1687,6 +1689,44 @@ fn dep_info_path(artifact_file: &Path) -> Option<PathBuf> {
         dir.join("deps")
     };
     Some(deps.join(format!("{stem}.d")))
+}
+
+/// The prerequisite paths a dep-info `.d` lists.
+///
+/// Cargo writes Makefile syntax: one `<target>: <space-separated
+/// prerequisites>` rule per emitted artifact, then an empty `<path>:` rule
+/// per prerequisite. The target splits from its prerequisites at the first
+/// `": "` — a Windows drive colon arrives as `C:\` (colon, backslash), and a
+/// literal `": "` inside a name is escaped `":\ "`, so the unescaped
+/// separator is unambiguous. rustc escapes only a literal space as `\ `;
+/// every other byte, a Windows backslash included, is verbatim.
+fn dep_info_prerequisites(contents: &str) -> Vec<PathBuf> {
+    let mut prerequisites = Vec::new();
+    for line in contents.lines() {
+        let Some((_, rest)) = line.split_once(": ") else {
+            continue;
+        };
+        let mut token = String::new();
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars.peek() == Some(&' ') => {
+                    chars.next();
+                    token.push(' ');
+                }
+                c if c.is_whitespace() => {
+                    if !token.is_empty() {
+                        prerequisites.push(PathBuf::from(std::mem::take(&mut token)));
+                    }
+                }
+                c => token.push(c),
+            }
+        }
+        if !token.is_empty() {
+            prerequisites.push(PathBuf::from(token));
+        }
+    }
+    prerequisites
 }
 
 /// The package name a `package_id` specifier carries — `source#name@version`,
@@ -2209,9 +2249,11 @@ mod tests {
             std::fs::write(&dylib, []).expect("dylib");
 
             let ours = temporary.path().join("ours");
-            std::fs::create_dir_all(&ours).expect("our manifest dir");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
             let manifest = ours.join("Cargo.toml");
             std::fs::write(&manifest, "").expect("manifest");
+            let own_source = ours.join("src/lib.rs");
+            std::fs::write(&own_source, "").expect("own source");
 
             let artifact = |fresh: bool| {
                 serde_json::json!({
@@ -2222,7 +2264,7 @@ mod tests {
                         "kind": ["lib"],
                         "crate_types": ["dylib"],
                         "name": "waterui_dylib",
-                        "src_path": ours.join("src/lib.rs"),
+                        "src_path": own_source,
                         "edition": "2021",
                         "doc": true,
                         "doctest": true,
@@ -2244,34 +2286,39 @@ mod tests {
             };
             let dep_info = deps.join("waterui_dylib.d");
 
+            // Dep-info rides in rustc's Makefile spelling: a literal space in
+            // a path is `\ ` and every other byte is verbatim, so the fixture
+            // writes real tempdir paths through the same escaping.
+            let foreign = temporary.path().join("foreign");
+            std::fs::create_dir_all(foreign.join("src")).expect("foreign source dir");
+            let foreign_source = foreign.join("src/lib.rs");
+            std::fs::write(&foreign_source, "").expect("foreign source");
+            let dep_escape =
+                |path: &std::path::Path| path.display().to_string().replace(' ', "\\ ");
+            let write_dep_info = |source: &std::path::Path| {
+                std::fs::write(
+                    &dep_info,
+                    format!("{}: {}\n", dep_escape(&dylib), dep_escape(source)),
+                )
+                .expect("dep-info");
+            };
+
             // A `fresh` unit whose dep-info names another source's checkout.
-            std::fs::write(
-                &dep_info,
-                format!("{}: /elsewhere/waterui-dylib/src/lib.rs\n", dylib.display()),
-            )
-            .expect("foreign dep-info");
+            write_dep_info(&foreign_source);
             let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
                 .await
                 .expect("scan");
             assert_eq!(stale, ["waterui-dylib"]);
 
             // The same file written by this unit's own source is trusted.
-            std::fs::write(
-                &dep_info,
-                format!("{}: {}/src/lib.rs\n", dylib.display(), ours.display()),
-            )
-            .expect("own dep-info");
+            write_dep_info(&own_source);
             let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
                 .await
                 .expect("scan");
             assert!(stale.is_empty(), "our own artifact is never stale");
 
             // A unit cargo just emitted needs no dep-info check at all.
-            std::fs::write(
-                &dep_info,
-                format!("{}: /elsewhere/waterui-dylib/src/lib.rs\n", dylib.display()),
-            )
-            .expect("foreign dep-info");
+            write_dep_info(&foreign_source);
             let stale = super::stale_shared_dylib_packages(artifact(false).as_bytes())
                 .await
                 .expect("scan");
