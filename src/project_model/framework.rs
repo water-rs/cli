@@ -105,6 +105,15 @@ pub struct ResolvedFramework {
         skip_serializing_if = "Option::is_none"
     )]
     minimum_cli_version: Option<cargo_toml::SemVer>,
+    /// The framework's own `rust-version` — `[workspace.package].rust-version`
+    /// of the manifest at the selected revision — persisted with the
+    /// selection so the project's Rust floor is known without a checkout.
+    #[serde(
+        default,
+        rename = "rust-version",
+        skip_serializing_if = "Option::is_none"
+    )]
+    rust_version: Option<cargo_toml::SemVer>,
     /// The framework's `[package.metadata.waterui]` table at the selected
     /// revision, carried verbatim from its manifest.
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
@@ -289,6 +298,7 @@ impl ResolvedFramework {
         )?;
         let metadata = framework_metadata(&manifest)?;
         let minimum_cli_version = minimum_cli_version(&metadata)?;
+        let rust_version = manifest_rust_version(&manifest)?;
         if let Some(minimum) = &minimum_cli_version {
             validate_installed_cli(minimum, &checkout_cli_update())?;
         }
@@ -330,6 +340,7 @@ impl ResolvedFramework {
                 root: root.to_path_buf(),
             },
             minimum_cli_version,
+            rust_version,
             metadata,
             scaffold,
             packages: BTreeMap::new(),
@@ -380,6 +391,15 @@ impl ResolvedFramework {
         self.scaffold
             .get(key)
             .unwrap_or_else(|| panic!("resolved framework carries no `{key}` scaffold metadata"))
+    }
+
+    /// The Rust floor the selected framework declares — its
+    /// `[workspace.package].rust-version` at the resolved revision. A record
+    /// written before this key existed carries `None`; the caller falls back
+    /// to the CLI's own `rust-version`.
+    #[must_use]
+    pub const fn rust_version(&self) -> Option<&cargo_toml::SemVer> {
+        self.rust_version.as_ref()
     }
 
     /// The Apple backend release a scaffolded project pins, when the
@@ -936,6 +956,7 @@ impl ResolvedFramework {
         let root: toml::Value = toml::from_str(std::str::from_utf8(&manifest_bytes)?)?;
         let metadata = framework_metadata(&root)?;
         let minimum_cli_version = minimum_cli_version(&metadata)?;
+        let rust_version = manifest_rust_version(&root)?;
         let mut scaffold = framework_scaffold(&root)?;
         let lock_bytes = fetch(&format!("{base}/Cargo.lock")).await?;
         let lock_sha256 = hex::encode(Sha256::digest(&lock_bytes));
@@ -1017,6 +1038,7 @@ impl ResolvedFramework {
             Self {
                 source,
                 minimum_cli_version,
+                rust_version,
                 metadata,
                 scaffold,
                 packages,
@@ -1320,6 +1342,30 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
         scaffold.insert(key.clone(), value.to_owned());
     }
     Ok(scaffold)
+}
+
+/// The Rust floor a root manifest declares — `[workspace.package].rust-version`,
+/// or `[package].rust-version` when the manifest is a plain package. Shared by
+/// framework resolution (the framework's own manifest at the selected
+/// revision) and the doctor (the project's and a local checkout's manifests).
+pub(crate) fn manifest_rust_version(manifest: &toml::Value) -> Result<Option<cargo_toml::SemVer>> {
+    let declared = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("rust-version"))
+        .or_else(|| {
+            manifest
+                .get("package")
+                .and_then(|package| package.get("rust-version"))
+        });
+    declared
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| eyre!("rust-version must be a string"))?;
+            crate::utils::parse_semver_version(text).wrap_err("invalid rust-version")
+        })
+        .transpose()
 }
 
 /// The CLI floor a `package.metadata.waterui` metadata table declares —
@@ -1770,6 +1816,7 @@ pub(crate) mod test_fixtures {
                 }),
             },
             minimum_cli_version: None,
+            rust_version: None,
             metadata: toml::toml! {
                 android-min-api-level = 26
             },
@@ -2323,6 +2370,7 @@ mod tests {
                 lock_sha256: hex::encode(Sha256::digest(&bytes)),
             },
             minimum_cli_version: None,
+            rust_version: None,
             metadata: toml::toml! {
                 android-min-api-level = 26
             },
