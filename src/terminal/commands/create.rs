@@ -10,6 +10,7 @@ use heck::{ToKebabCase, ToSnakeCase};
 use crate::shell::Shell;
 use crate::{header, line, success};
 use waterui_cli::framework::FrameworkChannel;
+use waterui_cli::platform::TargetBackend;
 use waterui_cli::project::{CreateOptions, PackageType, Project, WebScaffold};
 use waterui_cli::project_types::BundleIdentifier;
 use waterui_cli::web::PackageManager;
@@ -24,7 +25,7 @@ pub struct Args {
     #[arg(long)]
     bundle_id: Option<String>,
 
-    /// Backends to scaffold (apple, android, gtk4, hydrolysis, esp32).
+    /// Backends to scaffold (apple, android, gtk4, hydrolysis, winui, esp32).
     #[arg(long, value_delimiter = ',')]
     backends: Option<Vec<String>>,
 
@@ -155,6 +156,19 @@ impl Backend {
     /// ahead of milestone releases — so scaffolding it asks for confirmation.
     const fn is_experimental(self) -> bool {
         matches!(self, Self::Gtk4 | Self::WinUi)
+    }
+
+    /// The library's backend identity — what `CreateOptions` holds a
+    /// channel's scaffold packages against.
+    const fn target_backend(self) -> TargetBackend {
+        match self {
+            Self::Apple => TargetBackend::Apple,
+            Self::Android => TargetBackend::Android,
+            Self::Gtk4 => TargetBackend::Gtk4,
+            Self::Hydrolysis => TargetBackend::Hydrolysis,
+            Self::WinUi => TargetBackend::WinUi,
+            Self::Esp32 => TargetBackend::Dew,
+        }
     }
 
     fn from_str(s: &str) -> Option<Self> {
@@ -291,7 +305,7 @@ fn resolve_backends(
 
     if backends.is_empty() {
         bail!(
-            "At least one backend is required. Choose from: apple, android, gtk4, hydrolysis, esp32."
+            "At least one backend is required. Choose from: apple, android, gtk4, hydrolysis, winui, esp32."
         );
     }
 
@@ -313,6 +327,13 @@ async fn create_project(shell: &Shell, plan: &CreatePlan) -> Result<Project> {
             framework: None,
             author: whoami::username()
                 .map_err(|error| eyre!("Failed to determine project author: {error}"))?,
+            // The create-time gate holds each requested backend's scaffold
+            // packages against the resolved channel before a file lands.
+            backends: plan
+                .backends
+                .iter()
+                .map(|backend| backend.target_backend())
+                .collect(),
             web: (plan.template == CreateTemplate::Web).then(|| WebScaffold {
                 package_manager: plan.package_manager,
                 include_arg: "web".to_string(),
@@ -586,6 +607,7 @@ mod tests {
                 framework_manifest: None,
                 framework: None,
                 author: "water test".to_string(),
+                backends: Vec::new(),
                 web: Some(waterui_cli::project::WebScaffold {
                     package_manager: super::PackageManager::Bun,
                     include_arg: "web".to_string(),

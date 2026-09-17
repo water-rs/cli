@@ -92,6 +92,24 @@ impl Project {
         )
         .map_err(|error| eyre::eyre!(error))?;
         let (framework, lockfile) = ResolvedFramework::resolve(channel).await?;
+        // A configured backend whose scaffold packages the target channel
+        // withholds could never be regenerated — refuse the switch before a
+        // manifest is rewritten.
+        for (configured, backend) in [
+            (previous.backends.gtk4().is_some(), TargetBackend::Gtk4),
+            (
+                previous.backends.hydrolysis().is_some(),
+                TargetBackend::Hydrolysis,
+            ),
+            (previous.backends.winui().is_some(), TargetBackend::WinUi),
+            (previous.backends.esp32().is_some(), TargetBackend::Dew),
+        ] {
+            if configured {
+                for package in backend.scaffold_packages() {
+                    framework.require_distributable(package)?;
+                }
+            }
+        }
         let mut next = previous.clone();
         next.waterui_path = None;
         next.framework = Some(framework.clone());
@@ -526,6 +544,31 @@ impl Project {
         ResolvedFramework::for_manifest(self.manifest(), &self.root).await
     }
 
+    /// Assert the selected framework channel distributes every scaffold
+    /// package `backend` links — the git-pinned experimental set `stable`
+    /// withholds. Runs before the backend writes a file, so a withheld
+    /// package fails the init with the channel fix rather than partway
+    /// through the generated tree.
+    async fn require_distributable_backend(
+        &self,
+        backend: TargetBackend,
+    ) -> Result<(), crate::backend::FailToInitBackend> {
+        let packages = backend.scaffold_packages();
+        if packages.is_empty() {
+            return Ok(());
+        }
+        let framework = self
+            .resolved_framework()
+            .await
+            .map_err(crate::backend::FailToInitBackend::Config)?;
+        for package in packages {
+            framework
+                .require_distributable(package)
+                .map_err(crate::backend::FailToInitBackend::Config)?;
+        }
+        Ok(())
+    }
+
     /// Returns whether the packaged application links `package_name`.
     ///
     /// Development-only and build-only dependencies are excluded because they
@@ -907,6 +950,11 @@ pub struct CreateOptions {
     pub framework: Option<ResolvedFramework>,
     /// Author name for Cargo.toml.
     pub author: String,
+    /// The backends the caller will scaffold after creation: each one's
+    /// scaffold packages are held against the resolved channel before a
+    /// file is written, so a package the channel withholds — the git-pinned
+    /// experimental set — fails the create rather than the backend init.
+    pub backends: Vec<TargetBackend>,
     /// The declared web frontend: `Some` generates the `include_web!` root
     /// view and writes `[web] package_manager`.
     pub web: Option<WebScaffold>,
@@ -1142,6 +1190,16 @@ impl Project {
             .await
             .map_err(FailToCreateProject::Framework)?;
 
+        // A backend whose scaffold packages the channel withholds cannot be
+        // scaffolded at all — reject before a single file lands.
+        for backend in &options.backends {
+            for package in backend.scaffold_packages() {
+                framework
+                    .require_distributable(package)
+                    .map_err(FailToCreateProject::Framework)?;
+            }
+        }
+
         // Framework validation precedes directory creation so a rejected
         // local checkout leaves nothing behind; on `init` the directory
         // already exists and this is a no-op.
@@ -1326,6 +1384,8 @@ impl Project {
     pub async fn init_gtk4_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
         use crate::{backend::Backend, gtk4::backend::Gtk4Backend};
 
+        self.require_distributable_backend(TargetBackend::Gtk4)
+            .await?;
         if !cfg!(target_os = "linux") {
             return Err(crate::backend::FailToInitBackend::Io(
                 std::io::Error::other("GTK4 backend is only supported on Linux hosts"),
@@ -1353,6 +1413,8 @@ impl Project {
     ) -> Result<(), crate::backend::FailToInitBackend> {
         use crate::{backend::Backend, hydrolysis::backend::HydrolysisBackend};
 
+        self.require_distributable_backend(TargetBackend::Hydrolysis)
+            .await?;
         let backend = HydrolysisBackend::init(self).await?;
         self.manifest.backends.set_hydrolysis(backend);
         self.manifest
@@ -1376,6 +1438,8 @@ impl Project {
     pub async fn init_winui_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
         use crate::{backend::Backend, winui::backend::WinUiBackend};
 
+        self.require_distributable_backend(TargetBackend::WinUi)
+            .await?;
         if !cfg!(target_os = "windows") {
             return Err(crate::backend::FailToInitBackend::Io(
                 std::io::Error::other("WinUI backend is only supported on Windows hosts"),
@@ -1401,6 +1465,8 @@ impl Project {
     pub async fn init_esp32_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
         use crate::{backend::Backend, esp32::backend::Esp32Backend};
 
+        self.require_distributable_backend(TargetBackend::Dew)
+            .await?;
         let backend = Esp32Backend::init(self).await?;
         self.manifest.backends.set_esp32(backend);
         self.manifest
@@ -2368,6 +2434,7 @@ mod channel_tests {
                 framework_manifest: None,
                 framework: None,
                 author: String::new(),
+                backends: Vec::new(),
                 web: None,
             };
             let error = Project::create(&project_root, options)
@@ -2662,7 +2729,7 @@ mod webview_backend_tests {
 
 #[cfg(test)]
 mod scaffold_tests {
-    use super::{BundleIdentifier, CreateOptions, PackageType, Project};
+    use super::{BundleIdentifier, CreateOptions, PackageType, Project, TargetBackend};
 
     /// The documented `assets!` workflow requires the assets root to exist: the
     /// planner walks it recursively, so a missing directory fails the first
@@ -2687,6 +2754,7 @@ mod scaffold_tests {
                 // GitHub; a unit test resolves a fixture in place instead.
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
                 author: "Lexo Liu".to_string(),
+                backends: Vec::new(),
                 web: None,
             },
         ))
@@ -2707,6 +2775,49 @@ mod scaffold_tests {
             assets.join("README.md").is_file(),
             "a tracked file keeps the assets directory present in git"
         );
+    }
+
+    /// `stable` withholds the git-pinned experimental scaffold packages, so a
+    /// backend whose generated crate links one — GTK4, `WinUI`, Dew — must fail
+    /// `create` before a file lands, naming the package and the channel fix
+    /// rather than dying partway through the backend's own scaffold.
+    #[test]
+    fn create_rejects_backends_whose_packages_stable_withholds() {
+        for backend in [
+            TargetBackend::Gtk4,
+            TargetBackend::WinUi,
+            TargetBackend::Dew,
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().join("water-example");
+            let error = smol::block_on(Project::create(
+                &root,
+                CreateOptions {
+                    name: "Water Example".to_string(),
+                    bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                        .expect("bundle identifier"),
+                    package_type: PackageType::App,
+                    waterui_path: None,
+                    channel: None,
+                    framework_manifest: None,
+                    framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    author: "Lexo Liu".to_string(),
+                    backends: vec![backend],
+                    web: None,
+                },
+            ))
+            .expect_err("a withheld scaffold package must reject create");
+            let error = error.to_string();
+            for package in backend.scaffold_packages() {
+                assert!(error.contains(package), "{error}");
+            }
+            assert!(error.contains("stable"), "{error}");
+            assert!(error.contains("--channel dev"), "{error}");
+            assert!(
+                !root.exists(),
+                "the rejection precedes any file write: {error}"
+            );
+        }
     }
 }
 

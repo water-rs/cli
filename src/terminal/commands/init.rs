@@ -296,6 +296,8 @@ async fn scaffold_shell(
             framework: None,
             author: whoami::username()
                 .map_err(|error| eyre!("Failed to determine project author: {error}"))?,
+            // `water init` scaffolds no backend through `Project::init`.
+            backends: Vec::new(),
             web: Some(WebScaffold {
                 package_manager,
                 include_arg: include_arg.to_string(),
