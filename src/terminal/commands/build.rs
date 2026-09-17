@@ -20,7 +20,7 @@ use waterui_cli::{
     esp32::{backend::Esp32Backend, platform::build_esp32},
     gtk4::{backend::Gtk4Backend, platform::build_gtk4},
     hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
-    platform::TargetPlatform as LibTargetPlatform,
+    platform::{TargetBackend as LibTargetBackend, TargetPlatform as LibTargetPlatform},
     project::{PackageType, Project},
     winui::{backend::WinUiBackend, platform::build_winui},
 };
@@ -85,6 +85,18 @@ impl TargetBackend {
     const fn is_experimental(self) -> bool {
         matches!(self, Self::Gtk4 | Self::WinUi)
     }
+
+    /// The library backend enum this CLI value selects.
+    const fn lib_backend(self) -> LibTargetBackend {
+        match self {
+            Self::Apple => LibTargetBackend::Apple,
+            Self::Android => LibTargetBackend::Android,
+            Self::Gtk4 => LibTargetBackend::Gtk4,
+            Self::Hydrolysis => LibTargetBackend::Hydrolysis,
+            Self::WinUi => LibTargetBackend::WinUi,
+            Self::Dew => LibTargetBackend::Dew,
+        }
+    }
 }
 
 /// Target architecture for building.
@@ -118,6 +130,11 @@ pub struct Args {
     /// Build in release mode (optimized).
     #[arg(long)]
     release: bool,
+
+    /// Build fully unoptimized, skipping the light optimization development
+    /// builds apply by default to backends whose per-frame cost is high.
+    #[arg(long, conflicts_with = "release")]
+    debug: bool,
 
     /// Project directory path (defaults to current directory).
     #[arg(long, default_value = ".")]
@@ -301,12 +318,25 @@ where
     Ok(project)
 }
 
-async fn build_options(shell: &Shell, args: &Args, backend: TargetBackend) -> BuildOptions {
-    let profile = if args.release {
+/// Resolve the Cargo profile `water build` builds under.
+///
+/// With no profile flag the backend's default development profile applies —
+/// the same default `water run` uses, so a build's units are what a later
+/// run reuses from the shared target directory rather than a variant the run
+/// must recompile. `--debug` opts into a fully unoptimized build and
+/// `--release` selects the release profile.
+const fn build_profile(args: &Args, backend: TargetBackend) -> BuildProfile {
+    if args.release {
         BuildProfile::Release
-    } else {
+    } else if args.debug {
         BuildProfile::Debug
-    };
+    } else {
+        backend.lib_backend().default_development_profile()
+    }
+}
+
+async fn build_options(shell: &Shell, args: &Args, backend: TargetBackend) -> BuildOptions {
+    let profile = build_profile(args, backend);
     let mut build_options = args
         .output_dir
         .as_ref()
@@ -781,7 +811,66 @@ const fn apple_target_triple_override(
 
 #[cfg(test)]
 mod tests {
-    use super::{TargetBackend, TargetPlatform, resolve_backend, validate_output_dir_args};
+    use super::{
+        Args, TargetBackend, TargetPlatform, build_profile, resolve_backend,
+        validate_output_dir_args,
+    };
+    use clap::Parser as _;
+    use waterui_cli::build::BuildProfile;
+
+    /// The build `Args` wrapped in a `Parser` so tests can exercise the real
+    /// flag surface instead of constructing the clap struct field by field.
+    #[derive(clap::Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    fn build_args(argv: &[&str]) -> Args {
+        let mut full = vec!["water-build", "--platform", "windows"];
+        full.extend_from_slice(argv);
+        TestCli::try_parse_from(full)
+            .expect("build args parse")
+            .args
+    }
+
+    #[test]
+    fn build_profile_defaults_to_backend_development_profile() {
+        // Regression: `water build` used to always pick the declared dev
+        // profile while `water run` built Hydrolysis with the Optimized
+        // development profile. Sharing one target dir, the mismatch
+        // re-fingerprinted every dependency unit — the run then cold-compiled
+        // the whole graph (nightly "Fresh user / Windows" timeout).
+        use clap::ValueEnum;
+        let args = build_args(&[]);
+        for backend in TargetBackend::value_variants() {
+            assert_eq!(
+                build_profile(&args, *backend),
+                backend.lib_backend().default_development_profile(),
+                "{backend:?} flag-free profile drifted from the backend default"
+            );
+        }
+        assert_eq!(
+            build_profile(&args, TargetBackend::Hydrolysis),
+            BuildProfile::Optimized
+        );
+        assert_eq!(
+            build_profile(&args, TargetBackend::Apple),
+            BuildProfile::Debug
+        );
+    }
+
+    #[test]
+    fn build_profile_flags_override_the_default() {
+        assert_eq!(
+            build_profile(&build_args(&["--debug"]), TargetBackend::Hydrolysis),
+            BuildProfile::Debug
+        );
+        assert_eq!(
+            build_profile(&build_args(&["--release"]), TargetBackend::Hydrolysis),
+            BuildProfile::Release
+        );
+    }
 
     #[test]
     fn only_gtk4_and_winui_are_experimental() {
