@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 #[cfg(target_os = "macos")]
 use jiff::Timestamp;
 
-use super::detect_sccache_path;
+use super::{TargetBackend, detect_sccache_path};
 use crate::shell::Shell;
 use crate::{error, header, line, note, success, warn};
 use waterui_cli::toolchain_checks;
@@ -39,9 +39,7 @@ use waterui_cli::{
             prepare_hydrolysis_web_dev_site,
         },
     },
-    platform::{
-        PackageOptions, TargetBackend as LibTargetBackend, TargetPlatform as LibTargetPlatform,
-    },
+    platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
     project::Project,
     web,
     winui::{
@@ -175,44 +173,6 @@ impl TargetPlatform {
             Self::Esp32c3 => Some(Esp32Chip::Esp32C3),
             Self::Esp32p4 => Some(Esp32Chip::Esp32P4),
             _ => None,
-        }
-    }
-}
-
-/// Target backend for running (how the app is built and rendered).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TargetBackend {
-    /// Apple backend (UIKit/AppKit).
-    Apple,
-    /// Android backend (Android Views).
-    Android,
-    /// GTK4 backend (Linux only, experimental).
-    Gtk4,
-    /// Hydrolysis backend (self-drawn renderer).
-    Hydrolysis,
-    /// `WinUI` backend (Windows only, experimental).
-    #[value(name = "winui")]
-    WinUi,
-    /// Dew backend (ESP32 firmware).
-    Dew,
-}
-
-impl TargetBackend {
-    /// Whether the backend is experimental — shipped without full testing
-    /// ahead of milestone releases — so selecting it asks for confirmation.
-    const fn is_experimental(self) -> bool {
-        matches!(self, Self::Gtk4 | Self::WinUi)
-    }
-
-    /// The library backend enum this CLI value selects.
-    const fn lib_backend(self) -> LibTargetBackend {
-        match self {
-            Self::Apple => LibTargetBackend::Apple,
-            Self::Android => LibTargetBackend::Android,
-            Self::Gtk4 => LibTargetBackend::Gtk4,
-            Self::Hydrolysis => LibTargetBackend::Hydrolysis,
-            Self::WinUi => LibTargetBackend::WinUi,
-            Self::Dew => LibTargetBackend::Dew,
         }
     }
 }

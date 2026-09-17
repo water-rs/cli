@@ -8,6 +8,7 @@ use target_lexicon::{
     Aarch64Architecture, Architecture, BinaryFormat, Environment, OperatingSystem, Triple, Vendor,
 };
 
+use super::TargetBackend;
 use crate::shell::Shell;
 use crate::{error, header, success};
 use waterui_cli::toolchain_checks;
@@ -20,7 +21,7 @@ use waterui_cli::{
     esp32::{backend::Esp32Backend, platform::build_esp32},
     gtk4::{backend::Gtk4Backend, platform::build_gtk4},
     hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
-    platform::{TargetBackend as LibTargetBackend, TargetPlatform as LibTargetPlatform},
+    platform::TargetPlatform as LibTargetPlatform,
     project::{PackageType, Project},
     winui::{backend::WinUiBackend, platform::build_winui},
 };
@@ -57,44 +58,6 @@ impl TargetPlatform {
             Self::Esp32c3 => Some(Esp32Chip::Esp32C3),
             Self::Esp32p4 => Some(Esp32Chip::Esp32P4),
             _ => None,
-        }
-    }
-}
-
-/// Target backend for building.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum TargetBackend {
-    /// Apple backend (UIKit/AppKit).
-    Apple,
-    /// Android backend.
-    Android,
-    /// GTK4 backend.
-    Gtk4,
-    /// Hydrolysis backend.
-    Hydrolysis,
-    /// `WinUI` backend.
-    #[value(name = "winui")]
-    WinUi,
-    /// Dew backend (ESP32 firmware).
-    Dew,
-}
-
-impl TargetBackend {
-    /// Whether the backend is experimental — shipped without full testing
-    /// ahead of milestone releases — so selecting it asks for confirmation.
-    const fn is_experimental(self) -> bool {
-        matches!(self, Self::Gtk4 | Self::WinUi)
-    }
-
-    /// The library backend enum this CLI value selects.
-    const fn lib_backend(self) -> LibTargetBackend {
-        match self {
-            Self::Apple => LibTargetBackend::Apple,
-            Self::Android => LibTargetBackend::Android,
-            Self::Gtk4 => LibTargetBackend::Gtk4,
-            Self::Hydrolysis => LibTargetBackend::Hydrolysis,
-            Self::WinUi => LibTargetBackend::WinUi,
-            Self::Dew => LibTargetBackend::Dew,
         }
     }
 }
