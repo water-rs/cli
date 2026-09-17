@@ -1219,6 +1219,20 @@ pub async fn nightly_toolchain_with_rust_src(host: &Host) -> eyre::Result<String
     Ok(toolchain)
 }
 
+/// The `rustc -vV` identity of `toolchain` — what a cached `-Zbuild-std`
+/// artifact pins to, because a channel name like `nightly` outlives the
+/// compiler it resolves to after `rustup update`.
+///
+/// # Errors
+/// Returns an error when `rustup` cannot run the toolchain's `rustc`.
+pub async fn rustc_verbose_version(host: &Host, toolchain: &str) -> eyre::Result<String> {
+    host.run("rustup", ["run", toolchain, "rustc", "-vV"])
+        .await
+        .map_err(|error| {
+            eyre::eyre!("Failed to read `rustc -vV` of Rust toolchain `{toolchain}`: {error}")
+        })
+}
+
 /// Pick the toolchain a `-Zbuild-std` build should use out of `rustup
 /// toolchain list` output: `nightly-<host>` first, else the newest dated
 /// nightly for the host.
@@ -1347,7 +1361,9 @@ mod tests {
 
 #[cfg(test)]
 mod host_tests {
-    use super::{CLI_MINIMUM_RUST_VERSION, RustToolchain, tool_binary_name};
+    use super::{
+        CLI_MINIMUM_RUST_VERSION, RustToolchain, rustc_verbose_version, tool_binary_name,
+    };
     use crate::toolchain::testing::TestMachine;
     use crate::toolchain::{Installation, Toolchain, ToolchainError};
 
@@ -1541,6 +1557,23 @@ mod host_tests {
             }
             other => panic!("a version pin below the floor must be manual: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rustc_verbose_version_proxies_through_rustup_run() {
+        let machine = TestMachine::new();
+        machine.install("rustup");
+        machine.install("rustc");
+        let host = machine.host([(
+            String::from("WATERUI_FAKE_RUSTC_HOST"),
+            String::from("aarch64-apple-darwin"),
+        )]);
+        let version = smol::block_on(rustc_verbose_version(&host, "nightly-fake"))
+            .expect("`rustup run` must dispatch to the sibling rustc");
+        assert!(
+            version.contains("host: aarch64-apple-darwin"),
+            "the toolchain's `rustc -vV` identity must come back: {version}"
+        );
     }
 
     #[test]

@@ -232,12 +232,17 @@ impl PreviewSession {
 /// Cargo folds both the deployment target and the unified feature set into that
 /// same `-C metadata` hash, so a module that disagrees with its host on either
 /// one links against symbols the host does not have.
+/// Returns the configured build and, when the module compiles under a
+/// `-Zbuild-std` toolchain, that toolchain's `rustc -vV` identity so the
+/// module signature can pin the exact compiler — a `rustup update` changes
+/// what `nightly` resolves to without changing its name, and a cached module
+/// built against the previous `libstd-<hash>.so` would fail `dlopen`.
 async fn configure_preview_module_build(
     preview_crate_path: &Path,
     platform: PreviewPlatform,
     target: TargetPlatform,
     link_mode: PreviewLinkMode,
-) -> Result<RustBuild> {
+) -> Result<(RustBuild, Option<String>)> {
     let support_project = Project::open(&preview_support_path()?)
         .await
         .wrap_err("Failed to open the preview support project")?;
@@ -265,13 +270,19 @@ async fn configure_preview_module_build(
         // under the same nightly, the same `-Zbuild-std` wrapper, and the
         // same 16 KB page-size link flag as the support app.
         let nightly = crate::toolchain::rust::nightly_toolchain_with_rust_src(&host).await?;
-        Ok(rust_build
-            .with_envs(rust_envs)
-            .with_rustc_flag("-Clink-arg=-Wl,-z,max-page-size=16384")
-            .with_build_std(nightly)
-            .with_features(
-                crate::android::platform::android_ffi_dependency_features(&support_project).await?,
-            ))
+        let toolchain_identity =
+            crate::toolchain::rust::rustc_verbose_version(&host, &nightly).await?;
+        Ok((
+            rust_build
+                .with_envs(rust_envs)
+                .with_rustc_flag("-Clink-arg=-Wl,-z,max-page-size=16384")
+                .with_build_std(nightly)
+                .with_features(
+                    crate::android::platform::android_ffi_dependency_features(&support_project)
+                        .await?,
+                ),
+            Some(toolchain_identity),
+        ))
     } else {
         let browser_runtime = support_project
             .browser_runtime_plan(target, crate::platform::TargetBackend::Apple)
@@ -280,12 +291,15 @@ async fn configure_preview_module_build(
             crate::apple::platform::apple_deployment_target(&support_project, target)
                 .await
                 .wrap_err("Failed to resolve the preview support deployment target")?;
-        Ok(rust_build.with_env(key, value).with_features(
-            crate::apple::platform::apple_ffi_dependency_features(
-                &support_project,
-                browser_runtime,
-            )
-            .await?,
+        Ok((
+            rust_build.with_env(key, value).with_features(
+                crate::apple::platform::apple_ffi_dependency_features(
+                    &support_project,
+                    browser_runtime,
+                )
+                .await?,
+            ),
+            None,
         ))
     }
 }
@@ -340,7 +354,7 @@ async fn build_preview_dylib(
 
     ensure_project_dev_feature_for_preview(&project).await?;
 
-    let mut rust_build =
+    let (mut rust_build, toolchain_identity) =
         configure_preview_module_build(&preview_crate_path, platform, target, link_mode).await?;
     let dylib_path_start = Instant::now();
     let expected_path = rust_build
@@ -361,6 +375,7 @@ async fn build_preview_dylib(
         &target_triple,
         preview_crate_name.as_str(),
         link_mode,
+        toolchain_identity.as_deref(),
     );
     let built_path = if dylib_is_up_to_date(&candidate_path, &dylib_signature).await? {
         candidate_path
@@ -466,10 +481,12 @@ fn dylib_build_signature(
     target_triple: &str,
     crate_name: &str,
     link_mode: PreviewLinkMode,
+    toolchain_identity: Option<&str>,
 ) -> String {
     let link_mode = link_mode.signature_tag();
+    let toolchain = toolchain_identity.unwrap_or("ambient");
     format!(
-        "inputs={project_inputs}\nruntime={runtime_fingerprint}\ntarget={target_triple}\ncrate={crate_name}\nlink_mode={link_mode}"
+        "inputs={project_inputs}\nruntime={runtime_fingerprint}\ntarget={target_triple}\ncrate={crate_name}\nlink_mode={link_mode}\ntoolchain={toolchain}"
     )
 }
 
@@ -1757,5 +1774,33 @@ mod tests {
             link_mode.abi_feature,
             crate::templates::preview_ffi::ANDROID_ABI_FEATURE
         );
+    }
+
+    #[test]
+    fn dylib_signature_pins_the_build_std_toolchain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn main() {}").unwrap();
+        let inputs = smol::block_on(super::project_inputs_fingerprint(dir.path())).unwrap();
+
+        let signature = |toolchain| {
+            super::dylib_build_signature(
+                inputs,
+                "runtime",
+                "aarch64-linux-android",
+                "preview_ffi",
+                PreviewLinkMode::ANDROID_DYNAMIC,
+                toolchain,
+            )
+        };
+
+        // A `rustup update` keeps the channel name but changes `rustc -vV` —
+        // the cached module then names a libstd soname that no longer exists,
+        // so the identity, not the name, is what must land in the signature.
+        assert_ne!(
+            signature(Some("rustc 1.100.0-nightly (aaa 2026-08-30)")),
+            signature(Some("rustc 1.101.0-nightly (bbb 2026-10-04)")),
+        );
+        assert_ne!(signature(None), signature(Some("rustc 1.100.0-nightly")));
     }
 }
