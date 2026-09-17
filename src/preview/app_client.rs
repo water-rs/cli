@@ -586,7 +586,11 @@ fn connect_timeout() -> Duration {
 }
 
 fn handshake_timeout() -> Duration {
-    const DEFAULT_MS: u64 = 500;
+    // 500 ms is plenty over loopback, but an `adb forward` channel to a
+    // network-connected device rides the adb transport: every frame pays the
+    // remote round trip, so a Ping/Pong handshake measures in the hundreds of
+    // milliseconds and can exceed a tight cap even on a healthy app.
+    const DEFAULT_MS: u64 = 5000;
     timeout_from_env("WATERUI_PREVIEW_HANDSHAKE_TIMEOUT_MS", DEFAULT_MS)
 }
 
