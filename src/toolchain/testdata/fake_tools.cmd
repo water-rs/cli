@@ -119,7 +119,9 @@ goto :exit_ok
 exit /b 0
 
 :rustup
-rem Mutable rustup state - one channel/target/component per line.
+rem Mutable rustup state - one channel/target/component per line in the
+rem state files, plus a directory per installed toolchain under
+rem %RUSTUP_HOME%\toolchains, the same layout a real rustup produces.
 set "state_toolchains=%HOME%\.fake-rustup-toolchains"
 set "state_default=%HOME%\.fake-rustup-default"
 set "state_targets=%HOME%\.fake-rustup-targets"
@@ -129,12 +131,12 @@ if not defined WATERUI_FAKE_RUSTC_HOST set "WATERUI_FAKE_RUSTC_HOST=x86_64-unkno
 if "%*"=="show active-toolchain" goto :rustup_active_toolchain
 set "args=%*"
 if not defined args exit /b 2
-call :last_arg %*
+for %%a in (%*) do set "last_arg=%%a"
 rem Prefix matches below mirror the .sh globs: `rustup <verb> ...` qualified
 rem with `--toolchain <name>` must match the same branch as the bare form.
-if "!args:~0,17!"=="toolchain install" (>>"%state_toolchains%" echo !last_arg! & exit /b 0)
-if "!args:~0,13!"=="toolchain add" (>>"%state_toolchains%" echo !last_arg! & exit /b 0)
-if "!args:~0,7!"=="default" (>>"%state_toolchains%" echo !last_arg! & >"%state_default%" echo !last_arg! & exit /b 0)
+if "!args:~0,17!"=="toolchain install" goto :rustup_install
+if "!args:~0,13!"=="toolchain add" goto :rustup_install
+if "!args:~0,7!"=="default" goto :rustup_default
 if "!args:~0,6!"=="update" (>"%HOME%\.fake-rustc-version" echo %WATERUI_FAKE_RUSTC_UPDATED_VERSION% & exit /b 0)
 if "!args:~0,23!"=="target list --installed" (
     if defined WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS echo !WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS!
@@ -154,18 +156,29 @@ if "%1"=="--version" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 if "%1"=="-V" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 exit /b 2
 
+rem `rustup toolchain install`/`add` records the channel and lays down its
+rem toolchain directory, like rustup itself.
+:rustup_install
+>>"%state_toolchains%" echo !last_arg!
+mkdir "!rustup_home!\toolchains\!last_arg!" 2>nul
+exit /b 0
+
+rem `rustup default <channel>` installs it if absent and records the default.
+:rustup_default
+>>"%state_toolchains%" echo !last_arg!
+>"%state_default%" echo !last_arg!
+mkdir "!rustup_home!\toolchains\!last_arg!" 2>nul
+exit /b 0
+
 rem `exit /b` inside a nested parenthesized block does not reach the process
 rem exit code through `cmd /c`, so the no-toolchain branch lives at top level.
 :rustup_active_toolchain
 if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN echo error: no active toolchain 1>&2
 if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN exit /b 1
 if defined WATERUI_FAKE_RUSTUP_TOOLCHAIN_NOT_INSTALLED goto :rustup_pinned_toolchain
-if exist "%state_default%" (
-    for /f "usebackq delims=" %%l in ("%state_default%") do (
-        echo %%l-%WATERUI_FAKE_RUSTC_HOST% (default)
-        exit /b 0
-    )
-)
+set "def_channel="
+if exist "%state_default%" for /f "usebackq delims=" %%l in ("%state_default%") do set "def_channel=%%l"
+if defined def_channel (echo !def_channel!-%WATERUI_FAKE_RUSTC_HOST% (default) & exit /b 0)
 call :respond RUSTUP_ACTIVE_TOOLCHAIN
 exit /b %errorlevel%
 
@@ -178,11 +191,7 @@ rem toolchain names (esp, stage0) print bare - the same split as the .sh.
 :rustup_pinned_toolchain
 set "pin=%WATERUI_FAKE_RUSTUP_TOOLCHAIN_NOT_INSTALLED%"
 set "pin_installed="
-if exist "%state_toolchains%" (
-    for /f "usebackq delims=" %%l in ("%state_toolchains%") do (
-        if "%%l"=="!pin!" set "pin_installed=file"
-    )
-)
+if exist "%state_toolchains%" for /f "usebackq delims=" %%l in ("%state_toolchains%") do if "%%l"=="!pin!" set "pin_installed=file"
 if exist "!rustup_home!\toolchains\!pin!" set "pin_installed=dir"
 if not defined pin_installed (
     echo error: toolchain '!pin!' is not installed 1>&2
@@ -198,10 +207,8 @@ echo !pin! (overridden by rust-toolchain.toml)
 exit /b 0
 
 :rustc
-if defined WATERUI_FAKE_RUSTC_VERSION (set "rustc_version=%WATERUI_FAKE_RUSTC_VERSION%") else (set "rustc_version=1.0.0")
-if exist "%HOME%\.fake-rustc-version" (
-    for /f "usebackq delims=" %%v in ("%HOME%\.fake-rustc-version") do set "rustc_version=%%v"
-)
+set "rustc_version=%WATERUI_FAKE_RUSTC_VERSION%"
+if exist "%HOME%\.fake-rustc-version" for /f "usebackq delims=" %%v in ("%HOME%\.fake-rustc-version") do set "rustc_version=%%v"
 if "%1"=="--version" (echo rustc %rustc_version% (waterui-test 2026-01-01) & exit /b 0)
 if "%1"=="-vV" (
     if defined WATERUI_FAKE_RUSTC_HOST (
