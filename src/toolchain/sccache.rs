@@ -23,8 +23,48 @@ use crate::{
 /// in [`crate::build::configure_generated_crate_compilation`] rather than here, because
 /// it must not depend on whether a machine happens to have `sccache` installed: it
 /// changes the compiled ABI, and two builds in one flow have to agree on it.
+///
+/// The server address is namespaced to the invoking user. sccache discovers
+/// its server on a host-wide address — TCP `127.0.0.1:4226` unless told
+/// otherwise — and every compile job runs inside the server process under
+/// the *server owner's* identity. Left at the default, a build running as one
+/// user borrows a server another user left alive and its artifacts land in
+/// this user's target dir owned by the other uid, ending the build on
+/// `Permission denied`. A unix socket under the user's own Water home gives
+/// each account its own server with no port to collide over; where unix
+/// sockets do not exist, a deterministic per-user port does the same.
 pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) {
     command.env("RUSTC_WRAPPER", sccache_path);
+    #[cfg(unix)]
+    if let Some(socket) = server_socket_path() {
+        command.env("SCCACHE_SERVER_UDS", socket);
+        return;
+    }
+    command.env("SCCACHE_SERVER_PORT", per_user_server_port().to_string());
+}
+
+/// The unix socket a per-user sccache server listens on, under the invoking
+/// user's own `~/.water` so no other account can reach — or be reached by —
+/// it. `None` when the home directory cannot be resolved or created.
+#[cfg(unix)]
+fn server_socket_path() -> Option<PathBuf> {
+    let water_home = crate::project_model::water_dir::water_home_dir().ok()?;
+    std::fs::create_dir_all(&water_home).ok()?;
+    Some(water_home.join("sccache-server.sock"))
+}
+
+/// A deterministic per-user TCP port for the sccache server, chosen inside
+/// the 40000–49150 block that sits below every platform's ephemeral range.
+/// FNV-1a over the user name spreads two accounts on one host apart without
+/// any state to coordinate.
+fn per_user_server_port() -> u16 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in whoami::username().unwrap_or_default().as_bytes() {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
+    }
+    40_000 + (hash % 9_151) as u16
 }
 
 /// Toolchain for `sccache` - a shared compilation cache for Rust.

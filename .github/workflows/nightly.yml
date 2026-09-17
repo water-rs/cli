@@ -439,7 +439,13 @@ jobs:
           # The fresh user's home itself is not traversable by default — the
           # console user needs +x on it to reach the project inside.
           sudo chmod a+x "/Users/$E2E_USER"
-          sudo chmod -R a+rwX "/Users/$E2E_USER/e2eplay" "/Users/$E2E_USER/e2e-logs"
+          # Hand the project and log dirs to the console user through an
+          # inherited ACL: entries stay owned by the fresh user, anything
+          # created beneath later takes the grant, and no other account gains
+          # access — a recursive a+rwX would open the whole tree instead.
+          sudo chmod -R +a \
+            "$(id -un) allow read,write,execute,delete,append,delete_child,file_inherit,directory_inherit" \
+            "/Users/$E2E_USER/e2eplay" "/Users/$E2E_USER/e2e-logs"
           cd "/Users/$E2E_USER/e2eplay" || exit 1
           water run > "$RUNNER_TEMP/run-play.log" 2>&1 &
           run_pid=$!
