@@ -312,9 +312,9 @@ impl Shell {
     ///
     /// Attach it through `BuildOptions::with_progress`. An interactive
     /// terminal sees every status line cargo prints, rendered above the
-    /// progress area; a piped terminal gets one phase line per crate unit
-    /// cargo reports; JSON mode gets a structured `build-progress` record per
-    /// event.
+    /// progress area; a piped terminal gets the same lines on stderr, one per
+    /// cargo status event; JSON mode gets a structured `build-progress` record
+    /// per event.
     #[must_use]
     pub fn build_progress(&self) -> BuildProgress {
         let mode = if self.is_json() {
@@ -326,15 +326,10 @@ impl Shell {
         };
         let bars = self.multi_progress.clone();
         let units = Arc::new(AtomicUsize::new(0));
-        let progress =
-            BuildProgress::new(move |event| render_compile_event(mode, &bars, &units, &event));
-        // An interactive terminal renders every line live, so a failure report
-        // tails the captured output instead of dumping it a second time.
-        if matches!(mode, CompileRender::Interactive) {
-            progress.showing_all_lines()
-        } else {
-            progress
-        }
+        // Every mode renders every event, so a build failure report can tail
+        // the captured output instead of dumping it a second time.
+        BuildProgress::new(move |event| render_compile_event(mode, &bars, &units, &event))
+            .showing_all_lines()
     }
 
     /// Display a panic report from a platform crash message.
@@ -674,11 +669,12 @@ fn render_compile_event(
             let _ = bars.println(compile_event_text(units, event));
         }
         CompileRender::Piped => {
-            if matches!(event, CompileEvent::Line(_)) {
-                return;
-            }
             // Events carry cargo's raw line, which a user-forced color
             // setting leaves ANSI-wrapped; plain piped output strips it.
+            // `Line` events must render too: they carry cargo's `Updating` /
+            // `Downloaded` / `Blocking waiting for file lock` status text —
+            // the only signal a piped build's resolve phase emits, and the
+            // difference between a stalled log and a diagnosable one.
             let text = compile_event_text(units, event);
             let mut stderr = anstream::stderr().lock();
             let _ = writeln!(stderr, "{}", console::strip_ansi_codes(&text));

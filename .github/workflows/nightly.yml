@@ -382,7 +382,7 @@ jobs:
             Fail "water package produced no artifact line"
           }
 
-          $p = Start-Process -FilePath water -ArgumentList 'run' -PassThru `
+          $p = Start-Process -FilePath water -ArgumentList "run --platform $env:E2E_PLATFORM --backend $env:E2E_BACKEND" -PassThru `
             -WorkingDirectory "$env:USERPROFILE\e2eplay" `
             -RedirectStandardOutput "$logs\run-play.out" -RedirectStandardError "$logs\run-play.err"
           $runStart = Get-Date
@@ -447,7 +447,8 @@ jobs:
             "$(id -un) allow read,write,execute,delete,append,delete_child,file_inherit,directory_inherit" \
             "/Users/$E2E_USER/e2eplay" "/Users/$E2E_USER/e2e-logs"
           cd "/Users/$E2E_USER/e2eplay" || exit 1
-          water run > "$RUNNER_TEMP/run-play.log" 2>&1 &
+          water run --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+            > "$RUNNER_TEMP/run-play.log" 2>&1 &
           run_pid=$!
           run_start=$SECONDS
           started=1
@@ -488,12 +489,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo -u "$E2E_USER" -H bash -s <<'SCRIPT'
+          sudo -u "$E2E_USER" -H env E2E_PLATFORM="$E2E_PLATFORM" E2E_BACKEND="$E2E_BACKEND" \
+            bash -s <<'SCRIPT'
           set -uo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
           cd "$HOME/e2eplay"
-          # `--yes` answers the GTK4 experimental-backend confirmation.
-          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a water run --yes > "$HOME/e2e-logs/run-play.log" 2>&1 &
+          # `--yes` answers the GTK4 experimental-backend confirmation, and the
+          # backend must be named: the project default on Linux is hydrolysis.
+          LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a \
+            water run --yes --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
+            > "$HOME/e2e-logs/run-play.log" 2>&1 &
           run_pid=$!
           run_start=$SECONDS
           started=1
