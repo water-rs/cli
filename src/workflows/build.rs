@@ -1,7 +1,7 @@
 //! Build system
 
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     io::{self, Write as _},
     path::{Path, PathBuf},
     process::Stdio,
@@ -1775,6 +1775,14 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
         let Some(manifest_dir) = artifact.manifest_path.as_std_path().parent() else {
             continue;
         };
+        // Only a `dylib`/`cdylib` unit uplifts to an unhashed, shareable
+        // filename. A proc-macro's dylib keeps its metadata hash — the hash
+        // covers the package id, so two sources never meet — and cargo's
+        // build-dir layout stores it where no dep-info convention below
+        // applies.
+        if !uplifts_dynamic_library(&artifact.target) {
+            continue;
+        }
         let manifest_root = dunce::simplified(manifest_dir);
         let mut package_stale = false;
         for filename in &artifact.filenames {
@@ -1782,8 +1790,15 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
             if !is_dynamic_library(file) {
                 continue;
             }
-            let Some(dep_info) = dep_info_path(file) else {
-                continue;
+            let Some(dep_info) = dep_info_path(file, &artifact.filenames) else {
+                return Err(RustBuildError::FailToBuildRustLibrary(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "Cargo reported {} fresh but no dep-info was found beside it or in its unit directory (reported files: {:?})",
+                        file.display(),
+                        artifact.filenames
+                    ),
+                )));
             };
             let contents = smol::fs::read_to_string(&dep_info).await.map_err(|error| {
                 RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
@@ -1822,19 +1837,57 @@ fn is_dynamic_library(file: &Path) -> bool {
         .is_some_and(|extension| matches!(extension.to_str(), Some("so" | "dylib" | "dll")))
 }
 
-/// The dep-info `.d` Cargo wrote for the unit that produced `artifact_file`:
-/// `<name>.d` in the profile's `deps/` directory, named after the library
-/// with its `lib` prefix and extension stripped.
-fn dep_info_path(artifact_file: &Path) -> Option<PathBuf> {
-    let stem = artifact_file.file_stem()?.to_str()?;
-    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+/// Whether the unit's final artifact is a dynamic library cargo uplifts to
+/// an unhashed filename: a `dylib` or `cdylib` crate type. Proc-macro
+/// crates are dynamic libraries too, but stay hashed and are never shared.
+fn uplifts_dynamic_library(target: &cargo_metadata::Target) -> bool {
+    target.crate_types.iter().any(|kind| {
+        matches!(
+            kind,
+            cargo_metadata::CrateType::DyLib | cargo_metadata::CrateType::CDyLib
+        )
+    })
+}
+
+/// The dep-info `.d` cargo wrote for the unit that produced `artifact_file`,
+/// found where each cargo layout puts it.
+///
+/// Measured on a `dylib` dependency and a `cdylib` root unit (cargo 1.98
+/// stable and the 1.100 nightly build-dir layout, `--message-format=json`):
+///
+/// - stable writes `<profile>/deps/<name>.d` for both, beside the hashed
+///   copy, and uplifts the root unit's as `<profile>/lib<name>.d`;
+/// - the build-dir layout writes `<name>.d` in the unit's own
+///   `build/<package>/<hash>/out/` directory — a directory the message names
+///   only through the unit's other outputs (the `.rmeta`/`.rlib` a dependency
+///   emits) — and still uplifts the root unit's as `<profile>/lib<name>.d`.
+///
+/// `sibling_files` are the unit's reported filenames; the first candidate
+/// that exists wins, and no candidate means the caller reports the miss.
+fn dep_info_path(
+    artifact_file: &Path,
+    sibling_files: &[cargo_metadata::camino::Utf8PathBuf],
+) -> Option<PathBuf> {
+    let file_stem = artifact_file.file_stem()?.to_str()?;
+    let name = file_stem.strip_prefix("lib").unwrap_or(file_stem);
     let dir = artifact_file.parent()?;
-    let deps = if dir.file_name() == Some(OsStr::new("deps")) {
-        dir.to_path_buf()
-    } else {
-        dir.join("deps")
-    };
-    Some(deps.join(format!("{stem}.d")))
+    // Most specific first: the uplifted `lib<name>.d`, the stable `deps/`
+    // copy, the unit directory a sibling output names, and only then a bare
+    // `<name>.d` beside the artifact (which the hashed proc-macro layout
+    // spells that way, and which a same-named bin would also write).
+    let mut candidates = vec![
+        dir.join(format!("{file_stem}.d")),
+        dir.join("deps").join(format!("{name}.d")),
+    ];
+    candidates.extend(
+        sibling_files
+            .iter()
+            .filter_map(|sibling| sibling.as_std_path().parent())
+            .filter(|unit_dir| *unit_dir != dir)
+            .map(|unit_dir| unit_dir.join(format!("{name}.d"))),
+    );
+    candidates.push(dir.join(format!("{name}.d")));
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 /// The prerequisite paths a dep-info `.d` lists.
@@ -2552,6 +2605,92 @@ mod tests {
                 .await
                 .expect("scan");
             assert!(stale.is_empty(), "a non-fresh unit wrote the file itself");
+        });
+    }
+
+    /// Cargo's build-dir layout (nightly 1.100) writes a unit's dep-info in
+    /// `build/<package>/<hash>/out/` beside its other outputs instead of
+    /// `<profile>/deps/`; the unit's `.rmeta` names that directory. A fresh
+    /// proc-macro unit — hashed, never uplifted, and on that layout without
+    /// any dep-info the `deps/` convention could find — takes no part.
+    #[test]
+    fn stale_check_reads_build_dir_dep_info_and_skips_proc_macros() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let profile = temporary.path().join("debug");
+            let unit_dir = profile.join("build/waterui-dylib/0123456789abcdef/out");
+            std::fs::create_dir_all(&unit_dir).expect("unit dir");
+            let dylib = profile.join("libwaterui_dylib.so");
+            std::fs::write(&dylib, []).expect("dylib");
+            let rmeta = unit_dir.join("libwaterui_dylib.rmeta");
+            std::fs::write(&rmeta, []).expect("rmeta");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+            let foreign = temporary.path().join("foreign/src/lib.rs");
+            std::fs::create_dir_all(foreign.parent().expect("parent")).expect("foreign dir");
+            std::fs::write(&foreign, []).expect("foreign source");
+            std::fs::write(
+                unit_dir.join("waterui_dylib.d"),
+                format!("{}: {}\n", dylib.display(), foreign.display()),
+            )
+            .expect("dep-info");
+
+            let unit = |name: &str, crate_type: &str, filenames: Vec<&std::path::Path>| {
+                serde_json::json!({
+                    "reason": "compiler-artifact",
+                    "package_id": format!("path+file:///x#{name}@0.1.0"),
+                    "manifest_path": manifest,
+                    "target": {
+                        "kind": [if crate_type == "proc-macro" { "proc-macro" } else { "lib" }],
+                        "crate_types": [crate_type],
+                        "name": name.replace('-', "_"),
+                        "src_path": ours.join("src/lib.rs"),
+                        "edition": "2021",
+                        "doc": true,
+                        "doctest": true,
+                        "test": true,
+                    },
+                    "profile": {
+                        "opt_level": "0",
+                        "debuginfo": 0,
+                        "debug_assertions": true,
+                        "overflow_checks": true,
+                        "test": false,
+                    },
+                    "features": [],
+                    "filenames": filenames,
+                    "executable": null,
+                    "fresh": true,
+                })
+                .to_string()
+            };
+            // The proc-macro's dylib exists nowhere on disk and has no
+            // dep-info; only the dylib unit is examined, and its dep-info is
+            // found through the `.rmeta` sibling's directory.
+            let macro_dylib = unit_dir.join("libthiserror_impl-0123456789abcdef.so");
+            let stdout = format!(
+                "{}\n{}\n",
+                unit("thiserror-impl", "proc-macro", vec![&macro_dylib]),
+                unit("waterui-dylib", "dylib", vec![&dylib, &rmeta]),
+            );
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes())
+                .await
+                .expect("scan");
+            assert_eq!(stale, ["waterui-dylib"]);
+
+            // Without any dep-info the check fails loudly rather than
+            // trusting the shared artifact.
+            std::fs::remove_file(unit_dir.join("waterui_dylib.d")).expect("remove dep-info");
+            let error = super::stale_shared_dylib_packages(stdout.as_bytes())
+                .await
+                .expect_err("a fresh dylib without dep-info is an error");
+            assert!(
+                error.to_string().contains("no dep-info was found"),
+                "{error}"
+            );
         });
     }
 
