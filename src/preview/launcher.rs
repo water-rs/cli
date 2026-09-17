@@ -257,10 +257,13 @@ async fn configure_preview_module_build(
     if matches!(platform, PreviewPlatform::Android) {
         let host = crate::toolchain::Host::current();
         let triple = target.triple();
+        let abi = crate::android::platform::AndroidAbi::from_triple(&triple).ok_or_else(|| {
+            eyre::eyre!("the Android preview module needs a supported ABI; `{triple}` has none")
+        })?;
         let rust_envs = crate::android::platform::android_rust_build_envs(
             &host,
             &support_project,
-            crate::android::platform::AndroidAbi::Arm64V8a,
+            abi,
             &triple,
             true,
         )
@@ -275,7 +278,7 @@ async fn configure_preview_module_build(
         Ok((
             rust_build
                 .with_envs(rust_envs)
-                .with_rustc_flag("-Clink-arg=-Wl,-z,max-page-size=16384")
+                .with_rustc_flag(crate::android::platform::ANDROID_MAX_PAGE_SIZE_LINK_ARG)
                 .with_build_std(nightly)
                 .with_features(
                     crate::android::platform::android_ffi_dependency_features(&support_project)

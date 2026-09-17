@@ -210,6 +210,12 @@ fn ndk_libcxx_path(ndk_path: &Path, abi: AndroidAbi) -> PathBuf {
         .join("libc++_shared.so")
 }
 
+/// The linker flag that aligns every produced ELF's `LOAD` segments to 16 KB
+/// pages — the largest page size Android ships (Pixel 9 class) and Google
+/// Play's packaging requirement. The app and every preview module it
+/// `dlopen`s must carry the same flag.
+pub(crate) const ANDROID_MAX_PAGE_SIZE_LINK_ARG: &str = "-Clink-arg=-Wl,-z,max-page-size=16384";
+
 /// Represents an Android platform for a specific architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AndroidAbi {
@@ -277,6 +283,20 @@ impl AndroidAbi {
             Self::X86_64 => "x86_64-linux-android",
             Self::ArmeabiV7a => "arm-linux-androideabi",
             Self::X86 => "i686-linux-android",
+        }
+    }
+
+    /// The ABI a Rust target triple names — the inverse of
+    /// [`AndroidPlatform::triple`], so call sites holding a triple never keep
+    /// a second copy of the architecture mapping.
+    #[must_use]
+    pub const fn from_triple(triple: &Triple) -> Option<Self> {
+        match triple.architecture {
+            Architecture::Aarch64(_) => Some(Self::Arm64V8a),
+            Architecture::X86_64 => Some(Self::X86_64),
+            Architecture::Arm(target_lexicon::ArmArchitecture::Armv7) => Some(Self::ArmeabiV7a),
+            Architecture::X86_32(target_lexicon::X86_32Architecture::I686) => Some(Self::X86),
+            _ => None,
         }
     }
 }
@@ -689,9 +709,7 @@ async fn configure_android_rust_build(
         .with_project(project)
         .with_features(android_ffi_dependency_features(project).await?)
         .with_crate_type_override("cdylib")
-        // Devices with 16 KB pages (Pixel 9 class and Play's 2025 requirement)
-        // refuse or warn on 4 KB-aligned LOAD segments.
-        .with_rustc_flag("-Clink-arg=-Wl,-z,max-page-size=16384");
+        .with_rustc_flag(ANDROID_MAX_PAGE_SIZE_LINK_ARG);
     if options.linkage() == RustLinkage::SharedRuntime {
         // The preview support app dlopens the pushed module, so the runtime is
         // shared: the `dev` feature resolves `waterui-dylib`, `-Cprefer-dynamic`
