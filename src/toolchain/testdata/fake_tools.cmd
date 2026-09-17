@@ -136,6 +136,12 @@ rem Prefix matches below mirror the .sh globs: `rustup <verb> ...` qualified
 rem with `--toolchain <name>` must match the same branch as the bare form.
 if "!args:~0,17!"=="toolchain install" goto :rustup_install
 if "!args:~0,13!"=="toolchain add" goto :rustup_install
+if "!args:~0,14!"=="toolchain list" (
+    if defined WATERUI_FAKE_RUSTUP_TOOLCHAINS echo !WATERUI_FAKE_RUSTUP_TOOLCHAINS!
+    if exist "%WATERUI_FAKE_RESPONSES%\RUSTUP_TOOLCHAINS" type "%WATERUI_FAKE_RESPONSES%\RUSTUP_TOOLCHAINS"
+    if exist "%state_toolchains%" type "%state_toolchains%"
+    exit /b 0
+)
 if "!args:~0,7!"=="default" goto :rustup_default
 if "!args:~0,6!"=="update" (>"%HOME%\.fake-rustc-version" echo %WATERUI_FAKE_RUSTC_UPDATED_VERSION% & exit /b 0)
 if "!args:~0,23!"=="target list --installed" (
@@ -145,13 +151,14 @@ if "!args:~0,23!"=="target list --installed" (
     exit /b 0
 )
 if "!args:~0,10!"=="target add" (>>"%state_targets%" echo !last_arg! & exit /b 0)
-if "!args:~0,26!"=="component list --installed" (
+if "!args:~0,14!"=="component list" (
     if defined WATERUI_FAKE_RUSTUP_INSTALLED_COMPONENTS echo !WATERUI_FAKE_RUSTUP_INSTALLED_COMPONENTS!
     if exist "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_COMPONENTS" type "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_COMPONENTS"
     if exist "%state_components%" type "%state_components%"
     exit /b 0
 )
 if "!args:~0,13!"=="component add" (>>"%state_components%" echo !last_arg! & exit /b 0)
+if "!args:~0,3!"=="run" goto :rustup_run
 if "%1"=="--version" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 if "%1"=="-V" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 exit /b 2
@@ -162,6 +169,19 @@ rem toolchain directory, like rustup itself.
 >>"%state_toolchains%" echo !last_arg!
 mkdir "!rustup_home!\toolchains\!last_arg!" 2>nul
 exit /b 0
+
+rem `rustup run <toolchain> <tool> <args...>` proxies to the named tool —
+rem dispatch to the sibling fake in this directory, like a real rustup proxy.
+rem cmd's `shift` rewrites %0, so the sibling path must be resolved first.
+:rustup_run
+set "run_tool=%~dp0%~3.cmd"
+shift
+shift
+set "run_args="
+:rustup_run_args
+if not "%~2"=="" (set "run_args=!run_args! %~2" & shift & goto :rustup_run_args)
+call "%run_tool%" %run_args%
+exit /b %errorlevel%
 
 rem `rustup default <channel>` installs it if absent and records the default.
 :rustup_default

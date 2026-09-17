@@ -157,6 +157,19 @@ impl Host {
         self.home.as_deref()
     }
 
+    /// Path of the running `water` executable.
+    ///
+    /// A fact about this process rather than the declared machine — every
+    /// `Host` reports the same binary, which is what `RUSTC_WRAPPER`
+    /// self-wrapping must name. Associated with [`Host`] so the probe stays
+    /// inside the seam.
+    ///
+    /// # Errors
+    /// Returns an error when the OS cannot report the executable's path.
+    pub fn current_exe() -> io::Result<PathBuf> {
+        env::current_exe()
+    }
+
     /// Roots holding installed platform application bundles.
     ///
     /// `/Applications` on macOS, empty elsewhere and on declared hosts.
