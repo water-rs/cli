@@ -529,6 +529,22 @@ fn apple_linker_flags_from_build_output(output: &str) -> Vec<String> {
             push_unique_flag(&mut flags, format!("-framework {framework}"));
         } else if let Some(arg) = line.strip_prefix("cargo:rustc-link-arg=") {
             push_unique_flag(&mut flags, arg.to_string());
+        } else if let Some(search) = line.strip_prefix("cargo:rustc-link-search=") {
+            // A `-l<lib>` link arg a build script emits (waterkit-build's
+            // `-lclang_rt.osx`, resolved from the toolchain's
+            // `lib/clang/<ver>/lib/darwin`) only resolves at Xcode's link
+            // alongside the search path the same script declared for it.
+            // `native=`/`all=`/bare paths are `-L`, `framework=` is `-F`.
+            let (kind, dir) = search
+                .split_once('=')
+                .map_or(("all", search), |(kind, dir)| (kind, dir));
+            match kind {
+                "framework" => push_unique_flag(&mut flags, format!("-F{dir}")),
+                "native" | "all" => push_unique_flag(&mut flags, format!("-L{dir}")),
+                // `crate=` and `dependency=` name rustc's own artifact lookups,
+                // which Xcode's clang never performs.
+                _ => {}
+            }
         }
     }
     flags
@@ -1095,6 +1111,24 @@ mod tests {
                 "-rpath".to_string(),
                 "/usr/lib/swift".to_string(),
                 "-framework Foundation".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn forwards_link_search_dirs_that_link_args_depend_on() {
+        // waterkit-build 0.1.3 declares the compiler-rt builtins this way; the
+        // `-l` alone made Xcode's link fail with "library 'clang_rt.osx' not
+        // found" on every macOS and iOS package in the Apple nightly.
+        let output = "cargo:rustc-link-search=native=/Xcode/lib/clang/17/lib/darwin\ncargo:rustc-link-arg=-lclang_rt.osx\ncargo:rustc-link-search=framework=/Frameworks\ncargo:rustc-link-search=/plain\ncargo:rustc-link-search=crate=/target/deps\ncargo:rustc-link-search=native=/Xcode/lib/clang/17/lib/darwin\n";
+        let flags = apple_linker_flags_from_build_output(output);
+        assert_eq!(
+            flags,
+            vec![
+                "-L/Xcode/lib/clang/17/lib/darwin".to_string(),
+                "-lclang_rt.osx".to_string(),
+                "-F/Frameworks".to_string(),
+                "-L/plain".to_string(),
             ]
         );
     }
