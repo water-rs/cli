@@ -47,8 +47,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   E2E_USER: watere2e
-  # Windows rejects a password containing the account name; keep them disjoint.
-  E2E_PASS: 'hQ9$vM2#zL8!tR4'
 
 jobs:
   ignored:
@@ -168,6 +166,21 @@ jobs:
       - name: Install DirectX Shader Compiler
         if: runner.os == 'Windows'
         uses: ./.github/actions/install-dxc
+
+      # The fresh user's password is generated per run: a literal in this
+      # file would print in every step's environment block of the public
+      # job log. The mask is registered before the value can appear
+      # anywhere, and $GITHUB_ENV carries it to the provisioning steps —
+      # the `env:` block never sees it. The fixed tail guarantees the
+      # Windows complexity rule (upper, lower, digit, symbol) that a bare
+      # base64 draw can miss.
+      - name: Generate the fresh user's password
+        shell: bash
+        run: |
+          set -euo pipefail
+          pass="$(openssl rand -base64 24)Zx9!"
+          echo "::add-mask::$pass"
+          echo "E2E_PASS=$pass" >> "$GITHUB_ENV"
 
       - name: Provision fresh user + rustup bootstrap (macOS)
         if: runner.os == 'macOS'
