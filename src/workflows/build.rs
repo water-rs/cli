@@ -1287,7 +1287,8 @@ Automatic meson installation failed: {install_err}\n\n{}",
             // that NDK-compiled C objects reference, which otherwise stay
             // undefined and make `dlopen` reject the libraries.
             cmd = cmd.arg("-Zbuild-std=std,panic_abort");
-            cmd = cmd.arg("-Zbuild-std-features=panic-unwind,backtrace,default,compiler-builtins-c");
+            cmd =
+                cmd.arg("-Zbuild-std-features=panic-unwind,backtrace,default,compiler-builtins-c");
         }
         let mut cmd = cmd
             .args(cargo_target.cargo_args())
@@ -1396,7 +1397,8 @@ Automatic meson installation failed: {install_err}\n\n{}",
             .env("RUSTUP_TOOLCHAIN", toolchain)
             .env(
                 "RUSTC_WRAPPER",
-                std::env::current_exe().map_err(RustBuildError::FailToExecuteCargoBuild)?,
+                crate::toolchain::Host::current_exe()
+                    .map_err(RustBuildError::FailToExecuteCargoBuild)?,
             )
             .env(crate::workflows::rustc_wrapper::WRAPPER_MODE_ENV, "1")
             .env(
@@ -1595,8 +1597,8 @@ mod tests {
     use std::ffi::OsString;
 
     use super::{
-        BuildOptions, BuildProfile, CargoTarget, CompileEvent, RustDynamicLibraries, RustLinkage,
-        classify_compile_line, dynamic_library_file_name, lib_extension_for_triple,
+        BuildOptions, BuildProfile, CargoTarget, CompileEvent, RustBuild, RustDynamicLibraries,
+        RustLinkage, classify_compile_line, dynamic_library_file_name, lib_extension_for_triple,
         resolve_rust_standard_library_in,
     };
 
@@ -1613,6 +1615,64 @@ mod tests {
             CargoTarget::Binary("waterui-cef-helper").cargo_args(),
             ["--bin", "waterui-cef-helper"]
         );
+    }
+
+    #[test]
+    fn build_std_envs_wire_the_wrapper_and_clear_workspace_wrappers() {
+        use std::ffi::OsStr;
+
+        let dir = tempdir().expect("target dir");
+        let toolchain = "nightly-2026-09-09-aarch64-apple-darwin";
+        let build = RustBuild::new(dir.path(), triple("aarch64-linux-android"))
+            .with_build_std(toolchain)
+            .with_target_dir(dir.path().join("target"))
+            .with_sccache(std::path::PathBuf::from("/fake/sccache"));
+        let mut cmd = smol::process::Command::new("cargo");
+        smol::block_on(build.with_build_std_envs(&mut cmd, false)).expect("build-std envs apply");
+
+        let env = |key: &str| -> Option<Option<OsString>> {
+            cmd.get_envs()
+                .find(|(name, _)| *name == OsStr::new(key))
+                .map(|(_, value)| value.map(ToOwned::to_owned))
+        };
+        assert_eq!(
+            env("RUSTUP_TOOLCHAIN"),
+            Some(Some(OsString::from(toolchain)))
+        );
+        assert_eq!(
+            env("RUSTC_WRAPPER"),
+            Some(Some(
+                crate::toolchain::Host::current_exe()
+                    .expect("the test binary path")
+                    .into_os_string()
+            )),
+            "the wrapper must name this binary"
+        );
+        assert_eq!(
+            env(crate::workflows::rustc_wrapper::WRAPPER_MODE_ENV),
+            Some(Some(OsString::from("1")))
+        );
+        assert_eq!(
+            env(crate::workflows::rustc_wrapper::BUILD_STD_TARGET_ENV),
+            Some(Some(OsString::from("aarch64-linux-android")))
+        );
+        assert_eq!(
+            env(crate::workflows::rustc_wrapper::BUILD_STD_DYLIB_DIR_ENV),
+            Some(Some(
+                dir.path()
+                    .join("target/aarch64-linux-android/debug/deps")
+                    .into_os_string()
+            ))
+        );
+        assert_eq!(
+            env(crate::workflows::rustc_wrapper::WRAPPER_CHAIN_ENV),
+            Some(Some(OsString::from("/fake/sccache"))),
+            "a configured sccache chains behind the shim"
+        );
+        // A workspace wrapper would replace RUSTC_WRAPPER on exactly the
+        // link-emitting member units, so both spellings must be removed.
+        assert_eq!(env("RUSTC_WORKSPACE_WRAPPER"), Some(None));
+        assert_eq!(env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"), Some(None));
     }
 
     #[test]
