@@ -192,6 +192,40 @@ async fn ensure_shared_target_dir_in(cache_root: &Path) -> eyre::Result<PathBuf>
     Ok(target_dir)
 }
 
+/// Remove the shared Cargo target directory every project's builds write
+/// into, returning the disk space it held — `None` when no shared target
+/// exists.
+///
+/// The garbage collector only reclaims the directory once it has been unused
+/// for the configured window; this is the explicit drop, for when a user
+/// wants the space back now. A build in flight holds no lock against it —
+/// like `cargo clean`, dropping the cache under a live build is the caller's
+/// choice.
+///
+/// # Errors
+/// Returns an error if the cache root cannot be resolved or the directory
+/// cannot be removed.
+pub async fn remove_shared_target_dir() -> eyre::Result<Option<u64>> {
+    let water_home = water_home_dir()?;
+    let (_, cache_root) = resolved_build_cache_root_in(&water_home).await?;
+    remove_shared_target_dir_in(&cache_root).await
+}
+
+async fn remove_shared_target_dir_in(cache_root: &Path) -> eyre::Result<Option<u64>> {
+    let target_dir = cache_root.join(SHARED_TARGET_DIR_NAME);
+    if !target_dir.exists() {
+        return Ok(None);
+    }
+    let bytes = directory_disk_usage(target_dir.clone()).await?;
+    fs::remove_dir_all(&target_dir).await.wrap_err_with(|| {
+        format!(
+            "Failed to remove shared target dir {}",
+            target_dir.display()
+        )
+    })?;
+    Ok(Some(bytes))
+}
+
 /// Return the managed build-cache directory for a project.
 ///
 /// # Errors
@@ -1131,6 +1165,40 @@ mod tests {
             assert_eq!(outcome, super::BuildCacheGcOutcome::SkippedAlreadyRunning);
 
             drop(held);
+        });
+    }
+
+    /// The survey reports the shared target, and an explicit drop removes it
+    /// immediately instead of waiting out the unused-days policy.
+    #[test]
+    fn shared_target_dir_can_be_dropped_on_demand() {
+        smol::block_on(async {
+            let cache_root = tempdir().expect("cache root");
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            smol::fs::create_dir_all(target_dir.join("debug"))
+                .await
+                .expect("create a unit dir");
+            smol::fs::write(target_dir.join("debug/unit.rlib"), [0u8; 1024])
+                .await
+                .expect("write a unit");
+
+            let freed = super::remove_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("drop the shared target");
+            assert!(
+                freed.is_some_and(|bytes| bytes > 0),
+                "the drop reports the space it held: {freed:?}"
+            );
+            assert!(!target_dir.exists());
+            assert_eq!(
+                super::remove_shared_target_dir_in(cache_root.path())
+                    .await
+                    .expect("a second drop"),
+                None,
+                "dropping an absent shared target is a no-op"
+            );
         });
     }
 
