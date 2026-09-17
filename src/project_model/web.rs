@@ -159,7 +159,7 @@ pub async fn web_mount(
 pub fn decode_web_mount(symbols: &ArtifactSymbols) -> eyre::Result<Option<BundleMountMeta>> {
     let mut frontend = None;
     for leaf in symbols.leaves_with_prefix(BUNDLE_META_PREFIX) {
-        let meta = BundleMountMeta::from_payload(&symbols.static_bytes(&leaf)?)?;
+        let meta = symbols.bundle_mount_meta(&leaf)?;
         if meta.project.is_none() {
             continue;
         }
