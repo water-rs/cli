@@ -298,8 +298,47 @@ mod tests {
     /// its `cargo build --lib` compiles the pinned framework's graph, which is
     /// the expensive part, and a persistent target dir lets a nextest retry —
     /// and the next cached CI run — resume that compile instead of restarting
-    /// it cold every attempt.
+    /// it cold every attempt. Sources stage into a wiped `crate/` beside the
+    /// persistent `target/` so a file deleted from `tests/fixtures/web_meta`
+    /// cannot survive in the staged tree.
     fn web_meta_fixture() -> PathBuf {
+        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures/web-meta");
+        // Sources stage into a wiped `crate/`: copying over an existing tree
+        // keeps files the fixture deleted, so the staged crate must start
+        // empty — and anything beside it that is not the persistent `target/`
+        // is a leftover from an older layout.
+        std::fs::create_dir_all(&fixture).expect("the fixture directory is creatable");
+        for entry in std::fs::read_dir(&fixture).expect("the fixture directory is readable") {
+            let path = entry.expect("a fixture entry is readable").path();
+            if path == fixture.join("target") {
+                continue;
+            }
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .expect("a stale fixture entry is removable");
+        }
+        let staged = fixture.join("crate");
+        fs_extra::dir::copy(
+            &sources,
+            &staged,
+            &fs_extra::dir::CopyOptions::new()
+                .content_only(true)
+                .overwrite(true),
+        )
+        .expect("the fixture sources copy");
+        std::fs::write(staged.join("Cargo.toml"), web_meta_manifest())
+            .expect("the manifest is written");
+        fixture
+    }
+
+    /// The staged fixture's `Cargo.toml`, with the `waterui` dependency pinned
+    /// to the revision this crate's own manifest carries — the revision lives
+    /// in one place.
+    fn web_meta_manifest() -> String {
         #[derive(serde::Serialize)]
         struct Manifest {
             package: Package,
@@ -345,16 +384,6 @@ mod tests {
             debug: u8,
         }
 
-        let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures/web-meta");
-        fs_extra::dir::copy(
-            &sources,
-            &fixture,
-            &fs_extra::dir::CopyOptions::new()
-                .content_only(true)
-                .overwrite(true),
-        )
-        .expect("the fixture sources copy");
         let (git, rev) = crate::pinned_framework::source();
         // The lean facade: `include_web!` expands against `waterui::webview`
         // and `waterui::Bundle`, nothing else of the framework is needed.
@@ -402,12 +431,7 @@ mod tests {
                 dev: DevProfile { debug: 0 },
             },
         };
-        std::fs::write(
-            fixture.join("Cargo.toml"),
-            toml::to_string(&manifest).expect("the manifest serializes"),
-        )
-        .expect("the manifest is written");
-        fixture
+        toml::to_string(&manifest).expect("the manifest serializes")
     }
 
     /// `include_web!` is the one web mount an application declares; its
@@ -422,7 +446,8 @@ mod tests {
     fn reads_include_web_mount_meta_from_built_rlib() {
         futures_lite::future::block_on(async {
             let fixture = web_meta_fixture();
-            let rlib = build_host_rlib(&fixture, &fixture.join("target"), None, None)
+            let project = fixture.join("crate");
+            let rlib = build_host_rlib(&project, &fixture.join("target"), None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
@@ -441,7 +466,7 @@ mod tests {
             assert_eq!(
                 meta.project.as_deref(),
                 Some(
-                    dunce::canonicalize(fixture.join("web"))
+                    dunce::canonicalize(project.join("web"))
                         .as_deref()
                         .expect("web root")
                 )
