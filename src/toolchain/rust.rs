@@ -1233,6 +1233,7 @@ pub async fn rustc_verbose_version(host: &Host, toolchain: &str) -> eyre::Result
 /// nightly for the host.
 fn pick_nightly(list_output: &str, host_triple: &str) -> Option<String> {
     let default_nightly = format!("nightly-{host_triple}");
+    let suffix = format!("-{host_triple}");
     let mut dated = Vec::new();
     for name in list_output
         .lines()
@@ -1241,7 +1242,24 @@ fn pick_nightly(list_output: &str, host_triple: &str) -> Option<String> {
         if name == default_nightly {
             return Some(name.to_string());
         }
-        if name.starts_with("nightly-") && name.ends_with(&format!("-{host_triple}")) {
+        let Some(date) = name
+            .strip_prefix("nightly-")
+            .and_then(|rest| rest.strip_suffix(&suffix))
+        else {
+            continue;
+        };
+        // Only the dated shape `nightly-YYYY-MM-DD-<host>` is ordered by
+        // recency: a custom-linked toolchain named `nightly-anything-<host>`
+        // must not sort last and silently outrank every dated nightly.
+        let mut fields = date.split('-');
+        let is_dated = matches!(
+            (fields.next(), fields.next(), fields.next(), fields.next()),
+            (Some(year), Some(month), Some(day), None)
+                if year.len() == 4 && month.len() == 2 && day.len() == 2
+                    && year.bytes().chain(month.bytes()).chain(day.bytes())
+                        .all(|byte| byte.is_ascii_digit())
+        );
+        if is_dated {
             dated.push(name.to_string());
         }
     }
@@ -1275,6 +1293,22 @@ mod tests {
         );
 
         assert_eq!(pick_nightly("stable-aarch64-apple-darwin\n", host), None);
+    }
+
+    #[test]
+    fn pick_nightly_ignores_custom_toolchains_shaped_like_dated_ones() {
+        let host = "aarch64-apple-darwin";
+        // A linked toolchain named `nightly-zzz-<host>` sorts after every
+        // dated nightly — without the date-shape check it would win.
+        let list = "nightly-2026-05-28-aarch64-apple-darwin\nnightly-zzz-aarch64-apple-darwin\n";
+        assert_eq!(
+            pick_nightly(list, host).as_deref(),
+            Some("nightly-2026-05-28-aarch64-apple-darwin")
+        );
+        assert_eq!(
+            pick_nightly("nightly-zzz-aarch64-apple-darwin\n", host),
+            None
+        );
     }
 
     #[test]
@@ -1588,9 +1622,9 @@ mod host_tests {
         let error = smol::block_on(nightly_toolchain_with_rust_src(&host))
             .expect_err("missing rust-src must fail");
         assert!(
-            error
-                .to_string()
-                .contains(&format!("rustup component add --toolchain {nightly} rust-src")),
+            error.to_string().contains(&format!(
+                "rustup component add --toolchain {nightly} rust-src"
+            )),
             "the error must name the exact install command: {error}"
         );
     }
