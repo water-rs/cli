@@ -186,17 +186,89 @@ fn rewrite_std_unit(args: &[OsString]) -> Vec<OsString> {
     rewritten
 }
 
-/// Poll until `path` exists, up to a bound far beyond any dependency's
+/// Poll until `ready` holds, up to a bound far beyond any dependency's
 /// codegen time. Returns `false` on timeout so a genuinely missing artifact
 /// surfaces as rustc's own error rather than a silent drop.
-fn wait_for_file(path: &Path) -> bool {
+fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     const POLL: std::time::Duration = std::time::Duration::from_millis(20);
     let deadline = std::time::Instant::now() + TIMEOUT;
-    while !path.is_file() && std::time::Instant::now() < deadline {
+    while !ready() && std::time::Instant::now() < deadline {
         std::thread::sleep(POLL);
     }
-    path.is_file()
+    ready()
+}
+
+/// Poll until `path` exists — safe only for artifacts rustc renames into
+/// place (rlibs, rmeta), where presence already means complete.
+fn wait_for_file(path: &Path) -> bool {
+    wait_until(|| path.is_file())
+}
+
+/// Wait for the produced `libstd-*.so` to be *complete*, not merely present:
+/// the native linker streams the dylib to its final path, so `is_file` can
+/// observe a partially written file a dependent's rustc would then fail to
+/// read. The real completion signal is the unit's dep-info `std-<hash>.d`,
+/// which rustc writes only after linking returns; when no dep-info is
+/// emitted, the `.so` must instead parse as a complete ELF before use.
+fn wait_for_std_dylib(dylib: &Path) -> bool {
+    let dep_info = dylib
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .and_then(|stem| stem.strip_prefix("lib"))
+        .map(|stem| dylib.with_file_name(format!("{stem}.d")));
+    wait_until(|| {
+        dep_info.as_ref().is_some_and(|dep| dep.is_file())
+            || dylib.is_file() && elf_file_is_parseable(dylib)
+    })
+}
+
+/// Whether `path` currently holds a completely written, parseable ELF — the
+/// readiness fallback for the `libstd` dylib when the `std` unit emits no
+/// dep-info. A file the linker is still streaming fails to parse.
+fn elf_file_is_parseable(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    object::File::parse(&*bytes).is_ok()
+}
+
+/// Every value paired with `flag` (split and joined forms); a flag may be
+/// repeated.
+fn arg_values<'a>(args: &'a [OsString], flag: &str) -> Vec<&'a OsStr> {
+    let mut values = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            if let Some(value) = iter.next() {
+                values.push(value.as_os_str());
+            }
+        } else if let Some(value) = arg.to_str().and_then(|arg| {
+            arg.strip_prefix(flag)
+                .and_then(|rest| rest.strip_prefix('='))
+        }) {
+            values.push(OsStr::new(value));
+        }
+    }
+    values
+}
+
+/// Whether the invocation's `--crate-type` list names a kind the linker
+/// writes — `bin`/`cdylib`/`dylib`/`staticlib`/`proc-macro`. rlib and rmeta
+/// units only archive metadata and never resolve `std` at link time, so
+/// rewriting them would only serialize pipelined dependents behind the
+/// dylib wait. An absent `--crate-type` keeps the conservative answer:
+/// rustc's default crate type is a linked kind.
+fn links_native_artifact(args: &[OsString]) -> bool {
+    const LINKED: &[&str] = &["bin", "cdylib", "dylib", "staticlib", "proc-macro"];
+    let values = arg_values(args, "--crate-type");
+    values.is_empty()
+        || values.iter().any(|value| {
+            value
+                .to_string_lossy()
+                .split(',')
+                .any(|kind| LINKED.contains(&kind))
+        })
 }
 
 /// Hand every link-emitting unit that depends on `std` the freshly built
@@ -205,10 +277,11 @@ fn wait_for_file(path: &Path) -> bool {
 /// Cargo may express the dependency as either the `libstd-*.rlib` or the
 /// `libstd-*.rmeta` produced in the `std` unit's own out dir; the dylib sits
 /// next to both. A unit that only reads metadata never links `std`, so only
-/// `--emit` sets containing `link` are rewritten — and only those wait for
-/// the dylib, since Cargo starts them no earlier than the unit producing it.
+/// `--emit` sets containing `link` *and* `--crate-type`s that link natively
+/// are rewritten — and only those wait for the dylib, since Cargo starts
+/// them no earlier than the unit producing it.
 fn add_std_dylib_extern(args: &[OsString]) -> Vec<OsString> {
-    if !emits_linked_output(args) {
+    if !emits_linked_output(args) || !links_native_artifact(args) {
         return args.to_vec();
     }
     let mut rewritten = args.to_vec();
@@ -227,14 +300,15 @@ fn add_std_dylib_extern(args: &[OsString]) -> Vec<OsString> {
         let dylib = Path::new(path).with_extension("so");
         // The `std` unit emits the dylib at the end of the same invocation
         // that wrote the rmeta/rlib this extern points at; if pipelining let
-        // this unit start early, the dylib is on its way — wait for the file,
-        // and let rustc's own error surface if it never arrives.
-        if wait_for_file(&dylib) {
+        // this unit start early, the dylib is on its way — wait for the
+        // post-link completion signal, and let rustc's own error surface if
+        // it never arrives.
+        if wait_for_std_dylib(&dylib) {
             rewritten.push(OsString::from("--extern"));
             rewritten.push(OsString::from(format!("{}={}", name, dylib.display())));
         } else {
             eprintln!(
-                "water: build-std libstd dylib never appeared at {}; \
+                "water: build-std libstd dylib never completed at {}; \
                  this unit will link `std` statically",
                 dylib.display()
             );
@@ -260,22 +334,10 @@ fn extern_values(args: &[OsString]) -> Vec<OsString> {
     specs
 }
 
-/// The value paired with `flag` in split or joined (`--flag=value`) form.
+/// The first value paired with `flag` in split or joined (`--flag=value`)
+/// form.
 fn arg_value<'a>(args: &'a [OsString], flag: &str) -> &'a OsStr {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == flag {
-            if let Some(value) = iter.next() {
-                return value;
-            }
-        } else if let Some(value) = arg.to_str().and_then(|arg| {
-            arg.strip_prefix(flag)
-                .and_then(|rest| rest.strip_prefix('='))
-        }) {
-            return OsStr::new(value);
-        }
-    }
-    OsStr::new("")
+    arg_values(args, flag).first().copied().unwrap_or_default()
 }
 
 /// Whether this invocation links an artifact (as opposed to a metadata-only
@@ -415,10 +477,16 @@ mod tests {
         std::fs::write(&rmeta, []).expect("rmeta");
         std::fs::write(&dylib_rlib, []).expect("dylib for rlib extern");
         std::fs::write(&dylib_rmeta, []).expect("dylib for rmeta extern");
+        // rustc writes dep-info after the link finishes — its presence, not
+        // the `.so` appearing, is what marks the dylib complete.
+        std::fs::write(dir.path().join("std-abc123.d"), []).expect("dep-info");
+        std::fs::write(dir.path().join("std-def456.d"), []).expect("dep-info");
 
         let args = os(&[
             "--crate-name",
             "waterui_preview",
+            "--crate-type",
+            "cdylib",
             "--target",
             "aarch64-linux-android",
             "--emit=dep-info,metadata,link",
@@ -447,6 +515,29 @@ mod tests {
                 .any(|arg| arg.to_string_lossy().contains("libstd_detect-zz.so")),
             "std_detect must not be rewritten"
         );
+    }
+
+    #[test]
+    fn rlib_units_pass_through_without_waiting_for_the_dylib() {
+        let dir = tempdir().expect("std out dir");
+        let rlib = dir.path().join("libstd-abc123.rlib");
+        std::fs::write(&rlib, []).expect("rlib");
+        // No `std-*.d` dep-info and no `.so` at all — a linked-kind unit
+        // would block on the dylib wait here; an rlib unit archives metadata
+        // only, so it must pass through untouched and unblocked.
+        let args = os(&[
+            "--crate-name",
+            "waterui_dep",
+            "--crate-type",
+            "rlib",
+            "--target",
+            "aarch64-linux-android",
+            "--emit=dep-info,link",
+            "--extern",
+            &format!("std={}", rlib.display()),
+        ]);
+        let rewritten = rewrite_args(&args, OsString::from("aarch64-linux-android").as_os_str());
+        assert_eq!(rewritten.args, args);
     }
 
     #[test]
