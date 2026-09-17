@@ -1240,7 +1240,7 @@ mod tests {
 
 #[cfg(test)]
 mod host_tests {
-    use super::{CLI_MINIMUM_RUST_VERSION, RustToolchain};
+    use super::{CLI_MINIMUM_RUST_VERSION, RustToolchain, tool_binary_name};
     use crate::toolchain::testing::TestMachine;
     use crate::toolchain::{Installation, Toolchain, ToolchainError};
 
@@ -1480,8 +1480,14 @@ mod host_tests {
         machine.install("rustup");
         // rustup is on PATH, cargo/rustc are not — but their proxies exist
         // under the fake home's `.cargo/bin`.
-        machine.file("home/.cargo/bin/cargo", "proxy");
-        machine.file("home/.cargo/bin/rustc", "proxy");
+        machine.file(
+            format!("home/.cargo/bin/{}", tool_binary_name("cargo")),
+            "proxy",
+        );
+        machine.file(
+            format!("home/.cargo/bin/{}", tool_binary_name("rustc")),
+            "proxy",
+        );
         let host = machine.host(Vec::<(String, String)>::new());
         let result = smol::block_on(RustToolchain::default().check(&host));
         match &result {

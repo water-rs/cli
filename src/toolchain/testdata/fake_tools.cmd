@@ -24,6 +24,7 @@ set "tool=%~n0"
 rem Defaults matching the .sh `${VAR:-default}` expansions; a declared value
 rem always wins.
 if not defined WATERUI_FAKE_RUSTC_VERSION set "WATERUI_FAKE_RUSTC_VERSION=1.0.0"
+if not defined WATERUI_FAKE_RUSTC_UPDATED_VERSION set "WATERUI_FAKE_RUSTC_UPDATED_VERSION=99.0.0"
 if not defined WATERUI_FAKE_CARGO_VERSION set "WATERUI_FAKE_CARGO_VERSION=1.95.0"
 if not defined WATERUI_FAKE_XCODE_VERSION set "WATERUI_FAKE_XCODE_VERSION=16.4"
 if not defined WATERUI_FAKE_ADB_VERSION set "WATERUI_FAKE_ADB_VERSION=36.0.0-test"
@@ -124,29 +125,31 @@ set "state_default=%HOME%\.fake-rustup-default"
 set "state_targets=%HOME%\.fake-rustup-targets"
 set "state_components=%HOME%\.fake-rustup-components"
 if defined RUSTUP_HOME (set "rustup_home=%RUSTUP_HOME%") else (set "rustup_home=%HOME%\.rustup")
+if not defined WATERUI_FAKE_RUSTC_HOST set "WATERUI_FAKE_RUSTC_HOST=x86_64-unknown-fake"
 if "%*"=="show active-toolchain" goto :rustup_active_toolchain
 set "args=%*"
 if not defined args exit /b 2
 call :last_arg %*
+rem Prefix matches below mirror the .sh globs: `rustup <verb> ...` qualified
+rem with `--toolchain <name>` must match the same branch as the bare form.
 if "!args:~0,17!"=="toolchain install" (>>"%state_toolchains%" echo !last_arg! & exit /b 0)
-if "!args:~0,14!"=="toolchain add " (>>"%state_toolchains%" echo !last_arg! & exit /b 0)
-if "!args:~0,8!"=="default " (>>"%state_toolchains%" echo !last_arg! & >"%state_default%" echo !last_arg! & exit /b 0)
-if "!args!"=="update" (>"%HOME%\.fake-rustc-version" echo 99.0.0 & exit /b 0)
-if "!args:~0,7!"=="update " (>"%HOME%\.fake-rustc-version" echo 99.0.0 & exit /b 0)
-if "!args:~0,24!"=="target list --installed" (
+if "!args:~0,13!"=="toolchain add" (>>"%state_toolchains%" echo !last_arg! & exit /b 0)
+if "!args:~0,7!"=="default" (>>"%state_toolchains%" echo !last_arg! & >"%state_default%" echo !last_arg! & exit /b 0)
+if "!args:~0,6!"=="update" (>"%HOME%\.fake-rustc-version" echo %WATERUI_FAKE_RUSTC_UPDATED_VERSION% & exit /b 0)
+if "!args:~0,23!"=="target list --installed" (
     if defined WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS echo !WATERUI_FAKE_RUSTUP_INSTALLED_TARGETS!
     if exist "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_TARGETS" type "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_TARGETS"
     if exist "%state_targets%" type "%state_targets%"
     exit /b 0
 )
-if "!args:~0,10!"=="target add " (>>"%state_targets%" echo !last_arg! & exit /b 0)
-if "!args:~0,27!"=="component list --installed" (
+if "!args:~0,10!"=="target add" (>>"%state_targets%" echo !last_arg! & exit /b 0)
+if "!args:~0,26!"=="component list --installed" (
     if defined WATERUI_FAKE_RUSTUP_INSTALLED_COMPONENTS echo !WATERUI_FAKE_RUSTUP_INSTALLED_COMPONENTS!
     if exist "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_COMPONENTS" type "%WATERUI_FAKE_RESPONSES%\RUSTUP_INSTALLED_COMPONENTS"
     if exist "%state_components%" type "%state_components%"
     exit /b 0
 )
-if "!args:~0,14!"=="component add " (>>"%state_components%" echo !last_arg! & exit /b 0)
+if "!args:~0,13!"=="component add" (>>"%state_components%" echo !last_arg! & exit /b 0)
 if "%1"=="--version" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 if "%1"=="-V" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
 exit /b 2
@@ -169,8 +172,9 @@ exit /b %errorlevel%
 rem A test's `rust-toolchain.toml` pin names this channel; it resolves once
 rem `rustup toolchain install`/`default` recorded it, or a toolchain
 rem directory exists (linked/esp-style toolchains live under
-rem %RUSTUP_HOME%\toolchains). Installed-by-file channels report the
-rem `-<host>` suffix rustup appends; directory-resolved names print bare.
+rem %RUSTUP_HOME%\toolchains). stable/beta/nightly and version-prefixed
+rem channels carry the `-<host>` suffix rustup appends; custom/linked
+rem toolchain names (esp, stage0) print bare - the same split as the .sh.
 :rustup_pinned_toolchain
 set "pin=%WATERUI_FAKE_RUSTUP_TOOLCHAIN_NOT_INSTALLED%"
 set "pin_installed="
@@ -184,12 +188,17 @@ if not defined pin_installed (
     echo error: toolchain '!pin!' is not installed 1>&2
     exit /b 1
 )
-if "!pin_installed!"=="dir" (echo !pin! (overridden by rust-toolchain.toml) & exit /b 0)
-echo !pin!-%WATERUI_FAKE_RUSTC_HOST% (overridden by rust-toolchain.toml)
+set "pin_suffixed="
+if /i "!pin!"=="stable" set "pin_suffixed=1"
+if /i "!pin!"=="beta" set "pin_suffixed=1"
+if /i "!pin!"=="nightly" set "pin_suffixed=1"
+for %%d in (0 1 2 3 4 5 6 7 8 9) do if "!pin:~0,1!"=="%%d" set "pin_suffixed=1"
+if defined pin_suffixed (echo !pin!-%WATERUI_FAKE_RUSTC_HOST% (overridden by rust-toolchain.toml) & exit /b 0)
+echo !pin! (overridden by rust-toolchain.toml)
 exit /b 0
 
 :rustc
-set "rustc_version=%WATERUI_FAKE_RUSTC_VERSION%"
+if defined WATERUI_FAKE_RUSTC_VERSION (set "rustc_version=%WATERUI_FAKE_RUSTC_VERSION%") else (set "rustc_version=1.0.0")
 if exist "%HOME%\.fake-rustc-version" (
     for /f "usebackq delims=" %%v in ("%HOME%\.fake-rustc-version") do set "rustc_version=%%v"
 )
@@ -210,6 +219,7 @@ if "%1"=="-vV" (
 exit /b 2
 
 :cargo
+if not defined WATERUI_FAKE_CARGO_VERSION set "WATERUI_FAKE_CARGO_VERSION=1.95.0"
 if "%1"=="--version" (echo cargo %WATERUI_FAKE_CARGO_VERSION% (waterui-test) & exit /b 0)
 if "%1"=="install" goto :cargo_install
 if "%1"=="binstall" goto :cargo_install
