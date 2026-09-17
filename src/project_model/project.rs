@@ -2615,8 +2615,7 @@ mod webview_backend_tests {
     #[test]
     #[ignore = "clones the pinned framework revision"]
     fn runtime_graph_is_scoped_to_the_selected_application() {
-        let checkout = crate::pinned_framework::checkout();
-        let repository = checkout.path();
+        let repository = crate::pinned_framework::checkout();
         let chromium = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/chromium"),
         ))
@@ -2704,8 +2703,7 @@ mod webview_backend_tests {
     #[test]
     #[ignore = "clones the pinned framework revision"]
     fn the_map_capability_is_read_from_the_application_graph() {
-        let checkout = crate::pinned_framework::checkout();
-        let repository = checkout.path();
+        let repository = crate::pinned_framework::checkout();
 
         let map = smol::block_on(resolve_linked_runtime_packages(
             repository.join("examples/map"),

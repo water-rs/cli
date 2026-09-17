@@ -5677,7 +5677,7 @@ pub mod inspector {
         #[ignore = "clones the pinned framework revision"]
         fn the_inspector_app_crate_path_exists() {
             let checkout = crate::pinned_framework::checkout();
-            let crate_path = checkout.path().join(super::INSPECTOR_APP_CRATE);
+            let crate_path = checkout.join(super::INSPECTOR_APP_CRATE);
             assert!(
                 crate_path.join("Cargo.toml").is_file(),
                 "inspector app crate is not at {}",

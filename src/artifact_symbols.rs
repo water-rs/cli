@@ -287,13 +287,20 @@ mod tests {
     /// The `web_meta` fixture staged against the pinned framework: its sources
     /// copied beside a manifest whose `waterui` dependency is the git pin this
     /// crate's own manifest carries, so the revision lives in one place.
-    fn web_meta_fixture() -> tempfile::TempDir {
+    ///
+    /// The fixture lives under `target/test-fixtures/` rather than a tempdir:
+    /// its `cargo build --lib` compiles the pinned framework's graph, which is
+    /// the expensive part, and a persistent target dir lets a nextest retry —
+    /// and the next cached CI run — resume that compile instead of restarting
+    /// it cold every attempt.
+    fn web_meta_fixture() -> PathBuf {
         #[derive(serde::Serialize)]
         struct Manifest {
             package: Package,
             workspace: toml::Table,
             dependencies: std::collections::BTreeMap<&'static str, Dependency>,
             patch: Patch,
+            profile: Profile,
         }
         #[derive(serde::Serialize)]
         struct Patch {
@@ -319,13 +326,27 @@ mod tests {
             default_features: bool,
             features: Vec<&'static str>,
         }
+        #[derive(serde::Serialize)]
+        struct Profile {
+            dev: DevProfile,
+        }
+        /// The rlib is read for `waterui_meta_*` statics, which live behind
+        /// `debug_assertions` — debug info itself buys the test nothing, and
+        /// emitting it for the whole framework graph is a real slice of a cold
+        /// build's time.
+        #[derive(serde::Serialize)]
+        struct DevProfile {
+            debug: u8,
+        }
 
         let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/web_meta");
-        let fixture = tempfile::tempdir().expect("fixture directory");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-fixtures/web-meta");
         fs_extra::dir::copy(
             &sources,
-            fixture.path(),
-            &fs_extra::dir::CopyOptions::new().content_only(true),
+            &fixture,
+            &fs_extra::dir::CopyOptions::new()
+                .content_only(true)
+                .overwrite(true),
         )
         .expect("the fixture sources copy");
         let (git, rev) = crate::pinned_framework::source();
@@ -371,9 +392,12 @@ mod tests {
                 })
                 .collect(),
             },
+            profile: Profile {
+                dev: DevProfile { debug: 0 },
+            },
         };
         std::fs::write(
-            fixture.path().join("Cargo.toml"),
+            fixture.join("Cargo.toml"),
             toml::to_string(&manifest).expect("the manifest serializes"),
         )
         .expect("the manifest is written");
@@ -392,7 +416,7 @@ mod tests {
     fn reads_include_web_mount_meta_from_built_rlib() {
         futures_lite::future::block_on(async {
             let fixture = web_meta_fixture();
-            let rlib = build_host_rlib(fixture.path(), None, None)
+            let rlib = build_host_rlib(&fixture, None, None)
                 .await
                 .expect("fixture crate should build");
             let symbols = ArtifactSymbols::read(&rlib).expect("rlib should parse");
@@ -411,7 +435,7 @@ mod tests {
             assert_eq!(
                 meta.project.as_deref(),
                 Some(
-                    dunce::canonicalize(fixture.path().join("web"))
+                    dunce::canonicalize(fixture.join("web"))
                         .as_deref()
                         .expect("web root")
                 )

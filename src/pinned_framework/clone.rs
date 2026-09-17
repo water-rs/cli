@@ -2,7 +2,7 @@
 //! binary's tests compile too (`src/terminal/main.rs` includes this file by
 //! path), so it must not name the GitHub helpers beside it.
 
-use std::{path::Path, process::Command};
+use std::{path::Path, path::PathBuf, process::Command};
 
 /// The framework repository URL and the revision the `waterui-*` git
 /// dependencies in this crate's manifest pin. Every `waterui-*` dependency
@@ -43,26 +43,65 @@ pub fn source() -> (String, String) {
         .expect("the length check leaves one source")
 }
 
-/// A blob-less clone of the pinned framework revision, submodules included —
-/// the workspace `[patch]` table names `kit/` paths, so `cargo metadata`
-/// against any member needs them checked out.
-pub fn checkout() -> tempfile::TempDir {
+/// A shallow clone of the pinned framework revision, submodules included —
+/// `cargo metadata` against a member needs the workspace tree complete, so
+/// the clone materializes whatever the pin carries.
+///
+/// The clone is shared: every caller in every test binary gets the same
+/// directory under `target/pinned-framework/<rev>`, materialized once behind
+/// a file lock and kept for the next run's cache. The previous per-caller
+/// blob-less clone made every ignored test fetch and expand the same tree at
+/// once, and a blob-less checkout pays a lazy fetch per file — five of them
+/// racing did not finish inside the nightly job's per-test timeout on
+/// Windows.
+pub fn checkout() -> PathBuf {
     let (git, rev) = source();
-    let directory = tempfile::tempdir().expect("framework clone directory");
-    let status = Command::new("git")
-        .args([
-            "-c",
-            "advice.detachedHead=false",
-            "clone",
-            "--filter=blob:none",
-            "--recurse-submodules",
-            "--revision",
-            &rev,
-            &git,
-        ])
-        .arg(directory.path())
-        .status()
-        .expect("git must spawn");
-    assert!(status.success(), "cloning water-rs/waterui@{rev} failed");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/pinned-framework");
+    std::fs::create_dir_all(&root).expect("the pinned-framework directory is creatable");
+    let lock = std::fs::File::create(root.join(".checkout.lock"))
+        .expect("the checkout lock file is creatable");
+    // The lock is released by dropping it: a process that dies mid-clone frees
+    // it, and the absent `.complete` marker makes the next caller rebuild.
+    lock.lock().expect("the checkout lock is taken");
+    let directory = root.join(&rev);
+    if !directory.join(".complete").is_file() {
+        let _ = std::fs::remove_dir_all(&directory);
+        clone_revision(&git, &rev, &directory);
+        std::fs::write(directory.join(".complete"), &rev)
+            .expect("the completion marker is written");
+    }
+    drop(lock);
     directory
+}
+
+/// Fetch exactly `rev` and expand it, submodules included. A depth-1 fetch of
+/// the pinned commit downloads the complete tree in one pack — no lazy blob
+/// requests during checkout, no history nobody reads.
+fn clone_revision(git: &str, rev: &str, directory: &Path) {
+    std::fs::create_dir_all(directory).expect("the clone directory is creatable");
+    let run = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(["-c", "advice.detachedHead=false"])
+            .args(args)
+            .current_dir(directory)
+            .status()
+            .expect("git must spawn");
+        assert!(
+            status.success(),
+            "git {} failed for {git}@{rev}",
+            args.join(" ")
+        );
+    };
+    run(&["init", "--quiet"]);
+    run(&["remote", "add", "origin", git]);
+    run(&["fetch", "--depth", "1", "origin", rev]);
+    run(&["checkout", "--detach", "FETCH_HEAD"]);
+    run(&[
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+        "--depth",
+        "1",
+    ]);
 }
