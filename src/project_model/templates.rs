@@ -1869,7 +1869,9 @@ mod tests {
         // cycle; the manifest names the scaffold's scene delegate by its
         // Objective-C name so the module name stays out of the plist.
         assert!(
-            plist.contains("<key>UISceneDelegateClassName</key>\n\t\t\t\t\t<string>SceneDelegate</string>"),
+            plist.contains(
+                "<key>UISceneDelegateClassName</key>\n\t\t\t\t\t<string>SceneDelegate</string>"
+            ),
             "{plist}"
         );
 
