@@ -33,11 +33,11 @@ pub(crate) fn run() {
 }
 
 fn new_runtime(width: f32, height: f32) -> HeadlessRuntime {
-    let mut env = waterui::configure_environment!(waterui::env::Environment::new());
-    preview_symbol::install_preview_theme(&mut env);
-    // This environment never passes through `App::new`, which is what
-    // installs the self-drawn realizations for a normal run.
-    waterui::realization::install(&mut env);
+    // The environment is the application's own composition root: `app(env)`
+    // installs the realizations and options the application configures
+    // (`waterui_map_gpu::install`, provider options, fonts), and the preview
+    // theme goes over it exactly as `main` installs its theme defaults.
+    let env = preview_symbol::app_environment();
     let content = AnyViewBuilder::new(preview_symbol::load_preview_view);
     // Previews are read on HiDPI displays, so render at 2x: the layout stays in
     // logical units and only the captured image gets sharper.

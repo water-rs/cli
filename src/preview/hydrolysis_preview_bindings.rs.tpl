@@ -32,6 +32,20 @@ pub(crate) fn load_preview_view() -> waterui::AnyView {
 pub(crate) fn install_preview_theme(env: &mut waterui::env::Environment) {
     {{ preview_theme_installer }}(env);
 }
+
+/// The environment previews resolve under.
+///
+/// This goes through the application's own composition root — `app(env)` is
+/// what installs the realizations and options the application configures
+/// (`waterui_map_gpu::install`, provider options, fonts) — so a preview sees
+/// the same environment a run would, with the preview theme installed over it
+/// exactly as `main` installs its theme defaults.
+pub(crate) fn app_environment() -> waterui::env::Environment {
+    let env = waterui::configure_environment!(waterui::env::Environment::new());
+    let mut app = {{ crate_name_ident }}::app(env);
+    install_preview_theme(&mut app.env);
+    app.env
+}
 {% if include_automation %}
 
 pub(crate) fn run_semantic_automation(app: &mut waterui_testing::SemanticApp) {
