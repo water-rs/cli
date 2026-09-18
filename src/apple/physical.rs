@@ -129,15 +129,21 @@ struct HardwareProperties {
     device_type: Option<String>,
     marketing_name: Option<String>,
     udid: Option<String>,
+    /// `simulated` on a booted simulator, which Xcode 26's `devicectl` lists
+    /// beside the paired hardware; absent on a physical device.
+    reality: Option<String>,
 }
 
 impl DeviceEntry {
-    /// iPhones and iPads are the devices `water run` can target.
+    /// iPhones and iPads are the devices `water run` can target. A booted
+    /// simulator shows up here too, as a `simulated` device that
+    /// `devicectl` cannot install to; it is the simulator list's, under the
+    /// same UDID.
     fn is_ios_device(&self) -> bool {
         matches!(
             self.hardware_properties.device_type.as_deref(),
             Some("iPhone" | "iPad")
-        )
+        ) && self.hardware_properties.reality.as_deref() != Some("simulated")
     }
 }
 
@@ -671,6 +677,17 @@ mod tests {
         assert_eq!(device.tunnel_state, TunnelState::Disconnected);
         assert!(device.developer_mode_enabled);
         assert!(device.usability().is_ok());
+    }
+
+    #[test]
+    fn booted_simulator_is_not_a_physical_device() {
+        let devices = ApplePhysicalDevice::parse_list(DEVICE_LIST_JSON).expect("parse list");
+        assert!(
+            devices
+                .iter()
+                .all(|device| device.udid != "3C6AEFDA-0324-4C6E-9352-4A2DAF059AF0"),
+            "the simulated iPhone 17 entry must stay out of the physical device list"
+        );
     }
 
     #[test]
