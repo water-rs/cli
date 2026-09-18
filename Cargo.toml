@@ -64,6 +64,7 @@ notify = { version = "8", default-features = false, features = ["macos_kqueue"],
 
 # Terminal UI dependencies
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 # Only `Confirm`, `Input` and `MultiSelect` are used; the default `editor`
 # (tempfile) and `password` (zeroize) prompts are not.
 dialoguer = { version = "0.12", default-features = false }

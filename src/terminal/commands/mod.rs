@@ -134,6 +134,7 @@ pub mod bench;
 pub mod build;
 pub mod channel;
 pub mod clean;
+pub mod completions;
 pub mod create;
 pub mod device;
 pub mod devices;

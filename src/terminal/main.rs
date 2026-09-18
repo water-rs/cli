@@ -21,14 +21,14 @@ use futures_util::future::{self, Either};
 use tracing_subscriber::EnvFilter;
 
 use commands::{
-    backend, bench, build, channel, clean, create, device, devices, doctor, gc, init, inspector,
-    mcp, package, preview, run,
+    backend, bench, build, channel, clean, completions, create, device, devices, doctor, gc, init,
+    inspector, mcp, package, preview, run,
 };
 
 /// `WaterUI` command line interface.
 #[derive(Parser, Debug)]
 #[command(name = "water", version, about, long_about = None)]
-struct Cli {
+pub(crate) struct Cli {
     /// Output in JSON format (machine-readable).
     #[arg(long, global = true)]
     json: bool,
@@ -91,6 +91,9 @@ enum Commands {
 
     /// Serve the app to an agent over MCP.
     Mcp(mcp::Args),
+
+    /// Print the shell completion script for a shell.
+    Completions(completions::Args),
 }
 
 fn main() -> Result<()> {
@@ -157,6 +160,7 @@ fn main() -> Result<()> {
                     Commands::Preview(args) => Box::pin(preview::run(&shell, args)).await,
                     Commands::Inspector(args) => inspector::run(&shell, args).await,
                     Commands::Mcp(args) => mcp::run(&shell, args).await,
+                    Commands::Completions(args) => completions::run(&args),
                 }
             };
 
