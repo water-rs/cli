@@ -5,8 +5,6 @@ import WaterUI
 
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate {
-    var window: UIWindow?
-
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
@@ -16,12 +14,30 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         if let assetsRoot = Bundle.main.resourceURL?.appendingPathComponent("waterui_assets").path {
             setenv("WATERUI_ASSETS_ROOT", assetsRoot, 1)
         }
+        return true
+    }
+}
 
-        let window = UIWindow(frame: UIScreen.main.bounds)
+// The window belongs to the scene, not the app: UIKit requires the scene
+// life cycle from the iOS 27 SDK on, and Info.plist names this class (by its
+// Objective-C name, so the module name stays out of the manifest) as the
+// delegate of the app's single window scene.
+@objc(SceneDelegate)
+class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+
+    func scene(
+        _ scene: UIScene,
+        willConnectTo session: UISceneSession,
+        options connectionOptions: UIScene.ConnectionOptions
+    ) {
+        guard let windowScene = scene as? UIWindowScene else {
+            fatalError("The application scene is not a window scene: \(scene)")
+        }
+        let window = UIWindow(windowScene: windowScene)
         window.rootViewController = WaterUIViewController()
         window.makeKeyAndVisible()
         self.window = window
-        return true
     }
 }
 #elseif os(macOS)

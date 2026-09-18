@@ -1865,6 +1865,13 @@ mod tests {
             plist.contains("<key>UILaunchScreen</key>\n\t<dict>\n\t</dict>"),
             "{plist}"
         );
+        // The iOS 27 SDK refuses to launch an app without the scene life
+        // cycle; the manifest names the scaffold's scene delegate by its
+        // Objective-C name so the module name stays out of the plist.
+        assert!(
+            plist.contains("<key>UISceneDelegateClassName</key>\n\t\t\t\t\t<string>SceneDelegate</string>"),
+            "{plist}"
+        );
 
         let configured = app_ctx().with_launch(LaunchTemplateEntry {
             has_background: true,
