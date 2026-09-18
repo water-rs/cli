@@ -478,6 +478,15 @@ impl BuildProfile {
     /// that dependency optimization while the base rises to cover the root
     /// crate and the per-unit debug-assertion switches the override table
     /// does not mention.
+    ///
+    /// A development build links the shared Rust runtime, a `dylib` crate,
+    /// and a `dylib` links the toolchain's prebuilt `std`, which carries the
+    /// `panic_unwind` runtime: under the packaging profile's `panic = "abort"`
+    /// rustc refuses the link ("the linked panic runtime `panic_unwind` is
+    /// not compiled with this crate's panic strategy `abort`"), and under its
+    /// `lto = true` it refuses to prefer dynamic linking at all. The release
+    /// profiles therefore unwind without LTO here; the packaging build keeps
+    /// the manifest's `abort` and LTO.
     fn development_envs(self) -> Vec<(String, OsString)> {
         let entries: &[(&str, &str)] = match self {
             Self::Debug => &[],
@@ -487,9 +496,15 @@ impl BuildProfile {
                 ("CARGO_PROFILE_DEV_DEBUG_ASSERTIONS", "false"),
                 ("CARGO_PROFILE_DEV_OVERFLOW_CHECKS", "false"),
             ],
-            Self::Release => &[("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3")],
+            Self::Release => &[
+                ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3"),
+                ("CARGO_PROFILE_RELEASE_PANIC", "unwind"),
+                ("CARGO_PROFILE_RELEASE_LTO", "off"),
+            ],
             Self::Profiling => &[
                 ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3"),
+                ("CARGO_PROFILE_RELEASE_PANIC", "unwind"),
+                ("CARGO_PROFILE_RELEASE_LTO", "off"),
                 ("CARGO_PROFILE_RELEASE_DEBUG", "true"),
                 ("CARGO_PROFILE_RELEASE_STRIP", "none"),
             ],
@@ -554,8 +569,13 @@ impl BuildOptions {
     /// says so here rather than at the link step, so that the target directory
     /// and the staged libraries agree with what is actually built.
     #[must_use]
-    pub const fn with_static_runtime(mut self) -> Self {
+    pub fn with_static_runtime(mut self) -> Self {
         self.linkage = RustLinkage::Static;
+        // No shared runtime to link, so the manifest's panic strategy and LTO
+        // stand.
+        self.cargo_envs.retain(|(key, _)| {
+            key != "CARGO_PROFILE_RELEASE_PANIC" && key != "CARGO_PROFILE_RELEASE_LTO"
+        });
         self
     }
 
@@ -2293,8 +2313,39 @@ mod tests {
             "optimized development keeps full debug info: {envs:?}"
         );
 
+        let shared_runtime_envs = [
+            (
+                "CARGO_PROFILE_RELEASE_PANIC".to_string(),
+                OsString::from("unwind"),
+            ),
+            (
+                "CARGO_PROFILE_RELEASE_LTO".to_string(),
+                OsString::from("off"),
+            ),
+        ];
+        for env in &shared_runtime_envs {
+            assert!(
+                BuildOptions::development(BuildProfile::Release)
+                    .cargo_envs()
+                    .contains(env),
+                "a release development build links the shared runtime: missing {env:?}"
+            );
+            assert!(
+                !BuildOptions::development(BuildProfile::Release)
+                    .with_static_runtime()
+                    .cargo_envs()
+                    .contains(env),
+                "a static runtime keeps the manifest's {env:?}"
+            );
+        }
+        let unwind = &shared_runtime_envs[0];
+
         let profiling = BuildOptions::development(BuildProfile::Profiling);
         let envs = profiling.cargo_envs();
+        assert!(
+            envs.contains(unwind),
+            "profiling links the shared runtime too"
+        );
         for key in [
             "CARGO_PROFILE_RELEASE_OPT_LEVEL",
             "CARGO_PROFILE_RELEASE_DEBUG",
