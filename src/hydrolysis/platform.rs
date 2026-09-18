@@ -245,6 +245,7 @@ pub async fn built_hydrolysis_binary_path(
 /// Returns an error if the binary has no parent directory or the required shared
 /// libraries cannot be resolved and staged.
 pub(crate) async fn stage_hydrolysis_shared_runtime(
+    project: &Project,
     binary_path: &Path,
     platform: TargetPlatform,
 ) -> eyre::Result<()> {
@@ -257,7 +258,7 @@ pub(crate) async fn stage_hydrolysis_shared_runtime(
             binary_path.display()
         )
     })?;
-    let libraries = RustDynamicLibraries::resolve(runtime_dir, &platform.triple()).await?;
+    let libraries = RustDynamicLibraries::resolve(runtime_dir, &platform.triple(), project).await?;
     synchronize_shared_runtime(runtime_dir, Some(&libraries), &platform.triple()).await
 }
 
@@ -364,7 +365,7 @@ pub async fn package_hydrolysis(
                 final_binary_path.display()
             )
         })?;
-        Some(RustDynamicLibraries::resolve(lib_dir, &platform.triple()).await?)
+        Some(RustDynamicLibraries::resolve(lib_dir, &platform.triple(), project).await?)
     } else {
         None
     };

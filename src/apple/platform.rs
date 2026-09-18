@@ -235,7 +235,7 @@ pub async fn build_rust_lib(
         copy_file(&built_target.artifact, &dest_lib).await?;
         remove_superseded_host_library(output_dir, host_library).await?;
         if options.linkage() == RustLinkage::SharedRuntime {
-            let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple).await?;
+            let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple, project).await?;
             dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
             libraries.stage(output_dir).await?;
         }
@@ -693,7 +693,7 @@ pub async fn package_apple(
     }
 
     let shared_runtime = if options.uses_shared_rust_runtime() {
-        let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple).await?;
+        let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple, project).await?;
         dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
         libraries.stage(&products_dir).await?;
         Some(libraries)

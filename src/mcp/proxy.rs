@@ -319,7 +319,7 @@ async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)
     let binary_path =
         built_hydrolysis_binary_path(&project, platform, "debug", RustLinkage::SharedRuntime)
             .await?;
-    stage_hydrolysis_shared_runtime(&binary_path, platform).await?;
+    stage_hydrolysis_shared_runtime(&project, &binary_path, platform).await?;
 
     let run_config = McpRunConfig {
         width: config.width,
