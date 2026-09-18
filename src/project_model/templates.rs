@@ -1369,8 +1369,6 @@ mod tests {
             "src/main.rs.tpl",
             "src/lib.rs.tpl",
             "src/mcp_runtime.rs.tpl",
-            "src/preview_runtime.rs.tpl",
-            "src/preview_test_runtime.rs.tpl",
         ] {
             let rendered = render_embedded(
                 TemplateNamespace::Hydrolysis,
@@ -1383,6 +1381,35 @@ mod tests {
                 "hydrolysis {relative} must create its environment through `configure_environment!`"
             );
         }
+
+        // Preview runtimes reach `configure_environment!` through the
+        // generated bindings: `app_environment()` hands the configured
+        // environment to the application's `app(env)` composition root, which
+        // is what installs application-owned realizations such as
+        // `waterui_map_gpu::install` (#93). A runtime that built a bare
+        // `Environment` would render components the app never could.
+        for relative in [
+            "src/preview_runtime.rs.tpl",
+            "src/preview_test_runtime.rs.tpl",
+        ] {
+            let rendered = render_embedded(
+                TemplateNamespace::Hydrolysis,
+                &embedded::HYDROLYSIS,
+                relative,
+                &ctx,
+            );
+            assert!(
+                rendered.contains("app_environment()"),
+                "hydrolysis {relative} must take its environment from the generated `app_environment()` binding"
+            );
+        }
+        let preview_bindings = include_str!("../preview/hydrolysis_preview_bindings.rs.tpl");
+        assert!(
+            preview_bindings.contains("waterui::configure_environment!")
+                && preview_bindings.contains("::app(env)"),
+            "hydrolysis preview bindings must build the preview environment \
+             through `configure_environment!` and the application's `app(env)`"
+        );
 
         assert!(
             render_esp32("src/main.rs.tpl", &ctx).contains("waterui_core::configure_environment!"),
