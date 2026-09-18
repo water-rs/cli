@@ -207,7 +207,7 @@ pub async fn package_gtk4(project: &Project, options: PackageOptions) -> eyre::R
     .await?;
 
     if options.uses_shared_rust_runtime() {
-        RustDynamicLibraries::resolve(&target_dir, &TargetPlatform::Linux.triple())
+        RustDynamicLibraries::resolve(&target_dir, &TargetPlatform::Linux.triple(), project)
             .await?
             .stage(&runtime_dir)
             .await?;
