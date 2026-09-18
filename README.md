@@ -28,6 +28,7 @@ cargo build
 
 ### Shell Completions
 
+Homebrew installs completions automatically; for other install methods,
 `water completions` prints the completion script for your shell on stdout:
 
 ```bash
