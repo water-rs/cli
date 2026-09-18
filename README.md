@@ -26,6 +26,21 @@ Or build for development (not added to PATH):
 cargo build
 ```
 
+### Shell Completions
+
+`water completions` prints the completion script for your shell on stdout:
+
+```bash
+# zsh
+water completions zsh > ~/.zfunc/_water
+
+# bash
+water completions bash > ~/.local/share/bash-completion/completions/water
+
+# fish
+water completions fish > ~/.config/fish/completions/water.fish
+```
+
 ## Quick Start
 
 Create a new `WaterUI` project and run it on iOS Simulator:
