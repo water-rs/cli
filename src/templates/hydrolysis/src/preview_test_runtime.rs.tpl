@@ -24,10 +24,12 @@ pub(crate) fn run() {
 fn run_semantic(width: f32, height: f32) {
     // The environment is the application's own composition root: `app(env)`
     // installs the realizations and options the application configures, and
-    // the preview theme goes over it exactly as `main` installs its theme
-    // defaults.
+    // the styled mount applies the preview style's tokens exactly as `main`'s
+    // `hydrolysis::run` style does — component bodies that read Material
+    // tokens resolve them.
     let mut app = ui()
         .environment(preview_test::app_environment())
+        .theme(preview_test::preview_style())
         .viewport(dimension_to_u32(width), dimension_to_u32(height))
         .mount(preview_test::load_preview_view);
     preview_test::run_semantic_automation(&mut app);

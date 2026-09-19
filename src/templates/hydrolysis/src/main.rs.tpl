@@ -65,7 +65,6 @@ fn main() {
 )))]
 fn main() {
     let env = waterui::configure_environment!(waterui::env::Environment::new());
-    let mut app = {{ ctx.crate_name_ident() }}::app(env);
-    hydrolysis_m3::install_defaults(&mut app.env);
-    hydrolysis::run(app);
+    let app = {{ ctx.crate_name_ident() }}::app(env);
+    hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
 }
