@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 use commands::{
     backend, bench, build, channel, clean, completions, create, device, devices, doctor, gc, init,
-    inspector, mcp, package, preview, run,
+    inspector, mcp, package, preview, run, update,
 };
 
 /// `WaterUI` command line interface.
@@ -92,6 +92,9 @@ enum Commands {
     /// Serve the app to an agent over MCP.
     Mcp(mcp::Args),
 
+    /// Update the `water` CLI itself; `--check` reports without installing.
+    Update(update::Args),
+
     /// Print the shell completion script for a shell.
     Completions(completions::Args),
 }
@@ -141,6 +144,18 @@ fn main() -> Result<()> {
                 }
             };
 
+            // The passive update check stays off the `build`/`run` hot path,
+            // off machine-consumed output (`mcp`, `completions`), and never
+            // runs inside `update` itself, which checks explicitly.
+            let off_update_hot_path = !matches!(
+                cli.command,
+                Commands::Build(_)
+                    | Commands::Run(_)
+                    | Commands::Update(_)
+                    | Commands::Mcp(_)
+                    | Commands::Completions(_)
+            );
+
             let command = async {
                 match cli.command {
                     Commands::Create(args) => create::run(&shell, args).await,
@@ -160,6 +175,7 @@ fn main() -> Result<()> {
                     Commands::Preview(args) => Box::pin(preview::run(&shell, args)).await,
                     Commands::Inspector(args) => inspector::run(&shell, args).await,
                     Commands::Mcp(args) => mcp::run(&shell, args).await,
+                    Commands::Update(args) => update::run(&shell, args).await,
                     Commands::Completions(args) => completions::run(&args),
                 }
             };
@@ -187,6 +203,13 @@ fn main() -> Result<()> {
 
             // Clear progress bars to ensure clean exit
             shell.clear();
+
+            if result.is_ok()
+                && off_update_hot_path
+                && let Some(notice) = waterui_cli::self_update::passive_update_notice().await
+            {
+                crate::note!(shell, "{notice}");
+            }
 
             result
         }
