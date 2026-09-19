@@ -10,7 +10,6 @@ use waterui::env::Environment;
 #[wasm_bindgen(start)]
 pub fn start() {
     let env = waterui::configure_environment!(Environment::new());
-    let mut app = {{ ctx.crate_name_ident() }}::app(env);
-    hydrolysis_m3::install_defaults(&mut app.env);
-    hydrolysis::run(app);
+    let app = {{ ctx.crate_name_ident() }}::app(env);
+    hydrolysis::run(app, hydrolysis_m3::Material3::defaults());
 }
