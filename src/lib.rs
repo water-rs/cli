@@ -16,6 +16,7 @@ mod platforming;
 pub mod preview;
 mod project_model;
 mod runtime;
+pub mod self_update;
 pub mod toolchain;
 pub mod toolchain_checks;
 pub mod tui;
