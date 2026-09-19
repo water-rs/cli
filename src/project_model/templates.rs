@@ -2273,6 +2273,45 @@ mod tests {
     }
 
     #[test]
+    fn hydrolysis_manifest_enables_wasm_opt_for_the_features_rustc_emits() {
+        // wasm-pack invokes `wasm-opt -O` with no feature flags; without the
+        // wasm32 default target features enabled, binaryen rejects the
+        // bulk-memory ops rustc emits for memcpy/memset and every `--release`
+        // web bundle fails validation (#95).
+        let cargo_toml =
+            crate::templates::hydrolysis::rendered_outputs(&app_ctx(), "waterui-test-hydrolysis")
+                .expect("hydrolysis outputs should render")
+                .into_iter()
+                .find_map(|(path, content)| {
+                    (path == std::path::Path::new("Cargo.toml"))
+                        .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
+                })
+                .expect("hydrolysis Cargo.toml output should exist");
+        let manifest = cargo_toml
+            .parse::<toml::Table>()
+            .expect("hydrolysis Cargo.toml should parse");
+        let wasm_opt =
+            manifest["package"]["metadata"]["wasm-pack"]["profile"]["release"]["wasm-opt"]
+                .as_array()
+                .expect("wasm-pack release profile should carry wasm-opt flags")
+                .iter()
+                .map(|flag| flag.as_str().expect("wasm-opt flag should be a string"))
+                .collect::<Vec<_>>();
+        for required in [
+            "--enable-bulk-memory",
+            "--enable-mutable-globals",
+            "--enable-sign-ext",
+            "--enable-nontrapping-float-to-int",
+            "--enable-reference-types",
+        ] {
+            assert!(
+                wasm_opt.contains(&required),
+                "wasm-opt flags should include {required}, got {wasm_opt:?}"
+            );
+        }
+    }
+
+    #[test]
     fn path_pinned_hydrolysis_manifest_uses_the_checkouts_own_sources() {
         // A project pinned to a local checkout resolves `hydrolysis` and
         // `hydrolysis-m3` the way the checkout's root manifest does — the
@@ -3465,6 +3504,38 @@ struct GeneratedPackageSection {
     autobins: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     authors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<GeneratedPackageMetadata>,
+}
+
+/// `[package.metadata]` — presently only wasm-pack, which only hydrolysis's
+/// web bundle needs.
+#[derive(serde::Serialize)]
+struct GeneratedPackageMetadata {
+    #[serde(rename = "wasm-pack")]
+    wasm_pack: GeneratedWasmPackMetadata,
+}
+
+#[derive(serde::Serialize)]
+struct GeneratedWasmPackMetadata {
+    profile: GeneratedWasmPackProfiles,
+}
+
+#[derive(serde::Serialize)]
+struct GeneratedWasmPackProfiles {
+    release: GeneratedWasmPackProfile,
+}
+
+/// wasm-pack runs `wasm-opt -O` with no feature flags, so binaryen validates
+/// the wasm-bindgen output against its conservative default feature set and
+/// rejects the bulk-memory ops modern rustc emits for memcpy/memset — every
+/// `--release` web bundle fails validation without these. The flags are the
+/// wasm32 default target features plus reference-types for wasm-bindgen's
+/// externref glue.
+#[derive(serde::Serialize)]
+struct GeneratedWasmPackProfile {
+    #[serde(rename = "wasm-opt")]
+    wasm_opt: [&'static str; 6],
 }
 
 #[derive(serde::Serialize)]
@@ -3610,6 +3681,7 @@ fn generated_package(name: &str, authors: Vec<String>) -> GeneratedPackageSectio
         edition: "2024".to_string(),
         autobins: None,
         authors,
+        metadata: None,
     }
 }
 
@@ -4108,6 +4180,22 @@ pub mod hydrolysis {
     ) -> io::Result<GeneratedCargoManifest<GeneratedDependencyValue>> {
         let mut package = super::generated_package(package_name, Vec::new());
         package.autobins = Some(false);
+        package.metadata = Some(super::GeneratedPackageMetadata {
+            wasm_pack: super::GeneratedWasmPackMetadata {
+                profile: super::GeneratedWasmPackProfiles {
+                    release: super::GeneratedWasmPackProfile {
+                        wasm_opt: [
+                            "-O",
+                            "--enable-bulk-memory",
+                            "--enable-mutable-globals",
+                            "--enable-sign-ext",
+                            "--enable-nontrapping-float-to-int",
+                            "--enable-reference-types",
+                        ],
+                    },
+                },
+            },
+        });
         let mut bins = vec![GeneratedBinSection {
             name: package_name.to_string(),
             path: "src/main.rs".to_string(),
