@@ -938,7 +938,7 @@ async fn build_and_run(
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
     let _ = shell.status(">", "Building...");
-    build_for_backend(
+    let built = build_for_backend(
         project,
         backend,
         &build_plan,
@@ -961,6 +961,7 @@ async fn build_and_run(
         project,
         backend,
         &build_plan,
+        &built,
         config.profile.is_release(),
         dev_server.is_some(),
         Some(shell.build_progress()),
@@ -1128,11 +1129,9 @@ async fn build_for_backend(
     backend: TargetBackend,
     plan: &BuildPlan,
     build_options: BuildOptions,
-) -> Result<()> {
+) -> Result<waterui_cli::build::BuiltTarget> {
     match backend {
-        TargetBackend::Apple => {
-            build_rust_lib(project, plan.lib_platform, build_options).await?;
-        }
+        TargetBackend::Apple => build_rust_lib(project, plan.lib_platform, build_options).await,
         TargetBackend::Android => {
             let abi = plan
                 .android_abi
@@ -1140,28 +1139,24 @@ async fn build_for_backend(
             AndroidPlatform::clean_jni_libs(project).await?;
             AndroidPlatform::new(abi)
                 .build(project, build_options)
-                .await?;
+                .await
         }
-        TargetBackend::Gtk4 => {
-            build_gtk4(project, build_options).await?;
-        }
+        TargetBackend::Gtk4 => build_gtk4(project, build_options).await,
         TargetBackend::Hydrolysis => {
-            build_hydrolysis(project, plan.lib_platform, build_options).await?;
+            build_hydrolysis(project, plan.lib_platform, build_options).await
         }
-        TargetBackend::WinUi => {
-            build_winui(project, build_options).await?;
-        }
+        TargetBackend::WinUi => build_winui(project, build_options).await,
         TargetBackend::Dew => {
             panic!("esp32 run should not enter build_and_run")
         }
     }
-    Ok(())
 }
 
 async fn package_for_backend(
     project: &Project,
     backend: TargetBackend,
     plan: &BuildPlan,
+    built: &waterui_cli::build::BuiltTarget,
     release: bool,
     dev_server: bool,
     progress: Option<BuildProgress>,
@@ -1173,18 +1168,20 @@ async fn package_for_backend(
         package_options = package_options.with_progress(progress);
     }
     match backend {
-        TargetBackend::Apple => package_apple(project, plan.lib_platform, package_options).await,
+        TargetBackend::Apple => {
+            package_apple(project, plan.lib_platform, package_options, built).await
+        }
         TargetBackend::Android => {
             let abi = plan
                 .android_abi
                 .ok_or_else(|| eyre::eyre!("Internal error: missing Android ABI for packaging"))?;
             AndroidPlatform::package_with_abis(project, package_options, &[abi]).await
         }
-        TargetBackend::Gtk4 => package_gtk4(project, package_options).await,
+        TargetBackend::Gtk4 => package_gtk4(project, package_options, built).await,
         TargetBackend::Hydrolysis => {
-            package_hydrolysis(project, plan.lib_platform, package_options).await
+            package_hydrolysis(project, plan.lib_platform, package_options, Some(built)).await
         }
-        TargetBackend::WinUi => package_winui(project, package_options).await,
+        TargetBackend::WinUi => package_winui(project, package_options, built).await,
         TargetBackend::Dew => panic!("esp32 run should not enter build_and_run"),
     }
 }

@@ -145,7 +145,7 @@ impl Backend for HydrolysisBackend {
         project: &Project,
         platform: TargetPlatform,
         options: BuildOptions,
-    ) -> eyre::Result<PathBuf> {
+    ) -> eyre::Result<crate::build::BuiltTarget> {
         project
             .browser_runtime_plan(platform, TargetBackend::Hydrolysis)
             .await?;
@@ -157,8 +157,9 @@ impl Backend for HydrolysisBackend {
         project: &Project,
         platform: TargetPlatform,
         options: PackageOptions,
+        built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
-        package_hydrolysis(project, platform, options).await
+        package_hydrolysis(project, platform, options, Some(built)).await
     }
 
     async fn clean(&self, project: &Project, _platform: TargetPlatform) -> eyre::Result<()> {

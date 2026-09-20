@@ -186,7 +186,7 @@ impl Project {
             build_options = build_options.with_progress(progress.clone());
         }
         // Build rust library for the target platform
-        backend
+        let built = backend
             .build(self, platform, build_options)
             .await
             .map_err(FailToRun::Build)?;
@@ -197,7 +197,7 @@ impl Project {
         }
         // Package the build artifacts for the target platform
         let artifact = backend
-            .package(self, platform, package_options)
+            .package(self, platform, package_options, &built)
             .await
             .map_err(FailToRun::Package)?;
 
@@ -921,8 +921,9 @@ impl Project {
         backend: &B,
         platform: TargetPlatform,
         options: PackageOptions,
+        built: &crate::build::BuiltTarget,
     ) -> Result<Artifact, eyre::Report> {
-        backend.package(self, platform, options).await
+        backend.package(self, platform, options, built).await
     }
 
     fn app_crate_overrides(&self) -> Option<&AppCrates> {

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 /// `libstd` dylib or a pipelined dep rlib — before the wait is declared
 /// failed. `-Zbuild-std` codegen can run for minutes; the bound only keeps
 /// a genuinely missing artifact from hanging the build forever.
-const ARTIFACT_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+const ARTIFACT_WAIT_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Marks the `water` process as a Cargo rustc wrapper rather than a CLI.
 pub const WRAPPER_MODE_ENV: &str = "WATERUI_INTERNAL_RUSTC_WRAPPER";

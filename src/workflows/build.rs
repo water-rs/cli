@@ -127,6 +127,24 @@ pub struct BuiltTarget {
     /// its own `compiler-artifact` message, not a name reconstructed under
     /// the profile root.
     pub artifact: PathBuf,
+    /// The `waterui-dylib` dynamic library Cargo reported, when this build
+    /// produced one.
+    pub shared_runtime: Option<PathBuf>,
+}
+
+impl BuiltTarget {
+    /// Return the shared `WaterUI` runtime Cargo reported for this build.
+    ///
+    /// # Errors
+    /// Returns an error when this build did not produce a shared runtime.
+    pub fn shared_runtime(&self) -> eyre::Result<&Path> {
+        self.shared_runtime.as_deref().ok_or_else(|| {
+            eyre::eyre!(
+                "Cargo reported no `waterui-dylib` dynamic library for the build in {}; the shared WaterUI runtime was not built",
+                self.profile_dir.display()
+            )
+        })
+    }
 }
 
 /// Selects how Rust dependencies are linked into a native application.
@@ -176,24 +194,13 @@ impl RustDynamicLibraries {
     ///
     /// # Errors
     /// Returns an error when either required dynamic library is absent or ambiguous.
-    pub async fn resolve(lib_dir: &Path, triple: &Triple, project: &Project) -> eyre::Result<Self> {
-        let file_name = dynamic_library_file_name("waterui_dylib", triple);
-        // Cargo emits a dependency's final dylib artifact in `deps/` on stable
-        // and at the profile directory root on current nightlies; accept both.
-        // `deps/` wins: a copy an earlier `stage` left at the profile root must
-        // never mask the artifact the current build produced.
-        let waterui = [
-            lib_dir.join("deps").join(&file_name),
-            lib_dir.join(&file_name),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "Shared WaterUI runtime was not built at {}",
-                lib_dir.join("deps").join(&file_name).display()
-            )
-        })?;
+    pub async fn resolve(
+        built: &BuiltTarget,
+        triple: &Triple,
+        project: &Project,
+    ) -> eyre::Result<Self> {
+        let waterui = built.shared_runtime()?.to_path_buf();
+        let lib_dir = &built.profile_dir;
 
         // A `-Zbuild-std` build publishes its freshly compiled `libstd` into
         // the profile's `deps/` directory via the rustc wrapper; that copy —
@@ -1154,7 +1161,7 @@ impl RustBuild {
             .await
     }
 
-    /// Build a dynamic library (cdylib) and return the full path to the dylib file.
+    /// Build a dynamic library (cdylib) and return Cargo's reported build result.
     ///
     /// The path is Cargo's own `compiler-artifact` report, so the returned file
     /// is the one this build wrote even when another project's identically
@@ -1163,15 +1170,13 @@ impl RustBuild {
     /// # Errors
     /// - `RustBuildError::FailToExecuteCargoBuild`: If there was an error executing the cargo build command.
     /// - `RustBuildError::FailToBuildRustLibrary`: If the library was not found after building.
-    pub async fn build_dylib(&self, release: bool) -> Result<PathBuf, RustBuildError> {
-        let built = self
-            .build_inner(
-                release,
-                CargoTarget::Lib,
-                Some(lib_extension_for_triple(&self.triple)),
-            )
-            .await?;
-        Ok(built.artifact)
+    pub async fn build_dylib(&self, release: bool) -> Result<BuiltTarget, RustBuildError> {
+        self.build_inner(
+            release,
+            CargoTarget::Lib,
+            Some(lib_extension_for_triple(&self.triple)),
+        )
+        .await
     }
 
     /// Builds one named binary and returns its full output path.
@@ -1187,11 +1192,9 @@ impl RustBuild {
         &self,
         binary_name: &str,
         release: bool,
-    ) -> Result<PathBuf, RustBuildError> {
-        let built = self
-            .build_inner(release, CargoTarget::Binary(binary_name), None)
-            .await?;
-        Ok(built.artifact)
+    ) -> Result<BuiltTarget, RustBuildError> {
+        self.build_inner(release, CargoTarget::Binary(binary_name), None)
+            .await
     }
 
     /// Compute the expected dylib output path without building.
@@ -1289,10 +1292,12 @@ Automatic meson installation failed: {install_err}\n\n{}",
 
         let artifact =
             reported_artifact(&output.stdout, &self.path, cargo_target, artifact_extension)?;
+        let shared_runtime = reported_shared_runtime(&output.stdout)?;
         let profile_dir = self.lib_output_dir(release).await?;
         Ok(BuiltTarget {
             profile_dir,
             artifact,
+            shared_runtime,
         })
     }
 
@@ -1732,6 +1737,40 @@ pub(crate) fn compiler_artifacts(
     Ok(artifacts)
 }
 
+fn reported_shared_runtime(stdout: &[u8]) -> Result<Option<PathBuf>, RustBuildError> {
+    let mut reported = Vec::new();
+    for artifact in compiler_artifacts(stdout)? {
+        if artifact_package_name(&artifact.package_id) != "waterui-dylib"
+            || !artifact
+                .target
+                .kind
+                .contains(&cargo_metadata::TargetKind::DyLib)
+        {
+            continue;
+        }
+        for filename in &artifact.filenames {
+            let path = filename.as_std_path();
+            if is_dynamic_library(path) {
+                reported.push((path.to_path_buf(), artifact.manifest_path.clone()));
+            }
+        }
+    }
+    match reported.as_slice() {
+        [] => Ok(None),
+        [(path, _)] => Ok(Some(path.clone())),
+        _ => Err(RustBuildError::FailToBuildRustLibrary(io::Error::other(
+            format!(
+                "Cargo reported multiple `waterui-dylib` dynamic libraries: {}",
+                reported
+                    .iter()
+                    .map(|(_, manifest)| manifest.as_std_path().display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))),
+    }
+}
+
 /// Whether a `manifest_path` cargo reported is `expected`, the manifest of
 /// the crate this build ran. Cargo reports the path in the spelling its own
 /// working directory carried — a verbatim `\\?\` or an 8.3 short-name root on
@@ -2154,10 +2193,117 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        BuildOptions, BuildProfile, CargoTarget, CompileEvent, RustBuild, RustDynamicLibraries,
-        RustLinkage, classify_compile_line, dynamic_library_file_name, lib_extension_for_triple,
-        resolve_rust_standard_library_in,
+        BuildOptions, BuildProfile, BuiltTarget, CargoTarget, CompileEvent, RustBuild,
+        RustDynamicLibraries, RustLinkage, classify_compile_line, dynamic_library_file_name,
+        lib_extension_for_triple, reported_shared_runtime, resolve_rust_standard_library_in,
     };
+
+    fn shared_runtime_artifact_json(
+        manifest: &std::path::Path,
+        file: &std::path::Path,
+        package: &str,
+    ) -> String {
+        serde_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": format!("path+file:///x#{package}@0.1.0"),
+            "manifest_path": manifest,
+            "target": {
+                "kind": ["dylib"],
+                "crate_types": ["dylib"],
+                "name": package,
+                "src_path": manifest.parent().expect("manifest dir").join("src/lib.rs"),
+                "edition": "2021",
+                "doc": false,
+                "doctest": false,
+                "test": false,
+            },
+            "profile": {
+                "opt_level": "0",
+                "debuginfo": 0,
+                "debug_assertions": true,
+                "overflow_checks": true,
+                "test": false,
+            },
+            "features": [],
+            "filenames": [file],
+            "executable": null,
+            "fresh": true,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn reported_shared_runtime_selects_waterui_dylib_dynamic_artifact() {
+        let temporary = tempdir().expect("tempdir");
+        let manifest = temporary.path().join("waterui-dylib/Cargo.toml");
+        let runtime = temporary
+            .path()
+            .join("target/debug/deps/libwaterui_dylib.so");
+        let unrelated_manifest = temporary.path().join("app/Cargo.toml");
+        let unrelated = temporary.path().join("target/debug/app");
+        let stdout = format!(
+            "{}\n{}\n",
+            shared_runtime_artifact_json(&unrelated_manifest, &unrelated, "app"),
+            shared_runtime_artifact_json(&manifest, &runtime, "waterui-dylib"),
+        );
+
+        assert_eq!(
+            reported_shared_runtime(stdout.as_bytes()).expect("runtime report"),
+            Some(runtime)
+        );
+    }
+
+    #[test]
+    fn missing_shared_runtime_report_is_none_and_accessor_errors() {
+        let temporary = tempdir().expect("tempdir");
+        let stdout = shared_runtime_artifact_json(
+            &temporary.path().join("app/Cargo.toml"),
+            &temporary.path().join("target/debug/app"),
+            "app",
+        );
+        assert_eq!(
+            reported_shared_runtime(stdout.as_bytes()).expect("runtime report"),
+            None
+        );
+
+        let profile_dir = temporary.path().join("target/debug");
+        let error = BuiltTarget {
+            profile_dir: profile_dir.clone(),
+            artifact: temporary.path().join("app"),
+            shared_runtime: None,
+        }
+        .shared_runtime()
+        .expect_err("missing runtime should fail");
+        let message = error.to_string();
+        assert!(message.contains("waterui-dylib"));
+        assert!(message.contains(&profile_dir.display().to_string()));
+    }
+
+    #[test]
+    fn reported_shared_runtime_rejects_multiple_manifests() {
+        let temporary = tempdir().expect("tempdir");
+        let first_manifest = temporary.path().join("first/Cargo.toml");
+        let second_manifest = temporary.path().join("second/Cargo.toml");
+        let stdout = format!(
+            "{}\n{}\n",
+            shared_runtime_artifact_json(
+                &first_manifest,
+                &temporary.path().join("target/debug/libfirst.so"),
+                "waterui-dylib",
+            ),
+            shared_runtime_artifact_json(
+                &second_manifest,
+                &temporary.path().join("target/debug/libsecond.so"),
+                "waterui-dylib",
+            ),
+        );
+
+        let error =
+            reported_shared_runtime(stdout.as_bytes()).expect_err("ambiguous runtime report");
+        let message = error.to_string();
+        assert!(message.contains(&first_manifest.display().to_string()));
+        assert!(message.contains(&second_manifest.display().to_string()));
+    }
 
     fn triple(value: &str) -> Triple {
         value.parse().expect("test target triple must parse")
@@ -2512,7 +2658,8 @@ mod tests {
                     .with_target_dir(&shared_target)
                     .build_binary(package.as_str(), false)
                     .await
-                    .expect("the generated crate builds");
+                    .expect("the generated crate builds")
+                    .artifact;
                 assert!(artifact.is_file(), "the reported artifact exists");
                 artifacts.push(artifact);
             }

@@ -21,7 +21,9 @@ use crate::{
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
     assets::{self, ResolvedFont},
-    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{
+        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
+    },
     device::Artifact,
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
@@ -70,14 +72,6 @@ impl AppleHostLibrary {
         match self {
             Self::Archive => "staticlib",
             Self::Dynamic => "cdylib",
-        }
-    }
-
-    /// Extension Cargo gives the built artifact.
-    const fn built_extension(self) -> &'static str {
-        match self {
-            Self::Archive => "a",
-            Self::Dynamic => "dylib",
         }
     }
 
@@ -170,7 +164,7 @@ pub async fn build_rust_lib(
     project: &Project,
     platform: TargetPlatform,
     options: BuildOptions,
-) -> eyre::Result<PathBuf> {
+) -> eyre::Result<BuiltTarget> {
     // Resolve fonts BEFORE cargo build - this ensures icons.json is downloaded
     // for crates like fontawesome7 that need it during build.rs
     let font_declarations = crate::assets::scan_fonts(project).await?;
@@ -211,7 +205,6 @@ pub async fn build_rust_lib(
     }
     build = build.with_target_dir(project.water_target_dir(options.linkage()).await?);
     let built_target = build.build_lib(options.is_release()).await?;
-    let lib_dir = built_target.profile_dir.clone();
     // The helper `[[bin]]` exists only when the manifest declared it — the
     // application's linked engine, not chromium alone — so the build gates
     // on the manifest's own predicate or Cargo reports `no bin target`.
@@ -235,13 +228,13 @@ pub async fn build_rust_lib(
         copy_file(&built_target.artifact, &dest_lib).await?;
         remove_superseded_host_library(output_dir, host_library).await?;
         if options.linkage() == RustLinkage::SharedRuntime {
-            let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple, project).await?;
+            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
             dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
             libraries.stage(output_dir).await?;
         }
     }
 
-    Ok(lib_dir)
+    Ok(built_target)
 }
 
 /// Resolve the deployment-target environment variable an Apple build must carry.
@@ -606,6 +599,7 @@ pub async fn package_apple(
     project: &Project,
     platform: TargetPlatform,
     options: PackageOptions,
+    built: &BuiltTarget,
 ) -> eyre::Result<Artifact> {
     let backend = project
         .apple_backend()
@@ -652,14 +646,9 @@ pub async fn package_apple(
     } else {
         RustLinkage::Static
     };
-    let lib_dir = RustBuild::new(project.ffi_crate_path(), triple.clone())
-        .with_target_dir(project.water_target_dir(linkage).await?)
-        .lib_output_dir(!options.is_debug())
-        .await
-        .wrap_err("Failed to resolve native FFI crate target directory")?;
+    let lib_dir = &built.profile_dir;
     let host_library = AppleHostLibrary::for_linkage(linkage);
-    let lib_name = project.ffi_crate_name().replace('-', "_");
-    let source_lib = lib_dir.join(format!("lib{lib_name}.{}", host_library.built_extension()));
+    let source_lib = &built.artifact;
 
     // Get SDK name - must be an Apple platform
     let sdk_name = platform
@@ -693,7 +682,7 @@ pub async fn package_apple(
     }
 
     let shared_runtime = if options.uses_shared_rust_runtime() {
-        let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple, project).await?;
+        let libraries = RustDynamicLibraries::resolve(built, &triple, project).await?;
         dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
         libraries.stage(&products_dir).await?;
         Some(libraries)
@@ -702,7 +691,7 @@ pub async fn package_apple(
         None
     };
 
-    let native_link_inputs = collect_apple_native_link_inputs(&lib_dir).await?;
+    let native_link_inputs = collect_apple_native_link_inputs(lib_dir).await?;
     for archive in &native_link_inputs.archives {
         let file_name = archive.file_name().ok_or_else(|| {
             eyre::eyre!(
