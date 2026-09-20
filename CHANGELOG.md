@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2](https://github.com/water-rs/cli/compare/v0.4.1...v0.4.2) - 2026-09-20
+
+### Fixed
+
+- resolve the stable channel from the registry, not the GitHub API ([#113](https://github.com/water-rs/cli/pull/113))
+- let the managed crate add packages the project never locked ([#109](https://github.com/water-rs/cli/pull/109))
+- *(release)* link Linux binaries against glibc 2.28 and embed archive checksums ([#107](https://github.com/water-rs/cli/pull/107))
+
 ## [0.4.1](https://github.com/water-rs/cli/compare/v0.4.0...v0.4.1) - 2026-09-20
 
 ### Added
