@@ -21,3 +21,7 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 # per target inside the tag-triggered jobs. Without this, `dist build`
 # refuses to run until release.yml matches dist's own template.
 allow-dirty = ["ci"]
+# The Linux legs of release.yml link inside manylinux_2_28; the installer
+# refuses older hosts instead of installing a binary that cannot start.
+[dist.min-glibc-version]
+"*" = "2.28"

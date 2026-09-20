@@ -4,12 +4,20 @@ description: >
   for `serialport` (the default `esp32` feature) and `pkg-config` to find
   it. The framework action this is trimmed from carried the GUI stack —
   GTK4, fonts, VA-API, PipeWire — which no crate in this repository's graph
-  links.
+  links. `package-manager` selects the runner image's apt or the dnf of
+  the manylinux_2_28 (AlmaLinux 8) container the release legs link in.
+
+inputs:
+  package-manager:
+    description: "`apt` (Ubuntu runner image) or `dnf` (manylinux container)."
+    required: false
+    default: apt
 
 runs:
   using: composite
   steps:
-    - name: Install native dependencies
+    - name: Install native dependencies (apt)
+      if: inputs.package-manager == 'apt'
       shell: bash
       run: |
         set -euo pipefail
@@ -17,3 +25,10 @@ runs:
         # the pool; refresh before installing.
         sudo apt-get update -qq
         sudo apt-get install -y -qq libudev-dev pkg-config
+
+    - name: Install native dependencies (dnf)
+      if: inputs.package-manager == 'dnf'
+      shell: bash
+      run: |
+        set -euo pipefail
+        dnf install -y -q systemd-devel pkgconf-pkg-config
