@@ -10,7 +10,7 @@ ci = "github"
 # Build each app individually instead of `cargo build --workspace`
 precise-builds = true
 # The installers to generate for each app
-installers = ["homebrew"]
+installers = ["homebrew", "shell", "powershell"]
 # Homebrew tap published by the dist-generated formula.
 tap = "water-rs/homebrew-water"
 formula = "water"

@@ -1,6 +1,6 @@
 [package]
 name = "waterui-cli"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["Lexo Liu"]
 rust-version = "1.95"
@@ -119,6 +119,14 @@ toml_edit = { version = "=0.25.13", features = ["serde"] }
 diffy = { version = "=0.5.0", default-features = false }
 cargo-lock = { version = "=10.1.0", default-features = false }
 rustc-demangle = "0.1"
+# `water update`: reads the install receipt the dist shell/powershell
+# installers write and re-runs the newest release's own installer.
+axoupdater = "0.10.2"
+# axoupdater's async API is reqwest-based and needs a tokio reactor the
+# smol-based CLI does not run; self-update calls drive it on a scratch
+# current-thread runtime. `net`/`time` are what reqwest needs the reactor to
+# actually drive.
+tokio = { version = "1.48", default-features = false, features = ["rt", "net", "time"] }
 
 [features]
 default = ["esp32", "svg-icons", "preview"]

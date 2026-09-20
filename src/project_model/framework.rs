@@ -1543,6 +1543,10 @@ fn validate_cli_version(
     update: &str,
 ) -> Result<()> {
     if current.cmp_precedence(minimum).is_lt() {
+        // The fallback command is what a registry or git source already
+        // selected; the detected install source may replace it with `water
+        // update` or `brew upgrade water`.
+        let update = crate::self_update::cli_update_command(update);
         bail!(
             "This WaterUI framework requires waterui-cli >= {minimum}, but the running CLI is {current}.\nUpdate the CLI: {update}\nThen verify the installed version with `water --version`."
         );
