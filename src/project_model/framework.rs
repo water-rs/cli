@@ -158,6 +158,40 @@ struct LockedPackage {
     source: Option<String>,
 }
 
+/// Whether a resolved package took the place of one the lock pins.
+///
+/// The managed crate's graph is a superset of the project's: `waterui-ffi`
+/// and its feature-gated platform dependencies add packages the project
+/// never locked, and among them a second major of a name the project already
+/// carries (`annotate-snippets` 0.11 beside the locked 0.12, through
+/// bindgen). Cargo keeps both, so that is an addition, not a change. A change
+/// is a resolved version that Cargo could only have reached by moving a
+/// locked one — a version the locked entry's caret requirement accepts, from
+/// the same source.
+fn replaces_locked_package(
+    allowed: &BTreeSet<LockedPackage>,
+    name: &str,
+    version: &semver::Version,
+    source: Option<&str>,
+) -> bool {
+    let identity = LockedPackage {
+        name: name.to_owned(),
+        version: version.to_string(),
+        source: source.map(str::to_owned),
+    };
+    if allowed.contains(&identity) {
+        return false;
+    }
+    allowed
+        .iter()
+        .filter(|locked| locked.name == identity.name && locked.source == identity.source)
+        .any(|locked| {
+            semver::VersionReq::parse(&format!("^{}", locked.version))
+                .expect("a lockfile version is a valid caret requirement")
+                .matches(version)
+        })
+}
+
 impl From<&cargo_lock::Package> for LockedPackage {
     fn from(package: &cargo_lock::Package) -> Self {
         Self {
@@ -773,11 +807,14 @@ impl ResolvedFramework {
             validate_resolved_cli(&metadata)?;
             if !allow_new {
                 for package in &metadata.packages {
-                    if package.source.is_some() && !allowed.contains(&LockedPackage {
-                        name: package.name.to_string(),
-                        version: package.version.to_string(),
-                        source: package.source.as_ref().map(|source| source.repr.clone()),
-                    }) {
+                    if package.source.is_some()
+                        && replaces_locked_package(
+                            &allowed,
+                            &package.name,
+                            &package.version,
+                            package.source.as_ref().map(|source| source.repr.as_str()),
+                        )
+                    {
                         bail!("generated build would change locked dependency {}; update the framework channel explicitly", package.name);
                     }
                 }
@@ -2526,6 +2563,47 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn a_second_major_beside_the_locked_one_is_an_addition_not_a_change() {
+        let registry = "registry+https://github.com/rust-lang/crates.io-index";
+        let allowed: BTreeSet<_> = [("annotate-snippets", "0.12.16"), ("toml", "0.9.5")]
+            .into_iter()
+            .map(|(name, version)| LockedPackage {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                source: Some(registry.to_owned()),
+            })
+            .collect();
+        let resolved = |name: &str, version: &str| {
+            replaces_locked_package(
+                &allowed,
+                name,
+                &semver::Version::parse(version).unwrap(),
+                Some(registry),
+            )
+        };
+        assert!(
+            !resolved("annotate-snippets", "0.12.16"),
+            "the locked entry itself"
+        );
+        assert!(
+            !resolved("annotate-snippets", "0.11.5"),
+            "bindgen's 0.11 line coexists with the locked 0.12"
+        );
+        assert!(
+            !resolved("bincode", "2.0.1"),
+            "a name the project never locked"
+        );
+        assert!(
+            resolved("toml", "0.9.8"),
+            "the locked 0.9.5 moved within its caret range"
+        );
+        assert!(
+            resolved("annotate-snippets", "0.12.20"),
+            "the locked 0.12.16 moved"
+        );
+    }
 
     fn snapshot(lock: &Lockfile) -> (ResolvedFramework, Vec<u8>) {
         let bytes = lock.to_string().into_bytes();
