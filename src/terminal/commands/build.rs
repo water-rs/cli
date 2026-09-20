@@ -22,7 +22,7 @@ use waterui_cli::{
     gtk4::{backend::Gtk4Backend, platform::build_gtk4},
     hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
     platform::TargetPlatform as LibTargetPlatform,
-    project::{PackageType, Project},
+    project::{ManagedBackends, PackageType, Project},
     winui::{backend::WinUiBackend, platform::build_winui},
 };
 
@@ -140,7 +140,8 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
 
 async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<BuildContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let mut project = Project::open(&project_path).await?;
+    let managed_backends = ManagedBackends::for_platform(lib_platform(args.platform));
+    let mut project = Project::open(&project_path, managed_backends).await?;
     ensure_app_project(&project)?;
 
     let backend = resolve_and_validate_backend(args)?;
@@ -158,7 +159,9 @@ async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<Buil
         project.set_esp32_chip(chip).await?;
     }
 
-    let project = ensure_generated_backend_ready(shell, &project_path, project, backend).await?;
+    let project =
+        ensure_generated_backend_ready(shell, &project_path, project, backend, managed_backends)
+            .await?;
     let build_options = build_options(shell, args, backend).await;
 
     Ok(Some(BuildContext {
@@ -215,6 +218,7 @@ async fn ensure_generated_backend_ready(
     project_path: &PathBuf,
     project: Project,
     backend: TargetBackend,
+    managed_backends: ManagedBackends,
 ) -> Result<Project> {
     match backend {
         TargetBackend::Gtk4 if Gtk4Backend::requires_regeneration(&project).await? => {
@@ -222,6 +226,7 @@ async fn ensure_generated_backend_ready(
                 shell,
                 project_path,
                 &project,
+                managed_backends,
                 "Re-initializing GTK4 backend...",
                 "GTK4 backend re-initialized",
             )
@@ -232,6 +237,7 @@ async fn ensure_generated_backend_ready(
                 shell,
                 project_path,
                 &project,
+                managed_backends,
                 "Re-initializing hydrolysis backend...",
                 "Hydrolysis backend re-initialized",
             )
@@ -242,6 +248,7 @@ async fn ensure_generated_backend_ready(
                 shell,
                 project_path,
                 &project,
+                managed_backends,
                 "Re-initializing WinUI backend...",
                 "WinUI backend re-initialized",
             )
@@ -252,6 +259,7 @@ async fn ensure_generated_backend_ready(
                 shell,
                 project_path,
                 &project,
+                managed_backends,
                 "Re-initializing ESP32 backend...",
                 "ESP32 backend re-initialized",
             )
@@ -265,6 +273,7 @@ async fn reinitialize_generated_backend<T>(
     shell: &Shell,
     project_path: &PathBuf,
     project: &Project,
+    managed_backends: ManagedBackends,
     spinner_message: &str,
     success_message: &str,
 ) -> Result<Project>
@@ -273,7 +282,7 @@ where
 {
     let spinner = shell.spinner(spinner_message);
     reinit_backend::<T>(project).await?;
-    let project = Project::open(project_path).await?;
+    let project = Project::open(project_path, managed_backends).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }

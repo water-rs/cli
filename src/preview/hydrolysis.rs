@@ -10,8 +10,8 @@ use crate::hydrolysis::platform::{
     build_hydrolysis_with_envs_and_features, built_hydrolysis_binary_path,
     stage_hydrolysis_shared_runtime,
 };
-use crate::platform::TargetPlatform;
-use crate::project::Project;
+use crate::platform::{TargetBackend, TargetPlatform};
+use crate::project::{ManagedBackends, Project};
 use crate::project_model::assets;
 use crate::utils::command;
 
@@ -242,14 +242,15 @@ pub async fn stage_hydrolysis_resources(
 /// Opens the project and makes sure its managed Hydrolysis backend exists and
 /// matches the current templates. Shared by the preview and MCP flows.
 pub async fn ensure_hydrolysis_backend_ready(project_path: &Path) -> Result<Project> {
-    let mut project = Project::open(project_path).await?;
+    let managed_backends = ManagedBackends::for_backend(TargetBackend::Hydrolysis);
+    let mut project = Project::open(project_path, managed_backends).await?;
     if project.hydrolysis_backend().is_none() && !project.is_playground() {
         bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
     }
 
     if HydrolysisBackend::requires_regeneration(&project).await? {
         reinit_backend::<HydrolysisBackend>(&project).await?;
-        project = Project::open(project_path).await?;
+        project = Project::open(project_path, managed_backends).await?;
     }
 
     Ok(project)
