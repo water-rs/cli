@@ -5,6 +5,7 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.30.2"
+install-success-msg = "water is installed; the release archive's SHA-256 checksum was verified before it was unpacked."
 # CI backends to support
 ci = "github"
 # Build each app individually instead of `cargo build --workspace`
