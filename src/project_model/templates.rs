@@ -2336,6 +2336,45 @@ mod tests {
         }));
     }
 
+    /// The generated backend's `[lib]` and main `[[bin]]` never share a name:
+    /// same-named targets share an output filename stem in the target
+    /// directory (`<name>.pdb`, `<name>.d`), which Cargo reports as an
+    /// `output filename collision` on every build.
+    #[test]
+    fn hydrolysis_manifest_gives_lib_and_bin_targets_distinct_names() {
+        let package_name = "e2eapp-hydrolysis-1a2b3c4d";
+        let cargo_toml = crate::templates::hydrolysis::rendered_outputs(&app_ctx(), package_name)
+            .expect("hydrolysis outputs should render")
+            .into_iter()
+            .find_map(|(path, content)| {
+                (path == std::path::Path::new("Cargo.toml"))
+                    .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
+            })
+            .expect("hydrolysis Cargo.toml output should exist");
+        let manifest = cargo_toml
+            .parse::<toml::Table>()
+            .expect("hydrolysis Cargo.toml should parse");
+        let lib_name = manifest["lib"]["name"]
+            .as_str()
+            .expect("the lib target is named explicitly");
+        assert_eq!(lib_name, "e2eapp_hydrolysis_1a2b3c4d_lib");
+        let bins = manifest["bin"]
+            .as_array()
+            .expect("the manifest declares the backend binary");
+        let bin_names: Vec<&str> = bins
+            .iter()
+            .map(|bin| bin["name"].as_str().expect("bin name"))
+            .collect();
+        assert_eq!(bin_names, [package_name]);
+        // Cargo compares output stems as crate identifiers.
+        assert!(
+            bin_names
+                .iter()
+                .all(|bin| bin.replace('-', "_") != lib_name),
+            "lib {lib_name} collides with a bin in {bin_names:?}"
+        );
+    }
+
     #[test]
     fn hydrolysis_manifest_enables_wasm_opt_for_the_features_rustc_emits() {
         // wasm-pack invokes `wasm-opt -O` with no feature flags; without the
@@ -3671,6 +3710,13 @@ struct GeneratedWasmPackProfile {
 
 #[derive(serde::Serialize)]
 struct GeneratedLibSection {
+    /// The library target's name when it must differ from the package's:
+    /// Cargo derives both a `[lib]` and a `[[bin]]` from the package name,
+    /// and two same-named targets share one output filename stem (the
+    /// `.pdb` on MSVC, the `.d` everywhere), which Cargo warns about as an
+    /// `output filename collision` on every build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     #[serde(rename = "crate-type")]
     crate_type: Vec<String>,
 }
@@ -3818,6 +3864,7 @@ fn generated_package(name: &str, authors: Vec<String>) -> GeneratedPackageSectio
 
 fn generated_lib(crate_types: &[&str]) -> GeneratedLibSection {
     GeneratedLibSection {
+        name: None,
         crate_type: crate_types
             .iter()
             .map(|crate_type| (*crate_type).to_string())
@@ -4337,9 +4384,15 @@ pub mod hydrolysis {
                 path: "src/bin/waterui-cef-helper.rs".to_string(),
             });
         }
+        // The backend binary keeps the package's name (`build_binary` and
+        // packaging select it by that name); the library target the web
+        // bundle compiles takes a distinct one so the two never share an
+        // output filename stem in the shared target directory.
+        let mut lib = super::generated_lib(&["cdylib", "rlib"]);
+        lib.name = Some(hydrolysis_library_target_name(package_name));
         Ok(GeneratedCargoManifest {
             package,
-            lib: super::generated_lib(&["cdylib", "rlib"]),
+            lib,
             bins,
             profile: super::generated_profiles(),
             features: BTreeMap::from([
@@ -4361,6 +4414,13 @@ pub mod hydrolysis {
             workspace: GeneratedWorkspaceSection {},
             patch,
         })
+    }
+
+    /// The `[lib]` target name of a generated Hydrolysis backend: the package
+    /// name as a crate identifier with a `_lib` suffix, distinct from the
+    /// `[[bin]]` that carries the package name itself.
+    pub fn hydrolysis_library_target_name(package_name: &str) -> String {
+        format!("{}_lib", package_name.replace('-', "_"))
     }
 
     /// Whether this application's graph links the bundled CEF runtime.

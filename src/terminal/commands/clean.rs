@@ -117,6 +117,11 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
                 pb.finish_and_clear();
             }
             success!(shell, "Cleaned all build artifacts");
+            note!(
+                shell,
+                "Shared dependency artifacts in {} are kept for every project on this machine; `water gc build-cache --shared-target` removes them",
+                water_dir::shared_target_dir_path().await?.display()
+            );
         }
         TargetBackend::Apple => {
             let spinner = shell.spinner("Cleaning Apple build artifacts...");

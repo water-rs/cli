@@ -11,6 +11,7 @@ use eyre::{Context as _, bail};
 use futures_util::StreamExt as _;
 use smol::{io::AsyncReadExt as _, process::Command, unblock};
 use target_lexicon::{Environment, OperatingSystem, Triple};
+use tracing::warn;
 
 use crate::project::Project;
 use crate::utils::{run_command, std_output_enabled};
@@ -1270,13 +1271,22 @@ Automatic meson installation failed: {install_err}\n\n{}",
         // A `fresh` unit emits nothing yet still reports that path, which can
         // leave a different source's bytes where `water run` expects its own
         // runtime. The dep-info `.d` written alongside records the producing
-        // sources; when they are not this unit's, clean the package so the
-        // rebuild below emits this source's artifact.
+        // sources; when they are not this unit's — or when no dep-info exists
+        // to say — clean the package so the rebuild below emits this source's
+        // artifact. The rebuild compiles the cleaned package anew, so a unit
+        // it still reports `fresh` in the same state is a cache this CLI
+        // cannot repair by rebuilding, and that is reported instead of retried.
         let stale = stale_shared_dylib_packages(&output.stdout).await?;
         if !stale.is_empty() {
             let target_dir = self.target_directory().await?;
-            for package in &stale {
-                clean_cargo_package(&self.path, package, &target_dir).await?;
+            for unit in &stale {
+                warn!(
+                    package = unit.package,
+                    artifact = %unit.artifact.display(),
+                    "discarding a shared dylib unit and rebuilding it: {}",
+                    unit.reason
+                );
+                clean_cargo_package(&self.path, &unit.package, &target_dir).await?;
             }
             output = self.cargo_build_output(release, cargo_target).await?;
             if !output.status.success() {
@@ -1287,6 +1297,10 @@ Automatic meson installation failed: {install_err}\n\n{}",
                         self.failure_report(&combined)
                     )),
                 ));
+            }
+            let unrecovered = stale_shared_dylib_packages(&output.stdout).await?;
+            if !unrecovered.is_empty() {
+                return Err(unrecoverable_shared_dylib_error(&unrecovered, &target_dir));
             }
         }
 
@@ -1863,17 +1877,86 @@ fn reported_artifact_file(
     Ok(artifact)
 }
 
-/// Names of dependency packages whose `fresh` dynamic-library unit reports an
-/// artifact another source's build of the same-named package last wrote.
+/// Why a `fresh` shared dylib unit cannot be trusted as this project's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaleSharedDylibReason {
+    /// The dep-info beside the artifact names no source under the unit's
+    /// manifest root: another source's build of the same-named package wrote
+    /// the file.
+    ForeignDepInfo { dep_info: PathBuf },
+    /// No dep-info exists beside the artifact or in its unit directory, so
+    /// nothing records which sources produced the bytes on disk.
+    MissingDepInfo { reported_files: Vec<PathBuf> },
+}
+
+impl std::fmt::Display for StaleSharedDylibReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForeignDepInfo { dep_info } => write!(
+                f,
+                "its dep-info {} names no source under this unit's manifest root, so another source's build wrote it",
+                dep_info.display()
+            ),
+            Self::MissingDepInfo { reported_files } => write!(
+                f,
+                "no dep-info was found beside it or in its unit directory, so nothing records which sources produced it (reported files: {reported_files:?})"
+            ),
+        }
+    }
+}
+
+/// A `fresh` shared dylib unit whose artifact this build must not trust, and
+/// the package whose units are cleaned so the rebuild emits its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleSharedDylib {
+    package: String,
+    artifact: PathBuf,
+    reason: StaleSharedDylibReason,
+}
+
+/// The error a build reports when a cleaned and rebuilt package still comes
+/// back `fresh` in a state this CLI cannot trust: rebuilding once did not
+/// repair the cache, so it names the target directory to drop rather than
+/// rebuilding again.
+fn unrecoverable_shared_dylib_error(
+    stale: &[StaleSharedDylib],
+    target_dir: &Path,
+) -> RustBuildError {
+    let units = stale.iter().fold(String::new(), |mut units, unit| {
+        let _ = std::fmt::Write::write_fmt(
+            &mut units,
+            format_args!(
+                "\n  - {} ({}): {}",
+                unit.artifact.display(),
+                unit.package,
+                unit.reason
+            ),
+        );
+        units
+    });
+    let message = format!(
+        "Cargo still reports a shared dylib unit as fresh after its package was cleaned and rebuilt:{units}\nThe shared Cargo target directory {} cannot be repaired by rebuilding; remove it with `water gc build-cache --shared-target` and build again.",
+        target_dir.display()
+    );
+    RustBuildError::FailToBuildRustLibrary(io::Error::other(message))
+}
+
+/// Dependency packages whose `fresh` dynamic-library unit reports an artifact
+/// this build did not verifiably write, with the reason for each.
 ///
 /// Dep-info is the one record that names the producing sources: the `.d`
 /// Cargo writes beside an uplifted dylib lists the writer's inputs, while the
 /// unit's own `manifest_path` says which source *this* graph resolved. A
 /// dep-info that names no file under the unit's manifest root was produced by
 /// a different source's build, and the unhashed artifact it accompanies does
-/// not belong to this project.
-async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustBuildError> {
-    let mut stale = Vec::new();
+/// not belong to this project. An uplifted dylib with no dep-info at all is
+/// a cache state this CLI's own builds leave behind (observed on Windows),
+/// and it is flagged the same way so the caller rebuilds the package instead
+/// of trusting bytes nothing accounts for.
+async fn stale_shared_dylib_packages(
+    stdout: &[u8],
+) -> Result<Vec<StaleSharedDylib>, RustBuildError> {
+    let mut stale: Vec<StaleSharedDylib> = Vec::new();
     for artifact in compiler_artifacts(stdout)? {
         if !artifact.fresh {
             continue;
@@ -1890,21 +1973,26 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
             continue;
         }
         let manifest_root = dunce::simplified(manifest_dir);
-        let mut package_stale = false;
+        let package = artifact_package_name(&artifact.package_id);
+        let mut package_stale = None;
         for filename in &artifact.filenames {
             let file = filename.as_std_path();
             if !is_dynamic_library(file) {
                 continue;
             }
             let Some(dep_info) = dep_info_path(file, &artifact.filenames) else {
-                return Err(RustBuildError::FailToBuildRustLibrary(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "Cargo reported {} fresh but no dep-info was found beside it or in its unit directory (reported files: {:?})",
-                        file.display(),
-                        artifact.filenames
-                    ),
-                )));
+                package_stale = Some(StaleSharedDylib {
+                    package: package.to_owned(),
+                    artifact: file.to_path_buf(),
+                    reason: StaleSharedDylibReason::MissingDepInfo {
+                        reported_files: artifact
+                            .filenames
+                            .iter()
+                            .map(|reported| reported.as_std_path().to_path_buf())
+                            .collect(),
+                    },
+                });
+                break;
             };
             let contents = smol::fs::read_to_string(&dep_info).await.map_err(|error| {
                 RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
@@ -1924,15 +2012,21 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
                 };
                 dunce::simplified(&source).starts_with(manifest_root)
             }) {
-                package_stale = true;
+                package_stale = Some(StaleSharedDylib {
+                    package: package.to_owned(),
+                    artifact: file.to_path_buf(),
+                    reason: StaleSharedDylibReason::ForeignDepInfo { dep_info },
+                });
+                break;
             }
         }
-        if package_stale {
-            stale.push(artifact_package_name(&artifact.package_id).to_owned());
+        if let Some(unit) = package_stale
+            && !stale.iter().any(|known| known.package == unit.package)
+        {
+            stale.push(unit);
         }
     }
-    stale.sort_unstable();
-    stale.dedup();
+    stale.sort_unstable_by(|left, right| left.package.cmp(&right.package));
     Ok(stale)
 }
 
@@ -2835,7 +2929,16 @@ mod tests {
             let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
                 .await
                 .expect("scan");
-            assert_eq!(stale, ["waterui-dylib"]);
+            assert_eq!(
+                stale,
+                [super::StaleSharedDylib {
+                    package: "waterui-dylib".to_owned(),
+                    artifact: dylib.clone(),
+                    reason: super::StaleSharedDylibReason::ForeignDepInfo {
+                        dep_info: dep_info.clone(),
+                    },
+                }]
+            );
 
             // The same file written by this unit's own source is trusted.
             write_dep_info(&own_source);
@@ -2924,18 +3027,98 @@ mod tests {
             let stale = super::stale_shared_dylib_packages(stdout.as_bytes())
                 .await
                 .expect("scan");
-            assert_eq!(stale, ["waterui-dylib"]);
-
-            // Without any dep-info the check fails loudly rather than
-            // trusting the shared artifact.
-            std::fs::remove_file(unit_dir.join("waterui_dylib.d")).expect("remove dep-info");
-            let error = super::stale_shared_dylib_packages(stdout.as_bytes())
-                .await
-                .expect_err("a fresh dylib without dep-info is an error");
+            assert_eq!(stale.len(), 1, "{stale:?}");
+            assert_eq!(stale[0].package, "waterui-dylib");
             assert!(
-                error.to_string().contains("no dep-info was found"),
+                matches!(
+                    stale[0].reason,
+                    super::StaleSharedDylibReason::ForeignDepInfo { .. }
+                ),
+                "{:?}",
+                stale[0].reason
+            );
+        });
+    }
+
+    /// A fresh uplifted dylib with no dep-info beside it or in its unit
+    /// directory is a cache this CLI wrote and can no longer account for. It
+    /// is recovered — flagged so the package is cleaned and rebuilt — rather
+    /// than reported as an error, and the reason names the missing record.
+    #[test]
+    fn fresh_uplifted_dylib_without_dep_info_is_recovered_not_reported() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let profile = temporary
+                .path()
+                .join("target/shared/x86_64-pc-windows-msvc/debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir_all(&deps).expect("deps dir");
+            let dylib = profile.join("waterui_dylib.dll");
+            std::fs::write(&dylib, []).expect("dylib");
+            let import_lib = profile.join("waterui_dylib.dll.lib");
+            std::fs::write(&import_lib, []).expect("import lib");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+
+            let stdout = serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///x#waterui-dylib@0.1.0",
+                "manifest_path": manifest,
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["dylib"],
+                    "name": "waterui_dylib",
+                    "src_path": ours.join("src/lib.rs"),
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true,
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 0,
+                    "debug_assertions": true,
+                    "overflow_checks": true,
+                    "test": false,
+                },
+                "features": [],
+                "filenames": [dylib, import_lib],
+                "executable": null,
+                "fresh": true,
+            })
+            .to_string();
+
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes())
+                .await
+                .expect("a fresh dylib without dep-info is recovered, not reported");
+            assert_eq!(
+                stale,
+                [super::StaleSharedDylib {
+                    package: "waterui-dylib".to_owned(),
+                    artifact: dylib.clone(),
+                    reason: super::StaleSharedDylibReason::MissingDepInfo {
+                        reported_files: vec![dylib.clone(), import_lib.clone()],
+                    },
+                }]
+            );
+            let reason = stale[0].reason.to_string();
+            assert!(reason.contains("no dep-info was found"), "{reason}");
+
+            // A second pass in the same state after the rebuild is the loud
+            // failure, naming the artifact, the package, and the target
+            // directory to drop.
+            let target_dir = temporary.path().join("target/shared");
+            let error = super::unrecoverable_shared_dylib_error(&stale, &target_dir).to_string();
+            assert!(
+                error.contains("after its package was cleaned and rebuilt"),
                 "{error}"
             );
+            assert!(error.contains("waterui-dylib"), "{error}");
+            assert!(error.contains(&dylib.display().to_string()), "{error}");
+            assert!(error.contains(&target_dir.display().to_string()), "{error}");
         });
     }
 
