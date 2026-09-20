@@ -824,7 +824,7 @@ pub async fn package_apple(
     if platform == TargetPlatform::MacOS && browser_runtime_plan.requires_cef() {
         browser_runtime::stage_macos_app(
             browser_runtime_plan,
-            &lib_dir,
+            lib_dir,
             &app_path.join("Contents"),
         )
         .await?;
