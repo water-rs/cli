@@ -24,7 +24,7 @@ use waterui_cli::{
         platform::{build_hydrolysis, package_hydrolysis},
     },
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
-    project::Project,
+    project::{ManagedBackends, Project},
     winui::{
         backend::WinUiBackend,
         platform::{build_winui, package_winui},
@@ -164,7 +164,8 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
 
 async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<PackagingContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let project = Project::open(&project_path).await?;
+    let managed_backends = ManagedBackends::for_platform(lib_platform(args.platform));
+    let project = Project::open(&project_path, managed_backends).await?;
     let backend = resolve_backend(args.platform, args.backend)?;
 
     validate_arch_args(backend, &args.arch)?;
@@ -176,8 +177,14 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     {
         return Ok(None);
     }
-    let project =
-        ensure_packaging_backend_generated(shell, &project_path, project, backend).await?;
+    let project = ensure_packaging_backend_generated(
+        shell,
+        &project_path,
+        project,
+        backend,
+        managed_backends,
+    )
+    .await?;
 
     let mut build_options = BuildOptions::packaging(if args.release {
         BuildProfile::Release
@@ -228,6 +235,7 @@ async fn ensure_packaging_backend_generated(
     project_path: &PathBuf,
     project: Project,
     backend: TargetBackend,
+    managed_backends: ManagedBackends,
 ) -> Result<Project> {
     match backend {
         TargetBackend::Gtk4 if project.is_playground() => {
@@ -236,6 +244,7 @@ async fn ensure_packaging_backend_generated(
                 shell,
                 project_path,
                 project,
+                managed_backends,
                 needs_reinit,
                 "Initializing GTK4 backend...",
                 "GTK4 backend initialized",
@@ -248,6 +257,7 @@ async fn ensure_packaging_backend_generated(
                 shell,
                 project_path,
                 project,
+                managed_backends,
                 needs_reinit,
                 "Initializing hydrolysis backend...",
                 "Hydrolysis backend initialized",
@@ -260,6 +270,7 @@ async fn ensure_packaging_backend_generated(
                 shell,
                 project_path,
                 project,
+                managed_backends,
                 needs_reinit,
                 "Initializing WinUI backend...",
                 "WinUI backend initialized",
@@ -274,6 +285,7 @@ async fn ensure_packaging_generated_backend<T>(
     shell: &Shell,
     project_path: &PathBuf,
     project: Project,
+    managed_backends: ManagedBackends,
     needs_reinit: bool,
     spinner_message: &str,
     success_message: &str,
@@ -287,7 +299,7 @@ where
 
     let spinner = shell.spinner(spinner_message);
     reinit_backend::<T>(&project).await?;
-    let project = Project::open(project_path).await?;
+    let project = Project::open(project_path, managed_backends).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -738,7 +750,7 @@ const fn lib_platform(platform: TargetPlatform) -> LibTargetPlatform {
         TargetPlatform::Macos => LibTargetPlatform::MacOS,
         TargetPlatform::Linux => LibTargetPlatform::Linux,
         TargetPlatform::Windows => LibTargetPlatform::Windows,
-        TargetPlatform::Web => panic!("web is not a native lib target"),
+        TargetPlatform::Web => LibTargetPlatform::Web,
     }
 }
 

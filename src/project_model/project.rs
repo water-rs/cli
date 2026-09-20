@@ -16,6 +16,82 @@ enum OpenMode {
     PreviewBuild,
 }
 
+/// The managed native backends a playground [`Project::open`] initialises.
+///
+/// A playground delegates its Apple and Android projects to the CLI, which
+/// scaffolds them into the build cache when the project is opened. Each
+/// scaffold costs time and leaves a generated project behind, so a command
+/// declares the platforms it is about to act on and only their backends are
+/// initialised. The other managed backends (GTK4, hydrolysis, `WinUI`, ESP32)
+/// are generated on demand by the command that runs them and are not part of
+/// this selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ManagedBackends {
+    apple: bool,
+    android: bool,
+}
+
+impl ManagedBackends {
+    /// No managed native backend.
+    pub const NONE: Self = Self {
+        apple: false,
+        android: false,
+    };
+
+    /// Every managed native backend, for commands that act on all of them.
+    pub const ALL: Self = Self {
+        apple: true,
+        android: true,
+    };
+
+    /// The backends `platform` builds with: Apple for the Apple platforms,
+    /// Android for Android, none for the rest.
+    #[must_use]
+    pub const fn for_platform(platform: TargetPlatform) -> Self {
+        Self {
+            apple: crate::apple::platform::is_apple_platform(platform),
+            android: crate::android::platform::is_android_platform(platform),
+        }
+    }
+
+    /// The union of [`Self::for_platform`] over `platforms`.
+    #[must_use]
+    pub fn for_platforms(platforms: &[TargetPlatform]) -> Self {
+        platforms.iter().fold(Self::NONE, |selected, platform| {
+            selected.union(Self::for_platform(*platform))
+        })
+    }
+
+    /// The managed backend `backend` itself is, if it is one: Apple or Android.
+    #[must_use]
+    pub const fn for_backend(backend: TargetBackend) -> Self {
+        Self {
+            apple: matches!(backend, TargetBackend::Apple),
+            android: matches!(backend, TargetBackend::Android),
+        }
+    }
+
+    #[must_use]
+    const fn union(self, other: Self) -> Self {
+        Self {
+            apple: self.apple || other.apple,
+            android: self.android || other.android,
+        }
+    }
+
+    /// Whether the Apple backend is selected.
+    #[must_use]
+    pub const fn apple(self) -> bool {
+        self.apple
+    }
+
+    /// Whether the Android backend is selected.
+    #[must_use]
+    pub const fn android(self) -> bool {
+        self.android
+    }
+}
+
 /// What `cargo metadata` reports about the tree a project builds in.
 ///
 /// Resolved once per [`Project`] and shared by everything that needs it, so
@@ -1681,14 +1757,19 @@ impl Project {
     /// Open a `WaterUI` project located at the specified path.
     ///
     /// This loads both the `Water.toml` manifest and the `Cargo.toml` file.
-    /// For playground projects, backends are automatically initialized if not configured.
+    /// For playground projects, the managed backends in `backends` — those the
+    /// caller's target platforms need — are initialised; the accessor of a
+    /// backend not selected returns `None`.
     ///
     /// # Errors
     /// - `FailToOpenProject::Manifest`: If there was an error opening the `Water.toml` manifest.
     /// - `FailToOpenProject::CargoManifest`: If there was an error reading the `Cargo.toml` file.
     /// - `FailToOpenProject::MissingCrateName`: If the crate name is missing in `Cargo.toml`.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, FailToOpenProject> {
-        Self::open_with_mode(path, OpenMode::Full).await
+    pub async fn open(
+        path: impl AsRef<Path>,
+        backends: ManagedBackends,
+    ) -> Result<Self, FailToOpenProject> {
+        Self::open_with_mode(path, OpenMode::Full, backends).await
     }
 
     /// Open a project for preview dylib builds without initializing native app backends.
@@ -1701,7 +1782,7 @@ impl Project {
     /// - `FailToOpenProject::CargoManifest`: If there was an error reading the `Cargo.toml` file.
     /// - `FailToOpenProject::MissingCrateName`: If the crate name is missing in `Cargo.toml`.
     pub async fn open_for_preview_build(path: impl AsRef<Path>) -> Result<Self, FailToOpenProject> {
-        Self::open_with_mode(path, OpenMode::PreviewBuild).await
+        Self::open_with_mode(path, OpenMode::PreviewBuild, ManagedBackends::NONE).await
     }
 
     /// Make a local-checkout project's `[patch]` tables the checkout's.
@@ -1765,6 +1846,7 @@ impl Project {
     async fn open_with_mode(
         path: impl AsRef<Path>,
         open_mode: OpenMode,
+        backends: ManagedBackends,
     ) -> Result<Self, FailToOpenProject> {
         use crate::backend::Backend;
 
@@ -1883,38 +1965,44 @@ impl Project {
             || std::env::var("XCODE_PRODUCT_BUILD_VERSION").is_ok();
 
         if is_playground && !skip_backend_init && open_mode == OpenMode::Full {
-            let apple_backend_start = std::time::Instant::now();
-            let apple_backend = AppleBackend::init(&project)
-                .await
-                .map_err(FailToOpenProject::BackendInit)?;
-            info!(
-                path = %project.root.display(),
-                elapsed_ms = apple_backend_start.elapsed().as_millis(),
-                "Project::open initialized Apple backend"
-            );
-            project.manifest.backends.set_apple(apple_backend);
+            if backends.apple() {
+                let apple_backend_start = std::time::Instant::now();
+                let apple_backend = AppleBackend::init(&project)
+                    .await
+                    .map_err(FailToOpenProject::BackendInit)?;
+                info!(
+                    path = %project.root.display(),
+                    elapsed_ms = apple_backend_start.elapsed().as_millis(),
+                    "Project::open initialized Apple backend"
+                );
+                project.manifest.backends.set_apple(apple_backend);
+            }
 
-            let android_backend_start = std::time::Instant::now();
-            let android_backend = AndroidBackend::init(&project)
-                .await
-                .map_err(FailToOpenProject::BackendInit)?;
-            info!(
-                path = %project.root.display(),
-                elapsed_ms = android_backend_start.elapsed().as_millis(),
-                "Project::open initialized Android backend"
-            );
-            project.manifest.backends.set_android(android_backend);
+            if backends.android() {
+                let android_backend_start = std::time::Instant::now();
+                let android_backend = AndroidBackend::init(&project)
+                    .await
+                    .map_err(FailToOpenProject::BackendInit)?;
+                info!(
+                    path = %project.root.display(),
+                    elapsed_ms = android_backend_start.elapsed().as_millis(),
+                    "Project::open initialized Android backend"
+                );
+                project.manifest.backends.set_android(android_backend);
+            }
 
-            let ffi_companion_start = std::time::Instant::now();
-            project
-                .scaffold_ffi_companion()
-                .await
-                .map_err(FailToOpenProject::BackendInit)?;
-            info!(
-                path = %project.root.display(),
-                elapsed_ms = ffi_companion_start.elapsed().as_millis(),
-                "Project::open scaffolded native ffi companion"
-            );
+            if project.apple_backend().is_some() || project.android_backend().is_some() {
+                let ffi_companion_start = std::time::Instant::now();
+                project
+                    .scaffold_ffi_companion()
+                    .await
+                    .map_err(FailToOpenProject::BackendInit)?;
+                info!(
+                    path = %project.root.display(),
+                    elapsed_ms = ffi_companion_start.elapsed().as_millis(),
+                    "Project::open scaffolded native ffi companion"
+                );
+            }
         }
 
         if !is_playground
@@ -2521,6 +2609,82 @@ pub enum PackageType {
 }
 
 #[cfg(test)]
+mod managed_backends_tests {
+    use super::{ManagedBackends, TargetBackend, TargetPlatform};
+
+    /// A macOS-only open scaffolds the Apple project and leaves no `android`
+    /// managed backend behind; an Android open the reverse.
+    #[test]
+    fn a_platform_selects_only_the_backend_it_builds_with() {
+        for platform in [
+            TargetPlatform::MacOS,
+            TargetPlatform::IOS,
+            TargetPlatform::IOSSimulator,
+        ] {
+            let selected = ManagedBackends::for_platform(platform);
+            assert!(selected.apple(), "{platform:?} builds with Apple");
+            assert!(!selected.android(), "{platform:?} leaves Android alone");
+        }
+        let selected = ManagedBackends::for_platform(TargetPlatform::Android);
+        assert!(selected.android());
+        assert!(!selected.apple());
+    }
+
+    /// The backends generated on demand (GTK4, hydrolysis, `WinUI`, ESP32) are
+    /// not initialised by `Project::open`, so their platforms select nothing.
+    #[test]
+    fn platforms_without_a_managed_native_backend_select_none() {
+        for platform in [
+            TargetPlatform::Linux,
+            TargetPlatform::Windows,
+            TargetPlatform::Web,
+            TargetPlatform::Esp32S3,
+            TargetPlatform::Esp32C3,
+            TargetPlatform::Esp32P4,
+        ] {
+            assert_eq!(
+                ManagedBackends::for_platform(platform),
+                ManagedBackends::NONE,
+                "{platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn several_platforms_select_the_union_of_their_backends() {
+        assert_eq!(
+            ManagedBackends::for_platforms(&[TargetPlatform::IOS, TargetPlatform::IOSSimulator]),
+            ManagedBackends::for_platform(TargetPlatform::MacOS)
+        );
+        assert_eq!(
+            ManagedBackends::for_platforms(&[TargetPlatform::MacOS, TargetPlatform::Android]),
+            ManagedBackends::ALL
+        );
+        assert_eq!(ManagedBackends::for_platforms(&[]), ManagedBackends::NONE);
+    }
+
+    #[test]
+    fn a_backend_selects_itself_when_it_is_managed_natively() {
+        assert!(ManagedBackends::for_backend(TargetBackend::Apple).apple());
+        assert!(!ManagedBackends::for_backend(TargetBackend::Apple).android());
+        assert!(ManagedBackends::for_backend(TargetBackend::Android).android());
+        assert!(!ManagedBackends::for_backend(TargetBackend::Android).apple());
+        for backend in [
+            TargetBackend::Gtk4,
+            TargetBackend::Hydrolysis,
+            TargetBackend::WinUi,
+            TargetBackend::Dew,
+        ] {
+            assert_eq!(
+                ManagedBackends::for_backend(backend),
+                ManagedBackends::NONE,
+                "{backend:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod channel_tests {
     use super::*;
 
@@ -2859,7 +3023,9 @@ mod webview_backend_tests {
 mod scaffold_tests {
     use std::path::Path;
 
-    use super::{BundleIdentifier, CreateOptions, PackageType, Project, TargetBackend};
+    use super::{
+        BundleIdentifier, CreateOptions, ManagedBackends, PackageType, Project, TargetBackend,
+    };
 
     /// The documented `assets!` workflow requires the assets root to exist: the
     /// planner walks it recursively, so a missing directory fails the first
@@ -2999,6 +3165,76 @@ mod scaffold_tests {
                 tagged.as_str().len() - shipped.as_str().len(),
                 9,
                 "the tag is a dash plus eight hex digits: {tagged}"
+            );
+        }
+    }
+
+    fn create_playground(root: &Path) -> Project {
+        smol::block_on(Project::create(
+            root,
+            CreateOptions {
+                name: "Water Example".to_string(),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                    .expect("bundle identifier"),
+                package_type: PackageType::Playground,
+                waterui_path: None,
+                channel: None,
+                framework_manifest: None,
+                framework: Some(crate::framework::test_fixtures::stable_framework()),
+                author: "Lexo Liu".to_string(),
+                backends: Vec::new(),
+                web: None,
+            },
+        ))
+        .expect("project creation must succeed")
+    }
+
+    /// Opening a playground for one platform scaffolds the managed backend
+    /// that platform builds with and nothing else: a macOS open must not
+    /// leave an Android project behind, and an Android open no Apple project.
+    #[test]
+    fn opening_a_playground_scaffolds_only_the_platforms_managed_backend() {
+        use crate::android::backend::AndroidBackend;
+        use crate::apple::backend::AppleBackend;
+        use crate::platform::TargetPlatform;
+
+        for (platform, apple_expected) in [
+            (TargetPlatform::MacOS, true),
+            (TargetPlatform::Android, false),
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().join("water-example");
+            create_playground(&root);
+
+            let project = smol::block_on(Project::open(
+                &root,
+                ManagedBackends::for_platform(platform),
+            ))
+            .expect("opening the playground must succeed");
+
+            let apple_path = project.backend_path::<AppleBackend>();
+            let android_path = project.backend_path::<AndroidBackend>();
+            assert_eq!(
+                project.apple_backend().is_some(),
+                apple_expected,
+                "{platform:?}: apple backend"
+            );
+            assert_eq!(
+                project.android_backend().is_some(),
+                !apple_expected,
+                "{platform:?}: android backend"
+            );
+            assert_eq!(
+                apple_path.exists(),
+                apple_expected,
+                "{platform:?}: {}",
+                apple_path.display()
+            );
+            assert_eq!(
+                android_path.exists(),
+                !apple_expected,
+                "{platform:?}: {}",
+                android_path.display()
             );
         }
     }

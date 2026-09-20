@@ -20,7 +20,8 @@ use waterui_cli::{
     apple::platform::clean_apple,
     gtk4::platform::clean_gtk4,
     hydrolysis::platform::clean_hydrolysis,
-    project::{Manifest, PackageType, Project},
+    platform::TargetBackend as LibTargetBackend,
+    project::{ManagedBackends, Manifest, PackageType, Project},
     water_dir,
     winui::platform::clean_winui,
 };
@@ -104,7 +105,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         return clean_recursive(shell, &root_path, args.yes).await;
     }
 
-    let project = Project::open(&root_path).await?;
+    let project = Project::open(&root_path, managed_backends(args.backend)).await?;
 
     header!(shell, "Cleaning build artifacts...");
 
@@ -160,6 +161,19 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The managed native backends whose generated projects a clean of `backend`
+/// sweeps: the one named, or every one of them for `all`.
+const fn managed_backends(backend: TargetBackend) -> ManagedBackends {
+    match backend {
+        TargetBackend::Apple => ManagedBackends::for_backend(LibTargetBackend::Apple),
+        TargetBackend::Android => ManagedBackends::for_backend(LibTargetBackend::Android),
+        TargetBackend::Gtk4 => ManagedBackends::for_backend(LibTargetBackend::Gtk4),
+        TargetBackend::Hydrolysis => ManagedBackends::for_backend(LibTargetBackend::Hydrolysis),
+        TargetBackend::WinUi => ManagedBackends::for_backend(LibTargetBackend::WinUi),
+        TargetBackend::All => ManagedBackends::ALL,
+    }
 }
 
 async fn clean_global_build_cache(shell: &Shell, yes: bool) -> Result<()> {
