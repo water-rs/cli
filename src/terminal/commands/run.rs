@@ -491,17 +491,16 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // The dev-server guard is held for the app's whole run: dropping it —
     // on app exit, normal return, or the Ctrl-C future-drop — kills the
     // bundler child (`kill_on_drop`).
-    let (running, _dev_server) = shell
-        .display_output(build_and_run(
-            shell,
-            &host,
-            &context.project,
-            context.platform,
-            context.backend,
-            selection,
-            config,
-        ))
-        .await?;
+    let (running, _dev_server) = Box::pin(shell.display_output(build_and_run(
+        shell,
+        &host,
+        &context.project,
+        context.platform,
+        context.backend,
+        selection,
+        config,
+    )))
+    .await?;
 
     line!(shell);
     note!(shell, "Press Ctrl+C to stop the application");

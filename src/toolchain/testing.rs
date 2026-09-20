@@ -142,8 +142,8 @@ impl TestMachine {
     /// the scratch SDK; returns the NDK root.
     ///
     /// The fake clang is the dispatcher script, so the host-toolchain probe
-    /// (`clang -x c -c probe.c -o /dev/null`) exits 0 on every platform where
-    /// scripts run — on Windows the `.cmd` name gets cmd dispatch.
+    /// (`clang -x c -c probe.c -o /dev/null`) exits 0.
+    #[cfg(unix)]
     pub fn install_android_ndk(&self, version: &str) -> PathBuf {
         self.executable(
             Path::new("sdk")
@@ -156,6 +156,7 @@ impl TestMachine {
     }
 
     /// Stage `emulator/emulator` inside the scratch SDK.
+    #[cfg(unix)]
     pub fn install_android_emulator(&self) -> PathBuf {
         self.executable(Path::new("sdk").join("emulator").join(emulator_file_name()))
     }
@@ -249,25 +250,23 @@ fn adb_file_name() -> &'static str {
 }
 
 /// The name `emulator` carries inside `emulator/`.
+#[cfg(unix)]
 fn emulator_file_name() -> &'static str {
-    if cfg!(windows) {
-        "emulator.exe"
-    } else {
-        "emulator"
-    }
+    "emulator"
 }
 
 /// The API level the staged NDK wrapper carries. The host-toolchain probe
 /// accepts any `aarch64-linux-android<api>-clang` wrapper (it picks the lowest
 /// level a prebuilt ships), so the fixture stages the lowest level a current
 /// NDK provides.
+#[cfg(unix)]
 const NDK_WRAPPER_API_LEVEL: u32 = 21;
 
 /// The NDK host clang name the probe looks for
 /// (`aarch64-linux-android<api>-clang`).
+#[cfg(unix)]
 fn ndk_clang_file_name() -> String {
-    let suffix = if cfg!(windows) { ".cmd" } else { "" };
-    format!("aarch64-linux-android{NDK_WRAPPER_API_LEVEL}-clang{suffix}")
+    format!("aarch64-linux-android{NDK_WRAPPER_API_LEVEL}-clang")
 }
 
 #[cfg(unix)]
