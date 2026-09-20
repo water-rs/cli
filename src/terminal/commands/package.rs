@@ -13,7 +13,7 @@ use waterui_cli::{
     apple::platform::{build_rust_lib, package_apple},
     apple::toolchain::AppleSdk,
     backend::reinit_backend,
-    build::{BuildOptions, BuildProfile},
+    build::{BuildOptions, BuildProfile, BuiltTarget},
     device::Artifact,
     gtk4::{
         backend::Gtk4Backend,
@@ -158,8 +158,8 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.distribution,
     );
     check_packaging_toolchain(shell, args.platform, context.backend, &args.arch).await?;
-    build_packaging_artifacts(shell, &args, &context).await?;
-    package_artifact(shell, &args, &context).await
+    let built = build_packaging_artifacts(shell, &args, &context).await?;
+    package_artifact(shell, &args, &context, built.as_ref()).await
 }
 
 async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<PackagingContext>> {
@@ -341,7 +341,7 @@ async fn build_packaging_artifacts(
     shell: &Shell,
     args: &Args,
     context: &PackagingContext,
-) -> Result<()> {
+) -> Result<Option<BuiltTarget>> {
     match context.backend {
         TargetBackend::Android => {
             build_android_packaging_artifacts(
@@ -386,20 +386,22 @@ async fn build_android_packaging_artifacts(
     project: &Project,
     arch: &[AndroidArch],
     build_options: BuildOptions,
-) -> Result<()> {
+) -> Result<Option<BuiltTarget>> {
+    let mut built = None;
     AndroidPlatform::clean_jni_libs(project).await?;
     for arch in arch {
         let abi = arch.to_abi();
         let spinner = shell.spinner(format!("Building Rust library ({})...", abi.as_str()));
-        shell
+        let target = shell
             .display_output(AndroidPlatform::new(abi).build(project, build_options.clone()))
             .await?;
+        built = Some(target);
         if let Some(pb) = spinner {
             pb.finish_and_clear();
         }
         success!(shell, "Built for {}", abi.as_str());
     }
-    Ok(())
+    Ok(built)
 }
 
 async fn build_apple_packaging_artifacts(
@@ -407,9 +409,9 @@ async fn build_apple_packaging_artifacts(
     project: &Project,
     platform: TargetPlatform,
     build_options: BuildOptions,
-) -> Result<()> {
+) -> Result<Option<BuiltTarget>> {
     let spinner = shell.spinner("Building Rust library...");
-    shell
+    let built = shell
         .display_output(build_rust_lib(
             project,
             lib_platform(platform),
@@ -420,39 +422,39 @@ async fn build_apple_packaging_artifacts(
         pb.finish_and_clear();
     }
     success!(shell, "Built Rust library");
-    Ok(())
+    Ok(Some(built))
 }
 
 async fn build_gtk4_packaging_artifacts(
     shell: &Shell,
     project: &Project,
     build_options: BuildOptions,
-) -> Result<()> {
+) -> Result<Option<BuiltTarget>> {
     let spinner = shell.spinner("Building GTK4 app...");
-    shell
+    let built = shell
         .display_output(build_gtk4(project, build_options))
         .await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
     success!(shell, "Built GTK4 app");
-    Ok(())
+    Ok(Some(built))
 }
 
 async fn build_winui_packaging_artifacts(
     shell: &Shell,
     project: &Project,
     build_options: BuildOptions,
-) -> Result<()> {
+) -> Result<Option<BuiltTarget>> {
     let spinner = shell.spinner("Building WinUI app...");
-    shell
+    let built = shell
         .display_output(build_winui(project, build_options))
         .await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
     success!(shell, "Built WinUI app");
-    Ok(())
+    Ok(Some(built))
 }
 
 async fn build_hydrolysis_packaging_artifacts(
@@ -460,13 +462,13 @@ async fn build_hydrolysis_packaging_artifacts(
     project: &Project,
     platform: TargetPlatform,
     build_options: BuildOptions,
-) -> Result<()> {
+) -> Result<Option<BuiltTarget>> {
     if platform == TargetPlatform::Web {
-        return Ok(());
+        return Ok(None);
     }
 
     let spinner = shell.spinner("Building hydrolysis app...");
-    shell
+    let built = shell
         .display_output(build_hydrolysis(
             project,
             hydrolysis_platform(platform),
@@ -477,13 +479,18 @@ async fn build_hydrolysis_packaging_artifacts(
         pb.finish_and_clear();
     }
     success!(shell, "Built hydrolysis app");
-    Ok(())
+    Ok(Some(built))
 }
 
-async fn package_artifact(shell: &Shell, args: &Args, context: &PackagingContext) -> Result<()> {
+async fn package_artifact(
+    shell: &Shell,
+    args: &Args,
+    context: &PackagingContext,
+    built: Option<&BuiltTarget>,
+) -> Result<()> {
     let spinner = shell.spinner("Packaging application...");
     let artifact = shell
-        .display_output(package_artifact_inner(shell, args, context))
+        .display_output(package_artifact_inner(shell, args, context, built))
         .await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
@@ -496,6 +503,7 @@ async fn package_artifact_inner(
     shell: &Shell,
     args: &Args,
     context: &PackagingContext,
+    built: Option<&BuiltTarget>,
 ) -> Result<Artifact> {
     let package_options = PackageOptions::packaging(args.distribution, !args.release)
         .with_progress(shell.build_progress());
@@ -505,20 +513,43 @@ async fn package_artifact_inner(
             AndroidPlatform::package_with_abis(&context.project, package_options, &abis).await
         }
         TargetBackend::Apple => {
+            let built = built.ok_or_else(|| {
+                eyre::eyre!("Internal error: Apple packaging has no build result")
+            })?;
             package_apple(
                 &context.project,
                 lib_platform(args.platform),
                 package_options,
+                built,
             )
             .await
         }
-        TargetBackend::Gtk4 => package_gtk4(&context.project, package_options).await,
-        TargetBackend::WinUi => package_winui(&context.project, package_options).await,
+        TargetBackend::Gtk4 => {
+            package_gtk4(
+                &context.project,
+                package_options,
+                built.ok_or_else(|| {
+                    eyre::eyre!("Internal error: GTK4 packaging has no build result")
+                })?,
+            )
+            .await
+        }
+        TargetBackend::WinUi => {
+            package_winui(
+                &context.project,
+                package_options,
+                built.ok_or_else(|| {
+                    eyre::eyre!("Internal error: WinUI packaging has no build result")
+                })?,
+            )
+            .await
+        }
         TargetBackend::Hydrolysis => {
             package_hydrolysis(
                 &context.project,
                 hydrolysis_platform(args.platform),
                 package_options,
+                built,
             )
             .await
         }

@@ -134,7 +134,7 @@ impl Backend for Gtk4Backend {
         project: &Project,
         _platform: TargetPlatform,
         options: BuildOptions,
-    ) -> eyre::Result<PathBuf> {
+    ) -> eyre::Result<crate::build::BuiltTarget> {
         project
             .browser_runtime_plan(TargetPlatform::Linux, TargetBackend::Gtk4)
             .await?;
@@ -146,8 +146,9 @@ impl Backend for Gtk4Backend {
         project: &Project,
         _platform: TargetPlatform,
         options: PackageOptions,
+        built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
-        package_gtk4(project, options).await
+        package_gtk4(project, options, built).await
     }
 
     async fn clean(&self, project: &Project, _platform: TargetPlatform) -> eyre::Result<()> {

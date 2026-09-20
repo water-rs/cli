@@ -17,7 +17,7 @@ use waterui_cli::{
     apple::platform::build_rust_lib,
     apple::toolchain::AppleSdk,
     backend::reinit_backend,
-    build::{BuildOptions, BuildProfile},
+    build::{BuildOptions, BuildProfile, BuiltTarget},
     esp32::{backend::Esp32Backend, platform::build_esp32},
     gtk4::{backend::Gtk4Backend, platform::build_gtk4},
     hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
@@ -363,7 +363,7 @@ async fn check_build_toolchain(
     Ok(())
 }
 
-async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<PathBuf> {
+async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<BuiltTarget> {
     let spinner = shell.spinner("Compiling...");
     let result = shell
         .display_output(async {
@@ -411,12 +411,12 @@ async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Re
 
 fn handle_build_result(
     shell: &Shell,
-    result: Result<PathBuf>,
+    result: Result<BuiltTarget>,
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
     match result {
-        Ok(output_path) => {
-            success!(shell, "Build output at {}", output_path.display());
+        Ok(built) => {
+            success!(shell, "Build output at {}", built.profile_dir.display());
             if let Some(output_dir) = output_dir {
                 success!(shell, "Copied library to {}", output_dir.display());
             }
@@ -578,7 +578,7 @@ async fn build_for_apple(
     platform: TargetPlatform,
     arch: Option<TargetArch>,
     options: BuildOptions,
-) -> Result<PathBuf> {
+) -> Result<BuiltTarget> {
     match (platform, arch) {
         (TargetPlatform::Ios, None | Some(TargetArch::Arm64)) => {
             build_rust_lib(project, LibTargetPlatform::IOS, options).await
@@ -625,7 +625,7 @@ async fn build_for_android(
     project: &Project,
     arch: Option<TargetArch>,
     options: BuildOptions,
-) -> Result<PathBuf> {
+) -> Result<BuiltTarget> {
     let abi = android_abi(arch.unwrap_or(TargetArch::Arm64));
     AndroidPlatform::new(abi).build(project, options).await
 }

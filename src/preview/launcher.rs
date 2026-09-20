@@ -26,7 +26,7 @@ use super::protocol::PreviewTcpConfig;
 use crate::build::BuildProgress;
 
 use crate::apple::dynamic_runtime;
-use crate::build::{BuildOptions, BuildProfile, RustBuild, RustLinkage};
+use crate::build::{BuildOptions, BuildProfile, BuiltTarget, RustBuild, RustLinkage};
 use crate::device::{Device, DeviceEvent, Local, LogLevel, RunOptions, Running};
 use crate::platform::TargetPlatform;
 use crate::project::Project;
@@ -357,7 +357,7 @@ async fn build_preview_dylib(
 
     ensure_project_dev_feature_for_preview(&project).await?;
 
-    let (mut rust_build, toolchain_identity) =
+    let (rust_build, toolchain_identity) =
         configure_preview_module_build(&preview_crate_path, platform, target, link_mode).await?;
     let dylib_path_start = Instant::now();
     let expected_path = rust_build
@@ -383,28 +383,16 @@ async fn build_preview_dylib(
     let built_path = if dylib_is_up_to_date(&candidate_path, &dylib_signature).await? {
         candidate_path
     } else {
-        info!("Building dylib...");
-        if let Some(sccache) = sccache_path {
-            rust_build = rust_build.with_sccache(sccache.clone());
-        }
-        if link_mode.prefer_dynamic {
-            rust_build = rust_build.with_preferred_dynamic_linking();
-        }
-        let build_start = Instant::now();
-        let built_path = rust_build
-            .build_dylib(false)
-            .await
-            .wrap_err("Failed to build dylib")?;
-        prepare_preview_module_linkage(&built_path, link_mode, platform).await?;
-        write_dylib_signature(&built_path, &dylib_signature).await?;
-        info!(
-            build_crate_path = %preview_crate_path.display(),
-            build_crate_name = %preview_crate_name,
-            path = %built_path.display(),
-            elapsed_ms = build_start.elapsed().as_millis(),
-            "Preview built dylib"
-        );
-        built_path
+        build_preview_module_dylib(
+            rust_build,
+            sccache_path,
+            link_mode,
+            platform,
+            &dylib_signature,
+            &preview_crate_path,
+            &preview_crate_name,
+        )
+        .await?
     };
 
     *dylib_path = Some(built_path.clone());
@@ -423,8 +411,41 @@ async fn build_preview_dylib(
     })
 }
 
+async fn build_preview_module_dylib(
+    mut rust_build: RustBuild,
+    sccache_path: Option<&PathBuf>,
+    link_mode: PreviewLinkMode,
+    platform: PreviewPlatform,
+    dylib_signature: &str,
+    preview_crate_path: &Path,
+    preview_crate_name: &str,
+) -> Result<PathBuf> {
+    info!("Building dylib...");
+    if let Some(sccache) = sccache_path {
+        rust_build = rust_build.with_sccache(sccache.clone());
+    }
+    if link_mode.prefer_dynamic {
+        rust_build = rust_build.with_preferred_dynamic_linking();
+    }
+    let build_start = Instant::now();
+    let built = rust_build
+        .build_dylib(false)
+        .await
+        .wrap_err("Failed to build dylib")?;
+    prepare_preview_module_linkage(&built, link_mode, platform).await?;
+    write_dylib_signature(&built.artifact, dylib_signature).await?;
+    info!(
+        build_crate_path = %preview_crate_path.display(),
+        build_crate_name = %preview_crate_name,
+        path = %built.artifact.display(),
+        elapsed_ms = build_start.elapsed().as_millis(),
+        "Preview built dylib"
+    );
+    Ok(built.artifact)
+}
+
 async fn prepare_preview_module_linkage(
-    built_path: &Path,
+    built: &BuiltTarget,
     link_mode: PreviewLinkMode,
     platform: PreviewPlatform,
 ) -> Result<()> {
@@ -432,7 +453,7 @@ async fn prepare_preview_module_linkage(
         // The module is pushed to a device that may run 16 KB pages; a
         // 4 KB-aligned LOAD segment would fail `dlopen` there.
         return smol::unblock({
-            let built_path = built_path.to_path_buf();
+            let built_path = built.artifact.clone();
             move || crate::elf::require_aligned_load_segments(&built_path)
         })
         .await;
@@ -440,13 +461,7 @@ async fn prepare_preview_module_linkage(
     if !link_mode.prefer_dynamic {
         return Ok(());
     }
-    let build_lib_dir = built_path.parent().ok_or_else(|| {
-        eyre::eyre!(
-            "Preview dylib path has no output directory: {}",
-            built_path.display()
-        )
-    })?;
-    dynamic_runtime::retarget_module(built_path, build_lib_dir).await
+    dynamic_runtime::retarget_module(&built.artifact, built.shared_runtime()?).await
 }
 
 async fn ensure_project_dev_feature_for_preview(project: &Project) -> Result<()> {

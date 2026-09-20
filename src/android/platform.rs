@@ -21,7 +21,9 @@ use crate::{
         toolchain::{AndroidNdk, AndroidSdk, Java, Kotlin, java_proxy_properties_from_env},
     },
     assets::{self, ResolvedFont},
-    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{
+        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
+    },
     device::Artifact,
     platform::{PackageOptions, TargetPlatform},
     project::Project,
@@ -409,7 +411,11 @@ impl AndroidPlatform {
     ///
     /// # Errors
     /// Returns an error if the build fails.
-    pub async fn build(&self, project: &Project, options: BuildOptions) -> eyre::Result<PathBuf> {
+    pub async fn build(
+        &self,
+        project: &Project,
+        options: BuildOptions,
+    ) -> eyre::Result<BuiltTarget> {
         // Only an app that will `dlopen` WaterUI modules — the preview support
         // app — ships the shared Rust runtime. `-Cprefer-dynamic` on Android
         // cannot resolve `std` to rustup's prebuilt `libstd.so` (its LOAD
@@ -447,11 +453,10 @@ impl AndroidPlatform {
             &options,
             abi,
             &build_context.ndk_path,
-            &built_target.profile_dir,
-            &built_target.artifact,
+            &built_target,
         )
         .await?;
-        Ok(built_target.profile_dir)
+        Ok(built_target)
     }
 
     /// Clean all jniLibs directories to remove stale libraries from previous builds.
@@ -888,8 +893,7 @@ async fn copy_android_build_outputs(
     options: &BuildOptions,
     abi: AndroidAbi,
     ndk_path: &Path,
-    lib_dir: &Path,
-    source_lib: &Path,
+    built_target: &BuiltTarget,
 ) -> eyre::Result<()> {
     let output_dir = options.output_dir().map_or_else(
         || {
@@ -901,11 +905,15 @@ async fn copy_android_build_outputs(
         std::path::Path::to_path_buf,
     );
     fs::create_dir_all(&output_dir).await?;
-    copy_file(source_lib, &output_dir.join("libwaterui_app.so")).await?;
+    copy_file(
+        &built_target.artifact,
+        &output_dir.join("libwaterui_app.so"),
+    )
+    .await?;
 
     if options.linkage() == RustLinkage::SharedRuntime {
         let triple = AndroidPlatform::new(abi).triple();
-        let libraries = RustDynamicLibraries::resolve(lib_dir, &triple, project).await?;
+        let libraries = RustDynamicLibraries::resolve(built_target, &triple, project).await?;
         libraries.stage(&output_dir).await?;
     } else {
         RustDynamicLibraries::remove_staged(&output_dir, &AndroidPlatform::new(abi).triple())
