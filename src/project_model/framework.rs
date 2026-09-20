@@ -1929,11 +1929,13 @@ async fn fetch(url: &str) -> Result<Vec<u8>> {
 /// arrives as an [`Error::Http`], never as a response to inspect.
 async fn fetch_optional(url: &str) -> Result<Option<Vec<u8>>> {
     let mut client = zenwave::client();
-    let response = match client
+    let mut request = client
         .method(Method::GET, url)?
-        .header("User-Agent", env!("CARGO_PKG_NAME"))?
-        .await
-    {
+        .header("User-Agent", env!("CARGO_PKG_NAME"))?;
+    if let Some(token) = github_api_token(url) {
+        request = request.header("Authorization", &format!("Bearer {token}"))?;
+    }
+    let response = match request.await {
         Ok(response) => response,
         Err(zenwave::Error::Http { status, .. }) if status == StatusCode::NOT_FOUND => {
             return Ok(None);
@@ -1941,6 +1943,22 @@ async fn fetch_optional(url: &str) -> Result<Option<Vec<u8>>> {
         Err(error) => return Err(error.into()),
     };
     Ok(Some(response.into_body().into_bytes().await?.to_vec()))
+}
+
+/// The token a GitHub REST request carries: `WATERUI_GITHUB_TOKEN`, else the
+/// `GITHUB_TOKEN` every Actions job holds. Unauthenticated requests share
+/// sixty an hour across every machine behind one address — CI runners and
+/// cloud VMs first of all — and the same token `water update` sends. Only
+/// `api.github.com` sees it; release downloads and raw file reads are not
+/// metered and must not receive a credential.
+fn github_api_token(url: &str) -> Option<String> {
+    if !url.starts_with("https://api.github.com/") {
+        return None;
+    }
+    ["WATERUI_GITHUB_TOKEN", "GITHUB_TOKEN"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|token| !token.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -2273,13 +2291,105 @@ async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) ->
     Ok(revision)
 }
 
-/// The newest GitHub release `channel` accepts, with its certification
+/// The newest distribution `channel` accepts, with its certification
 /// manifest loaded and verified against the release it rode in on.
+///
+/// Stable is the registry: the highest published `waterui` version names the
+/// framework release tag (`v<version>`, the version group release-plz tags),
+/// so the version comes from the crates.io sparse index and the manifest from
+/// the release's download URL — neither is a GitHub API request, so a
+/// resolution costs nothing against the sixty-an-hour unauthenticated limit
+/// that paging through every crate release used to exhaust (#110). Nightly
+/// prereleases exist only on GitHub and are still listed there.
 async fn latest_certification(
     repository: &str,
     channel: FrameworkChannel,
 ) -> Result<Certification> {
     let slug = repository_slug(repository)?;
+    let (tag, manifest_url, release) = match channel {
+        FrameworkChannel::Stable => {
+            let version = newest_registry_version(&fetch(&sparse_index_url("waterui")).await?)?;
+            let tag = format!("v{version}");
+            let manifest_url =
+                format!("https://github.com/{slug}/releases/download/{tag}/framework.json");
+            (tag, manifest_url, None)
+        }
+        FrameworkChannel::Nightly => {
+            let release = newest_nightly_release(slug).await?;
+            let asset = certification_asset(&release)?;
+            (
+                release.tag_name.clone(),
+                asset.browser_download_url.clone(),
+                Some(release),
+            )
+        }
+        FrameworkChannel::Dev => unreachable!("dev is not a certified channel"),
+    };
+    let Some(bytes) = fetch_optional(&manifest_url).await? else {
+        return Err(match channel {
+            FrameworkChannel::Stable => StableReleaseWithoutManifest { tag }.into(),
+            FrameworkChannel::Nightly => eyre!("nightly {tag} has no certification manifest"),
+            FrameworkChannel::Dev => unreachable!("dev is not a certified channel"),
+        });
+    };
+    let certification = parse_certification(&bytes)?;
+    if certification.tag != tag {
+        bail!("{channel} certification does not match its release");
+    }
+    verify_certification(&certification, release.as_ref(), repository)?;
+    certifies_channel(&certification, channel)?;
+    Ok(certification)
+}
+
+/// The crates.io sparse index entry for `name`: one JSON line per published
+/// version, served from a CDN with no request metering.
+fn sparse_index_url(name: &str) -> String {
+    let prefix = match name.len() {
+        1 => "1".to_owned(),
+        2 => "2".to_owned(),
+        3 => format!("3/{}", &name[..1]),
+        _ => format!("{}/{}", &name[..2], &name[2..4]),
+    };
+    format!("https://index.crates.io/{prefix}/{name}")
+}
+
+/// One version line of a sparse index entry, reduced to what selection reads.
+#[derive(Deserialize)]
+struct IndexVersion {
+    vers: cargo_toml::SemVer,
+    yanked: bool,
+}
+
+/// The highest published, unyanked, bare-semver version in a sparse index
+/// entry: prereleases are not stable distributions, and a yanked version has
+/// no release a user should scaffold against.
+fn newest_registry_version(index: &[u8]) -> Result<cargo_toml::SemVer> {
+    std::str::from_utf8(index)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<IndexVersion>(line).map_err(eyre::Report::from))
+        .filter_map(|entry| match entry {
+            Ok(entry) if entry.yanked || !entry.vers.pre.is_empty() => None,
+            Ok(entry) => Some(Ok(entry.vers)),
+            Err(error) => Some(Err(error)),
+        })
+        .try_fold(None, |newest: Option<cargo_toml::SemVer>, version| {
+            let version = version?;
+            Ok::<_, eyre::Report>(Some(match newest {
+                Some(newest) if newest.cmp_precedence(&version).is_ge() => newest,
+                _ => version,
+            }))
+        })?
+        .ok_or_else(|| {
+            eyre!(
+                "no stable framework release carries a manifest yet; \
+                 select dev or nightly explicitly"
+            )
+        })
+}
+
+/// The newest published `nightly-*` prerelease of the framework repository.
+async fn newest_nightly_release(slug: &str) -> Result<Release> {
     let mut releases = Vec::new();
     let mut page = 1;
     loop {
@@ -2289,22 +2399,16 @@ async fn latest_certification(
         .await?;
         let batch: Vec<Release> = serde_json::from_slice(&bytes)?;
         let complete = batch.len() < 100;
-        releases.extend(
-            batch
-                .into_iter()
-                .filter(|release| release_matches(release, channel)),
-        );
+        releases.extend(batch.into_iter().filter(is_nightly_release));
         if complete {
             break;
         }
         page += 1;
     }
-    let release = newest_release(releases, channel)?;
-    let asset = certification_asset(&release, channel)?;
-    let certification = parse_certification(&fetch(&asset.browser_download_url).await?)?;
-    verify_certification(&certification, Some(&release), repository)?;
-    certifies_channel(&certification, channel)?;
-    Ok(certification)
+    releases
+        .into_iter()
+        .max_by(|left, right| left.published_at.cmp(&right.published_at))
+        .ok_or_else(|| eyre!("no certified nightly exists; select dev or stable explicitly"))
 }
 
 /// A release selected for `channel` must carry that channel's manifest: the
@@ -2341,56 +2445,10 @@ fn parse_certification(bytes: &[u8]) -> Result<Certification> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
-/// Whether a GitHub release can carry `channel`'s manifest.
-fn release_matches(release: &Release, channel: FrameworkChannel) -> bool {
-    match channel {
-        FrameworkChannel::Nightly => {
-            release.prerelease && !release.draft && release.tag_name.starts_with("nightly-")
-        }
-        FrameworkChannel::Stable => {
-            !release.prerelease && !release.draft && is_stable_tag(&release.tag_name)
-        }
-        FrameworkChannel::Dev => false,
-    }
-}
-
-/// A stable framework release tag: `v` followed by a bare semver version —
-/// prerelease and build-metadata tags are not stable distributions.
-fn is_stable_tag(tag: &str) -> bool {
-    tag.strip_prefix('v').is_some_and(|version| {
-        version
-            .parse::<cargo_toml::SemVer>()
-            .is_ok_and(|version| version.pre.is_empty() && version.build.is_empty())
-    })
-}
-
-/// The release a channel resolves to: the highest version for stable, whose
-/// tags are ordered; the most recently published for nightly, whose tags are
-/// dated. Publication order breaks ties.
-fn newest_release(releases: Vec<Release>, channel: FrameworkChannel) -> Result<Release> {
-    let version = |release: &Release| -> Option<cargo_toml::SemVer> {
-        match channel {
-            FrameworkChannel::Stable => release.tag_name.strip_prefix('v')?.parse().ok(),
-            FrameworkChannel::Nightly | FrameworkChannel::Dev => None,
-        }
-    };
-    releases
-        .into_iter()
-        .max_by(|left, right| {
-            version(left)
-                .cmp(&version(right))
-                .then_with(|| left.published_at.cmp(&right.published_at))
-        })
-        .ok_or_else(|| match channel {
-            FrameworkChannel::Nightly => {
-                eyre!("no certified nightly exists; select dev or stable explicitly")
-            }
-            FrameworkChannel::Stable => eyre!(
-                "no stable framework release carries a manifest yet; \
-                 select dev or nightly explicitly"
-            ),
-            FrameworkChannel::Dev => unreachable!("dev releases are not certified"),
-        })
+/// A published `nightly-*` prerelease: the only release shape the nightly
+/// channel certifies.
+fn is_nightly_release(release: &Release) -> bool {
+    release.prerelease && !release.draft && release.tag_name.starts_with("nightly-")
 }
 
 /// The first stable framework release whose GitHub release publishes a
@@ -2413,22 +2471,13 @@ struct StableReleaseWithoutManifest {
     tag: String,
 }
 
-/// The `framework.json` asset of the selected release.
-fn certification_asset(release: &Release, channel: FrameworkChannel) -> Result<&ReleaseAsset> {
+/// The `framework.json` asset of a nightly release.
+fn certification_asset(release: &Release) -> Result<&ReleaseAsset> {
     release
         .assets
         .iter()
         .find(|asset| asset.name == "framework.json")
-        .ok_or_else(|| match channel {
-            FrameworkChannel::Nightly => {
-                eyre!("nightly {} has no certification manifest", release.tag_name)
-            }
-            FrameworkChannel::Stable => StableReleaseWithoutManifest {
-                tag: release.tag_name.clone(),
-            }
-            .into(),
-            FrameworkChannel::Dev => unreachable!("dev releases are not certified"),
-        })
+        .ok_or_else(|| eyre!("nightly {} has no certification manifest", release.tag_name))
 }
 
 /// Read and verify a `framework.json` from disk: the same schema, channel,
@@ -3445,51 +3494,52 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
     }
 
     #[test]
-    fn stable_release_selection_takes_the_newest_stable_tag() {
-        let releases = vec![
-            release("v0.4.0", false, false, "2025-10-01T00:00:00Z"),
-            // A prerelease tag and a nightly prerelease are not stable
-            // distributions no matter how recent.
-            release("v0.5.0-rc.1", true, false, "2025-12-01T00:00:00Z"),
-            release("nightly-2025-12-01", false, true, "2025-12-02T00:00:00Z"),
-            release("v0.4.1", false, false, "2025-11-01T00:00:00Z"),
-            release("v0.9.9", true, false, "2025-12-03T00:00:00Z"),
-            // Build metadata is not a stable distribution either.
-            release("v0.6.0+build.5", false, false, "2025-12-04T00:00:00Z"),
+    fn stable_version_is_the_highest_published_unyanked_bare_semver() {
+        let index = concat!(
+            r#"{"name":"waterui","vers":"0.4.0","yanked":false}"#,
+            "\n",
+            // A prerelease is not a stable distribution no matter how recent.
+            r#"{"name":"waterui","vers":"0.5.0-rc.1","yanked":false}"#,
+            "\n",
+            r#"{"name":"waterui","vers":"0.4.1","yanked":false}"#,
+            "\n",
+            // A yanked version has no release a user should scaffold against.
+            r#"{"name":"waterui","vers":"0.9.9","yanked":true}"#,
+            "\n",
             // A backport published after a newer version does not outrank it:
-            // stable is ordered by version, not by publication date.
-            release("v0.3.9", false, false, "2025-12-05T00:00:00Z"),
-        ];
-        let eligible: Vec<_> = releases
-            .into_iter()
-            .filter(|release| release_matches(release, FrameworkChannel::Stable))
-            .collect();
-        let release = newest_release(eligible, FrameworkChannel::Stable).unwrap();
-        assert_eq!(release.tag_name, "v0.4.1");
-        assert_eq!(
-            certification_asset(&release, FrameworkChannel::Stable)
-                .unwrap()
-                .name,
-            "framework.json"
+            // stable is ordered by version, not by publication order.
+            r#"{"name":"waterui","vers":"0.3.9","yanked":false}"#,
+            "\n",
         );
+        let version = newest_registry_version(index.as_bytes()).unwrap();
+        assert_eq!(version.to_string(), "0.4.1");
+    }
+
+    #[test]
+    fn stable_index_with_nothing_publishable_names_the_other_channels() {
+        let index = r#"{"name":"waterui","vers":"0.1.0","yanked":true}"#;
+        let error = newest_registry_version(index.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dev or nightly"), "{error}");
+    }
+
+    #[test]
+    fn sparse_index_paths_follow_the_registry_layout() {
+        assert_eq!(
+            sparse_index_url("waterui"),
+            "https://index.crates.io/wa/te/waterui"
+        );
+        assert_eq!(sparse_index_url("ab"), "https://index.crates.io/2/ab");
+        assert_eq!(sparse_index_url("abc"), "https://index.crates.io/3/a/abc");
     }
 
     #[test]
     fn stable_release_without_a_manifest_reports_it_predates_publishing() {
-        let mut latest = release("v0.4.1", false, false, "2025-11-01T00:00:00Z");
-        latest.assets.clear();
-        let releases = vec![
-            release("v0.4.0", false, false, "2025-10-01T00:00:00Z"),
-            latest,
-        ];
-        let eligible: Vec<_> = releases
-            .into_iter()
-            .filter(|release| release_matches(release, FrameworkChannel::Stable))
-            .collect();
-        let release = newest_release(eligible, FrameworkChannel::Stable).unwrap();
-        let error = certification_asset(&release, FrameworkChannel::Stable)
-            .unwrap_err()
-            .to_string();
+        let error = StableReleaseWithoutManifest {
+            tag: "v0.4.1".to_owned(),
+        }
+        .to_string();
         assert!(error.contains("v0.4.1"), "{error}");
         assert!(error.contains("predates manifest publishing"), "{error}");
         assert!(
@@ -3499,6 +3549,39 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
         assert!(
             error.contains("--channel dev") && error.contains("--channel nightly"),
             "{error} must name the channels that resolve today"
+        );
+    }
+
+    #[test]
+    fn nightly_selection_takes_the_newest_published_prerelease() {
+        let releases = vec![
+            release("nightly-2025-12-01", false, true, "2025-12-02T00:00:00Z"),
+            // Stable tags, drafts and non-prerelease tags are not nightlies.
+            release("v0.4.1", false, false, "2025-12-03T00:00:00Z"),
+            release("nightly-2025-12-04", true, true, "2025-12-05T00:00:00Z"),
+            release("nightly-2025-12-03", false, true, "2025-12-04T00:00:00Z"),
+        ];
+        let newest = releases
+            .into_iter()
+            .filter(is_nightly_release)
+            .max_by(|left, right| left.published_at.cmp(&right.published_at))
+            .unwrap();
+        assert_eq!(newest.tag_name, "nightly-2025-12-03");
+        assert_eq!(certification_asset(&newest).unwrap().name, "framework.json");
+    }
+
+    #[test]
+    fn only_github_api_requests_carry_the_token() {
+        assert!(
+            github_api_token(
+                "https://github.com/water-rs/waterui/releases/download/v0.5.0/framework.json"
+            )
+            .is_none()
+        );
+        assert!(github_api_token("https://index.crates.io/wa/te/waterui").is_none());
+        assert!(
+            github_api_token("https://raw.githubusercontent.com/water-rs/waterui/abc/Cargo.toml")
+                .is_none()
         );
     }
 
