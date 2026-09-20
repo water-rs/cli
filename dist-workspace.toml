@@ -5,6 +5,10 @@ members = ["cargo:."]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.30.2"
+# The installer verifies the archive against the checksum dist embeds in it,
+# and says so on success. The algorithm is pinned here rather than left to
+# dist's default, because the message above states the mechanism as fact.
+checksum = "sha256"
 install-success-msg = "water is installed; the release archive's SHA-256 checksum was verified before it was unpacked."
 # CI backends to support
 ci = "github"

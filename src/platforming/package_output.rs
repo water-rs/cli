@@ -92,10 +92,12 @@ fn remove_existing(path: &Path) -> std::io::Result<()> {
 fn copy_recursively(source: &Path, destination: &Path) -> std::io::Result<()> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("cannot copy symlink packaged artifact {}", source.display()),
-        ));
+        // A macOS `.app` carries symlinks by construction — every embedded
+        // framework has `Versions/Current` and the shims beside it — so a
+        // bundle that crosses a device boundary must keep them as symlinks.
+        // Following them would inflate the bundle and break code signing;
+        // refusing them would fail every framework-bearing bundle.
+        return copy_symlink(source, destination);
     }
     if metadata.is_dir() {
         fs::create_dir_all(destination)?;
@@ -109,10 +111,51 @@ fn copy_recursively(source: &Path, destination: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Recreates `source`'s symlink at `destination`, target text unchanged.
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(source)?, destination)
+}
+
+/// Windows needs a privilege to create symlinks and its bundles do not rely
+/// on them, so a symlink there is reported rather than silently dereferenced.
+#[cfg(not(unix))]
+fn copy_symlink(source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::InvalidInput,
+        format!("cannot copy symlink packaged artifact {}", source.display()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A `.app` that crosses a device boundary keeps the framework symlinks
+    /// every macOS bundle is built from.
+    #[cfg(unix)]
+    #[test]
+    fn copies_a_bundle_symlink_as_a_symlink() {
+        let temp = tempdir().expect("tempdir");
+        let versions = temp.path().join("App.app").join("Versions");
+        fs::create_dir_all(versions.join("A")).expect("bundle");
+        fs::write(versions.join("A").join("App"), b"binary").expect("bundle binary");
+        std::os::unix::fs::symlink("A", versions.join("Current")).expect("framework symlink");
+
+        let copied = temp.path().join("copied.app");
+        copy_recursively(&temp.path().join("App.app"), &copied).expect("bundle must copy");
+
+        let link = copied.join("Versions").join("Current");
+        assert!(
+            fs::symlink_metadata(&link)
+                .expect("copied link")
+                .file_type()
+                .is_symlink(),
+            "the copy must stay a symlink, not a second copy of the version directory"
+        );
+        assert_eq!(fs::read_link(&link).expect("link target"), Path::new("A"));
+    }
 
     #[test]
     fn moves_file_and_replaces_stale_file() {
