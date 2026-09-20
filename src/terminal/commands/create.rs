@@ -25,7 +25,9 @@ pub struct Args {
     #[arg(long)]
     bundle_id: Option<String>,
 
-    /// Backends to scaffold (apple, android, gtk4, hydrolysis, winui, esp32).
+    /// Backends to scaffold in app mode (apple, android, gtk4, hydrolysis,
+    /// winui, esp32). A playground manages its backends itself and rejects
+    /// this flag.
     #[arg(long, value_delimiter = ',')]
     backends: Option<Vec<String>>,
 
@@ -43,7 +45,8 @@ pub struct Args {
     #[arg(long, conflicts_with_all = ["waterui_path", "channel"])]
     framework_manifest: Option<PathBuf>,
 
-    /// Project mode (`app` or `playground`).
+    /// Project mode: `app` scaffolds the backends `--backends` names into
+    /// the project; `playground` manages its backends itself.
     #[arg(long, value_enum, default_value_t = ProjectMode::App)]
     mode: ProjectMode,
 
@@ -291,7 +294,8 @@ fn resolve_backends(
     if package_type == PackageType::Playground {
         if args.backends.is_some() {
             bail!(
-                "Playground mode does not support --backends; backend projects are auto-managed."
+                "--backends applies to app mode; a playground manages its backends itself. \
+                 Drop the flag, or pass `--mode app` to scaffold the named backends."
             );
         }
         return Ok(Vec::new());
@@ -345,6 +349,11 @@ async fn create_project(shell: &Shell, plan: &CreatePlan) -> Result<Project> {
         pb.finish_and_clear();
     }
     success!(shell, "Created Cargo.toml and src/lib.rs");
+    // The channel resolution is the one fact of a `create` a user cannot
+    // see in the files it wrote without opening Water.toml.
+    if let Some(framework) = &project.manifest().framework {
+        success!(shell, "Resolved framework: {framework}");
+    }
     Ok(project)
 }
 

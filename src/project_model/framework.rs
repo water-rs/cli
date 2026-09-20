@@ -136,6 +136,31 @@ pub struct ResolvedFramework {
     patches: PatchSet,
 }
 
+/// The selection in one line, as `water create` reports it: the channel and
+/// what it resolved to — the release tag for stable and nightly, the commit
+/// for dev — with the short revision after it.
+impl fmt::Display for ResolvedFramework {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let short = |revision: &str| revision.get(..8).unwrap_or(revision).to_owned();
+        match &self.source {
+            Source::Stable {
+                release: Some(release),
+            } => write!(
+                formatter,
+                "stable {} ({})",
+                release.tag,
+                short(&release.revision)
+            ),
+            Source::Stable { release: None } => formatter.write_str("stable"),
+            Source::Nightly { tag, revision, .. } => {
+                write!(formatter, "nightly {tag} ({})", short(revision))
+            }
+            Source::Dev { revision, .. } => write!(formatter, "dev {}", short(revision)),
+            Source::Local { root } => write!(formatter, "local checkout {}", root.display()),
+        }
+    }
+}
+
 /// A scaffold package a channel withholds.
 ///
 /// Its workspace requirement pins a git revision because the package has no
