@@ -967,7 +967,8 @@ pub enum FailToOpenProject {
     /// Backend-project configuration is not allowed in playground manifests.
     #[error(
         "Backend project configuration is not allowed in playground projects \
-         (device settings under [backends.esp32] are the exception)"
+         ([backends.esp32] device settings and `backend_path` source \
+         selections are the exceptions)"
     )]
     BackendsNotAllowedInPlayground,
 
@@ -1821,10 +1822,12 @@ impl Project {
         }
 
         // Playgrounds delegate backend projects to the CLI, so backend
-        // scaffolding configuration is rejected. `[backends.esp32]` is the
-        // exception: it is device configuration (chip, panel geometry,
-        // bundled fonts) only the app author can supply, and its harness
-        // still lives in the managed build cache.
+        // scaffolding configuration is rejected. Two kinds of entries are
+        // exceptions: `[backends.esp32]`, which is device configuration
+        // (chip, panel geometry, bundled fonts) only the app author can
+        // supply while its harness still lives in the managed build cache,
+        // and `backend_path`, which selects where a backend's runtime source
+        // comes from without configuring a project.
         if is_playground && manifest.backends.configures_backend_projects() {
             return Err(FailToOpenProject::BackendsNotAllowedInPlayground);
         }
