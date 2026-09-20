@@ -34,11 +34,10 @@ use waterui_mcp_protocol::{
 };
 use waterui_preview_protocol::hydrolysis::{MCP_RUN_CONFIG_ENV, McpRunConfig};
 
-use crate::build::{BuildOptions, BuildProfile, RustLinkage};
+use crate::build::{BuildOptions, BuildProfile};
 use crate::hydrolysis::backend::HydrolysisBackend;
 use crate::hydrolysis::platform::{
-    build_hydrolysis_with_envs_and_features, built_hydrolysis_binary_path,
-    stage_hydrolysis_shared_runtime,
+    build_hydrolysis_with_envs_and_features, stage_hydrolysis_shared_runtime,
 };
 use crate::mcp::{host_platform, write_run_config};
 use crate::preview::hydrolysis::{
@@ -307,7 +306,7 @@ async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)
     if let Some(sccache_path) = &config.sccache_path {
         build_options = build_options.with_sccache(sccache_path.clone());
     }
-    build_hydrolysis_with_envs_and_features(
+    let built = build_hydrolysis_with_envs_and_features(
         &project,
         platform,
         build_options,
@@ -315,11 +314,8 @@ async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)
         &[HYDROLYSIS_MCP_FEATURE],
     )
     .await?;
-
-    let binary_path =
-        built_hydrolysis_binary_path(&project, platform, "debug", RustLinkage::SharedRuntime)
-            .await?;
-    stage_hydrolysis_shared_runtime(&project, &binary_path, platform).await?;
+    stage_hydrolysis_shared_runtime(&project, &built, platform).await?;
+    let binary_path = &built.artifact;
 
     let run_config = McpRunConfig {
         width: config.width,
@@ -331,7 +327,7 @@ async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)
 
     // stdout is the MCP link — never inherit it; stderr flows straight to the
     // parent's stderr so app logs and build diagnostics stay visible.
-    let mut command = smol::process::Command::new(&binary_path);
+    let mut command = smol::process::Command::new(binary_path);
     command
         .kill_on_drop(true)
         .current_dir(&backend_path)

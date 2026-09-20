@@ -168,7 +168,7 @@ impl Backend for AndroidBackend {
         project: &Project,
         platform: TargetPlatform,
         options: BuildOptions,
-    ) -> eyre::Result<PathBuf> {
+    ) -> eyre::Result<crate::build::BuiltTarget> {
         debug_assert_eq!(platform, TargetPlatform::Android);
         project
             .browser_runtime_plan(platform, TargetBackend::Android)
@@ -181,6 +181,7 @@ impl Backend for AndroidBackend {
         project: &Project,
         platform: TargetPlatform,
         options: PackageOptions,
+        _built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
         debug_assert_eq!(platform, TargetPlatform::Android);
         AndroidPlatform::package_with_abis(project, options, &[AndroidAbi::Arm64V8a]).await

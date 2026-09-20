@@ -112,6 +112,7 @@ pub async fn build(
     build
         .build_binary(project.tui_backend_crate_name().as_str(), false)
         .await
+        .map(|built| built.artifact)
         .map_err(|error| eyre::eyre!("failed to build the TUI launcher: {error}"))
 }
 

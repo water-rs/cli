@@ -340,7 +340,7 @@ impl Backend for Esp32Backend {
         project: &Project,
         platform: TargetPlatform,
         options: BuildOptions,
-    ) -> eyre::Result<PathBuf> {
+    ) -> eyre::Result<crate::build::BuiltTarget> {
         if !is_esp32_platform(platform) {
             eyre::bail!("ESP32 backend only supports the esp32s3, esp32c3, and esp32p4 platforms");
         }
@@ -352,11 +352,12 @@ impl Backend for Esp32Backend {
         project: &Project,
         platform: TargetPlatform,
         options: PackageOptions,
+        built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
         if !is_esp32_platform(platform) {
             eyre::bail!("ESP32 backend only supports the esp32s3, esp32c3, and esp32p4 platforms");
         }
-        package_esp32(project, options).await
+        package_esp32(project, options, built).await
     }
 
     async fn clean(&self, project: &Project, _platform: TargetPlatform) -> eyre::Result<()> {
