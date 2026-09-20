@@ -1006,7 +1006,7 @@ async fn build_and_run(
         apply_dev_url_handoff(&device, server.url(), &mut run_options)?;
     }
 
-    let _ = shell.status(">", "Running...");
+    let _ = shell.status(">", format!("Running {}", artifact.path().display()));
     let running = run_with_options(host, device, artifact, run_options).await?;
 
     Ok((running, dev_server))
