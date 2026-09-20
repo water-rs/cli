@@ -35,7 +35,14 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
             }
         }
     } else {
-        match self_update::update(&host).await? {
+        let report = self_update::update(&host).await?;
+        line!(
+            shell,
+            "Install source: {} ({})",
+            report.source.label(),
+            report.install_dir.display()
+        );
+        match report.outcome {
             UpdateOutcome::Updated {
                 previous,
                 installed,

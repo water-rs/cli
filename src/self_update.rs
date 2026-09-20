@@ -66,6 +66,17 @@ pub enum InstallSource {
 }
 
 impl InstallSource {
+    /// The human-readable name of this install channel.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dist => "release installer",
+            Self::Homebrew => "Homebrew",
+            Self::Cargo => "cargo",
+            Self::Unknown => "unknown",
+        }
+    }
+
     /// Classify the running executable on `host` — the real-machine entry
     /// point.
     ///
@@ -142,6 +153,17 @@ pub enum UpdateOutcome {
     },
 }
 
+/// The result of a `water update` operation.
+#[derive(Debug)]
+pub struct UpdateReport {
+    /// The channel that owns the running executable.
+    pub source: InstallSource,
+    /// The directory containing the running executable.
+    pub install_dir: PathBuf,
+    /// The update operation's outcome.
+    pub outcome: UpdateOutcome,
+}
+
 /// What `water update --check` reports.
 #[derive(Debug)]
 pub enum CheckOutcome {
@@ -169,16 +191,29 @@ pub enum CheckOutcome {
 /// Returns an error when the install source cannot be determined (no receipt,
 /// no Homebrew prefix, no `CARGO_HOME/bin`) or when the updater fails — a
 /// missing receipt, a failed release query, or an installer that exits badly.
-pub async fn update(host: &Host) -> Result<UpdateOutcome> {
-    match InstallSource::detect(host)? {
-        InstallSource::Dist => run_dist_update(host).await,
+pub async fn update(host: &Host) -> Result<UpdateReport> {
+    let source = InstallSource::detect(host)?;
+    let install_dir = Host::current_exe()
+        .wrap_err("the running executable's path cannot be determined")?
+        .canonicalize()
+        .wrap_err("the running executable's path cannot be canonicalized")?
+        .parent()
+        .ok_or_else(|| eyre::eyre!("the running executable's path has no parent directory"))?
+        .to_path_buf();
+    let outcome = match source {
+        InstallSource::Dist => run_dist_update(host).await?,
         source => {
             let Some(command) = source.update_command() else {
                 bail!("{UNKNOWN_INSTALL_MESSAGE}");
             };
-            Ok(UpdateOutcome::ExternallyManaged { command })
+            UpdateOutcome::ExternallyManaged { command }
         }
-    }
+    };
+    Ok(UpdateReport {
+        source,
+        install_dir,
+        outcome,
+    })
 }
 
 /// `water update --check`: report the newest release without installing it.
@@ -685,6 +720,14 @@ mod tests {
         let host = machine.host(vars);
         let exe = machine.file("home/.cargo/bin/water", "");
         assert!(InstallSource::detect_exe(&host, &exe).is_err());
+    }
+
+    #[test]
+    fn install_source_labels_are_human_readable() {
+        assert_eq!(InstallSource::Dist.label(), "release installer");
+        assert_eq!(InstallSource::Homebrew.label(), "Homebrew");
+        assert_eq!(InstallSource::Cargo.label(), "cargo");
+        assert_eq!(InstallSource::Unknown.label(), "unknown");
     }
 
     /// The 24-hour gate: first check always runs, then once per interval.

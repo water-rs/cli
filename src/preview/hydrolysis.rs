@@ -233,15 +233,17 @@ pub async fn stage_hydrolysis_resources(
 /// Opens the project and makes sure its managed Hydrolysis backend exists and
 /// matches the current templates. Shared by the preview and MCP flows.
 pub async fn ensure_hydrolysis_backend_ready(project_path: &Path) -> Result<Project> {
-    let managed_backends = ManagedBackends::for_backend(TargetBackend::Hydrolysis);
-    let mut project = Project::open(project_path, managed_backends).await?;
+    let project = Project::open(
+        project_path,
+        ManagedBackends::for_backend(TargetBackend::Hydrolysis),
+    )
+    .await?;
     if project.hydrolysis_backend().is_none() && !project.is_playground() {
         bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
     }
 
     if HydrolysisBackend::requires_regeneration(&project).await? {
         reinit_backend::<HydrolysisBackend>(&project).await?;
-        project = Project::open(project_path, managed_backends).await?;
     }
 
     Ok(project)
