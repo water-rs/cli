@@ -256,12 +256,12 @@ pub struct TemplateContext {
     pub author: String,
     /// Path to the Android backend (relative or absolute)
     pub android_backend_path: Option<PathBuf>,
-    /// `[backend.apple] backend_path` — a local Apple backend checkout that
+    /// `[backends.apple] backend_path` — a local Apple backend checkout that
     /// replaces the remote Swift package reference.
     pub apple_backend_path: Option<PathBuf>,
-    /// `[backend.apple] branch` — pin the remote package to a branch.
+    /// `[backends.apple] branch` — pin the remote package to a branch.
     pub apple_backend_branch: Option<String>,
-    /// `[backend.apple] revision` — pin the remote package to a revision.
+    /// `[backends.apple] revision` — pin the remote package to a revision.
     pub apple_backend_revision: Option<String>,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
@@ -358,7 +358,10 @@ impl TemplateContext {
             crate_name,
             bundle_identifier: manifest.package.bundle_identifier.clone(),
             author: String::new(),
-            android_backend_path: None,
+            android_backend_path: manifest
+                .backends
+                .android()
+                .and_then(|backend| backend.backend_path().map(PathBuf::from)),
             apple_backend_path: apple
                 .and_then(|backend| backend.backend_path.as_deref())
                 .map(PathBuf::from),
@@ -559,7 +562,7 @@ impl TemplateContext {
 
     /// Whether the Android project consumes the runtime as the remote
     /// coordinate `android_remote_backend_dependency` names rather than a
-    /// local checkout: true unless `[backend.android] backend_path` names one
+    /// local checkout: true unless `[backends.android] backend_path` names one
     /// or `waterui_path/backends/android` is a Gradle project.
     #[must_use]
     pub fn use_remote_dev_backend(&self) -> bool {
@@ -609,7 +612,7 @@ impl TemplateContext {
     /// `target`, resolved from the backend project's directory.
     ///
     /// `target` is absolute, or relative to the project root the way
-    /// `waterui_path` and `[backend.apple] backend_path` are. This accounts
+    /// `waterui_path` and `[backends.apple] backend_path` are. This accounts
     /// for the project being in a generated backend subdirectory.
     fn backend_relative_path(&self, target: &Path) -> String {
         // If `target` is absolute, use it directly. This avoids producing
@@ -660,7 +663,7 @@ impl TemplateContext {
         normalize_path_for_config(&backend_path)
     }
 
-    /// The path to the local Apple backend checkout `[backend.apple]`
+    /// The path to the local Apple backend checkout `[backends.apple]`
     /// `backend_path` names, resolved from the Xcode project's directory.
     /// `None` consumes the remote Swift package instead.
     ///
@@ -682,7 +685,7 @@ impl TemplateContext {
             })
     }
 
-    /// The path to the local Android backend checkout `[backend.android]`
+    /// The path to the local Android backend checkout `[backends.android]`
     /// `backend_path` names, resolved from the Android project's directory.
     /// `None` consumes the remote runtime coordinate instead.
     ///
@@ -696,7 +699,7 @@ impl TemplateContext {
     fn compute_android_backend_path(&self) -> Option<String> {
         self.android_backend_path
             .as_ref()
-            .map(|path| normalize_path_for_config(path))
+            .map(|path| self.backend_relative_path(path))
             .or_else(|| {
                 let local = self.waterui_workspace_root()?.join("backends/android");
                 local
@@ -776,7 +779,7 @@ impl TemplateContext {
     }
 
     /// The `SwiftPM` requirement the generated `XCRemoteSwiftPackageReference`
-    /// pins the Apple backend at: a `[backend.apple]` override first —
+    /// pins the Apple backend at: a `[backends.apple]` override first —
     /// `branch`, then `revision` — then the pin the framework's channel
     /// carries. `dev` and `nightly` pin `apple-backend-revision`, the
     /// backend commit the channel resolved or certified, before the stable
@@ -785,7 +788,7 @@ impl TemplateContext {
     /// framework older than the submodule's removal records.
     fn apple_backend_requirement(&self) -> String {
         if let (Some(_), Some(_)) = (&self.apple_backend_branch, &self.apple_backend_revision) {
-            panic!("`[backend.apple]` sets both `branch` and `revision`; pick one");
+            panic!("`[backends.apple]` sets both `branch` and `revision`; pick one");
         }
         let revision =
             |revision: &str| format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";");
@@ -1239,6 +1242,67 @@ mod tests {
             "{}",
             overlaid.android_backend_path()
         );
+    }
+
+    /// `[backends.android] backend_path` names a local runtime checkout: the
+    /// generated `settings.gradle.kts` includes it as a composite build and
+    /// leaves the `JitPack` repository off. Without the key the project
+    /// resolves the remote runtime coordinate.
+    #[test]
+    fn android_backend_path_renders_a_composite_build() {
+        let manifest: crate::project::Manifest = toml::from_str(
+            r#"
+                [package]
+                type = "playground"
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+
+                [backends.android]
+                backend_path = "/opt/android-backend"
+            "#,
+        )
+        .expect("manifest parses");
+
+        let context = |manifest: &crate::project::Manifest| {
+            TemplateContext::for_project_manifest(
+                manifest,
+                CrateName::try_from("demo").expect("crate name"),
+                "Demo",
+                &stable_framework(),
+            )
+            .with_backend_project_path(PathBuf::from("/proj/android"))
+            .with_project_root_path(PathBuf::from("/proj"))
+        };
+
+        let template = embedded::ANDROID
+            .get_file("settings.gradle.kts.tpl")
+            .expect("settings.gradle.kts template must exist")
+            .contents_utf8()
+            .expect("settings.gradle.kts template must be utf-8");
+        let render = |ctx: &TemplateContext| {
+            render_scaffold_template(
+                TemplateNamespace::Android,
+                std::path::Path::new("settings.gradle.kts.tpl"),
+                template,
+                ctx,
+            )
+            .expect("settings.gradle.kts render")
+        };
+
+        let local = render(&context(&manifest));
+        assert!(
+            local.contains("includeBuild(\"/opt/android-backend\")"),
+            "{local}"
+        );
+        // The JitPack repository stays off while the composite build is on.
+        assert!(local.contains("if (false) {"), "{local}");
+        assert!(local.contains("if (!false) {"), "{local}");
+
+        let mut remote_manifest = manifest;
+        remote_manifest.backends.clear_android();
+        let remote = render(&context(&remote_manifest));
+        assert!(remote.contains("if (true) {"), "{remote}");
+        assert!(remote.contains("if (!true) {"), "{remote}");
     }
 
     fn playground_ctx() -> TemplateContext {

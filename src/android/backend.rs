@@ -14,7 +14,7 @@ use crate::{
 
 /// Configuration for the Android backend in a `WaterUI` project.
 ///
-/// `[backend.android]` in `Water.toml`
+/// `[backends.android]` in `Water.toml`
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AndroidBackend {
     #[serde(
@@ -24,6 +24,9 @@ pub struct AndroidBackend {
     project_path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    /// Path to a local `android-backend` checkout used as the runtime source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_path: Option<String>,
 }
 
 impl AndroidBackend {
@@ -33,6 +36,7 @@ impl AndroidBackend {
         Self {
             project_path: default_android_project_path(),
             version: None,
+            backend_path: None,
         }
     }
 
@@ -43,10 +47,30 @@ impl AndroidBackend {
         self
     }
 
+    /// Set the local `android-backend` checkout used as the runtime source.
+    #[must_use]
+    pub fn with_backend_path(mut self, path: impl Into<String>) -> Self {
+        self.backend_path = Some(path.into());
+        self
+    }
+
     /// Get the path to the Android project within the `WaterUI` project.
     #[must_use]
     pub const fn project_path(&self) -> &PathBuf {
         &self.project_path
+    }
+
+    /// Get the local `android-backend` checkout used as the runtime source.
+    #[must_use]
+    pub fn backend_path(&self) -> Option<&str> {
+        self.backend_path.as_deref()
+    }
+
+    /// Whether this entry configures backend-project scaffolding — anything
+    /// beyond `backend_path`, which only selects the runtime's source.
+    #[must_use]
+    pub fn configures_project(&self) -> bool {
+        self.project_path != default_android_project_path() || self.version.is_some()
     }
 
     /// Get the path to the Gradle wrapper script within the Android project.
@@ -88,8 +112,6 @@ impl Backend for AndroidBackend {
             .filter(|c| c.is_alphanumeric())
             .collect::<String>();
 
-        let project_path = default_android_project_path();
-
         // Android is where a missing declaration actually breaks things, so
         // surface anything a dependency needs that the app has not enabled.
         match crate::assets::scan_required_permissions(project).await {
@@ -127,9 +149,13 @@ impl Backend for AndroidBackend {
             .await
             .map_err(crate::backend::FailToInitBackend::Io)?;
 
+        let existing = manifest.backends.android();
         Ok(Self {
-            project_path,
-            version: None,
+            project_path: existing.map_or_else(default_android_project_path, |backend| {
+                backend.project_path.clone()
+            }),
+            version: existing.and_then(|backend| backend.version.clone()),
+            backend_path: existing.and_then(|backend| backend.backend_path.clone()),
         })
     }
 

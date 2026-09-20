@@ -56,11 +56,18 @@ impl Backends {
     /// `[backends.esp32]` is deliberately excluded: it carries device
     /// configuration — chip, panel geometry, bundled fonts — that only the
     /// app author can know, while the other entries describe backend
-    /// projects that playground mode delegates to the CLI.
+    /// projects that playground mode delegates to the CLI. A `backend_path`
+    /// entry is excluded for the opposite reason: it only selects where the
+    /// CLI finds a backend's runtime source and configures no project.
     #[must_use]
-    pub const fn configures_backend_projects(&self) -> bool {
-        self.android.is_some()
-            || self.apple.is_some()
+    pub fn configures_backend_projects(&self) -> bool {
+        self.android
+            .as_ref()
+            .is_some_and(AndroidBackend::configures_project)
+            || self
+                .apple
+                .as_ref()
+                .is_some_and(AppleBackend::configures_project)
             || self.gtk4.is_some()
             || self.hydrolysis.is_some()
             || self.winui.is_some()
@@ -306,5 +313,68 @@ mod tests {
 
         backends.set_gtk4(Gtk4Backend::default());
         assert!(backends.configures_backend_projects());
+    }
+
+    /// `[backends.android] backend_path` selects where the runtime comes
+    /// from; it configures no backend project, so a playground manifest may
+    /// carry it. Project settings such as `project_path` still count.
+    #[test]
+    fn android_backend_path_alone_is_not_project_configuration() {
+        let mut backends = Backends::default();
+        backends.set_android(AndroidBackend::new().with_backend_path("/opt/android-backend"));
+        assert!(!backends.configures_backend_projects());
+
+        backends.set_android(
+            AndroidBackend::new()
+                .with_backend_path("/opt/android-backend")
+                .with_project_path("droid"),
+        );
+        assert!(backends.configures_backend_projects());
+    }
+
+    /// The same distinction on the manifest surface `Project::open` reads:
+    /// a playground `Water.toml` with only `[backends.android] backend_path`
+    /// passes the playground gate; one that configures the Android project
+    /// is rejected.
+    #[test]
+    fn playground_manifest_may_select_the_android_runtime_source() {
+        let manifest: crate::project::Manifest = toml::from_str(
+            r#"
+                [package]
+                type = "playground"
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+
+                [backends.android]
+                backend_path = "/opt/android-backend"
+            "#,
+        )
+        .expect("manifest parses");
+        assert_eq!(
+            manifest.package.package_type,
+            crate::project::PackageType::Playground
+        );
+        assert!(!manifest.backends.configures_backend_projects());
+        assert_eq!(
+            manifest
+                .backends
+                .android()
+                .and_then(|b| b.backend_path().map(str::to_string)),
+            Some("/opt/android-backend".to_string())
+        );
+
+        let scaffolded: crate::project::Manifest = toml::from_str(
+            r#"
+                [package]
+                type = "playground"
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+
+                [backends.android]
+                project_path = "droid"
+            "#,
+        )
+        .expect("manifest parses");
+        assert!(scaffolded.backends.configures_backend_projects());
     }
 }

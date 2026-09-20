@@ -18,7 +18,7 @@ use crate::{
 // Warn: You cannot use both revision and local_path at the same time.
 /// Configuration for the Apple backend in a `WaterUI` project.
 ///
-/// `[backend.apple]` in `Water.toml`
+/// `[backends.apple]` in `Water.toml`
 pub struct AppleBackend {
     #[serde(
         default = "default_apple_project_path",
@@ -105,6 +105,16 @@ impl AppleBackend {
     pub fn project_path(&self) -> &Path {
         &self.project_path
     }
+
+    /// Whether this entry configures backend-project scaffolding — anything
+    /// beyond `backend_path`, which only selects the runtime's source.
+    #[must_use]
+    pub fn configures_project(&self) -> bool {
+        self.project_path != default_apple_project_path()
+            || !self.scheme.is_empty()
+            || self.branch.is_some()
+            || self.revision.is_some()
+    }
 }
 
 fn default_apple_project_path() -> PathBuf {
@@ -127,7 +137,7 @@ impl Backend for AppleBackend {
 
     async fn init(project: &Project) -> Result<Self, crate::backend::FailToInitBackend> {
         let manifest = project.manifest();
-        // A `[backend.apple]` source override the manifest already carries is
+        // A `[backends.apple]` source override the manifest already carries is
         // a user choice; init re-scaffolds the project without rewriting it.
         let existing = manifest.backends.apple();
 
