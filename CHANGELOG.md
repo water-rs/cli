@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/water-rs/cli/compare/v0.3.2...v0.4.0) - 2026-09-20
+
+### Added
+
+- [**breaking**] hydrolysis scaffolds, preview and mcp construct the runtime with Material3::defaults() ([#100](https://github.com/water-rs/cli/pull/100))
+- add `water completions` for shell completion scripts
+
+### Fixed
+
+- *(android)* honour [backends.android] backend_path as a local runtime source ([#102](https://github.com/water-rs/cli/pull/102))
+- *(package)* enable wasm-opt feature flags for rustc's wasm32 output ([#96](https://github.com/water-rs/cli/pull/96))
+- *(preview)* build hydrolysis preview env through the app's composition root ([#94](https://github.com/water-rs/cli/pull/94))
+- *(build)* unwind without LTO when a release development build links the shared runtime
+- *(apple)* adopt the UIScene life cycle in the iOS scaffold
+
+### Other
+
+- Merge branch 'dev' into fix/project-toolchain-for-generated-crates
+- format the plist manifest assertion
+- *(release)* install shell completions in the Homebrew formula
+
 ## [0.3.2](https://github.com/water-rs/cli/compare/v0.3.1...v0.3.2) - 2026-09-17
 
 ### Added
