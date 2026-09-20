@@ -51,6 +51,10 @@ pub struct WaterConfig {
     /// identifier, an Android serial, or an AVD name.
     #[serde(default)]
     pub last_used_device: std::collections::BTreeMap<String, String>,
+    /// Unix seconds of the last passive `water update` check, which runs at
+    /// most once per 24 hours.
+    #[serde(default)]
+    pub last_update_check_unix_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -417,7 +421,7 @@ async fn resolved_build_cache_root_in(water_home: &Path) -> eyre::Result<(WaterC
     Ok((config, cache_root))
 }
 
-async fn ensure_global_config_in(water_home: &Path) -> eyre::Result<WaterConfig> {
+pub(crate) async fn ensure_global_config_in(water_home: &Path) -> eyre::Result<WaterConfig> {
     fs::create_dir_all(water_home)
         .await
         .wrap_err_with(|| format!("Failed to create Water home {}", water_home.display()))?;
@@ -445,7 +449,10 @@ pub async fn write_global_config(config: &WaterConfig) -> eyre::Result<()> {
     write_global_config_in(&water_home, config).await
 }
 
-async fn write_global_config_in(water_home: &Path, config: &WaterConfig) -> eyre::Result<()> {
+pub(crate) async fn write_global_config_in(
+    water_home: &Path,
+    config: &WaterConfig,
+) -> eyre::Result<()> {
     let config_path = water_home.join(CONFIG_FILE_NAME);
     let contents = toml::to_string_pretty(config).wrap_err("Failed to serialize Water config")?;
     fs::write(&config_path, contents)

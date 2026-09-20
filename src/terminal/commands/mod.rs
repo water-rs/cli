@@ -146,6 +146,7 @@ pub mod mcp;
 pub mod package;
 pub mod preview;
 pub mod run;
+pub mod update;
 pub mod web;
 
 /// Parse a viewport size from a `WIDTHxHEIGHT` string into whole pixels.
