@@ -911,13 +911,58 @@ impl Project {
         backend.clean(self, platform).await
     }
 
+    /// The names of every crate the CLI generates for this project: the
+    /// backend, FFI, preview and launcher crates. Each is tagged with this
+    /// project's root (see [`generated_crate_name`]) unless `[crates]`
+    /// overrides it, so their units in the shared Cargo target directory are
+    /// this project's alone.
+    #[must_use]
+    pub fn generated_crate_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = [
+            self.ffi_crate_name(),
+            self.preview_ffi_crate_name(),
+            self.gtk_backend_crate_name(),
+            self.hydrolysis_backend_crate_name(),
+            self.winui_backend_crate_name(),
+            self.esp32_backend_crate_name(),
+            self.tui_backend_crate_name(),
+        ]
+        .into_iter()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Remove this project's own units from the shared Cargo target directory.
+    ///
+    /// The shared target is one directory for every project on the machine,
+    /// so only units Cargo named after this project's generated crates go;
+    /// dependency artifacts stay for the other projects that resolve them.
+    async fn clean_shared_target_units(&self) -> Result<(), eyre::Report> {
+        let removed = crate::water_dir::remove_project_units_from_shared_target(
+            &self.generated_crate_names(),
+        )
+        .await?;
+        for path in &removed {
+            info!(path = %path.display(), "removed this project's unit from the shared target");
+        }
+        Ok(())
+    }
+
     /// Clean all build artifacts for the project.
     ///
     /// This cleans:
     /// - Rust target directory
+    /// - this project's own units in the shared Cargo target directory
     /// - Apple build artifacts (if backend configured)
     /// - Android build artifacts (if backend configured)
     /// - GTK4 build artifacts (if backend configured)
+    ///
+    /// Dependency artifacts in the shared Cargo target directory are left in
+    /// place: every project on the machine resolves them identically, and
+    /// `water gc build-cache --shared-target` drops them all.
     ///
     /// # Errors
     ///
@@ -930,12 +975,15 @@ impl Project {
         };
 
         if self.is_playground() {
+            // The generated backends' units go first: once the managed
+            // manifests below are gone, nothing else names them.
+            self.clean_shared_target_units().await?;
             crate::water_dir::remove_project_build_cache(self.root()).await?;
-            // Compiled artifacts live in the per-user shared target directory
-            // and outlive any single project, so they stay. What remains to
-            // sweep here is the `water-backends` subtree older CLI layouts
-            // left under the project's own Cargo target directory — never the
-            // user's other compiled artifacts.
+            // Dependency artifacts live in the per-user shared target
+            // directory and outlive any single project, so they stay. What
+            // remains to sweep here is the `water-backends` subtree older CLI
+            // layouts left under the project's own Cargo target directory —
+            // never the user's other compiled artifacts.
             let water_backends_root = self.target_dir().await?.join("water-backends");
             if water_backends_root.exists() {
                 smol::fs::remove_dir_all(&water_backends_root).await?;
@@ -948,6 +996,8 @@ impl Project {
         if target_dir.exists() {
             smol::fs::remove_dir_all(&target_dir).await?;
         }
+
+        self.clean_shared_target_units().await?;
 
         // Clean Apple backend if configured
         if self.apple_backend().is_some() {
