@@ -3,7 +3,10 @@
 //! [`doctor`] runs every check against an explicit [`Host`], so the report is
 //! fully determined by that host's environment, PATH, and filesystem — never
 //! by ambient process state. Each [`DoctorItem`] carries a stable
-//! machine-readable `id` (`DoctorItem::id`) for `--json` output and tests.
+//! machine-readable `id` (`DoctorItem::id`) for `--json` output and tests,
+//! the [`DoctorGroup`] it is reported under, and whether the backend it
+//! belongs to is in scope for the surrounding project (or, without one, for
+//! the host).
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -12,6 +15,7 @@ use std::pin::Pin;
 
 use semver::Version;
 
+use crate::platform::TargetBackend;
 use crate::{
     android::{
         device::AndroidDevice,
@@ -44,6 +48,7 @@ use crate::{
     utils::parse_semver_version,
     winui::toolchain::WinUiToolchain,
 };
+use futures_util::join;
 use serde::{Deserialize, Serialize};
 
 /// Status of a toolchain check.
@@ -73,12 +78,189 @@ impl CheckStatus {
 pub type BoxedInstallFn =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send>> + Send>;
 
+/// The heading an item is reported under.
+///
+/// The Rust toolchain, one backend, or the build helpers. Backends a host
+/// builds for by default come before the optional ones in
+/// [`DoctorGroup::ORDER`], the order a new user needs them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DoctorGroup {
+    /// The rustup-managed Rust toolchain every backend builds with.
+    Rust,
+    /// Xcode, Apple SDKs, simulators, and the Apple rustup targets.
+    Apple,
+    /// The Hydrolysis renderer: native desktop prerequisites and the web pieces.
+    Hydrolysis,
+    /// `WinUI` build prerequisites.
+    WinUi,
+    /// GTK4 development libraries.
+    Gtk4,
+    /// The Android SDK chain and its Java/Kotlin/CMake helpers.
+    Android,
+    /// The Espressif toolchain the Dew backend flashes with.
+    Esp32,
+    /// Build accelerators and cargo helper binaries.
+    Helpers,
+}
+
+impl DoctorGroup {
+    /// Every group in report order: Rust, the backends (host-capable ones
+    /// first), then helpers.
+    pub const ORDER: &[Self] = &[
+        Self::Rust,
+        Self::Apple,
+        Self::Hydrolysis,
+        Self::WinUi,
+        Self::Gtk4,
+        Self::Android,
+        Self::Esp32,
+        Self::Helpers,
+    ];
+
+    /// The stable `snake_case` label emitted in `--json` records.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Apple => "apple",
+            Self::Hydrolysis => "hydrolysis",
+            Self::WinUi => "winui",
+            Self::Gtk4 => "gtk4",
+            Self::Android => "android",
+            Self::Esp32 => "esp32",
+            Self::Helpers => "helpers",
+        }
+    }
+
+    /// The heading the terminal prints for the group.
+    #[must_use]
+    pub const fn title(&self) -> &'static str {
+        match self {
+            Self::Rust => "Rust toolchain",
+            Self::Apple => "Apple (iOS, macOS)",
+            Self::Hydrolysis => "Hydrolysis (desktop, web)",
+            Self::WinUi => "WinUI",
+            Self::Gtk4 => "GTK4",
+            Self::Android => "Android",
+            Self::Esp32 => "ESP32 (Dew)",
+            Self::Helpers => "Build helpers",
+        }
+    }
+
+    /// The backend the group checks for; `None` for the Rust toolchain and
+    /// the helpers, which are always in scope.
+    #[must_use]
+    pub const fn backend(&self) -> Option<TargetBackend> {
+        match self {
+            Self::Rust | Self::Helpers => None,
+            Self::Apple => Some(TargetBackend::Apple),
+            Self::Hydrolysis => Some(TargetBackend::Hydrolysis),
+            Self::WinUi => Some(TargetBackend::WinUi),
+            Self::Gtk4 => Some(TargetBackend::Gtk4),
+            Self::Android => Some(TargetBackend::Android),
+            Self::Esp32 => Some(TargetBackend::Dew),
+        }
+    }
+
+    /// The group an item id is reported under.
+    ///
+    /// # Panics
+    /// Panics on an id outside [`ids::ALL`]; every item constructor passes a
+    /// constant from that module.
+    #[must_use]
+    pub fn of(id: &str) -> Self {
+        match id {
+            ids::RUST => Self::Rust,
+            ids::XCODE
+            | ids::IOS_SDK
+            | ids::IOS_SIMULATOR_SDK
+            | ids::IOS_SIMULATORS
+            | ids::MACOS_SDK
+            | ids::APPLE_RUST_TARGETS => Self::Apple,
+            ids::LINUX_SYSTEM_PACKAGES
+            | ids::WINDOWS_ARM64_LLVM
+            | ids::WASM32_TARGET
+            | ids::WASM_PACK
+            | ids::WEB_PACKAGE_MANAGER => Self::Hydrolysis,
+            ids::WINUI => Self::WinUi,
+            ids::GTK4 => Self::Gtk4,
+            ids::ANDROID_SDK
+            | ids::ANDROID_PLATFORM_TOOLS
+            | ids::ANDROID_SDK_PLATFORMS
+            | ids::ANDROID_BUILD_TOOLS
+            | ids::ANDROID_NDK
+            | ids::ANDROID_RUST_TARGETS
+            | ids::ANDROID_RUN_TARGETS
+            | ids::CMAKE
+            | ids::JAVA
+            | ids::KOTLIN => Self::Android,
+            ids::ESP32_TOOLCHAIN => Self::Esp32,
+            ids::SCCACHE | ids::CARGO_HELPERS => Self::Helpers,
+            other => unreachable!("doctor item id `{other}` is not in `ids::ALL`"),
+        }
+    }
+}
+
+/// One heading of the rendered report: a group, whether it is optional for
+/// the current project or host, and its items in emission order.
+#[derive(Debug)]
+pub struct DoctorSection {
+    /// The group the items belong to.
+    pub group: DoctorGroup,
+    /// `true` when the group's backend is out of scope, so its missing items
+    /// are hints rather than failures.
+    pub optional: bool,
+    /// The group's items, in [`ids::ALL`] order.
+    pub items: Vec<DoctorItem>,
+}
+
+/// Group `items` by [`DoctorGroup`] in report order: in-scope groups in
+/// [`DoctorGroup::ORDER`], then optional groups in the same order, with
+/// helpers last. Groups with no items are omitted.
+#[must_use]
+pub fn sections(items: Vec<DoctorItem>) -> Vec<DoctorSection> {
+    let mut sections: Vec<DoctorSection> = Vec::new();
+    for item in items {
+        match sections
+            .iter_mut()
+            .find(|section| section.group == item.group)
+        {
+            Some(section) => section.items.push(item),
+            None => sections.push(DoctorSection {
+                group: item.group,
+                optional: item.optional,
+                items: vec![item],
+            }),
+        }
+    }
+    let position = |group: DoctorGroup| {
+        DoctorGroup::ORDER
+            .iter()
+            .position(|candidate| *candidate == group)
+            .unwrap_or_else(|| unreachable!("`DoctorGroup::ORDER` lists every group"))
+    };
+    sections.sort_by_key(|section| {
+        (
+            section.group == DoctorGroup::Helpers,
+            section.optional,
+            position(section.group),
+        )
+    });
+    sections
+}
+
 /// A single item in the doctor report.
 pub struct DoctorItem {
     /// Stable machine-readable identifier (e.g. `android-sdk`).
     pub id: &'static str,
     /// Human-readable name of the toolchain or component.
     pub name: &'static str,
+    /// The heading the item is reported under.
+    pub group: DoctorGroup,
+    /// `true` when the item's backend is out of scope for the current project
+    /// or host: it is reported with its hint but neither fails the run nor
+    /// counts toward `--fix`.
+    pub optional: bool,
     /// Status of the check.
     pub status: CheckStatus,
     /// Optional message with details or suggestions.
@@ -92,6 +274,8 @@ impl std::fmt::Debug for DoctorItem {
         f.debug_struct("DoctorItem")
             .field("id", &self.id)
             .field("name", &self.name)
+            .field("group", &self.group)
+            .field("optional", &self.optional)
             .field("status", &self.status)
             .field("message", &self.message)
             .field("install_fn", &self.install_fn.as_ref().map(|_| "..."))
@@ -114,6 +298,10 @@ pub struct DoctorItemRecord {
     pub id: Cow<'static, str>,
     /// Human-readable item name.
     pub name: Cow<'static, str>,
+    /// The [`DoctorGroup`] label the item is reported under.
+    pub group: Cow<'static, str>,
+    /// Whether the item's backend is out of scope for the project or host.
+    pub optional: bool,
     /// `ok`, `missing`, or `skipped`.
     pub status: Cow<'static, str>,
     /// Whether `--fix` can remediate the item automatically.
@@ -129,6 +317,8 @@ impl From<&DoctorItem> for DoctorItemRecord {
             ty: Cow::Borrowed("doctor-item"),
             id: Cow::Borrowed(item.id),
             name: Cow::Borrowed(item.name),
+            group: Cow::Borrowed(item.group.as_str()),
+            optional: item.optional,
             status: Cow::Borrowed(item.status.as_str()),
             fixable: item.is_fixable(),
             message: item.message.clone(),
@@ -137,10 +327,12 @@ impl From<&DoctorItem> for DoctorItemRecord {
 }
 
 impl DoctorItem {
-    const fn ok(id: &'static str, name: &'static str) -> Self {
+    fn ok(id: &'static str, name: &'static str) -> Self {
         Self {
             id,
             name,
+            group: DoctorGroup::of(id),
+            optional: false,
             status: CheckStatus::Ok,
             message: None,
             install_fn: None,
@@ -151,6 +343,8 @@ impl DoctorItem {
         Self {
             id,
             name,
+            group: DoctorGroup::of(id),
+            optional: false,
             status: CheckStatus::Missing,
             message: Some(message.into()),
             install_fn: None,
@@ -168,6 +362,8 @@ impl DoctorItem {
         Self {
             id,
             name,
+            group: DoctorGroup::of(id),
+            optional: false,
             status: CheckStatus::Missing,
             message: Some(message.into()),
             install_fn: Some(Box::new(move || {
@@ -176,10 +372,12 @@ impl DoctorItem {
         }
     }
 
-    const fn skipped(id: &'static str, name: &'static str) -> Self {
+    fn skipped(id: &'static str, name: &'static str) -> Self {
         Self {
             id,
             name,
+            group: DoctorGroup::of(id),
+            optional: false,
             status: CheckStatus::Skipped,
             message: None,
             install_fn: None,
@@ -194,6 +392,8 @@ impl DoctorItem {
         Self {
             id,
             name,
+            group: DoctorGroup::of(id),
+            optional: false,
             status: CheckStatus::Skipped,
             message: Some(message.into()),
             install_fn: None,
@@ -269,19 +469,27 @@ pub mod ids {
     /// The `[web] package_manager` the current project's `Water.toml` declares.
     pub const WEB_PACKAGE_MANAGER: &str = "web-package-manager";
 
-    /// Every doctor item id in emission order.
+    /// Every doctor item id in emission order — grouped by
+    /// [`super::DoctorGroup`] in [`super::DoctorGroup::ORDER`].
     ///
     /// This is the single source of truth for the report's identity set:
     /// [`crate::toolchain::doctor::doctor`], the lib-level ordering test, and
     /// the `water doctor --json` integration test all assert against it.
     pub const ALL: &[&str] = &[
+        RUST,
         XCODE,
         IOS_SDK,
         IOS_SIMULATOR_SDK,
         IOS_SIMULATORS,
         MACOS_SDK,
-        RUST,
         APPLE_RUST_TARGETS,
+        LINUX_SYSTEM_PACKAGES,
+        WINDOWS_ARM64_LLVM,
+        WASM32_TARGET,
+        WASM_PACK,
+        WEB_PACKAGE_MANAGER,
+        WINUI,
+        GTK4,
         ANDROID_SDK,
         ANDROID_PLATFORM_TOOLS,
         ANDROID_SDK_PLATFORMS,
@@ -290,18 +498,11 @@ pub mod ids {
         ANDROID_RUST_TARGETS,
         ANDROID_RUN_TARGETS,
         CMAKE,
-        WINDOWS_ARM64_LLVM,
         JAVA,
         KOTLIN,
-        WASM32_TARGET,
-        WASM_PACK,
         ESP32_TOOLCHAIN,
-        CARGO_HELPERS,
-        LINUX_SYSTEM_PACKAGES,
-        GTK4,
-        WINUI,
         SCCACHE,
-        WEB_PACKAGE_MANAGER,
+        CARGO_HELPERS,
     ];
 }
 
@@ -311,6 +512,24 @@ fn unfixable_message(error: &UnfixableToolchain) -> String {
         error.message(),
         error.suggestion()
     )
+}
+
+/// Why a backend is (or is not) checked in the current run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendScope {
+    /// The project's `Water.toml` selects the backend (or is a playground).
+    Selected,
+    /// No project surrounds the run and the host can build for the backend.
+    HostDefault,
+    /// Neither: the backend is reported with its hints but does not fail
+    /// the run.
+    Optional,
+}
+
+impl BackendScope {
+    const fn is_in_scope(self) -> bool {
+        matches!(self, Self::Selected | Self::HostDefault)
+    }
 }
 
 /// What `host.cwd()` tells doctor about the surrounding project: the
@@ -324,12 +543,63 @@ struct ProjectContext {
 }
 
 impl ProjectContext {
-    /// Whether the project selects a backend — always true for a playground,
-    /// whose platform projects the CLI manages on demand.
-    fn selects(&self, selected: impl Fn(&crate::backend::Backends) -> bool) -> bool {
-        self.manifest.as_ref().is_some_and(|manifest| {
-            manifest.package.package_type == PackageType::Playground || selected(&manifest.backends)
-        })
+    /// Whether `backend` is checked in this run and why.
+    ///
+    /// Inside a project the manifest decides: a selected backend (every
+    /// backend, for a playground) is [`BackendScope::Selected`], anything
+    /// else optional. Outside a project the host decides: the backends the
+    /// machine can build for — Apple on macOS, `WinUI` on Windows, GTK4 on
+    /// Linux, Hydrolysis on every desktop host — are
+    /// [`BackendScope::HostDefault`]; Android and Dew need a project to
+    /// select them and are optional everywhere.
+    fn scope(&self, backend: TargetBackend) -> BackendScope {
+        self.manifest.as_ref().map_or_else(
+            || {
+                let host_builds = match backend {
+                    TargetBackend::Apple => cfg!(target_os = "macos"),
+                    TargetBackend::WinUi => cfg!(target_os = "windows"),
+                    TargetBackend::Gtk4 => cfg!(target_os = "linux"),
+                    TargetBackend::Hydrolysis => true,
+                    TargetBackend::Android | TargetBackend::Dew => false,
+                };
+                if host_builds {
+                    BackendScope::HostDefault
+                } else {
+                    BackendScope::Optional
+                }
+            },
+            |manifest| {
+                let selected = match backend {
+                    TargetBackend::Apple => manifest.backends.apple().is_some(),
+                    TargetBackend::Android => manifest.backends.android().is_some(),
+                    TargetBackend::Gtk4 => manifest.backends.gtk4().is_some(),
+                    TargetBackend::Hydrolysis => manifest.backends.hydrolysis().is_some(),
+                    TargetBackend::WinUi => manifest.backends.winui().is_some(),
+                    TargetBackend::Dew => manifest.backends.esp32().is_some(),
+                };
+                if manifest.package.package_type == PackageType::Playground || selected {
+                    BackendScope::Selected
+                } else {
+                    BackendScope::Optional
+                }
+            },
+        )
+    }
+
+    fn in_scope(&self, backend: TargetBackend) -> bool {
+        self.scope(backend).is_in_scope()
+    }
+
+    /// The `skipped` message for a project-gated item whose backend is out
+    /// of scope: names the manifest table that would bring it in.
+    fn out_of_scope_message(&self, backend: &str, table: &str) -> String {
+        if self.manifest.is_some() {
+            format!("No {backend} backend is selected in this project's Water.toml.")
+        } else {
+            format!(
+                "Optional: checked inside a project whose Water.toml has a `[backends.{table}]` section."
+            )
+        }
     }
 
     /// The chips the project's ESP32 (Dew) backend can target: the chip
@@ -390,571 +660,134 @@ async fn project_context(host: &Host) -> ProjectContext {
     }
 }
 
-async fn push_toolchain_check<T>(
+async fn toolchain_check<T>(
     host: &Host,
-    items: &mut Vec<DoctorItem>,
     id: &'static str,
     name: &'static str,
     fixable_message: &'static str,
     toolchain: T,
-) where
+) -> DoctorItem
+where
     T: Toolchain,
     T::Installation: Send + 'static,
 {
-    match toolchain.check(host).await {
-        Ok(()) => items.push(DoctorItem::ok(id, name)),
-        Err(ToolchainError::Fixable(installation)) => {
-            items.push(DoctorItem::fixable(
-                id,
-                name,
-                fixable_message,
-                installation,
-                host,
-            ));
-        }
-        Err(ToolchainError::Unfixable(error)) => {
-            items.push(DoctorItem::missing(id, name, unfixable_message(&error)));
-        }
-    }
+    toolchain_check_with_unfixable(
+        host,
+        id,
+        name,
+        fixable_message,
+        toolchain,
+        unfixable_message,
+    )
+    .await
 }
 
-async fn push_toolchain_check_with_unfixable<T, F>(
+async fn toolchain_check_with_unfixable<T, F>(
     host: &Host,
-    items: &mut Vec<DoctorItem>,
     id: &'static str,
     name: &'static str,
     fixable_message: &'static str,
     toolchain: T,
     unfixable_message_fn: F,
-) where
+) -> DoctorItem
+where
     T: Toolchain,
     T::Installation: Send + 'static,
     F: FnOnce(&UnfixableToolchain) -> String,
 {
     match toolchain.check(host).await {
-        Ok(()) => items.push(DoctorItem::ok(id, name)),
+        Ok(()) => DoctorItem::ok(id, name),
         Err(ToolchainError::Fixable(installation)) => {
-            items.push(DoctorItem::fixable(
-                id,
-                name,
-                fixable_message,
-                installation,
-                host,
-            ));
+            DoctorItem::fixable(id, name, fixable_message, installation, host)
         }
         Err(ToolchainError::Unfixable(error)) => {
-            items.push(DoctorItem::missing(id, name, unfixable_message_fn(&error)));
+            DoctorItem::missing(id, name, unfixable_message_fn(&error))
         }
     }
 }
 
-async fn push_apple_checks(host: &Host, items: &mut Vec<DoctorItem>) {
+/// Xcode, the Apple SDKs, the iOS simulators, and the Apple rustup targets.
+/// The `xcrun` probes are independent and run concurrently.
+async fn apple_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorItem> {
     if !cfg!(target_os = "macos") {
-        items.push(DoctorItem::skipped(ids::XCODE, "Xcode"));
-        items.push(DoctorItem::skipped(ids::IOS_SDK, "iOS SDK"));
-        items.push(DoctorItem::skipped(
-            ids::IOS_SIMULATOR_SDK,
-            "iOS Simulator SDK",
-        ));
-        items.push(DoctorItem::skipped(ids::IOS_SIMULATORS, "iOS Simulators"));
-        items.push(DoctorItem::skipped(ids::MACOS_SDK, "macOS SDK"));
-        return;
+        return vec![
+            DoctorItem::skipped(ids::XCODE, "Xcode"),
+            DoctorItem::skipped(ids::IOS_SDK, "iOS SDK"),
+            DoctorItem::skipped(ids::IOS_SIMULATOR_SDK, "iOS Simulator SDK"),
+            DoctorItem::skipped(ids::IOS_SIMULATORS, "iOS Simulators"),
+            DoctorItem::skipped(ids::MACOS_SDK, "macOS SDK"),
+            DoctorItem::skipped_with_message(
+                ids::APPLE_RUST_TARGETS,
+                "Apple Rust targets",
+                "Apple platforms can only be built on macOS.",
+            ),
+        ];
     }
 
-    push_simple_check(items, ids::XCODE, "Xcode", Xcode.check(host).await);
-    push_simple_check(
-        items,
-        ids::IOS_SDK,
-        "iOS SDK",
-        AppleSdk::Ios.check(host).await,
+    let (xcode, ios_sdk, ios_simulator_sdk, ios_simulators, macos_sdk, rust_targets) = join!(
+        Xcode.check(host),
+        AppleSdk::Ios.check(host),
+        AppleSdk::IosSimulator.check(host),
+        ios_simulator_check(host),
+        AppleSdk::Macos.check(host),
+        apple_rust_targets_check(host, project),
     );
-    push_simple_check(
-        items,
-        ids::IOS_SIMULATOR_SDK,
-        "iOS Simulator SDK",
-        AppleSdk::IosSimulator.check(host).await,
-    );
-    push_ios_simulator_check(host, items).await;
-    push_simple_check(
-        items,
-        ids::MACOS_SDK,
-        "macOS SDK",
-        AppleSdk::Macos.check(host).await,
-    );
+    vec![
+        simple_check(ids::XCODE, "Xcode", xcode),
+        simple_check(ids::IOS_SDK, "iOS SDK", ios_sdk),
+        simple_check(
+            ids::IOS_SIMULATOR_SDK,
+            "iOS Simulator SDK",
+            ios_simulator_sdk,
+        ),
+        ios_simulators,
+        simple_check(ids::MACOS_SDK, "macOS SDK", macos_sdk),
+        rust_targets,
+    ]
 }
 
-fn push_simple_check(
-    items: &mut Vec<DoctorItem>,
+fn simple_check(
     id: &'static str,
     name: &'static str,
     result: Result<(), impl std::fmt::Display>,
-) {
+) -> DoctorItem {
     match result {
-        Ok(()) => items.push(DoctorItem::ok(id, name)),
-        Err(error) => items.push(DoctorItem::missing(id, name, error.to_string())),
+        Ok(()) => DoctorItem::ok(id, name),
+        Err(error) => DoctorItem::missing(id, name, error.to_string()),
     }
 }
 
-async fn push_ios_simulator_check(host: &Host, items: &mut Vec<DoctorItem>) {
+async fn ios_simulator_check(host: &Host) -> DoctorItem {
+    const NAME: &str = "iOS Simulators";
     match AppleSimulator::scan_ios(host).await {
-        Ok(simulators) if simulators.is_empty() => items.push(DoctorItem::missing(
+        Ok(simulators) if simulators.is_empty() => DoctorItem::missing(
             ids::IOS_SIMULATORS,
-            "iOS Simulators",
+            NAME,
             "No iOS simulators available. Install a simulator runtime in Xcode Settings > Platforms.",
-        )),
-        Ok(_) => items.push(DoctorItem::ok(ids::IOS_SIMULATORS, "iOS Simulators")),
-        Err(error) => items.push(DoctorItem::missing(
+        ),
+        Ok(_) => DoctorItem::ok(ids::IOS_SIMULATORS, NAME),
+        Err(error) => DoctorItem::missing(
             ids::IOS_SIMULATORS,
-            "iOS Simulators",
+            NAME,
             format!("Failed to list iOS simulators: {error}"),
-        )),
+        ),
     }
-}
-
-async fn push_android_sdk_checks(host: &Host, items: &mut Vec<DoctorItem>) -> bool {
-    push_toolchain_check(
-        host,
-        items,
-        ids::ANDROID_SDK,
-        "Android SDK",
-        "Android SDK is missing (automatic install is supported on this host)",
-        AndroidSdk,
-    )
-    .await;
-
-    AndroidSdk::sdkmanager_path(host).await.is_some()
-}
-
-async fn push_android_component_checks(
-    host: &Host,
-    items: &mut Vec<DoctorItem>,
-    sdk_ready: bool,
-    project: &ProjectContext,
-) {
-    if sdk_ready {
-        push_toolchain_check(
-            host,
-            items,
-            ids::ANDROID_PLATFORM_TOOLS,
-            "Android Platform-Tools (adb)",
-            "Required for `water run --platform android`",
-            AndroidPlatformTools,
-        )
-        .await;
-        push_toolchain_check(
-            host,
-            items,
-            ids::ANDROID_SDK_PLATFORMS,
-            "Android SDK Platforms",
-            "Required for Android build/package workflows",
-            AndroidSdkPlatforms,
-        )
-        .await;
-        push_toolchain_check(
-            host,
-            items,
-            ids::ANDROID_BUILD_TOOLS,
-            "Android SDK Build-Tools (d8)",
-            "Required for Android build/package workflows",
-            AndroidBuildTools,
-        )
-        .await;
-        push_toolchain_check(
-            host,
-            items,
-            ids::ANDROID_NDK,
-            "Android NDK",
-            "Required for Android build/package workflows",
-            AndroidNdk,
-        )
-        .await;
-    } else {
-        push_blocked_android_component_checks(items);
-    }
-
-    // The rustup targets only need rustup — they are probed regardless of
-    // SDK state, and only when the project actually builds for Android.
-    if project.selects(|backends| backends.android().is_some()) {
-        push_toolchain_check(
-            host,
-            items,
-            ids::ANDROID_RUST_TARGETS,
-            "Android Rust Targets",
-            "Required for Android Rust cross-compilation",
-            AndroidRustTargets::default(),
-        )
-        .await;
-    } else {
-        items.push(DoctorItem::skipped_with_message(
-            ids::ANDROID_RUST_TARGETS,
-            "Android Rust Targets",
-            "No Android backend is selected in this project's Water.toml.",
-        ));
-    }
-}
-
-/// Items emitted when the SDK is missing, in the same order as the probed
-/// branch above so `--json` ordering does not depend on the diagnosis path.
-/// `android-rust-targets` is deliberately absent: it needs only rustup, so it
-/// is probed (or skipped) independently of the SDK.
-fn push_blocked_android_component_checks(items: &mut Vec<DoctorItem>) {
-    for (id, name) in [
-        (ids::ANDROID_PLATFORM_TOOLS, "Android Platform-Tools (adb)"),
-        (ids::ANDROID_SDK_PLATFORMS, "Android SDK Platforms"),
-        (ids::ANDROID_BUILD_TOOLS, "Android SDK Build-Tools (d8)"),
-        (ids::ANDROID_NDK, "Android NDK"),
-    ] {
-        items.push(DoctorItem::missing(
-            id,
-            name,
-            "Blocked: Android SDK / `sdkmanager` is not ready yet. Fix Android SDK first.",
-        ));
-    }
-}
-
-async fn push_android_run_target_check(host: &Host, items: &mut Vec<DoctorItem>) {
-    if AndroidSdk::adb_path(host).is_none() {
-        items.push(DoctorItem::missing(
-            ids::ANDROID_RUN_TARGETS,
-            "Android Run Targets",
-            "Blocked: Android Platform-Tools (`adb`) is not ready yet.",
-        ));
-        return;
-    }
-
-    match AndroidDevice::scan(host).await {
-        Ok(devices) if !devices.is_empty() => {
-            items.push(DoctorItem::ok(ids::ANDROID_RUN_TARGETS, "Android Run Targets"));
-        }
-        Ok(_) => match AndroidPlatform::list_avds(host).await {
-            Ok(avds) if !avds.is_empty() => {
-                items.push(DoctorItem::ok(ids::ANDROID_RUN_TARGETS, "Android Run Targets"));
-            }
-            Ok(_) => items.push(DoctorItem::missing(
-                ids::ANDROID_RUN_TARGETS,
-                "Android Run Targets",
-                "No connected Android devices and no emulator AVDs were found. Connect a device or create an AVD.",
-            )),
-            Err(error) => items.push(DoctorItem::missing(
-                ids::ANDROID_RUN_TARGETS,
-                "Android Run Targets",
-                format!(
-                    "No connected Android devices and failed to list AVDs: {error}. Install Android emulator components or connect a device."
-                ),
-            )),
-        },
-        Err(error) => items.push(DoctorItem::missing(
-            ids::ANDROID_RUN_TARGETS,
-            "Android Run Targets",
-            format!("Failed to query Android devices via adb: {error}"),
-        )),
-    }
-}
-
-async fn push_desktop_and_web_checks(
-    host: &Host,
-    items: &mut Vec<DoctorItem>,
-    project: &ProjectContext,
-) {
-    push_toolchain_check(
-        host,
-        items,
-        ids::CMAKE,
-        "Host CMake",
-        "Required for native Rust dependencies in Android builds",
-        Cmake::default(),
-    )
-    .await;
-
-    if WindowsArm64LlvmToolchain::required_on_host() {
-        push_toolchain_check(
-            host,
-            items,
-            ids::WINDOWS_ARM64_LLVM,
-            "Windows ARM64 LLVM toolchain",
-            "Required by native assembly dependencies in Windows ARM64 hydrolysis builds",
-            WindowsArm64LlvmToolchain,
-        )
-        .await;
-    } else {
-        items.push(DoctorItem::skipped_with_message(
-            ids::WINDOWS_ARM64_LLVM,
-            "Windows ARM64 LLVM toolchain",
-            "Only required on Windows ARM64 hosts for native assembly dependencies.",
-        ));
-    }
-
-    push_toolchain_check(
-        host,
-        items,
-        ids::JAVA,
-        "Java",
-        "Required for Android Gradle builds",
-        Java,
-    )
-    .await;
-    push_toolchain_check(
-        host,
-        items,
-        ids::KOTLIN,
-        "Kotlin",
-        "Required for Android Kotlin helper compilation",
-        Kotlin,
-    )
-    .await;
-
-    if project.selects(|backends| backends.hydrolysis().is_some()) {
-        push_toolchain_check_with_unfixable(
-            host,
-            items,
-            ids::WASM32_TARGET,
-            "Rust wasm32 target",
-            "wasm32-unknown-unknown target not installed",
-            wasm32_target(),
-            ToString::to_string,
-        )
-        .await;
-        push_toolchain_check_with_unfixable(
-            host,
-            items,
-            ids::WASM_PACK,
-            "wasm-pack",
-            "wasm-pack not found (required for web packaging)",
-            WasmPack,
-            ToString::to_string,
-        )
-        .await;
-    } else {
-        items.push(DoctorItem::skipped_with_message(
-            ids::WASM32_TARGET,
-            "Rust wasm32 target",
-            "No hydrolysis (web) backend is selected in this project's Water.toml.",
-        ));
-        items.push(DoctorItem::skipped_with_message(
-            ids::WASM_PACK,
-            "wasm-pack",
-            "No hydrolysis (web) backend is selected in this project's Water.toml.",
-        ));
-    }
-}
-
-/// The Espressif-side toolchain — `esp` Rust fork, clang/GCC, `rust-src`,
-/// `espflash`/`ldproxy`, QEMU — when the project selects a Dew/ESP32 backend.
-async fn push_esp32_check(host: &Host, items: &mut Vec<DoctorItem>, project: &ProjectContext) {
-    const NAME: &str = "ESP32 toolchain";
-    let Some(chips) = project.esp32_chips() else {
-        items.push(DoctorItem::skipped_with_message(
-            ids::ESP32_TOOLCHAIN,
-            NAME,
-            "No ESP32 backend is selected in this project's Water.toml.",
-        ));
-        return;
-    };
-    let chips = match chips {
-        Ok(chips) => chips,
-        Err(error) => {
-            items.push(DoctorItem::missing(
-                ids::ESP32_TOOLCHAIN,
-                NAME,
-                format!("Invalid `[backends.esp32]` configuration: {error}"),
-            ));
-            return;
-        }
-    };
-    match Esp32Toolchain::new(chips).check(host).await {
-        Ok(()) => items.push(DoctorItem::ok(ids::ESP32_TOOLCHAIN, NAME)),
-        Err(ToolchainError::Fixable(installation)) => items.push(DoctorItem::fixable(
-            ids::ESP32_TOOLCHAIN,
-            NAME,
-            installation.describe(),
-            installation,
-            host,
-        )),
-        Err(ToolchainError::Unfixable(error)) => items.push(DoctorItem::missing(
-            ids::ESP32_TOOLCHAIN,
-            NAME,
-            unfixable_message(&error),
-        )),
-    }
-}
-
-/// The cargo-installed helper binaries a project's workflows invoke —
-/// `cargo-nextest` for `water bench`. Platform helpers that are also cargo
-/// installs (`wasm-pack`, `espflash`/`ldproxy`) are covered by their own
-/// platform items.
-async fn push_cargo_helpers_check(host: &Host, items: &mut Vec<DoctorItem>) {
-    const NAME: &str = "Cargo helpers";
-    match CargoHelpers::new(["cargo-nextest"]).check(host).await {
-        Ok(()) => items.push(DoctorItem::ok(ids::CARGO_HELPERS, NAME)),
-        Err(ToolchainError::Fixable(installation)) => items.push(DoctorItem::fixable(
-            ids::CARGO_HELPERS,
-            NAME,
-            installation.describe(),
-            installation,
-            host,
-        )),
-        Err(ToolchainError::Unfixable(error)) => items.push(DoctorItem::missing(
-            ids::CARGO_HELPERS,
-            NAME,
-            unfixable_message(&error),
-        )),
-    }
-}
-
-async fn push_linux_checks(host: &Host, items: &mut Vec<DoctorItem>) {
-    if !cfg!(target_os = "linux") {
-        items.push(DoctorItem::skipped(
-            ids::LINUX_SYSTEM_PACKAGES,
-            "Linux system packages",
-        ));
-        items.push(DoctorItem::skipped(ids::GTK4, "GTK4"));
-        return;
-    }
-
-    let linux_packages_fixable = match LinuxSystemToolchain.check(host).await {
-        Ok(()) => {
-            items.push(DoctorItem::ok(
-                ids::LINUX_SYSTEM_PACKAGES,
-                "Linux system packages",
-            ));
-            false
-        }
-        Err(ToolchainError::Fixable(installation)) => {
-            let msg = format!(
-                "Missing packages for {}: {}. Install command: {}",
-                installation.package_manager_name(),
-                installation.missing_packages().join(", "),
-                installation.install_command_hint(),
-            );
-            items.push(DoctorItem::fixable(
-                ids::LINUX_SYSTEM_PACKAGES,
-                "Linux system packages",
-                msg,
-                installation,
-                host,
-            ));
-            true
-        }
-        Err(ToolchainError::Unfixable(error)) => {
-            items.push(DoctorItem::missing(
-                ids::LINUX_SYSTEM_PACKAGES,
-                "Linux system packages",
-                unfixable_message(&error),
-            ));
-            false
-        }
-    };
-
-    match Gtk4Toolchain.check(host).await {
-        Ok(()) => items.push(DoctorItem::ok(ids::GTK4, "GTK4")),
-        Err(ToolchainError::Fixable(installation)) => {
-            items.push(DoctorItem::fixable(
-                ids::GTK4,
-                "GTK4",
-                "GTK4 dependencies are missing",
-                installation,
-                host,
-            ));
-        }
-        Err(ToolchainError::Unfixable(error)) => {
-            if linux_packages_fixable {
-                items.push(DoctorItem::missing(
-                    ids::GTK4,
-                    "GTK4",
-                    "GTK4 probe failed because required Linux packages are missing. Run `water doctor --fix` to install Linux system packages, then re-run `water doctor`.",
-                ));
-            } else {
-                items.push(DoctorItem::missing(
-                    ids::GTK4,
-                    "GTK4",
-                    unfixable_message(&error),
-                ));
-            }
-        }
-    }
-}
-
-async fn push_windows_checks(host: &Host, items: &mut Vec<DoctorItem>) {
-    if !cfg!(target_os = "windows") {
-        items.push(DoctorItem::skipped(ids::WINUI, "WinUI"));
-        return;
-    }
-
-    push_toolchain_check(
-        host,
-        items,
-        ids::WINUI,
-        "WinUI",
-        "WinUI build prerequisites are missing",
-        WinUiToolchain,
-    )
-    .await;
-}
-
-/// Run diagnostics on all toolchains on `host` and return a report.
-///
-/// Item order is fixed and platform branching is driven by `cfg!` plus the
-/// project context `host.cwd()` resolves, so two runs on equal hosts in equal
-/// projects produce identical item sequences — the property the
-/// orchestration tests and `--json` consumers rely on. Without a `Water.toml`
-/// the host-level checks still run and every project-gated item reports
-/// `skipped`.
-pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
-    let project = project_context(host).await;
-    let mut items = Vec::new();
-    push_apple_checks(host, &mut items).await;
-    push_rust_toolchain_check(host, &mut items, &project).await;
-    push_apple_rust_targets(host, &mut items, &project).await;
-    let sdk_ready = push_android_sdk_checks(host, &mut items).await;
-    push_android_component_checks(host, &mut items, sdk_ready, &project).await;
-    push_android_run_target_check(host, &mut items).await;
-    push_desktop_and_web_checks(host, &mut items, &project).await;
-    push_esp32_check(host, &mut items, &project).await;
-    push_cargo_helpers_check(host, &mut items).await;
-    push_linux_checks(host, &mut items).await;
-    push_windows_checks(host, &mut items).await;
-    push_toolchain_check(
-        host,
-        &mut items,
-        ids::SCCACHE,
-        "sccache",
-        "sccache not found (recommended for faster builds)",
-        Sccache,
-    )
-    .await;
-    push_web_package_manager_check(host, &mut items, &project).await;
-
-    items
 }
 
 /// The iOS device and simulator rustup targets an Apple-backend project
 /// needs on its selected toolchain. (The macOS target is the host triple the
 /// `rust` item already requires.)
-async fn push_apple_rust_targets(
-    host: &Host,
-    items: &mut Vec<DoctorItem>,
-    project: &ProjectContext,
-) {
+async fn apple_rust_targets_check(host: &Host, project: &ProjectContext) -> DoctorItem {
     const NAME: &str = "Apple Rust targets";
-    if !cfg!(target_os = "macos") {
-        items.push(DoctorItem::skipped_with_message(
+    if !project.in_scope(TargetBackend::Apple) {
+        return DoctorItem::skipped_with_message(
             ids::APPLE_RUST_TARGETS,
             NAME,
-            "Apple platforms can only be built on macOS.",
-        ));
-        return;
+            project.out_of_scope_message("Apple", "apple"),
+        );
     }
-    if !project.selects(|backends| backends.apple().is_some()) {
-        items.push(DoctorItem::skipped_with_message(
-            ids::APPLE_RUST_TARGETS,
-            NAME,
-            "No Apple backend is selected in this project's Water.toml.",
-        ));
-        return;
-    }
-    push_toolchain_check(
+    toolchain_check(
         host,
-        items,
         ids::APPLE_RUST_TARGETS,
         NAME,
         "Required iOS targets are missing on the selected Rust toolchain",
@@ -963,24 +796,441 @@ async fn push_apple_rust_targets(
             TargetPlatform::IOSSimulator.triple().to_string(),
         ]),
     )
-    .await;
+    .await
+}
+
+/// The Android SDK chain. The component probes need `sdkmanager`, so they
+/// follow the SDK probe; the rustup targets, run targets, and the `CMake` /
+/// Java / Kotlin helpers are independent of it and run alongside.
+async fn android_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorItem> {
+    let components = async {
+        let sdk = toolchain_check(
+            host,
+            ids::ANDROID_SDK,
+            "Android SDK",
+            "Android SDK is missing (automatic install is supported on this host)",
+            AndroidSdk,
+        )
+        .await;
+        let mut items = vec![sdk];
+        if AndroidSdk::sdkmanager_path(host).await.is_some() {
+            let components = join!(
+                toolchain_check(
+                    host,
+                    ids::ANDROID_PLATFORM_TOOLS,
+                    "Android Platform-Tools (adb)",
+                    "Required for `water run --platform android`",
+                    AndroidPlatformTools,
+                ),
+                toolchain_check(
+                    host,
+                    ids::ANDROID_SDK_PLATFORMS,
+                    "Android SDK Platforms",
+                    "Required for Android build/package workflows",
+                    AndroidSdkPlatforms,
+                ),
+                toolchain_check(
+                    host,
+                    ids::ANDROID_BUILD_TOOLS,
+                    "Android SDK Build-Tools (d8)",
+                    "Required for Android build/package workflows",
+                    AndroidBuildTools,
+                ),
+                toolchain_check(
+                    host,
+                    ids::ANDROID_NDK,
+                    "Android NDK",
+                    "Required for Android build/package workflows",
+                    AndroidNdk,
+                ),
+            );
+            items.extend(<[DoctorItem; 4]>::from(components));
+        } else {
+            items.extend(blocked_android_component_checks());
+        }
+        items
+    };
+    let rust_targets = async {
+        // The rustup targets only need rustup — they are probed regardless
+        // of SDK state, and only when Android is in scope.
+        if project.in_scope(TargetBackend::Android) {
+            toolchain_check(
+                host,
+                ids::ANDROID_RUST_TARGETS,
+                "Android Rust Targets",
+                "Required for Android Rust cross-compilation",
+                AndroidRustTargets::default(),
+            )
+            .await
+        } else {
+            DoctorItem::skipped_with_message(
+                ids::ANDROID_RUST_TARGETS,
+                "Android Rust Targets",
+                project.out_of_scope_message("Android", "android"),
+            )
+        }
+    };
+    let (mut items, rust_targets, run_targets, cmake, java, kotlin) = join!(
+        components,
+        rust_targets,
+        android_run_target_check(host),
+        toolchain_check(
+            host,
+            ids::CMAKE,
+            "Host CMake",
+            "Required for native Rust dependencies in Android builds",
+            Cmake::default(),
+        ),
+        toolchain_check(
+            host,
+            ids::JAVA,
+            "Java",
+            "Required for Android Gradle builds",
+            Java,
+        ),
+        toolchain_check(
+            host,
+            ids::KOTLIN,
+            "Kotlin",
+            "Required for Android Kotlin helper compilation",
+            Kotlin,
+        ),
+    );
+    items.extend([rust_targets, run_targets, cmake, java, kotlin]);
+    items
+}
+
+/// Items emitted when the SDK is missing, in the same order as the probed
+/// branch above so `--json` ordering does not depend on the diagnosis path.
+/// `android-rust-targets` is deliberately absent: it needs only rustup, so it
+/// is probed (or skipped) independently of the SDK.
+fn blocked_android_component_checks() -> impl Iterator<Item = DoctorItem> {
+    [
+        (ids::ANDROID_PLATFORM_TOOLS, "Android Platform-Tools (adb)"),
+        (ids::ANDROID_SDK_PLATFORMS, "Android SDK Platforms"),
+        (ids::ANDROID_BUILD_TOOLS, "Android SDK Build-Tools (d8)"),
+        (ids::ANDROID_NDK, "Android NDK"),
+    ]
+    .into_iter()
+    .map(|(id, name)| {
+        DoctorItem::missing(
+            id,
+            name,
+            "Blocked: Android SDK / `sdkmanager` is not ready yet. Fix Android SDK first.",
+        )
+    })
+}
+
+async fn android_run_target_check(host: &Host) -> DoctorItem {
+    const NAME: &str = "Android Run Targets";
+    if AndroidSdk::adb_path(host).is_none() {
+        return DoctorItem::missing(
+            ids::ANDROID_RUN_TARGETS,
+            NAME,
+            "Blocked: Android Platform-Tools (`adb`) is not ready yet.",
+        );
+    }
+
+    match AndroidDevice::scan(host).await {
+        Ok(devices) if !devices.is_empty() => DoctorItem::ok(ids::ANDROID_RUN_TARGETS, NAME),
+        Ok(_) => match AndroidPlatform::list_avds(host).await {
+            Ok(avds) if !avds.is_empty() => DoctorItem::ok(ids::ANDROID_RUN_TARGETS, NAME),
+            Ok(_) => DoctorItem::missing(
+                ids::ANDROID_RUN_TARGETS,
+                NAME,
+                "No connected Android devices and no emulator AVDs were found. Connect a device or create an AVD.",
+            ),
+            Err(error) => DoctorItem::missing(
+                ids::ANDROID_RUN_TARGETS,
+                NAME,
+                format!(
+                    "No connected Android devices and failed to list AVDs: {error}. Install Android emulator components or connect a device."
+                ),
+            ),
+        },
+        Err(error) => DoctorItem::missing(
+            ids::ANDROID_RUN_TARGETS,
+            NAME,
+            format!("Failed to query Android devices via adb: {error}"),
+        ),
+    }
+}
+
+/// The Hydrolysis backend beyond the Linux system packages (probed with
+/// GTK4 in [`linux_checks`]): the Windows ARM64 LLVM pieces and the web
+/// target's `wasm32` target, `wasm-pack`, and declared package manager.
+async fn hydrolysis_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorItem> {
+    let windows_arm64_llvm = async {
+        if WindowsArm64LlvmToolchain::required_on_host() {
+            toolchain_check(
+                host,
+                ids::WINDOWS_ARM64_LLVM,
+                "Windows ARM64 LLVM toolchain",
+                "Required by native assembly dependencies in Windows ARM64 hydrolysis builds",
+                WindowsArm64LlvmToolchain,
+            )
+            .await
+        } else {
+            DoctorItem::skipped_with_message(
+                ids::WINDOWS_ARM64_LLVM,
+                "Windows ARM64 LLVM toolchain",
+                "Only required on Windows ARM64 hosts for native assembly dependencies.",
+            )
+        }
+    };
+    let web = async {
+        if project.in_scope(TargetBackend::Hydrolysis) {
+            join!(
+                toolchain_check_with_unfixable(
+                    host,
+                    ids::WASM32_TARGET,
+                    "Rust wasm32 target",
+                    "wasm32-unknown-unknown target not installed",
+                    wasm32_target(),
+                    ToString::to_string,
+                ),
+                toolchain_check_with_unfixable(
+                    host,
+                    ids::WASM_PACK,
+                    "wasm-pack",
+                    "wasm-pack not found (required for web packaging)",
+                    WasmPack,
+                    ToString::to_string,
+                ),
+            )
+        } else {
+            (
+                DoctorItem::skipped_with_message(
+                    ids::WASM32_TARGET,
+                    "Rust wasm32 target",
+                    project.out_of_scope_message("hydrolysis (web)", "hydrolysis"),
+                ),
+                DoctorItem::skipped_with_message(
+                    ids::WASM_PACK,
+                    "wasm-pack",
+                    project.out_of_scope_message("hydrolysis (web)", "hydrolysis"),
+                ),
+            )
+        }
+    };
+    let (windows_arm64_llvm, (wasm32, wasm_pack), web_package_manager) = join!(
+        windows_arm64_llvm,
+        web,
+        web_package_manager_check(host, project)
+    );
+    let mut items = vec![windows_arm64_llvm, wasm32, wasm_pack];
+    items.extend(web_package_manager);
+    items
+}
+
+/// The Espressif-side toolchain — `esp` Rust fork, clang/GCC, `rust-src`,
+/// `espflash`/`ldproxy`, QEMU — when the project selects a Dew/ESP32 backend.
+async fn esp32_check(host: &Host, project: &ProjectContext) -> DoctorItem {
+    const NAME: &str = "ESP32 toolchain";
+    let Some(chips) = project.esp32_chips() else {
+        return DoctorItem::skipped_with_message(
+            ids::ESP32_TOOLCHAIN,
+            NAME,
+            project.out_of_scope_message("ESP32", "esp32"),
+        );
+    };
+    let chips = match chips {
+        Ok(chips) => chips,
+        Err(error) => {
+            return DoctorItem::missing(
+                ids::ESP32_TOOLCHAIN,
+                NAME,
+                format!("Invalid `[backends.esp32]` configuration: {error}"),
+            );
+        }
+    };
+    match Esp32Toolchain::new(chips).check(host).await {
+        Ok(()) => DoctorItem::ok(ids::ESP32_TOOLCHAIN, NAME),
+        Err(ToolchainError::Fixable(installation)) => DoctorItem::fixable(
+            ids::ESP32_TOOLCHAIN,
+            NAME,
+            installation.describe(),
+            installation,
+            host,
+        ),
+        Err(ToolchainError::Unfixable(error)) => {
+            DoctorItem::missing(ids::ESP32_TOOLCHAIN, NAME, unfixable_message(&error))
+        }
+    }
+}
+
+/// The cargo-installed helper binaries a project's workflows invoke —
+/// `cargo-nextest` for `water bench`. Platform helpers that are also cargo
+/// installs (`wasm-pack`, `espflash`/`ldproxy`) are covered by their own
+/// platform items.
+async fn cargo_helpers_check(host: &Host) -> DoctorItem {
+    const NAME: &str = "Cargo helpers";
+    match CargoHelpers::new(["cargo-nextest"]).check(host).await {
+        Ok(()) => DoctorItem::ok(ids::CARGO_HELPERS, NAME),
+        Err(ToolchainError::Fixable(installation)) => DoctorItem::fixable(
+            ids::CARGO_HELPERS,
+            NAME,
+            installation.describe(),
+            installation,
+            host,
+        ),
+        Err(ToolchainError::Unfixable(error)) => {
+            DoctorItem::missing(ids::CARGO_HELPERS, NAME, unfixable_message(&error))
+        }
+    }
+}
+
+/// The Linux system packages and the GTK4 probe, as
+/// `(linux_system_packages, gtk4)`: the GTK4 diagnosis names the package
+/// install when the packages are what is missing.
+async fn linux_checks(host: &Host) -> (DoctorItem, DoctorItem) {
+    const PACKAGES: &str = "Linux system packages";
+    if !cfg!(target_os = "linux") {
+        return (
+            DoctorItem::skipped(ids::LINUX_SYSTEM_PACKAGES, PACKAGES),
+            DoctorItem::skipped(ids::GTK4, "GTK4"),
+        );
+    }
+
+    let (packages, gtk4) = join!(LinuxSystemToolchain.check(host), Gtk4Toolchain.check(host));
+    let (packages, packages_fixable) = match packages {
+        Ok(()) => (DoctorItem::ok(ids::LINUX_SYSTEM_PACKAGES, PACKAGES), false),
+        Err(ToolchainError::Fixable(installation)) => {
+            let msg = format!(
+                "Missing packages for {}: {}. Install command: {}",
+                installation.package_manager_name(),
+                installation.missing_packages().join(", "),
+                installation.install_command_hint(),
+            );
+            (
+                DoctorItem::fixable(
+                    ids::LINUX_SYSTEM_PACKAGES,
+                    PACKAGES,
+                    msg,
+                    installation,
+                    host,
+                ),
+                true,
+            )
+        }
+        Err(ToolchainError::Unfixable(error)) => (
+            DoctorItem::missing(
+                ids::LINUX_SYSTEM_PACKAGES,
+                PACKAGES,
+                unfixable_message(&error),
+            ),
+            false,
+        ),
+    };
+
+    let gtk4 = match gtk4 {
+        Ok(()) => DoctorItem::ok(ids::GTK4, "GTK4"),
+        Err(ToolchainError::Fixable(installation)) => DoctorItem::fixable(
+            ids::GTK4,
+            "GTK4",
+            "GTK4 dependencies are missing",
+            installation,
+            host,
+        ),
+        Err(ToolchainError::Unfixable(error)) => {
+            if packages_fixable {
+                DoctorItem::missing(
+                    ids::GTK4,
+                    "GTK4",
+                    "GTK4 probe failed because required Linux packages are missing. Run `water doctor --fix` to install Linux system packages, then re-run `water doctor`.",
+                )
+            } else {
+                DoctorItem::missing(ids::GTK4, "GTK4", unfixable_message(&error))
+            }
+        }
+    };
+    (packages, gtk4)
+}
+
+async fn winui_check(host: &Host) -> DoctorItem {
+    if !cfg!(target_os = "windows") {
+        return DoctorItem::skipped(ids::WINUI, "WinUI");
+    }
+
+    toolchain_check(
+        host,
+        ids::WINUI,
+        "WinUI",
+        "WinUI build prerequisites are missing",
+        WinUiToolchain,
+    )
+    .await
+}
+
+/// Run diagnostics on all toolchains on `host` and return a report.
+///
+/// Item order is fixed ([`ids::ALL`]) and platform branching is driven by
+/// `cfg!` plus the project context `host.cwd()` resolves, so two runs on
+/// equal hosts in equal projects produce identical item sequences — the
+/// property the orchestration tests and `--json` consumers rely on. The
+/// independent probes run concurrently; the report is returned once all of
+/// them have answered.
+///
+/// Which backends are in scope is [`ProjectContext::scope`]'s decision:
+/// inside a project the manifest's, outside it the host's. Items of an
+/// out-of-scope backend are marked [`DoctorItem::optional`].
+pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
+    let project = project_context(host).await;
+    let (
+        rust,
+        apple,
+        (linux_system_packages, gtk4),
+        hydrolysis,
+        winui,
+        android,
+        esp32,
+        sccache,
+        cargo_helpers,
+    ) = join!(
+        Box::pin(rust_toolchain_check(host, &project)),
+        Box::pin(apple_checks(host, &project)),
+        Box::pin(linux_checks(host)),
+        Box::pin(hydrolysis_checks(host, &project)),
+        Box::pin(winui_check(host)),
+        Box::pin(android_checks(host, &project)),
+        Box::pin(esp32_check(host, &project)),
+        Box::pin(toolchain_check(
+            host,
+            ids::SCCACHE,
+            "sccache",
+            "sccache not found (recommended for faster builds)",
+            Sccache,
+        )),
+        Box::pin(cargo_helpers_check(host)),
+    );
+
+    let mut items = vec![rust];
+    items.extend(apple);
+    items.push(linux_system_packages);
+    items.extend(hydrolysis);
+    items.push(winui);
+    items.push(gtk4);
+    items.extend(android);
+    items.push(esp32);
+    items.push(sccache);
+    items.push(cargo_helpers);
+    for item in &mut items {
+        item.optional = item
+            .group
+            .backend()
+            .is_some_and(|backend| !project.in_scope(backend));
+    }
+    items
 }
 
 /// Checks the `[web] package_manager` the project's `Water.toml` declares.
 /// Only the declared manager is probed — a project on `pnpm` is never
 /// reported healthy because `bun` happens to be installed.
-async fn push_web_package_manager_check(
-    host: &Host,
-    items: &mut Vec<DoctorItem>,
-    project: &ProjectContext,
-) {
-    let Some(web) = project
+async fn web_package_manager_check(host: &Host, project: &ProjectContext) -> Option<DoctorItem> {
+    let web = project
         .manifest
         .as_ref()
-        .and_then(|manifest| manifest.web.as_ref())
-    else {
-        return;
-    };
+        .and_then(|manifest| manifest.web.as_ref())?;
     let package_manager = web.package_manager;
     let name: &'static str = match package_manager {
         crate::web::PackageManager::Bun => "bun (web package manager)",
@@ -988,47 +1238,57 @@ async fn push_web_package_manager_check(
         crate::web::PackageManager::Npm => "npm (web package manager)",
         crate::web::PackageManager::Yarn => "yarn (web package manager)",
     };
-    push_toolchain_check(
-        host,
-        items,
-        ids::WEB_PACKAGE_MANAGER,
-        name,
-        package_manager.install_hint(),
-        PackageManagerToolchain(package_manager),
+    Some(
+        toolchain_check(
+            host,
+            ids::WEB_PACKAGE_MANAGER,
+            name,
+            package_manager.install_hint(),
+            PackageManagerToolchain(package_manager),
+        )
+        .await,
     )
-    .await;
 }
 
-async fn push_rust_toolchain_check(
-    host: &Host,
-    items: &mut Vec<DoctorItem>,
-    project: &ProjectContext,
-) {
+async fn rust_toolchain_check(host: &Host, project: &ProjectContext) -> DoctorItem {
     match RustToolchain::new(&project.rust_floor).check(host).await {
-        Ok(()) => items.push(DoctorItem::ok(ids::RUST, "Rust toolchain")),
-        Err(ToolchainError::Fixable(installation)) => {
-            items.push(DoctorItem::fixable(
-                ids::RUST,
-                "Rust toolchain",
-                format!(
-                    "Rust toolchain is missing, outdated, or incomplete. Planned automatic fixes: {}",
-                    installation.summary()
-                ),
-                installation,
-                host,
-            ));
-        }
-        Err(ToolchainError::Unfixable(error)) => items.push(DoctorItem::missing(
+        Ok(()) => DoctorItem::ok(ids::RUST, "Rust toolchain"),
+        Err(ToolchainError::Fixable(installation)) => DoctorItem::fixable(
             ids::RUST,
             "Rust toolchain",
-            unfixable_message(&error),
-        )),
+            format!(
+                "Rust toolchain is missing, outdated, or incomplete. Planned automatic fixes: {}",
+                installation.summary()
+            ),
+            installation,
+            host,
+        ),
+        Err(ToolchainError::Unfixable(error)) => {
+            DoctorItem::missing(ids::RUST, "Rust toolchain", unfixable_message(&error))
+        }
     }
 }
+
 #[cfg(test)]
 mod tests {
-    use super::{CheckStatus, doctor, ids};
+    use super::{BackendScope, CheckStatus, DoctorGroup, ProjectContext, doctor, ids, sections};
+    use crate::platform::TargetBackend;
     use crate::toolchain::testing::TestMachine;
+    use semver::Version;
+
+    fn project_less() -> ProjectContext {
+        ProjectContext {
+            manifest: None,
+            rust_floor: Version::new(1, 85, 0),
+        }
+    }
+
+    fn project_with(extra: &str) -> ProjectContext {
+        ProjectContext {
+            manifest: Some(toml::from_str(&manifest(extra)).expect("fixture manifest must parse")),
+            rust_floor: Version::new(1, 85, 0),
+        }
+    }
 
     const ANDROID_COMPONENT_IDS: &[&str] = &[
         ids::ANDROID_PLATFORM_TOOLS,
@@ -1279,27 +1539,141 @@ mod tests {
         assert!(wasm_pack.is_fixable());
     }
 
-    /// Project-gated items must not report failures for projects that do not
-    /// select the platform.
+    /// Outside a project the host decides: Hydrolysis everywhere, Apple on
+    /// macOS, GTK4 on Linux, `WinUI` on Windows; Android and Dew optional.
     #[test]
-    fn doctor_skips_platform_items_no_project_selects() {
+    fn scope_outside_a_project_follows_the_host() {
+        let project = project_less();
+        assert_eq!(
+            project.scope(TargetBackend::Hydrolysis),
+            BackendScope::HostDefault
+        );
+        assert_eq!(
+            project.scope(TargetBackend::Android),
+            BackendScope::Optional
+        );
+        assert_eq!(project.scope(TargetBackend::Dew), BackendScope::Optional);
+        let host_only = |backend, on_host: bool| {
+            let expected = if on_host {
+                BackendScope::HostDefault
+            } else {
+                BackendScope::Optional
+            };
+            assert_eq!(project.scope(backend), expected, "{backend:?}");
+        };
+        host_only(TargetBackend::Apple, cfg!(target_os = "macos"));
+        host_only(TargetBackend::Gtk4, cfg!(target_os = "linux"));
+        host_only(TargetBackend::WinUi, cfg!(target_os = "windows"));
+    }
+
+    /// Inside a project the manifest decides exactly as before: selected
+    /// backends are in scope, the rest optional, and a playground selects all.
+    #[test]
+    fn scope_inside_a_project_follows_the_manifest() {
+        let project = project_with("[backends.android]\n\n[backends.hydrolysis]\n");
+        assert_eq!(
+            project.scope(TargetBackend::Android),
+            BackendScope::Selected
+        );
+        assert_eq!(
+            project.scope(TargetBackend::Hydrolysis),
+            BackendScope::Selected
+        );
+        for backend in [
+            TargetBackend::Apple,
+            TargetBackend::Gtk4,
+            TargetBackend::WinUi,
+            TargetBackend::Dew,
+        ] {
+            assert_eq!(
+                project.scope(backend),
+                BackendScope::Optional,
+                "{backend:?} is not selected"
+            );
+        }
+
+        let playground = ProjectContext {
+            manifest: Some(
+                toml::from_str(
+                    "[package]\ntype = \"playground\"\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
+                )
+                    .expect("playground manifest must parse"),
+            ),
+            rust_floor: Version::new(1, 85, 0),
+        };
+        assert_eq!(playground.scope(TargetBackend::Dew), BackendScope::Selected);
+    }
+
+    /// Outside a project the host's backends are probed and Android / ESP32
+    /// are reported as optional rather than skipped-as-unselected.
+    #[test]
+    fn doctor_checks_the_hosts_backends_outside_a_project() {
         let machine = TestMachine::new();
         let host = machine.host(Vec::<(String, String)>::new());
         let items = smol::block_on(doctor(&host));
 
+        for id in [ids::WASM32_TARGET, ids::WASM_PACK] {
+            let hydrolysis = item(&items, id);
+            assert_eq!(hydrolysis.status, CheckStatus::Missing, "{id}");
+            assert!(!hydrolysis.optional, "{id} is in scope on every desktop");
+        }
+        let apple_targets = item(&items, ids::APPLE_RUST_TARGETS);
+        if cfg!(target_os = "macos") {
+            assert_eq!(apple_targets.status, CheckStatus::Missing);
+            assert!(!apple_targets.optional);
+        } else {
+            assert_eq!(apple_targets.status, CheckStatus::Skipped);
+        }
+        if cfg!(target_os = "linux") {
+            assert!(!item(&items, ids::GTK4).optional);
+        }
         for id in [
+            ids::ANDROID_SDK,
             ids::ANDROID_RUST_TARGETS,
-            ids::WASM32_TARGET,
-            ids::WASM_PACK,
             ids::ESP32_TOOLCHAIN,
-            ids::APPLE_RUST_TARGETS,
         ] {
-            assert_eq!(
-                item(&items, id).status,
-                CheckStatus::Skipped,
-                "{id} must be skipped on a project-less host"
+            assert!(
+                item(&items, id).optional,
+                "{id} is optional without a project"
             );
         }
+        assert_eq!(
+            item(&items, ids::ESP32_TOOLCHAIN).status,
+            CheckStatus::Skipped
+        );
+    }
+
+    /// The terminal groups follow the new-user order: Rust, the host's
+    /// backends, optional backends, helpers — with every in-scope backend
+    /// ahead of every optional one.
+    #[test]
+    fn sections_order_rust_host_optional_helpers() {
+        let machine = TestMachine::new();
+        let host = machine.host(Vec::<(String, String)>::new());
+        let sections = sections(smol::block_on(doctor(&host)));
+        let groups: Vec<DoctorGroup> = sections.iter().map(|section| section.group).collect();
+        assert_eq!(groups.first(), Some(&DoctorGroup::Rust));
+        assert_eq!(groups.last(), Some(&DoctorGroup::Helpers));
+        let first_optional = sections.iter().position(|section| section.optional);
+        let last_required_backend = sections
+            .iter()
+            .rposition(|section| !section.optional && section.group.backend().is_some());
+        if let (Some(first_optional), Some(last_required)) = (first_optional, last_required_backend)
+        {
+            assert!(last_required < first_optional);
+        }
+        assert!(
+            sections
+                .iter()
+                .find(|section| section.group == DoctorGroup::Android)
+                .is_some_and(|section| section.optional)
+        );
+        assert!(
+            sections
+                .iter()
+                .find(|section| section.group == DoctorGroup::Hydrolysis)
+                .is_some_and(|section| !section.optional)
+        );
     }
 
     /// Every platform the manifest selects is probed, even on a bare host.

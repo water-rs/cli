@@ -10,7 +10,7 @@ use crate::shell::Shell;
 use crate::{error, header, line, note, success, warn};
 use waterui_cli::toolchain::{
     Host,
-    doctor::{CheckStatus, DoctorItem, DoctorItemRecord, doctor},
+    doctor::{CheckStatus, DoctorItem, DoctorItemRecord, DoctorSection, doctor, sections},
 };
 
 /// Arguments for the doctor command.
@@ -23,6 +23,8 @@ pub struct Args {
 
 const MAX_AUTO_FIX_PASSES: usize = 3;
 
+/// The in-scope outcome of a diagnosis: optional backends' items are
+/// reported but never counted here.
 struct DoctorSummary {
     all_ok: bool,
     fixable_items: Vec<DoctorItem>,
@@ -38,6 +40,7 @@ fn emit_item(shell: &Shell, item: &DoctorItem) {
 
     match item.status {
         CheckStatus::Ok => success!(shell, "{}", item.name),
+        CheckStatus::Missing if item.optional => print_optional_missing_item(shell, item),
         CheckStatus::Missing => print_missing_item(shell, item),
         CheckStatus::Skipped => print_skipped_item(shell, item),
     }
@@ -55,6 +58,25 @@ fn print_missing_item(shell: &Shell, item: &DoctorItem) {
         warn!(shell, "{} [fixable]", item.name);
     } else {
         warn!(shell, "{} [manual]", item.name);
+    }
+}
+
+/// A missing piece of a backend that is out of scope: the install hint
+/// without the warning, so it neither reads as a failure nor is counted.
+fn print_optional_missing_item(shell: &Shell, item: &DoctorItem) {
+    if let Some(message) = &item.message {
+        line!(shell, "  - {} (not installed: {message})", item.name);
+    } else {
+        line!(shell, "  - {} (not installed)", item.name);
+    }
+}
+
+fn print_section_heading(shell: &Shell, section: &DoctorSection) {
+    line!(shell);
+    if section.optional {
+        header!(shell, "{} (optional)", section.group.title());
+    } else {
+        header!(shell, "{}", section.group.title());
     }
 }
 
@@ -110,7 +132,7 @@ fn collect_remaining_missing(
     let mut remaining_fixable = Vec::new();
 
     for item in items {
-        if item.status != CheckStatus::Missing {
+        if item.status != CheckStatus::Missing || item.optional {
             continue;
         }
         remaining_missing += 1;
@@ -168,24 +190,41 @@ where
     items
 }
 
+/// Print the report and collect the in-scope summary. JSON output keeps the
+/// `ids::ALL` emission order; the terminal groups items under one heading
+/// per [`DoctorSection`].
 fn print_diagnostics(shell: &Shell, items: Vec<DoctorItem>) -> DoctorSummary {
     let mut summary = DoctorSummary {
         all_ok: true,
         fixable_items: Vec::new(),
     };
 
-    for item in items {
-        if item.status == CheckStatus::Missing {
-            summary.all_ok = false;
-            if item.is_fixable() {
-                emit_item(shell, &item);
-                summary.fixable_items.push(item);
-                continue;
-            }
+    if shell.is_json() {
+        for item in items {
+            emit_item(shell, &item);
+            summarize_item(&mut summary, item);
         }
-        emit_item(shell, &item);
+        return summary;
+    }
+
+    for section in sections(items) {
+        print_section_heading(shell, &section);
+        for item in section.items {
+            emit_item(shell, &item);
+            summarize_item(&mut summary, item);
+        }
     }
     summary
+}
+
+fn summarize_item(summary: &mut DoctorSummary, item: DoctorItem) {
+    if item.status != CheckStatus::Missing || item.optional {
+        return;
+    }
+    summary.all_ok = false;
+    if item.is_fixable() {
+        summary.fixable_items.push(item);
+    }
 }
 
 fn print_skipped_item(shell: &Shell, item: &DoctorItem) {
@@ -344,7 +383,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use color_eyre::eyre;
-    use waterui_cli::toolchain::doctor::BoxedInstallFn;
+    use waterui_cli::toolchain::doctor::{BoxedInstallFn, DoctorGroup};
 
     use super::*;
 
@@ -357,6 +396,8 @@ mod tests {
         DoctorItem {
             id,
             name: id,
+            group: DoctorGroup::Helpers,
+            optional: false,
             status: CheckStatus::Ok,
             message: None,
             install_fn: None,
@@ -367,6 +408,8 @@ mod tests {
         DoctorItem {
             id,
             name: id,
+            group: DoctorGroup::Helpers,
+            optional: false,
             status: CheckStatus::Missing,
             message: Some(String::from("manual steps required")),
             install_fn: None,
@@ -388,10 +431,21 @@ mod tests {
         DoctorItem {
             id,
             name: id,
+            group: DoctorGroup::Helpers,
+            optional: false,
             status: CheckStatus::Missing,
             message: Some(String::from("fixable")),
             install_fn: Some(install_fn),
         }
+    }
+
+    /// A missing, fixable item of an out-of-scope backend; its install must
+    /// never run.
+    fn optional_item(id: &'static str, calls: &Arc<Mutex<Vec<&'static str>>>) -> DoctorItem {
+        let mut item = fixable_item(id, calls, Ok(()));
+        item.group = DoctorGroup::Android;
+        item.optional = true;
+        item
     }
 
     /// A scripted `diagnose` step: replays one report per call.
@@ -520,6 +574,22 @@ mod tests {
             diagnose_calls.load(Ordering::SeqCst),
             MAX_AUTO_FIX_PASSES + 1
         );
+    }
+
+    /// An optional backend's missing pieces are reported but never fixed or
+    /// counted: with only optional items missing the run is all-ok and
+    /// diagnoses once.
+    #[test]
+    fn fix_loop_ignores_optional_items() {
+        let installs = install_log();
+        let (diagnose, diagnose_calls) = scripted(vec![vec![
+            ok_item("a"),
+            optional_item("android-sdk", &installs),
+        ]]);
+        smol::block_on(run_with_diagnose(&test_shell(), true, diagnose))
+            .expect("doctor run must succeed");
+        assert!(taken(&installs).is_empty());
+        assert_eq!(diagnose_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
