@@ -2864,6 +2864,73 @@ mod tests {
         assert_eq!(release["panic"].as_str(), Some("abort"));
     }
 
+    /// The scaffolded app links text, layout, controls and assets; video is
+    /// declared as the crate's own `media` feature and left off, because
+    /// `waterui/media` carries the system media stack (VA-API, `PipeWire`) a
+    /// hello-world never uses.
+    #[test]
+    fn root_manifest_keeps_video_behind_an_opt_in_feature() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let project_root = temp.path().join("project");
+        let ctx = ctx(
+            None,
+            None,
+            Some(project_root.clone()),
+            crate::project::PackageType::Playground,
+        );
+
+        smol::block_on(crate::templates::root::scaffold(
+            &project_root,
+            &ctx,
+            "assets",
+        ))
+        .expect("root scaffold should succeed");
+
+        let rendered = std::fs::read_to_string(project_root.join("Cargo.toml"))
+            .expect("root Cargo.toml should be written");
+        let manifest = rendered
+            .parse::<toml::Table>()
+            .expect("root Cargo.toml should parse");
+
+        let native_features = manifest["target"]
+            ["cfg(not(any(target_arch = \"wasm32\", target_os = \"espidf\")))"]["dependencies"]
+            ["waterui"]["features"]
+            .as_array()
+            .expect("native waterui dependency lists features")
+            .iter()
+            .map(|feature| feature.as_str().expect("feature name"))
+            .collect::<Vec<_>>();
+        assert_eq!(native_features, ["assets", "flow-markdown"]);
+        assert_eq!(
+            manifest["dependencies"]["waterui"]["default-features"].as_bool(),
+            Some(false)
+        );
+
+        let media = manifest["features"][crate::templates::root::MEDIA_FEATURE]
+            .as_array()
+            .expect("media feature is declared")
+            .iter()
+            .map(|feature| feature.as_str().expect("feature name"))
+            .collect::<Vec<_>>();
+        assert_eq!(media, ["waterui/media"]);
+        assert_eq!(
+            manifest["features"]["dev"].as_array().map(Vec::len),
+            Some(1),
+            "dev stays the dynamic-linking switch only"
+        );
+
+        // The manifest documents the switch where the user will look for it.
+        let comment_then_feature = rendered
+            .lines()
+            .skip_while(|line| !line.starts_with("# Video playback"))
+            .find(|line| !line.starts_with('#'));
+        assert_eq!(comment_then_feature, Some("media = [\"waterui/media\"]"));
+        assert!(
+            rendered.contains("--features media"),
+            "manifest names the command that turns video on:\n{rendered}"
+        );
+    }
+
     #[test]
     fn playground_android_manifest_enables_picture_in_picture_by_default() {
         let ctx = playground_ctx();
@@ -5281,6 +5348,20 @@ pub mod root {
     };
     use std::collections::BTreeMap;
 
+    /// Cargo feature of the generated crate that turns on video playback.
+    ///
+    /// `waterui/media` links the framework's video stack, and on Linux that
+    /// stack needs VA-API 1.19+ and `PipeWire` 0.3.65+ at build time — floors
+    /// Ubuntu 22.04 and Debian 12 do not meet. A first app plays no video, so
+    /// the scaffold declares the feature and leaves it off; the manifest
+    /// comment on the declaration tells the user where to turn it on.
+    pub const MEDIA_FEATURE: &str = "media";
+
+    const MEDIA_FEATURE_COMMENT: &str = "\
+# Video playback. Off by default: it links the framework's video stack, which\n\
+# on Linux needs VA-API 1.19+ and PipeWire 0.3.65+ to build. Enable it when the\n\
+# app uses video: `cargo build --features media`, or add it to `default`.\n";
+
     /// Root template files, paired with their destination relative to the
     /// project root. The assets README is what makes the documented `assets!`
     /// workflow work out of the box: the planner walks the assets root
@@ -5380,10 +5461,13 @@ pub mod root {
             lib: super::generated_lib(&["lib"]),
             bins: Vec::new(),
             profile: super::generated_profiles(),
-            features: BTreeMap::from([(
-                "dev".to_string(),
-                vec!["waterui/dynamic_linking".to_string()],
-            )]),
+            features: BTreeMap::from([
+                (
+                    "dev".to_string(),
+                    vec!["waterui/dynamic_linking".to_string()],
+                ),
+                (MEDIA_FEATURE.to_string(), vec!["waterui/media".to_string()]),
+            ]),
             dependencies: BTreeMap::from([("waterui".to_string(), waterui_dependency.clone())]),
             build_dependencies: BTreeMap::new(),
             target: native_target_section(waterui_dependency, ctx.web_frontend_arg.is_some()),
@@ -5401,7 +5485,34 @@ pub mod root {
             },
         };
 
-        write_generated_cargo_toml(base_dir, super::render_generated_cargo_toml(&manifest)?).await
+        let rendered = annotate_media_feature(&super::render_generated_cargo_toml(&manifest)?)?;
+        write_generated_cargo_toml(base_dir, rendered).await
+    }
+
+    /// Places [`MEDIA_FEATURE_COMMENT`] above the `media` entry of
+    /// `[features]`, so the generated manifest itself says how video is
+    /// turned on. Serialization cannot carry comments, hence the second pass.
+    fn annotate_media_feature(rendered: &str) -> io::Result<String> {
+        let mut document: toml_edit::DocumentMut = rendered
+            .parse()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let features = document
+            .get_mut("features")
+            .and_then(toml_edit::Item::as_table_mut)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "generated Cargo.toml has no [features] table",
+                )
+            })?;
+        let mut media = features.key_mut(MEDIA_FEATURE).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("generated Cargo.toml declares no `{MEDIA_FEATURE}` feature"),
+            )
+        })?;
+        media.leaf_decor_mut().set_prefix(MEDIA_FEATURE_COMMENT);
+        Ok(document.to_string())
     }
 
     fn waterui_dependency(ctx: &TemplateContext) -> io::Result<GeneratedDependencyDetail> {
@@ -5416,13 +5527,14 @@ pub mod root {
         waterui_dependency: GeneratedDependencyDetail,
         web_frontend: bool,
     ) -> BTreeMap<String, GeneratedTargetSection<GeneratedDependencyDetail>> {
-        // Desktop conveniences only: `media` pulls the GPU stack, which does
+        // Desktop conveniences only: `assets` pulls the GPU stack, which does
         // not exist on espidf targets, so firmware builds must fall through
         // to the bare default-features-off dependency for the scaffolded app
-        // to cross-compile for ESP32 chips at all.
+        // to cross-compile for ESP32 chips at all. Video stays behind the
+        // crate's own [`MEDIA_FEATURE`].
         // `include_web!` expands against both the assets bundle API and the
         // webview surface, so a web-frontend project enables both.
-        let mut waterui_features = vec!["assets", "media", "flow-markdown"];
+        let mut waterui_features = vec!["assets", "flow-markdown"];
         if web_frontend {
             waterui_features.push("webview");
         }
