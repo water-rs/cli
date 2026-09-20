@@ -23,6 +23,7 @@ use waterui_cli::{
         backend::HydrolysisBackend,
         platform::{build_hydrolysis, package_hydrolysis},
     },
+    package_output::place_in_project,
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
     project::{ManagedBackends, Project},
     winui::{
@@ -177,14 +178,7 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     {
         return Ok(None);
     }
-    let project = ensure_packaging_backend_generated(
-        shell,
-        &project_path,
-        project,
-        backend,
-        managed_backends,
-    )
-    .await?;
+    let project = ensure_packaging_backend_generated(shell, project, backend).await?;
 
     let mut build_options = BuildOptions::packaging(if args.release {
         BuildProfile::Release
@@ -232,19 +226,15 @@ fn ensure_packaging_backend_ready(project: &Project, backend: TargetBackend) -> 
 
 async fn ensure_packaging_backend_generated(
     shell: &Shell,
-    project_path: &PathBuf,
     project: Project,
     backend: TargetBackend,
-    managed_backends: ManagedBackends,
 ) -> Result<Project> {
     match backend {
         TargetBackend::Gtk4 if project.is_playground() => {
             let needs_reinit = Gtk4Backend::requires_regeneration(&project).await?;
             ensure_packaging_generated_backend::<Gtk4Backend>(
                 shell,
-                project_path,
                 project,
-                managed_backends,
                 needs_reinit,
                 "Initializing GTK4 backend...",
                 "GTK4 backend initialized",
@@ -255,9 +245,7 @@ async fn ensure_packaging_backend_generated(
             let needs_reinit = HydrolysisBackend::requires_regeneration(&project).await?;
             ensure_packaging_generated_backend::<HydrolysisBackend>(
                 shell,
-                project_path,
                 project,
-                managed_backends,
                 needs_reinit,
                 "Initializing hydrolysis backend...",
                 "Hydrolysis backend initialized",
@@ -268,9 +256,7 @@ async fn ensure_packaging_backend_generated(
             let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
             ensure_packaging_generated_backend::<WinUiBackend>(
                 shell,
-                project_path,
                 project,
-                managed_backends,
                 needs_reinit,
                 "Initializing WinUI backend...",
                 "WinUI backend initialized",
@@ -283,9 +269,7 @@ async fn ensure_packaging_backend_generated(
 
 async fn ensure_packaging_generated_backend<T>(
     shell: &Shell,
-    project_path: &PathBuf,
     project: Project,
-    managed_backends: ManagedBackends,
     needs_reinit: bool,
     spinner_message: &str,
     success_message: &str,
@@ -299,7 +283,6 @@ where
 
     let spinner = shell.spinner(spinner_message);
     reinit_backend::<T>(&project).await?;
-    let project = Project::open(project_path, managed_backends).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -504,6 +487,7 @@ async fn package_artifact(
     let artifact = shell
         .display_output(package_artifact_inner(shell, args, context, built))
         .await?;
+    let artifact = place_in_project(&context.project, artifact).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }

@@ -582,9 +582,7 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunCon
         project.set_esp32_chip(chip).await?;
     }
 
-    let project =
-        ensure_generated_run_backend(shell, &project_path, project, backend, managed_backends)
-            .await?;
+    let project = ensure_generated_run_backend(shell, project, backend).await?;
 
     Ok(Some(RunContext {
         project,
@@ -653,19 +651,15 @@ fn ensure_run_backend_ready(project: &Project, backend: TargetBackend) -> Result
 
 async fn ensure_generated_run_backend(
     shell: &Shell,
-    project_path: &PathBuf,
     project: Project,
     backend: TargetBackend,
-    managed_backends: ManagedBackends,
 ) -> Result<Project> {
     match backend {
         TargetBackend::Gtk4 if project.is_playground() => {
             let needs_reinit = Gtk4Backend::requires_regeneration(&project).await?;
             ensure_generated_run_backend_impl::<Gtk4Backend>(
                 shell,
-                project_path,
                 project,
-                managed_backends,
                 needs_reinit,
                 "Initializing GTK4 backend...",
                 "GTK4 backend initialized",
@@ -676,9 +670,7 @@ async fn ensure_generated_run_backend(
             let needs_reinit = HydrolysisBackend::requires_regeneration(&project).await?;
             ensure_generated_run_backend_impl::<HydrolysisBackend>(
                 shell,
-                project_path,
                 project,
-                managed_backends,
                 needs_reinit,
                 "Initializing hydrolysis backend...",
                 "Hydrolysis backend initialized",
@@ -689,9 +681,7 @@ async fn ensure_generated_run_backend(
             let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
             ensure_generated_run_backend_impl::<WinUiBackend>(
                 shell,
-                project_path,
                 project,
-                managed_backends,
                 needs_reinit,
                 "Initializing WinUI backend...",
                 "WinUI backend initialized",
@@ -703,9 +693,7 @@ async fn ensure_generated_run_backend(
                 project.esp32_backend().is_none() || Esp32Backend::requires_regeneration(&project)?;
             ensure_generated_run_backend_impl::<Esp32Backend>(
                 shell,
-                project_path,
                 project,
-                managed_backends,
                 needs_reinit,
                 "Initializing ESP32 backend...",
                 "ESP32 backend initialized",
@@ -718,9 +706,7 @@ async fn ensure_generated_run_backend(
 
 async fn ensure_generated_run_backend_impl<T>(
     shell: &Shell,
-    project_path: &PathBuf,
     project: Project,
-    managed_backends: ManagedBackends,
     needs_reinit: bool,
     spinner_message: &str,
     success_message: &str,
@@ -734,7 +720,6 @@ where
 
     let spinner = shell.spinner(spinner_message);
     reinit_backend::<T>(&project).await?;
-    let project = Project::open(project_path, managed_backends).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
