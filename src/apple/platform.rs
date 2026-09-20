@@ -822,12 +822,8 @@ pub async fn package_apple(
 
     #[cfg(target_os = "macos")]
     if platform == TargetPlatform::MacOS && browser_runtime_plan.requires_cef() {
-        browser_runtime::stage_macos_app(
-            browser_runtime_plan,
-            lib_dir,
-            &app_path.join("Contents"),
-        )
-        .await?;
+        browser_runtime::stage_macos_app(browser_runtime_plan, lib_dir, &app_path.join("Contents"))
+            .await?;
         // Helper bundles wrap the helper `[[bin]]`, which the manifest
         // declares only when the application links the CEF engine crate —
         // chromium alone stages the runtime but builds no helper.
