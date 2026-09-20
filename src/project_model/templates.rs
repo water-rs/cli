@@ -256,12 +256,12 @@ pub struct TemplateContext {
     pub author: String,
     /// Path to the Android backend (relative or absolute)
     pub android_backend_path: Option<PathBuf>,
-    /// `[backend.apple] backend_path` — a local Apple backend checkout that
+    /// `[backends.apple] backend_path` — a local Apple backend checkout that
     /// replaces the remote Swift package reference.
     pub apple_backend_path: Option<PathBuf>,
-    /// `[backend.apple] branch` — pin the remote package to a branch.
+    /// `[backends.apple] branch` — pin the remote package to a branch.
     pub apple_backend_branch: Option<String>,
-    /// `[backend.apple] revision` — pin the remote package to a revision.
+    /// `[backends.apple] revision` — pin the remote package to a revision.
     pub apple_backend_revision: Option<String>,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
@@ -358,7 +358,10 @@ impl TemplateContext {
             crate_name,
             bundle_identifier: manifest.package.bundle_identifier.clone(),
             author: String::new(),
-            android_backend_path: None,
+            android_backend_path: manifest
+                .backends
+                .android()
+                .and_then(|backend| backend.backend_path().map(PathBuf::from)),
             apple_backend_path: apple
                 .and_then(|backend| backend.backend_path.as_deref())
                 .map(PathBuf::from),
@@ -559,7 +562,7 @@ impl TemplateContext {
 
     /// Whether the Android project consumes the runtime as the remote
     /// coordinate `android_remote_backend_dependency` names rather than a
-    /// local checkout: true unless `[backend.android] backend_path` names one
+    /// local checkout: true unless `[backends.android] backend_path` names one
     /// or `waterui_path/backends/android` is a Gradle project.
     #[must_use]
     pub fn use_remote_dev_backend(&self) -> bool {
@@ -609,7 +612,7 @@ impl TemplateContext {
     /// `target`, resolved from the backend project's directory.
     ///
     /// `target` is absolute, or relative to the project root the way
-    /// `waterui_path` and `[backend.apple] backend_path` are. This accounts
+    /// `waterui_path` and `[backends.apple] backend_path` are. This accounts
     /// for the project being in a generated backend subdirectory.
     fn backend_relative_path(&self, target: &Path) -> String {
         // If `target` is absolute, use it directly. This avoids producing
@@ -660,7 +663,7 @@ impl TemplateContext {
         normalize_path_for_config(&backend_path)
     }
 
-    /// The path to the local Apple backend checkout `[backend.apple]`
+    /// The path to the local Apple backend checkout `[backends.apple]`
     /// `backend_path` names, resolved from the Xcode project's directory.
     /// `None` consumes the remote Swift package instead.
     ///
@@ -682,7 +685,7 @@ impl TemplateContext {
             })
     }
 
-    /// The path to the local Android backend checkout `[backend.android]`
+    /// The path to the local Android backend checkout `[backends.android]`
     /// `backend_path` names, resolved from the Android project's directory.
     /// `None` consumes the remote runtime coordinate instead.
     ///
@@ -696,7 +699,7 @@ impl TemplateContext {
     fn compute_android_backend_path(&self) -> Option<String> {
         self.android_backend_path
             .as_ref()
-            .map(|path| normalize_path_for_config(path))
+            .map(|path| self.backend_relative_path(path))
             .or_else(|| {
                 let local = self.waterui_workspace_root()?.join("backends/android");
                 local
@@ -776,7 +779,7 @@ impl TemplateContext {
     }
 
     /// The `SwiftPM` requirement the generated `XCRemoteSwiftPackageReference`
-    /// pins the Apple backend at: a `[backend.apple]` override first —
+    /// pins the Apple backend at: a `[backends.apple]` override first —
     /// `branch`, then `revision` — then the pin the framework's channel
     /// carries. `dev` and `nightly` pin `apple-backend-revision`, the
     /// backend commit the channel resolved or certified, before the stable
@@ -785,7 +788,7 @@ impl TemplateContext {
     /// framework older than the submodule's removal records.
     fn apple_backend_requirement(&self) -> String {
         if let (Some(_), Some(_)) = (&self.apple_backend_branch, &self.apple_backend_revision) {
-            panic!("`[backend.apple]` sets both `branch` and `revision`; pick one");
+            panic!("`[backends.apple]` sets both `branch` and `revision`; pick one");
         }
         let revision =
             |revision: &str| format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";");
@@ -1241,6 +1244,67 @@ mod tests {
         );
     }
 
+    /// `[backends.android] backend_path` names a local runtime checkout: the
+    /// generated `settings.gradle.kts` includes it as a composite build and
+    /// leaves the `JitPack` repository off. Without the key the project
+    /// resolves the remote runtime coordinate.
+    #[test]
+    fn android_backend_path_renders_a_composite_build() {
+        let manifest: crate::project::Manifest = toml::from_str(
+            r#"
+                [package]
+                type = "playground"
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+
+                [backends.android]
+                backend_path = "/opt/android-backend"
+            "#,
+        )
+        .expect("manifest parses");
+
+        let context = |manifest: &crate::project::Manifest| {
+            TemplateContext::for_project_manifest(
+                manifest,
+                CrateName::try_from("demo").expect("crate name"),
+                "Demo",
+                &stable_framework(),
+            )
+            .with_backend_project_path(PathBuf::from("/proj/android"))
+            .with_project_root_path(PathBuf::from("/proj"))
+        };
+
+        let template = embedded::ANDROID
+            .get_file("settings.gradle.kts.tpl")
+            .expect("settings.gradle.kts template must exist")
+            .contents_utf8()
+            .expect("settings.gradle.kts template must be utf-8");
+        let render = |ctx: &TemplateContext| {
+            render_scaffold_template(
+                TemplateNamespace::Android,
+                std::path::Path::new("settings.gradle.kts.tpl"),
+                template,
+                ctx,
+            )
+            .expect("settings.gradle.kts render")
+        };
+
+        let local = render(&context(&manifest));
+        assert!(
+            local.contains("includeBuild(\"/opt/android-backend\")"),
+            "{local}"
+        );
+        // The JitPack repository stays off while the composite build is on.
+        assert!(local.contains("if (false) {"), "{local}");
+        assert!(local.contains("if (!false) {"), "{local}");
+
+        let mut remote_manifest = manifest;
+        remote_manifest.backends.clear_android();
+        let remote = render(&context(&remote_manifest));
+        assert!(remote.contains("if (true) {"), "{remote}");
+        assert!(remote.contains("if (!true) {"), "{remote}");
+    }
+
     fn playground_ctx() -> TemplateContext {
         TemplateContext::for_support_playground(
             "WaterUIApp",
@@ -1369,8 +1433,6 @@ mod tests {
             "src/main.rs.tpl",
             "src/lib.rs.tpl",
             "src/mcp_runtime.rs.tpl",
-            "src/preview_runtime.rs.tpl",
-            "src/preview_test_runtime.rs.tpl",
         ] {
             let rendered = render_embedded(
                 TemplateNamespace::Hydrolysis,
@@ -1383,6 +1445,35 @@ mod tests {
                 "hydrolysis {relative} must create its environment through `configure_environment!`"
             );
         }
+
+        // Preview runtimes reach `configure_environment!` through the
+        // generated bindings: `app_environment()` hands the configured
+        // environment to the application's `app(env)` composition root, which
+        // is what installs application-owned realizations such as
+        // `waterui_map_gpu::install` (#93). A runtime that built a bare
+        // `Environment` would render components the app never could.
+        for relative in [
+            "src/preview_runtime.rs.tpl",
+            "src/preview_test_runtime.rs.tpl",
+        ] {
+            let rendered = render_embedded(
+                TemplateNamespace::Hydrolysis,
+                &embedded::HYDROLYSIS,
+                relative,
+                &ctx,
+            );
+            assert!(
+                rendered.contains("app_environment()"),
+                "hydrolysis {relative} must take its environment from the generated `app_environment()` binding"
+            );
+        }
+        let preview_bindings = include_str!("../preview/hydrolysis_preview_bindings.rs.tpl");
+        assert!(
+            preview_bindings.contains("waterui::configure_environment!")
+                && preview_bindings.contains("::app(env)"),
+            "hydrolysis preview bindings must build the preview environment \
+             through `configure_environment!` and the application's `app(env)`"
+        );
 
         assert!(
             render_esp32("src/main.rs.tpl", &ctx).contains("waterui_core::configure_environment!"),
@@ -1865,6 +1956,15 @@ mod tests {
             plist.contains("<key>UILaunchScreen</key>\n\t<dict>\n\t</dict>"),
             "{plist}"
         );
+        // The iOS 27 SDK refuses to launch an app without the scene life
+        // cycle; the manifest names the scaffold's scene delegate by its
+        // Objective-C name so the module name stays out of the plist.
+        assert!(
+            plist.contains(
+                "<key>UISceneDelegateClassName</key>\n\t\t\t\t\t<string>SceneDelegate</string>"
+            ),
+            "{plist}"
+        );
 
         let configured = app_ctx().with_launch(LaunchTemplateEntry {
             has_background: true,
@@ -2234,6 +2334,45 @@ mod tests {
             bin["name"].as_str() == Some("waterui-test-hydrolysis-cef-helper")
                 && bin["path"].as_str() == Some("src/bin/waterui-cef-helper.rs")
         }));
+    }
+
+    #[test]
+    fn hydrolysis_manifest_enables_wasm_opt_for_the_features_rustc_emits() {
+        // wasm-pack invokes `wasm-opt -O` with no feature flags; without the
+        // wasm32 default target features enabled, binaryen rejects the
+        // bulk-memory ops rustc emits for memcpy/memset and every `--release`
+        // web bundle fails validation (#95).
+        let cargo_toml =
+            crate::templates::hydrolysis::rendered_outputs(&app_ctx(), "waterui-test-hydrolysis")
+                .expect("hydrolysis outputs should render")
+                .into_iter()
+                .find_map(|(path, content)| {
+                    (path == std::path::Path::new("Cargo.toml"))
+                        .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
+                })
+                .expect("hydrolysis Cargo.toml output should exist");
+        let manifest = cargo_toml
+            .parse::<toml::Table>()
+            .expect("hydrolysis Cargo.toml should parse");
+        let wasm_opt =
+            manifest["package"]["metadata"]["wasm-pack"]["profile"]["release"]["wasm-opt"]
+                .as_array()
+                .expect("wasm-pack release profile should carry wasm-opt flags")
+                .iter()
+                .map(|flag| flag.as_str().expect("wasm-opt flag should be a string"))
+                .collect::<Vec<_>>();
+        for required in [
+            "--enable-bulk-memory",
+            "--enable-mutable-globals",
+            "--enable-sign-ext",
+            "--enable-nontrapping-float-to-int",
+            "--enable-reference-types",
+        ] {
+            assert!(
+                wasm_opt.contains(&required),
+                "wasm-opt flags should include {required}, got {wasm_opt:?}"
+            );
+        }
     }
 
     #[test]
@@ -3429,6 +3568,38 @@ struct GeneratedPackageSection {
     autobins: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     authors: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<GeneratedPackageMetadata>,
+}
+
+/// `[package.metadata]` — presently only wasm-pack, which only hydrolysis's
+/// web bundle needs.
+#[derive(serde::Serialize)]
+struct GeneratedPackageMetadata {
+    #[serde(rename = "wasm-pack")]
+    wasm_pack: GeneratedWasmPackMetadata,
+}
+
+#[derive(serde::Serialize)]
+struct GeneratedWasmPackMetadata {
+    profile: GeneratedWasmPackProfiles,
+}
+
+#[derive(serde::Serialize)]
+struct GeneratedWasmPackProfiles {
+    release: GeneratedWasmPackProfile,
+}
+
+/// wasm-pack runs `wasm-opt -O` with no feature flags, so binaryen validates
+/// the wasm-bindgen output against its conservative default feature set and
+/// rejects the bulk-memory ops modern rustc emits for memcpy/memset — every
+/// `--release` web bundle fails validation without these. The flags are the
+/// wasm32 default target features plus reference-types for wasm-bindgen's
+/// externref glue.
+#[derive(serde::Serialize)]
+struct GeneratedWasmPackProfile {
+    #[serde(rename = "wasm-opt")]
+    wasm_opt: [&'static str; 6],
 }
 
 #[derive(serde::Serialize)]
@@ -3574,6 +3745,7 @@ fn generated_package(name: &str, authors: Vec<String>) -> GeneratedPackageSectio
         edition: "2024".to_string(),
         autobins: None,
         authors,
+        metadata: None,
     }
 }
 
@@ -4072,6 +4244,22 @@ pub mod hydrolysis {
     ) -> io::Result<GeneratedCargoManifest<GeneratedDependencyValue>> {
         let mut package = super::generated_package(package_name, Vec::new());
         package.autobins = Some(false);
+        package.metadata = Some(super::GeneratedPackageMetadata {
+            wasm_pack: super::GeneratedWasmPackMetadata {
+                profile: super::GeneratedWasmPackProfiles {
+                    release: super::GeneratedWasmPackProfile {
+                        wasm_opt: [
+                            "-O",
+                            "--enable-bulk-memory",
+                            "--enable-mutable-globals",
+                            "--enable-sign-ext",
+                            "--enable-nontrapping-float-to-int",
+                            "--enable-reference-types",
+                        ],
+                    },
+                },
+            },
+        });
         let mut bins = vec![GeneratedBinSection {
             name: package_name.to_string(),
             path: "src/main.rs".to_string(),

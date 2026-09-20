@@ -35,9 +35,11 @@ pub enum HydrolysisPreviewTheme {
 }
 
 impl HydrolysisPreviewTheme {
-    const fn installer(self) -> &'static str {
+    /// The Rust expression producing the `hydrolysis::Style` value the
+    /// preview runtimes are constructed with.
+    const fn style(self) -> &'static str {
         match self {
-            Self::Material3 => "hydrolysis_m3::install",
+            Self::Material3 => "hydrolysis_m3::Material3::defaults()",
         }
     }
 
@@ -82,7 +84,7 @@ struct HydrolysisPreviewBindingsTemplate<'a> {
     preview_symbol: &'a str,
     preview_expression: &'a str,
     crate_name_ident: &'a str,
-    preview_theme_installer: &'a str,
+    preview_theme_style: &'a str,
     include_automation: bool,
     semantic_automation_body: &'a str,
 }
@@ -94,7 +96,7 @@ pub struct HydrolysisPreviewRequest<'a> {
     pub project_path: &'a Path,
     /// Preview view source.
     pub source: HydrolysisPreviewSource<'a>,
-    /// Theme package installed into the preview environment.
+    /// Theme package the preview runtimes are constructed with.
     pub theme: HydrolysisPreviewTheme,
     /// Viewport width in logical units.
     pub width: f32,
@@ -151,7 +153,7 @@ pub async fn render_preview_with_hydrolysis(
         RustLinkage::SharedRuntime,
     )
     .await?;
-    stage_hydrolysis_shared_runtime(&binary_path, TargetPlatform::MacOS).await?;
+    stage_hydrolysis_shared_runtime(&project, &binary_path, TargetPlatform::MacOS).await?;
     run_preview_binary(&project, &binary_path, width, height, output_path, scenario).await
 }
 
@@ -199,7 +201,7 @@ pub async fn test_preview_with_hydrolysis(
         RustLinkage::SharedRuntime,
     )
     .await?;
-    stage_hydrolysis_shared_runtime(&binary_path, TargetPlatform::MacOS).await?;
+    stage_hydrolysis_shared_runtime(&project, &binary_path, TargetPlatform::MacOS).await?;
     run_preview_test_binary(&project, &binary_path, width, height).await
 }
 
@@ -278,7 +280,7 @@ async fn write_preview_bindings(
         preview_symbol,
         preview_expression,
         crate_name_ident: crate_name_ident.as_str(),
-        preview_theme_installer: theme.installer(),
+        preview_theme_style: theme.style(),
         include_automation: automation_body.is_some(),
         semantic_automation_body: automation_body.unwrap_or(""),
     }

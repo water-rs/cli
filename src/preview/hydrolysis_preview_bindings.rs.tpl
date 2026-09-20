@@ -29,8 +29,21 @@ pub(crate) fn load_preview_view() -> waterui::AnyView {
 }
 {% endif %}
 
-pub(crate) fn install_preview_theme(env: &mut waterui::env::Environment) {
-    {{ preview_theme_installer }}(env);
+/// The style the preview runtimes are constructed with — the value `main`
+/// hands to `hydrolysis::run(app, style)`.
+pub(crate) fn preview_style() -> impl hydrolysis::Style {
+    {{ preview_theme_style }}
+}
+
+/// The environment previews resolve under.
+///
+/// This goes through the application's own composition root — `app(env)` is
+/// what installs the realizations and options the application configures
+/// (`waterui_map_gpu::install`, provider options, fonts) — so a preview sees
+/// the same environment a run would.
+pub(crate) fn app_environment() -> waterui::env::Environment {
+    let env = waterui::configure_environment!(waterui::env::Environment::new());
+    {{ crate_name_ident }}::app(env).env
 }
 {% if include_automation %}
 

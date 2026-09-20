@@ -214,7 +214,7 @@ pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::
     }
 
     if options.uses_shared_rust_runtime() {
-        RustDynamicLibraries::resolve(&target_dir, &TargetPlatform::Windows.triple())
+        RustDynamicLibraries::resolve(&target_dir, &TargetPlatform::Windows.triple(), project)
             .await?
             .stage(&runtime_dir)
             .await?;

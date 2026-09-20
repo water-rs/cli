@@ -31,17 +31,29 @@ pub const fn lib_extension_for_triple(triple: &Triple) -> &'static str {
     }
 }
 
-/// Resolve the Rust standard-library directory for a target triple.
+/// The rustup toolchain a project's builds run under: the one its own
+/// directory selects, whatever directory the generated crate compiles in.
+///
+/// # Errors
+/// Returns an error when rustup resolves no toolchain for the project.
+pub async fn project_toolchain(project: &Project) -> eyre::Result<String> {
+    Ok(crate::toolchain::rust::project_rustup_toolchain(project.root()).await?)
+}
+
+/// Resolve the Rust standard-library directory for a target triple under
+/// `toolchain`, the rustup toolchain the libraries were built with.
 ///
 /// # Errors
 /// Returns an error if rustc cannot resolve an existing target library directory.
-pub async fn rust_target_libdir(triple: &Triple) -> eyre::Result<PathBuf> {
+pub async fn rust_target_libdir(triple: &Triple, toolchain: &str) -> eyre::Result<PathBuf> {
     let target = triple.to_string();
-    let output = run_command(
-        "rustc",
-        ["--print", "target-libdir", "--target", target.as_str()],
-    )
-    .await?;
+    let host = crate::toolchain::Host::current().with_env("RUSTUP_TOOLCHAIN", toolchain);
+    let output = host
+        .run(
+            "rustc",
+            ["--print", "target-libdir", "--target", target.as_str()],
+        )
+        .await?;
     let libdir = output.trim();
     if libdir.is_empty() {
         bail!("`rustc --print target-libdir --target {target}` returned an empty path");
@@ -156,9 +168,15 @@ pub struct RustDynamicLibraries {
 impl RustDynamicLibraries {
     /// Resolve the shared `WaterUI` runtime and target Rust standard library.
     ///
+    /// The prebuilt `libstd` comes from the toolchain `project` selects — the
+    /// one [`RustBuild`] compiled the runtime under — so the runtime and the
+    /// shipped standard library agree; a runtime built under one toolchain
+    /// and shipped with another's `libstd` fails at launch on the missing
+    /// library hash.
+    ///
     /// # Errors
     /// Returns an error when either required dynamic library is absent or ambiguous.
-    pub async fn resolve(lib_dir: &Path, triple: &Triple) -> eyre::Result<Self> {
+    pub async fn resolve(lib_dir: &Path, triple: &Triple, project: &Project) -> eyre::Result<Self> {
         let file_name = dynamic_library_file_name("waterui_dylib", triple);
         // Cargo emits a dependency's final dylib artifact in `deps/` on stable
         // and at the profile directory root on current nightlies; accept both.
@@ -189,7 +207,8 @@ impl RustDynamicLibraries {
         let standard_library = match staged {
             Ok(path) => path,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let target_libdir = rust_target_libdir(triple).await?;
+                let toolchain = project_toolchain(project).await?;
+                let target_libdir = rust_target_libdir(triple, &toolchain).await?;
                 let resolution_triple = triple.clone();
                 unblock(move || {
                     resolve_rust_standard_library_in(&target_libdir, &resolution_triple)
@@ -459,6 +478,15 @@ impl BuildProfile {
     /// that dependency optimization while the base rises to cover the root
     /// crate and the per-unit debug-assertion switches the override table
     /// does not mention.
+    ///
+    /// A development build links the shared Rust runtime, a `dylib` crate,
+    /// and a `dylib` links the toolchain's prebuilt `std`, which carries the
+    /// `panic_unwind` runtime: under the packaging profile's `panic = "abort"`
+    /// rustc refuses the link ("the linked panic runtime `panic_unwind` is
+    /// not compiled with this crate's panic strategy `abort`"), and under its
+    /// `lto = true` it refuses to prefer dynamic linking at all. The release
+    /// profiles therefore unwind without LTO here; the packaging build keeps
+    /// the manifest's `abort` and LTO.
     fn development_envs(self) -> Vec<(String, OsString)> {
         let entries: &[(&str, &str)] = match self {
             Self::Debug => &[],
@@ -468,9 +496,15 @@ impl BuildProfile {
                 ("CARGO_PROFILE_DEV_DEBUG_ASSERTIONS", "false"),
                 ("CARGO_PROFILE_DEV_OVERFLOW_CHECKS", "false"),
             ],
-            Self::Release => &[("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3")],
+            Self::Release => &[
+                ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3"),
+                ("CARGO_PROFILE_RELEASE_PANIC", "unwind"),
+                ("CARGO_PROFILE_RELEASE_LTO", "off"),
+            ],
             Self::Profiling => &[
                 ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "3"),
+                ("CARGO_PROFILE_RELEASE_PANIC", "unwind"),
+                ("CARGO_PROFILE_RELEASE_LTO", "off"),
                 ("CARGO_PROFILE_RELEASE_DEBUG", "true"),
                 ("CARGO_PROFILE_RELEASE_STRIP", "none"),
             ],
@@ -535,8 +569,13 @@ impl BuildOptions {
     /// says so here rather than at the link step, so that the target directory
     /// and the staged libraries agree with what is actually built.
     #[must_use]
-    pub const fn with_static_runtime(mut self) -> Self {
+    pub fn with_static_runtime(mut self) -> Self {
         self.linkage = RustLinkage::Static;
+        // No shared runtime to link, so the manifest's panic strategy and LTO
+        // stand.
+        self.cargo_envs.retain(|(key, _)| {
+            key != "CARGO_PROFILE_RELEASE_PANIC" && key != "CARGO_PROFILE_RELEASE_LTO"
+        });
         self
     }
 
@@ -924,6 +963,12 @@ impl RustBuild {
         }
     }
 
+    /// Build on behalf of `project`: its framework prepares the crate, and
+    /// cargo runs under the rustup toolchain the project's own directory
+    /// selects — the generated crate sits in the build cache, outside the
+    /// project tree, where rustup would fall back to its default toolchain and
+    /// link the runtime against a `libstd` the project's toolchain does not
+    /// have.
     pub(crate) fn with_project(mut self, project: &Project) -> Self {
         self.project = Some(project.clone());
         self
@@ -1360,6 +1405,7 @@ Automatic meson installation failed: {install_err}\n\n{}",
         for (key, value) in &self.envs {
             cmd.env(key, value);
         }
+        let mut cmd = self.with_project_toolchain_env(cmd).await?;
 
         if !self.rustc_flags.is_empty() {
             let mut rustflags = std::env::var_os("RUSTFLAGS").unwrap_or_default();
@@ -1437,6 +1483,27 @@ Automatic meson installation failed: {install_err}\n\n{}",
         command_output_with_progress(cmd, self.progress.clone())
             .await
             .map_err(RustBuildError::FailToExecuteCargoBuild)
+    }
+
+    /// Run cargo under the rustup toolchain the project's own directory
+    /// selects, so a crate generated outside the project tree (the build
+    /// cache) compiles with the same toolchain as the project instead of
+    /// rustup's default for that directory. A `-Zbuild-std` build names its
+    /// own nightly through [`Self::with_build_std_envs`] instead.
+    async fn with_project_toolchain_env<'a>(
+        &self,
+        cmd: &'a mut Command,
+    ) -> Result<&'a mut Command, RustBuildError> {
+        if self.build_std_toolchain.is_some() {
+            return Ok(cmd);
+        }
+        let Some(project) = &self.project else {
+            return Ok(cmd);
+        };
+        let toolchain = project_toolchain(project).await.map_err(|error| {
+            RustBuildError::FailToBuildRustLibrary(std::io::Error::other(error.to_string()))
+        })?;
+        Ok(cmd.env("RUSTUP_TOOLCHAIN", toolchain))
     }
 
     /// Point a `-Zbuild-std` cargo invocation at the nightly toolchain and at
@@ -2246,8 +2313,39 @@ mod tests {
             "optimized development keeps full debug info: {envs:?}"
         );
 
+        let shared_runtime_envs = [
+            (
+                "CARGO_PROFILE_RELEASE_PANIC".to_string(),
+                OsString::from("unwind"),
+            ),
+            (
+                "CARGO_PROFILE_RELEASE_LTO".to_string(),
+                OsString::from("off"),
+            ),
+        ];
+        for env in &shared_runtime_envs {
+            assert!(
+                BuildOptions::development(BuildProfile::Release)
+                    .cargo_envs()
+                    .contains(env),
+                "a release development build links the shared runtime: missing {env:?}"
+            );
+            assert!(
+                !BuildOptions::development(BuildProfile::Release)
+                    .with_static_runtime()
+                    .cargo_envs()
+                    .contains(env),
+                "a static runtime keeps the manifest's {env:?}"
+            );
+        }
+        let unwind = &shared_runtime_envs[0];
+
         let profiling = BuildOptions::development(BuildProfile::Profiling);
         let envs = profiling.cargo_envs();
+        assert!(
+            envs.contains(unwind),
+            "profiling links the shared runtime too"
+        );
         for key in [
             "CARGO_PROFILE_RELEASE_OPT_LEVEL",
             "CARGO_PROFILE_RELEASE_DEBUG",

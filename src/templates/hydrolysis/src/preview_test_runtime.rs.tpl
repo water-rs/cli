@@ -22,13 +22,14 @@ pub(crate) fn run() {
 }
 
 fn run_semantic(width: f32, height: f32) {
-    let mut env = waterui::configure_environment!(waterui::env::Environment::new());
-    preview_test::install_preview_theme(&mut env);
-    // This environment never passes through `App::new`, which is what
-    // installs the self-drawn realizations for a normal run.
-    waterui::realization::install(&mut env);
+    // The environment is the application's own composition root: `app(env)`
+    // installs the realizations and options the application configures, and
+    // the styled mount applies the preview style's tokens exactly as `main`'s
+    // `hydrolysis::run` style does — component bodies that read Material
+    // tokens resolve them.
     let mut app = ui()
-        .environment(env)
+        .environment(preview_test::app_environment())
+        .theme(preview_test::preview_style())
         .viewport(dimension_to_u32(width), dimension_to_u32(height))
         .mount(preview_test::load_preview_view);
     preview_test::run_semantic_automation(&mut app);

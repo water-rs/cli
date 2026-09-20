@@ -905,7 +905,7 @@ async fn copy_android_build_outputs(
 
     if options.linkage() == RustLinkage::SharedRuntime {
         let triple = AndroidPlatform::new(abi).triple();
-        let libraries = RustDynamicLibraries::resolve(lib_dir, &triple).await?;
+        let libraries = RustDynamicLibraries::resolve(lib_dir, &triple, project).await?;
         libraries.stage(&output_dir).await?;
     } else {
         RustDynamicLibraries::remove_staged(&output_dir, &AndroidPlatform::new(abi).triple())

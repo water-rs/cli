@@ -7,6 +7,23 @@
 	     sub-keys, so the launch screen is declared here: an empty dictionary
 	     is the system-generated launch screen, the named color and image are
 	     the sets the CLI stages into WaterUIAssets.xcassets. -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default</string>
+					<key>UISceneDelegateClassName</key>
+					<string>SceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
 	<key>UILaunchScreen</key>
 	<dict>
 {%- if ctx.launch.has_background %}
