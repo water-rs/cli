@@ -169,6 +169,8 @@ jobs:
   dist:
     name: dist / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Empty for the non-Linux legs, which GitHub reads as "no container".
+    container: ${{ matrix.container }}
     needs: release
     # Binaries belong to the same dispatch as the publish leg: building
     # them on `workflow_run` would only produce artifacts that
@@ -183,10 +185,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux legs link inside manylinux_2_28 (glibc 2.28: Ubuntu
+          # 20.04+, Debian 10+, RHEL 8+). A binary linked on the runner's
+          # own image needs the glibc of that image — `ubuntu-latest` is
+          # 24.04, glibc 2.39 — and does not start on Ubuntu 22.04 (#106).
+          # `min-glibc-version` in dist-workspace.toml states the same 2.28
+          # to the installer.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -206,22 +216,44 @@ jobs:
 
       - uses: ./.github/actions/setup-linux-deps
         if: runner.os == 'Linux'
+        with:
+          package-manager: ${{ matrix.container && 'dnf' || 'apt' }}
 
       - uses: ./.github/actions/install-dxc
         if: runner.os == 'Windows'
 
       - name: Install cargo-dist
+        if: ${{ !matrix.container }}
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-dist@${{ env.DIST_VERSION }}
 
+      # cargo-binstall picks the glibc build for a gnu host; dist's own
+      # installer measures the container's glibc and takes the static musl
+      # build when it is too old.
+      - name: Install cargo-dist (container)
+        if: matrix.container
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            "https://github.com/axodotdev/cargo-dist/releases/download/v${{ env.DIST_VERSION }}/cargo-dist-installer.sh" | sh
+
+      # The manifest goes to stdout; the global build reads it back from
+      # `target/distrib` to embed the archive checksums in the installers.
+      # Without it the installers ship with "no checksums to verify". It is
+      # written outside `target/distrib` first: dist merges every
+      # `*-dist-manifest.json` it finds there, and the shell would create
+      # the (empty) redirect target before dist runs.
       - name: Build artifacts
         shell: bash
         run: |
           dist build \
             --tag "${{ env.TAG }}" \
             --artifacts=local \
-            --target "${{ matrix.target }}"
+            --target "${{ matrix.target }}" \
+            --output-format=json \
+            > dist-manifest.json
+          mv dist-manifest.json "target/distrib/${{ matrix.target }}-dist-manifest.json"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
