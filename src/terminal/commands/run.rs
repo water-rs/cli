@@ -40,7 +40,7 @@ use waterui_cli::{
         },
     },
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
-    project::Project,
+    project::{ManagedBackends, Project},
     web,
     winui::{
         backend::WinUiBackend,
@@ -398,6 +398,25 @@ fn resolve_default_backend_for_project(
     backends[0]
 }
 
+/// The managed native backends a run on `platform` needs opened.
+///
+/// `--platform ios` covers both the physical device and the simulator; the
+/// device that decides between them is selected only after the project is
+/// open, and both build with the same Apple project.
+const fn managed_backends(platform: TargetPlatform) -> ManagedBackends {
+    match platform {
+        TargetPlatform::Ios => ManagedBackends::for_platform(LibTargetPlatform::IOS),
+        TargetPlatform::Macos => ManagedBackends::for_platform(LibTargetPlatform::MacOS),
+        TargetPlatform::Android => ManagedBackends::for_platform(LibTargetPlatform::Android),
+        TargetPlatform::Linux => ManagedBackends::for_platform(LibTargetPlatform::Linux),
+        TargetPlatform::Windows => ManagedBackends::for_platform(LibTargetPlatform::Windows),
+        TargetPlatform::Web => ManagedBackends::for_platform(LibTargetPlatform::Web),
+        TargetPlatform::Esp32s3 => ManagedBackends::for_platform(LibTargetPlatform::Esp32S3),
+        TargetPlatform::Esp32c3 => ManagedBackends::for_platform(LibTargetPlatform::Esp32C3),
+        TargetPlatform::Esp32p4 => ManagedBackends::for_platform(LibTargetPlatform::Esp32P4),
+    }
+}
+
 const fn resolve_platform(platform_override: Option<TargetPlatform>) -> TargetPlatform {
     if let Some(platform) = platform_override {
         return platform;
@@ -517,7 +536,7 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
     }
 
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let project = Project::open(&project_path).await?;
+    let project = Project::open(&project_path, ManagedBackends::NONE).await?;
     let launcher_dir = waterui_cli::tui::ensure_launcher(&project).await?;
 
     let sccache_path = detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await;
@@ -540,8 +559,9 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
 
 async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let mut project = Project::open(&project_path).await?;
     let platform = resolve_platform(args.platform);
+    let managed_backends = managed_backends(platform);
+    let mut project = Project::open(&project_path, managed_backends).await?;
     let backend = resolve_run_backend(&project, platform, args.backend)?;
 
     validate_desktop_backend_platform_on_host(platform, backend)?;
@@ -562,7 +582,9 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunCon
         project.set_esp32_chip(chip).await?;
     }
 
-    let project = ensure_generated_run_backend(shell, &project_path, project, backend).await?;
+    let project =
+        ensure_generated_run_backend(shell, &project_path, project, backend, managed_backends)
+            .await?;
 
     Ok(Some(RunContext {
         project,
@@ -634,6 +656,7 @@ async fn ensure_generated_run_backend(
     project_path: &PathBuf,
     project: Project,
     backend: TargetBackend,
+    managed_backends: ManagedBackends,
 ) -> Result<Project> {
     match backend {
         TargetBackend::Gtk4 if project.is_playground() => {
@@ -642,6 +665,7 @@ async fn ensure_generated_run_backend(
                 shell,
                 project_path,
                 project,
+                managed_backends,
                 needs_reinit,
                 "Initializing GTK4 backend...",
                 "GTK4 backend initialized",
@@ -654,6 +678,7 @@ async fn ensure_generated_run_backend(
                 shell,
                 project_path,
                 project,
+                managed_backends,
                 needs_reinit,
                 "Initializing hydrolysis backend...",
                 "Hydrolysis backend initialized",
@@ -666,6 +691,7 @@ async fn ensure_generated_run_backend(
                 shell,
                 project_path,
                 project,
+                managed_backends,
                 needs_reinit,
                 "Initializing WinUI backend...",
                 "WinUI backend initialized",
@@ -679,6 +705,7 @@ async fn ensure_generated_run_backend(
                 shell,
                 project_path,
                 project,
+                managed_backends,
                 needs_reinit,
                 "Initializing ESP32 backend...",
                 "ESP32 backend initialized",
@@ -693,6 +720,7 @@ async fn ensure_generated_run_backend_impl<T>(
     shell: &Shell,
     project_path: &PathBuf,
     project: Project,
+    managed_backends: ManagedBackends,
     needs_reinit: bool,
     spinner_message: &str,
     success_message: &str,
@@ -706,7 +734,7 @@ where
 
     let spinner = shell.spinner(spinner_message);
     reinit_backend::<T>(&project).await?;
-    let project = Project::open(project_path).await?;
+    let project = Project::open(project_path, managed_backends).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }

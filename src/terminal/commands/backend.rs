@@ -8,7 +8,8 @@ use eyre::{Result, bail};
 
 use crate::shell::Shell;
 use crate::{header, line, note, success, warn};
-use waterui_cli::project::{PackageType, Project};
+use waterui_cli::platform::TargetBackend;
+use waterui_cli::project::{ManagedBackends, PackageType, Project};
 
 /// Backend management command arguments.
 #[derive(ClapArgs, Debug)]
@@ -61,7 +62,12 @@ enum BackendName {
 /// Run the backend command.
 pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     let project_path = crate::project_path::canonicalize(Path::new("."))?;
-    let mut project = Project::open(&project_path).await?;
+    let managed_backends = match &args.command {
+        BackendCommand::Add(add) => ManagedBackends::for_backend(lib_backend(add.backend)),
+        BackendCommand::Remove(remove) => ManagedBackends::for_backend(lib_backend(remove.backend)),
+        BackendCommand::List => ManagedBackends::ALL,
+    };
+    let mut project = Project::open(&project_path, managed_backends).await?;
 
     if project.package_type() != PackageType::App {
         bail!(
@@ -288,6 +294,17 @@ const fn is_backend_configured(project: &Project, backend: BackendName) -> bool 
         BackendName::Hydrolysis => project.hydrolysis_backend().is_some(),
         BackendName::WinUi => project.winui_backend().is_some(),
         BackendName::Esp32 => project.esp32_backend().is_some(),
+    }
+}
+
+const fn lib_backend(backend: BackendName) -> TargetBackend {
+    match backend {
+        BackendName::Apple => TargetBackend::Apple,
+        BackendName::Android => TargetBackend::Android,
+        BackendName::Gtk4 => TargetBackend::Gtk4,
+        BackendName::Hydrolysis => TargetBackend::Hydrolysis,
+        BackendName::WinUi => TargetBackend::WinUi,
+        BackendName::Esp32 => TargetBackend::Dew,
     }
 }
 
