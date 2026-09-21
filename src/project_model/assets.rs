@@ -953,8 +953,15 @@ async fn write_hydrolysis_web_font_manifest(
     Ok(())
 }
 
-/// Returns whether `feature` is enabled on `package` in the project's resolved
-/// dependency graph.
+/// Returns whether `feature` is enabled on `package` in the resolved
+/// dependency graph of `build_manifest`.
+///
+/// `build_manifest` is the `Cargo.toml` of the crate the build actually
+/// compiles — the generated FFI crate for Apple and Android, the generated
+/// backend crate for the self-drawn backends. That crate depends on the app,
+/// so its graph carries both the app's authored dependencies and the backend's
+/// own; resolving any other manifest misses declarations only the backend's
+/// dependencies make.
 ///
 /// Optional `WaterUI` capabilities are cargo features on the FFI crate, and the
 /// native backends must compile the matching component only when the app turned
@@ -965,11 +972,11 @@ async fn write_hydrolysis_web_font_manifest(
 ///
 /// Returns an error when `cargo metadata` cannot be read.
 pub async fn package_feature_enabled(
-    project: &Project,
+    build_manifest: &Path,
     package: &str,
     feature: &str,
 ) -> eyre::Result<bool> {
-    let manifest_path = app_closure_manifest(project);
+    let manifest_path = build_manifest.to_path_buf();
     let metadata = smol::unblock({
         let manifest_path = manifest_path.clone();
         move || {
@@ -979,7 +986,12 @@ pub async fn package_feature_enabled(
         }
     })
     .await
-    .wrap_err("Failed to run cargo metadata")?;
+    .wrap_err_with(|| {
+        format!(
+            "Failed to run cargo metadata on {}",
+            build_manifest.display()
+        )
+    })?;
 
     let Some(resolve) = metadata.resolve.as_ref() else {
         return Ok(false);
@@ -1083,16 +1095,23 @@ const OPTIONAL_CAPABILITIES: &[Capability] = &[
 /// manifest graph would always read them as off — the backend then prunes
 /// components whose symbols the dylib does export.
 ///
+/// `build_manifest` is the manifest of the crate being built — the resolved
+/// graph the feature check reads.
+///
 /// # Errors
 ///
 /// Returns an error when `cargo metadata` cannot be read.
-pub async fn capability_enabled(project: &Project, capability: &str) -> eyre::Result<bool> {
+pub async fn capability_enabled(
+    project: &Project,
+    build_manifest: &Path,
+    capability: &str,
+) -> eyre::Result<bool> {
     let capability = OPTIONAL_CAPABILITIES
         .iter()
         .find(|candidate| candidate.name == capability)
         .unwrap_or_else(|| panic!("unknown WaterUI capability: {capability}"));
     match capability.feature {
-        Some(feature) => package_feature_enabled(project, capability.package, feature).await,
+        Some(feature) => package_feature_enabled(build_manifest, capability.package, feature).await,
         None => project.links_runtime_package(capability.package).await,
     }
 }
@@ -1106,13 +1125,19 @@ pub async fn capability_enabled(project: &Project, capability: &str) -> eyre::Re
 /// choice has to reach its build; reading it back out keeps one declaration in
 /// the app's manifest.
 ///
+/// `build_manifest` is the manifest of the crate being built — the FFI
+/// companion for Apple and Android builds.
+///
 /// # Errors
 ///
 /// Returns an error when `cargo metadata` cannot be read.
-pub async fn capability_ffi_features(project: &Project) -> eyre::Result<Vec<String>> {
+pub async fn capability_ffi_features(
+    project: &Project,
+    build_manifest: &Path,
+) -> eyre::Result<Vec<String>> {
     let mut features = Vec::new();
     for capability in OPTIONAL_CAPABILITIES {
-        if capability_enabled(project, capability.name).await? {
+        if capability_enabled(project, build_manifest, capability.name).await? {
             features.push(format!("waterui-ffi/{}", capability.name));
         }
     }
@@ -1137,12 +1162,18 @@ pub async fn capability_ffi_features(project: &Project) -> eyre::Result<Vec<Stri
 /// its own `app(env)`, the way it installs a browser engine, so no build flag
 /// selects it.
 ///
+/// `build_manifest` is the manifest of the crate being built — the FFI
+/// companion whose `video` feature this list feeds.
+///
 /// # Errors
 ///
 /// Returns an error when `cargo metadata` cannot be read.
-pub async fn self_drawn_realization_features(project: &Project) -> eyre::Result<Vec<String>> {
+pub async fn self_drawn_realization_features(
+    project: &Project,
+    build_manifest: &Path,
+) -> eyre::Result<Vec<String>> {
     let mut features = Vec::new();
-    let opted_in = package_feature_enabled(project, "waterui", "video-gpu").await?
+    let opted_in = package_feature_enabled(build_manifest, "waterui", "video-gpu").await?
         || project.links_runtime_package("waterui-video-gpu").await?;
     if opted_in {
         features.push("waterui-ffi/video".to_string());
@@ -1340,11 +1371,19 @@ mod tests {
 /// Declarations gated behind a cargo feature are skipped unless the resolved
 /// graph actually enabled that feature for the declaring crate.
 ///
+/// The scan runs `cargo metadata` on `build_manifest` — the `Cargo.toml` of
+/// the crate this build compiles, i.e. the generated backend or FFI crate.
+/// That crate depends on the app, so its graph carries both the app's authored
+/// dependencies and the backend's own (a theme crate and friends); resolving
+/// the app's manifest instead would miss the backend's declarations entirely.
+///
 /// # Errors
 ///
 /// Returns an error when `cargo metadata` cannot be read.
-pub async fn scan_required_permissions(project: &Project) -> eyre::Result<Vec<RequiredPermission>> {
-    let manifest_path = app_closure_manifest(project);
+pub async fn scan_required_permissions(
+    build_manifest: &Path,
+) -> eyre::Result<Vec<RequiredPermission>> {
+    let manifest_path = build_manifest.to_path_buf();
     let metadata = smol::unblock({
         let manifest_path = manifest_path.clone();
         move || {
@@ -1354,7 +1393,12 @@ pub async fn scan_required_permissions(project: &Project) -> eyre::Result<Vec<Re
         }
     })
     .await
-    .wrap_err("Failed to run cargo metadata")?;
+    .wrap_err_with(|| {
+        format!(
+            "Failed to run cargo metadata on {}",
+            build_manifest.display()
+        )
+    })?;
 
     let enabled_features: HashMap<&PackageId, HashSet<&str>> = metadata
         .resolve
@@ -1520,6 +1564,7 @@ fn permission_toml_key(key: PermissionKey) -> String {
 #[cfg(test)]
 mod permission_audit_tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn requirement(key: PermissionKey) -> RequiredPermission {
         RequiredPermission {
@@ -1543,6 +1588,92 @@ mod permission_audit_tests {
             }}"#
         );
         serde_json::from_str(&manifest).expect("synthesize a cargo package")
+    }
+
+    /// Writes a minimal compilable crate — `[package]` for `name`, an empty
+    /// `src/lib.rs`, and `extra` verbatim manifest TOML — and returns the
+    /// manifest path a scan can be pointed at.
+    fn write_crate(dir: &Path, name: &str, extra: &str) -> PathBuf {
+        std::fs::create_dir_all(dir.join("src")).expect("crate src dir");
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n{extra}"
+            ),
+        )
+        .expect("crate manifest");
+        std::fs::write(dir.join("src/lib.rs"), "").expect("crate source");
+        manifest
+    }
+
+    /// The scan resolves the graph of the manifest it is handed — the crate
+    /// the build actually compiles. A permission declared only through the
+    /// managed backend's dependency tree is reported from the backend's
+    /// manifest and is invisible from the FFI companion's.
+    #[test]
+    fn a_permission_declared_in_the_built_crates_graph_is_scanned() {
+        let project = tempdir().expect("temp project");
+        // `theme` stands in for a managed backend's own dependency, such as
+        // hydrolysis-m3: the backend crate links it, the FFI crate does not.
+        write_crate(
+            &project.path().join("theme"),
+            "theme",
+            "[package.metadata.waterui.permissions]\n\
+             internet = { reason = \"downloads map styles and vector tiles\" }\n",
+        );
+        let ffi_manifest = write_crate(&project.path().join("ffi"), "app-ffi", "");
+        let backend_manifest = write_crate(
+            &project.path().join("hydrolysis"),
+            "app-hydrolysis",
+            "[dependencies]\ntheme = { path = \"../theme\" }\n",
+        );
+
+        let required = smol::block_on(scan_required_permissions(&backend_manifest))
+            .expect("scan the built crate's graph");
+        assert!(
+            required
+                .iter()
+                .any(|requirement| requirement.package == "theme"
+                    && requirement.key == PermissionKey::Internet
+                    && requirement.evidence == PermissionEvidence::Declared),
+            "the backend graph must report the permission `theme` declares"
+        );
+
+        let ffi = smol::block_on(scan_required_permissions(&ffi_manifest))
+            .expect("scan the ffi crate's graph");
+        assert!(
+            ffi.is_empty(),
+            "the ffi graph does not carry `theme` and must stay silent"
+        );
+    }
+
+    /// `package_feature_enabled` reads the same graph: a feature a dependency
+    /// carries only through the managed backend's manifest reports enabled
+    /// there and absent from the FFI companion's.
+    #[test]
+    fn a_feature_enabled_in_the_built_crates_graph_is_seen() {
+        let project = tempdir().expect("temp project");
+        write_crate(
+            &project.path().join("theme"),
+            "theme",
+            "[features]\nextra = []\n",
+        );
+        let ffi_manifest = write_crate(&project.path().join("ffi"), "app-ffi", "");
+        let backend_manifest = write_crate(
+            &project.path().join("hydrolysis"),
+            "app-hydrolysis",
+            "[dependencies]\ntheme = { path = \"../theme\", features = [\"extra\"] }\n",
+        );
+
+        assert!(
+            smol::block_on(package_feature_enabled(&backend_manifest, "theme", "extra"))
+                .expect("scan the built crate's graph")
+        );
+        assert!(
+            !smol::block_on(package_feature_enabled(&ffi_manifest, "theme", "extra"))
+                .expect("scan the ffi crate's graph")
+        );
     }
 
     #[test]

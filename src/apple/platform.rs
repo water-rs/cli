@@ -133,8 +133,11 @@ pub(crate) async fn apple_ffi_dependency_features(
     project: &Project,
     browser_runtime: BrowserRuntimePlan,
 ) -> eyre::Result<Vec<String>> {
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
     let mut features = vec!["waterui-ffi/c-api".to_string()];
-    features.extend(crate::project_model::assets::capability_ffi_features(project).await?);
+    features.extend(
+        crate::project_model::assets::capability_ffi_features(project, &build_manifest).await?,
+    );
     if browser_runtime.chromium {
         features.push("waterui-ffi/chromium".to_string());
     }
@@ -995,14 +998,19 @@ async fn apple_swift_conditions(project: &Project) -> eyre::Result<Vec<String>> 
     const DEFAULT_COMPONENTS: &[(&str, &str)] =
         &[("gpu", "WATERUI_NO_GPU"), ("media", "WATERUI_NO_MEDIA")];
 
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
     let mut conditions = Vec::new();
     for (capability, condition) in OPTIONAL_COMPONENTS {
-        if crate::project_model::assets::capability_enabled(project, capability).await? {
+        if crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
             conditions.push(format!("-D{condition}"));
         }
     }
     for (capability, condition) in DEFAULT_COMPONENTS {
-        if !crate::project_model::assets::capability_enabled(project, capability).await? {
+        if !crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
             conditions.push(format!("-D{condition}"));
         }
     }
