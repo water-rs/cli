@@ -701,10 +701,16 @@ async fn resolve_android_sdk_paths(host: &Host) -> eyre::Result<(PathBuf, PathBu
 pub(crate) async fn android_ffi_dependency_features(
     project: &Project,
 ) -> eyre::Result<Vec<String>> {
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
     let mut features = vec!["waterui-ffi/android-jni".to_string()];
-    features.extend(crate::project_model::assets::capability_ffi_features(project).await?);
+    features.extend(
+        crate::project_model::assets::capability_ffi_features(project, &build_manifest).await?,
+    );
     // Android has no player or map WaterUI bridges, so it draws both itself.
-    features.extend(crate::project_model::assets::self_drawn_realization_features(project).await?);
+    features.extend(
+        crate::project_model::assets::self_drawn_realization_features(project, &build_manifest)
+            .await?,
+    );
     Ok(features)
 }
 
