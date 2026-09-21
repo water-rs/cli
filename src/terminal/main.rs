@@ -21,8 +21,8 @@ use futures_util::future::{self, Either};
 use tracing_subscriber::EnvFilter;
 
 use commands::{
-    backend, bench, build, channel, clean, completions, create, device, devices, doctor, gc, init,
-    inspector, mcp, package, preview, run, update,
+    backend, bench, build, channel, clean, completions, create, device, devices, doctor, fetch, gc,
+    init, inspector, mcp, package, preview, run, update,
 };
 
 /// `WaterUI` command line interface.
@@ -82,6 +82,9 @@ enum Commands {
 
     /// Garbage-collect stale managed caches.
     Gc(gc::Args),
+
+    /// Download the project's declared fonts into the font cache.
+    Fetch(fetch::Args),
 
     /// Preview a view function as PNG.
     Preview(preview::Args),
@@ -172,6 +175,7 @@ fn main() -> Result<()> {
                     Commands::Device(args) => device::run(&shell, args).await,
                     Commands::Devices(args) => devices::run(&shell, args).await,
                     Commands::Gc(args) => gc::run(&shell, args).await,
+                    Commands::Fetch(args) => fetch::run(&shell, args).await,
                     Commands::Preview(args) => Box::pin(preview::run(&shell, args)).await,
                     Commands::Inspector(args) => inspector::run(&shell, args).await,
                     Commands::Mcp(args) => mcp::run(&shell, args).await,

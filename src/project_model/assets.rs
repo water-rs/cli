@@ -8,7 +8,9 @@
 //! - Copy assets to platform-specific locations
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 
 use cargo_metadata::PackageId;
 use eyre::{Context, OptionExt};
@@ -18,6 +20,7 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use waterui_assets_planner::BundleManifest;
+use zenwave::{Client as _, Method};
 
 use crate::build::BuildProgress;
 use crate::project::Project;
@@ -256,21 +259,29 @@ fn manifest_font_declarations(
 /// declarations.
 ///
 /// `[[assets.font]]` tables in `Water.toml` declare the app's own fonts and
-/// rank ahead of dependency declarations between equal sources. The dependency
-/// scan runs `cargo metadata` on `build_manifest` — the `Cargo.toml` of the
-/// crate this build compiles, i.e. the generated backend or FFI crate — and
-/// parses the `[package.metadata.waterui.assets.font]` sections of every
-/// package in its graph. That crate depends on the app, so the graph carries
-/// both the app's authored dependencies and the backend's own (the theme crate
-/// and friends); scanning the app manifest instead would miss the backend's
-/// declarations entirely.
-///
-/// Fonts with a `required-feature` field will only be included if that feature
-/// is enabled for the declaring package (checked via cargo metadata's resolved graph).
+/// rank ahead of dependency declarations between equal sources; the
+/// dependency half comes from [`scan_crate_font_declarations`].
 pub async fn scan_fonts(
     project: &Project,
     build_manifest: &Path,
 ) -> eyre::Result<Vec<FontDeclaration>> {
+    let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
+    declarations.extend(scan_crate_font_declarations(build_manifest).await?);
+    Ok(declarations)
+}
+
+/// Scans `build_manifest`'s dependency graph for
+/// `[package.metadata.waterui.assets.font]` declarations via `cargo metadata`.
+///
+/// `build_manifest` is the `Cargo.toml` of the crate this build compiles,
+/// i.e. the generated backend or FFI crate. That crate depends on the app, so
+/// the graph carries both the app's authored dependencies and the backend's
+/// own (the theme crate and friends); scanning the app manifest instead
+/// would miss the backend's declarations entirely.
+///
+/// Fonts with a `required-feature` field will only be included if that feature
+/// is enabled for the declaring package (checked via cargo metadata's resolved graph).
+async fn scan_crate_font_declarations(build_manifest: &Path) -> eyre::Result<Vec<FontDeclaration>> {
     debug!(
         "Scanning fonts from dependencies via cargo metadata on {}",
         build_manifest.display()
@@ -384,96 +395,137 @@ pub async fn scan_fonts(
     }
 
     info!("Found {} font declarations from dependencies", fonts.len());
-    let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
-    declarations.extend(fonts);
-    Ok(declarations)
+    Ok(fonts)
 }
 
-/// Resolves and deduplicates font declarations.
+/// Resolves and satisfies font declarations for a build.
+///
+/// Resolution is [`resolve_declarations`]: same `name` → keep only one font,
+/// local > remote > built-in, `Water.toml` ahead of dependencies on a tie.
+/// Satisfaction is [`satisfy_font`]: remote and built-in declarations resolve
+/// to files already in the font cache — a build performs no network access,
+/// so a declaration that is not already cached is an error naming the font,
+/// its URL, and `water fetch`.
+pub async fn resolve_fonts(declarations: Vec<FontDeclaration>) -> eyre::Result<Vec<ResolvedFont>> {
+    let cache_dir = cache_dir()?;
+    let registry = FontRegistry::builtin()?;
+
+    let mut resolved = Vec::new();
+    for decl in resolve_declarations(declarations) {
+        let path = satisfy_font(&decl, &cache_dir, &registry).await?;
+        debug!("Resolved font '{}' -> {}", decl.name, path.display());
+        resolved.push(ResolvedFont {
+            name: decl.name,
+            path,
+        });
+    }
+
+    info!("Resolved {} fonts", resolved.len());
+    Ok(resolved)
+}
+
+/// Deduplicates font declarations into the set a build or a fetch then
+/// satisfies — the resolution half of [`resolve_fonts`], shared so a fetch
+/// can never disagree with the build that follows it.
 ///
 /// Rules:
 /// - Same `name` → keep only one font
 /// - Priority: local > remote > built-in; between equal sources the earlier
 ///   declaration wins, so `Water.toml` overrides a dependency on a tie
-/// - Remote and built-in declarations resolve to files already in the font
-///   cache — a build performs no network access, so a declaration that is not
-///   already cached is an error naming the font, its URL and the cache
-///   directory to pre-seed
-pub async fn resolve_fonts(declarations: Vec<FontDeclaration>) -> eyre::Result<Vec<ResolvedFont>> {
+///
+/// Winners come out sorted by family name so reports read deterministically.
+fn resolve_declarations(declarations: Vec<FontDeclaration>) -> Vec<FontDeclaration> {
     // Group by name
     let mut by_name: HashMap<String, Vec<FontDeclaration>> = HashMap::new();
     for decl in declarations {
         by_name.entry(decl.name.clone()).or_default().push(decl);
     }
 
-    let mut resolved = Vec::new();
-    let cache_dir = cache_dir()?;
-    let registry = FontRegistry::builtin()?;
+    let mut resolved: Vec<FontDeclaration> = by_name
+        .into_values()
+        .map(|mut decls| {
+            // Sort by priority: Local > Remote > BuiltIn, take the first.
+            decls.sort_by_key(|d| match &d.source {
+                FontSource::Local { .. } => 0,
+                FontSource::Remote { .. } => 1,
+                FontSource::BuiltIn => 2,
+            });
+            decls.into_iter().next().unwrap()
+        })
+        .collect();
+    resolved.sort_by(|left, right| left.name.cmp(&right.name));
+    resolved
+}
 
-    for (name, decls) in by_name {
-        // Sort by priority: Local > Remote > BuiltIn
-        let mut sorted = decls;
-        sorted.sort_by_key(|d| match &d.source {
-            FontSource::Local { .. } => 0,
-            FontSource::Remote { .. } => 1,
-            FontSource::BuiltIn => 2,
-        });
-
-        // Take the first (highest priority)
-        let decl = sorted.into_iter().next().unwrap();
-
-        let path = match &decl.source {
-            FontSource::Local {
-                crate_root,
-                relative_path,
-            } => match resolve_local_font_path(crate_root, relative_path) {
-                Ok(Some(full_path)) => full_path,
-                // A declaration that cannot be satisfied is an error, never a
-                // skip: skipping renders the app in whatever face the shaper
-                // falls back to, which is the silent wrong-typeface this
-                // module exists to rule out. A crate-local font missing at
-                // build time means the crate did not package what it
-                // declares — say so, with the path that was expected.
-                Ok(None) => eyre::bail!(
-                    "font '{name}' is declared by {} at '{}', which does not exist in that crate",
-                    decl.crate_name,
-                    crate_root.join(relative_path).display(),
-                ),
-                Err(e) => {
-                    return Err(e).wrap_err_with(|| {
-                        format!(
-                            "font '{name}' has an invalid local path '{}' (declared by {})",
-                            relative_path.display(),
-                            decl.crate_name
-                        )
-                    });
-                }
-            },
-            FontSource::Remote { url } => cached_font(&name, url, &cache_dir).await?,
-            FontSource::BuiltIn => {
-                if let Some(url) = registry.url(&name) {
-                    cached_font(&name, url, &cache_dir).await?
-                } else {
-                    // Declared by name alone and the registry has no such
-                    // family: nothing can satisfy it, so this fails here
-                    // rather than at the first glyph the shaper draws in
-                    // some other face.
-                    eyre::bail!(
-                        "font '{name}' is declared by {} by name alone, but no font of that name \
-                         is in the built-in registry — give the declaration a `local_path` or a \
-                         `remote_path`",
-                        decl.crate_name
-                    )
-                }
-            }
-        };
-
-        debug!("Resolved font '{}' -> {}", name, path.display());
-        resolved.push(ResolvedFont { name, path });
+/// Satisfies one resolved declaration against crate-local files and the font
+/// cache — the build path, which never touches the network.
+///
+/// A declaration that cannot be satisfied is an error, never a skip:
+/// skipping renders the app in whatever face the shaper falls back to, which
+/// is the silent wrong-typeface this module exists to rule out.
+async fn satisfy_font(
+    decl: &FontDeclaration,
+    cache_dir: &Path,
+    registry: &FontRegistry,
+) -> eyre::Result<PathBuf> {
+    let name = &decl.name;
+    match &decl.source {
+        FontSource::Local {
+            crate_root,
+            relative_path,
+        } => match resolve_local_font_path(crate_root, relative_path) {
+            Ok(Some(full_path)) => Ok(full_path),
+            // A crate-local font missing at build time means the crate did
+            // not package what it declares — say so, with the path that was
+            // expected.
+            Ok(None) => Err(unsatisfiable_local_font(
+                decl,
+                &crate_root.join(relative_path),
+            )),
+            Err(e) => Err(e).wrap_err_with(|| {
+                format!(
+                    "font '{name}' has an invalid local path '{}' (declared by {})",
+                    relative_path.display(),
+                    decl.crate_name
+                )
+            }),
+        },
+        FontSource::Remote { url } => cached_font(name, url, cache_dir).await,
+        FontSource::BuiltIn => {
+            let Some(url) = registry.url(name) else {
+                // Declared by name alone and the registry has no such
+                // family: nothing can satisfy it, so this fails here rather
+                // than at the first glyph the shaper draws in some other
+                // face.
+                return Err(unsatisfiable_builtin_font(decl));
+            };
+            cached_font(name, url, cache_dir).await
+        }
     }
+}
 
-    info!("Resolved {} fonts", resolved.len());
-    Ok(resolved)
+/// The report for a crate-local declaration whose file is absent — used by
+/// both the build and `water fetch`, which reports the same thing it cannot
+/// fix.
+fn unsatisfiable_local_font(decl: &FontDeclaration, expected: &Path) -> eyre::Report {
+    eyre::eyre!(
+        "font '{}' is declared by {} at '{}', which does not exist in that crate",
+        decl.name,
+        decl.crate_name,
+        expected.display(),
+    )
+}
+
+/// The report for a by-name declaration the built-in registry does not know —
+/// used by both the build and `water fetch`.
+fn unsatisfiable_builtin_font(decl: &FontDeclaration) -> eyre::Report {
+    eyre::eyre!(
+        "font '{}' is declared by {} by name alone, but no font of that name \
+         is in the built-in registry — give the declaration a `local_path` or a \
+         `remote_path`",
+        decl.name,
+        decl.crate_name
+    )
 }
 
 /// Gets the cache directory holding fonts fetched out of band.
@@ -515,15 +567,30 @@ fn resolve_local_font_path(
 ///
 /// A build performs no network access: when the declaration is not already
 /// cached, this fails naming the font, its URL and the cache directory, so the
-/// user can pre-seed the cache out of band and retry the build.
+/// user can run `water fetch` and retry the build.
 async fn cached_font(name: &str, url: &str, cache_dir: &Path) -> eyre::Result<PathBuf> {
+    cached_font_entry(name, url, cache_dir)
+        .await?
+        .ok_or_else(|| uncached_font_error(name, url, cache_dir))
+}
+
+/// Probes the font cache for the face `url` declares.
+///
+/// `Some` is exactly the path [`cached_font`] resolves to; `None` means
+/// nothing usable is cached and `water fetch` can place it. A zero-length
+/// entry is dropped and reported absent.
+async fn cached_font_entry(
+    name: &str,
+    url: &str,
+    cache_dir: &Path,
+) -> eyre::Result<Option<PathBuf>> {
     // Use URL hash as filename to avoid conflicts
     let hash = sha256_hex(url);
     if is_zip_url(url) {
-        return cached_zip_font(name, url, cache_dir, &hash).await;
+        return cached_zip_font(name, cache_dir, &hash).await;
     }
 
-    cached_file_font(name, url, cache_dir, &hash).await
+    cached_file_font(name, cache_dir, &hash).await
 }
 
 fn is_zip_url(url: &str) -> bool {
@@ -534,10 +601,9 @@ fn is_zip_url(url: &str) -> bool {
 
 async fn cached_zip_font(
     name: &str,
-    url: &str,
     cache_dir: &Path,
     hash: &str,
-) -> eyre::Result<PathBuf> {
+) -> eyre::Result<Option<PathBuf>> {
     let extract_dir = cache_dir.join(hash);
     if extract_dir.exists() {
         debug!(
@@ -545,7 +611,7 @@ async fn cached_zip_font(
             name,
             extract_dir.display()
         );
-        return find_font_file(&extract_dir, name).await;
+        return find_font_file(&extract_dir, name).await.map(Some);
     }
 
     let cache_file = cache_dir.join(format!("{hash}.zip"));
@@ -559,19 +625,20 @@ async fn cached_zip_font(
             let _ = fs::remove_file(&cache_file).await;
         } else {
             debug!("Font '{}' already cached at {}", name, cache_file.display());
-            return find_font_in_extracted_zip(&cache_file, name).await;
+            return find_font_in_extracted_zip(&cache_file, name)
+                .await
+                .map(Some);
         }
     }
 
-    Err(uncached_font_error(name, url, cache_dir, &cache_file))
+    Ok(None)
 }
 
 async fn cached_file_font(
     name: &str,
-    url: &str,
     cache_dir: &Path,
     hash: &str,
-) -> eyre::Result<PathBuf> {
+) -> eyre::Result<Option<PathBuf>> {
     let cache_file = cache_dir.join(format!("{hash}.ttf"));
 
     if let Some(cache_len) = cached_file_len(name, &cache_file).await? {
@@ -584,24 +651,23 @@ async fn cached_file_font(
             let _ = fs::remove_file(&cache_file).await;
         } else {
             debug!("Font '{}' already cached at {}", name, cache_file.display());
-            return Ok(cache_file);
+            return Ok(Some(cache_file));
         }
     }
 
-    Err(uncached_font_error(name, url, cache_dir, &cache_file))
+    Ok(None)
 }
 
 /// The error for a remote font declaration that is not already in the font
-/// cache. Builds perform no network access, so the file has to be fetched out
-/// of band — the message names the font, the URL to fetch, the cache
-/// directory, and the exact cache entry to place it at.
-fn uncached_font_error(name: &str, url: &str, cache_dir: &Path, cache_file: &Path) -> eyre::Report {
+/// cache. Builds perform no network access, so the download is a separate,
+/// opt-in command — the message names the font, the URL it is fetched from,
+/// the cache directory, and `water fetch`.
+fn uncached_font_error(name: &str, url: &str, cache_dir: &Path) -> eyre::Report {
     eyre::eyre!(
         "font '{name}' is declared remote ({url}) but is not in the font cache at {}; \
-         builds never access the network — pre-seed the cache by fetching that URL into \
-         {} and retry the build",
+         builds never access the network — run `water fetch` to download the project's \
+         fonts and retry the build",
         cache_dir.display(),
-        cache_file.display()
     )
 }
 
@@ -617,6 +683,227 @@ async fn cached_file_len(name: &str, cache_file: &Path) -> eyre::Result<Option<u
             )
         }),
     }
+}
+
+/// What seeding the font cache did for one resolved font declaration.
+///
+/// `water fetch` and `water create` report these; a build never produces
+/// them because it never fetches — it turns the same states into errors.
+#[derive(Debug)]
+pub enum FetchOutcome {
+    /// Already satisfied — a crate-local file that exists, or a cache entry
+    /// — so nothing was downloaded.
+    Satisfied {
+        /// Font family name.
+        name: String,
+        /// The file a build resolves this font to.
+        path: PathBuf,
+    },
+    /// The declaration's URL was downloaded into the font cache.
+    Fetched {
+        /// Font family name.
+        name: String,
+        /// The file a build resolves this font to — the `.ttf` cache entry
+        /// itself, or the one face extracted out of a downloaded archive.
+        path: PathBuf,
+    },
+    /// No download can satisfy the declaration: a crate-local file that does
+    /// not exist, or a family name the built-in registry does not know.
+    /// `error` is the same report a build gives it — saying so is the point.
+    Unsatisfiable {
+        /// Font family name.
+        name: String,
+        /// What a build reports for this declaration.
+        error: eyre::Report,
+    },
+}
+
+/// Seeds the font cache with every font a build of `project` would demand.
+///
+/// `water fetch` and the tail of `water create` share this one path:
+/// declarations resolve exactly as a build resolves them —
+/// [`manifest_font_declarations`] plus [`scan_crate_font_declarations`] over
+/// each generated crate manifest that exists, then [`resolve_declarations`]
+/// — and whatever the cache does not already hold is downloaded into the
+/// entry the build then looks for. Builds keep their no-network guarantee;
+/// this is the explicit, opt-in network step.
+///
+/// # Errors
+///
+/// Returns an error when a manifest cannot be scanned or a download fails —
+/// the error names the font and its URL. Declarations fetching can never
+/// satisfy arrive as [`FetchOutcome::Unsatisfiable`] instead, carrying the
+/// same report the build gives them.
+pub async fn seed_font_cache(project: &Project) -> eyre::Result<Vec<FetchOutcome>> {
+    let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
+    for manifest in font_scan_manifests(project) {
+        declarations.extend(scan_crate_font_declarations(&manifest).await?);
+    }
+    fetch_fonts(declarations, &cache_dir()?, download_font).await
+}
+
+/// The crate manifests whose dependency graphs a build of `project` scans
+/// for font declarations: the project crate itself, then each generated
+/// crate that exists under the managed backends root — the FFI companion the
+/// Apple and Android builds read, then the GTK4, Hydrolysis and `WinUI`
+/// backends. (The ESP32 harness declares its fonts as plain file paths, not
+/// crate metadata, so it has no manifest to scan here.)
+///
+/// A generated crate that does not exist yet contributes nothing: whatever
+/// generates it exposes `water fetch` again afterwards.
+fn font_scan_manifests(project: &Project) -> Vec<PathBuf> {
+    let mut manifests = vec![project.root().join("Cargo.toml")];
+    for crate_dir in [
+        project.ffi_crate_path(),
+        project.backend_path::<crate::gtk4::backend::Gtk4Backend>(),
+        project.backend_path::<crate::hydrolysis::backend::HydrolysisBackend>(),
+        project.backend_path::<crate::winui::backend::WinUiBackend>(),
+    ] {
+        let manifest = crate_dir.join("Cargo.toml");
+        if manifest.is_file() {
+            manifests.push(manifest);
+        }
+    }
+    manifests
+}
+
+/// How `fetch_fonts` downloads one URL to a path — a seam a test closes
+/// with a stub so it never reaches the network.
+type FontFetch =
+    for<'a> fn(&'a str, &'a Path) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send + 'a>>;
+
+/// Fetches into `cache_dir` every font `declarations` resolves to.
+///
+/// Resolution is the same [`resolve_fonts`] applies —
+/// [`resolve_declarations`] — so a fetch can never disagree with the build
+/// that follows it, and a declaration already satisfied reports
+/// [`FetchOutcome::Satisfied`] without being downloaded again.
+///
+/// # Errors
+///
+/// A failed download aborts the run with an error naming the font and its
+/// URL; a quiet skip would leave the next build failing on a font this run
+/// was supposed to place.
+async fn fetch_fonts(
+    declarations: Vec<FontDeclaration>,
+    cache_dir: &Path,
+    fetch: FontFetch,
+) -> eyre::Result<Vec<FetchOutcome>> {
+    let registry = FontRegistry::builtin()?;
+    let mut outcomes = Vec::new();
+    for decl in resolve_declarations(declarations) {
+        let outcome = match &decl.source {
+            // Whatever fetching cannot fix — a crate-local file that is not
+            // there — is reported exactly as the build reports it.
+            FontSource::Local { .. } => match satisfy_font(&decl, cache_dir, &registry).await {
+                Ok(path) => FetchOutcome::Satisfied {
+                    name: decl.name.clone(),
+                    path,
+                },
+                Err(error) => FetchOutcome::Unsatisfiable {
+                    name: decl.name.clone(),
+                    error,
+                },
+            },
+            FontSource::Remote { .. } | FontSource::BuiltIn => {
+                match declaration_url(&decl, &registry) {
+                    Some(url) => {
+                        if let Some(path) = cached_font_entry(&decl.name, url, cache_dir).await? {
+                            FetchOutcome::Satisfied {
+                                name: decl.name.clone(),
+                                path,
+                            }
+                        } else {
+                            let path = fetch_remote_font(&decl.name, url, cache_dir, fetch).await?;
+                            FetchOutcome::Fetched {
+                                name: decl.name.clone(),
+                                path,
+                            }
+                        }
+                    }
+                    // Only a `BuiltIn` declaration reaches this arm.
+                    None => FetchOutcome::Unsatisfiable {
+                        name: decl.name.clone(),
+                        error: unsatisfiable_builtin_font(&decl),
+                    },
+                }
+            }
+        };
+        outcomes.push(outcome);
+    }
+    Ok(outcomes)
+}
+
+/// The URL a declaration is fetched from, when it has one: `Remote`
+/// declarations carry their own; `BuiltIn` ones resolve through the
+/// registry; `Local` ones have none.
+fn declaration_url<'a>(decl: &'a FontDeclaration, registry: &'a FontRegistry) -> Option<&'a str> {
+    match &decl.source {
+        FontSource::Remote { url } => Some(url.as_str()),
+        FontSource::BuiltIn => registry.url(&decl.name),
+        FontSource::Local { .. } => None,
+    }
+}
+
+/// Downloads one remote font into the cache entry a build looks for.
+///
+/// `url` lands at `{sha256(url)}.ttf` — or `.zip` for an archive — the same
+/// name the build probes, via a `.partial` sibling so an interrupted
+/// transfer never reads as a cached font. An archive is extracted the way
+/// the build's first resolution extracts it.
+async fn fetch_remote_font(
+    name: &str,
+    url: &str,
+    cache_dir: &Path,
+    fetch: FontFetch,
+) -> eyre::Result<PathBuf> {
+    waterui_assets_core::ensure_http_allowed(url)
+        .map_err(|error| eyre::eyre!("font '{name}' cannot be fetched from {url}: {error}"))?;
+    fs::create_dir_all(cache_dir).await?;
+
+    let hash = sha256_hex(url);
+    let extension = if is_zip_url(url) { "zip" } else { "ttf" };
+    let cache_file = cache_dir.join(format!("{hash}.{extension}"));
+    let partial = cache_dir.join(format!("{hash}.{extension}.partial"));
+    fetch(url, &partial)
+        .await
+        .wrap_err_with(|| format!("font '{name}' could not be fetched from {url}"))?;
+    if fs::metadata(&partial).await?.len() == 0 {
+        let _ = fs::remove_file(&partial).await;
+        eyre::bail!("font '{name}' fetched from {url} is empty");
+    }
+    fs::rename(&partial, &cache_file).await.wrap_err_with(|| {
+        format!(
+            "failed to place font '{name}' fetched from {url} at {}",
+            cache_file.display()
+        )
+    })?;
+
+    if is_zip_url(url) {
+        find_font_in_extracted_zip(&cache_file, name)
+            .await
+            .wrap_err_with(|| format!("font '{name}' fetched from {url}"))
+    } else {
+        Ok(cache_file)
+    }
+}
+
+/// `GET`s `url` into `dest` — the same request shape `framework.rs` and
+/// `browser_runtime.rs` send for their own downloads: a `zenwave` client, a
+/// `GET` under the crate's user agent, streamed to the path.
+fn download_font<'a>(
+    url: &'a str,
+    dest: &'a Path,
+) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut client = zenwave::client();
+        client
+            .method(Method::GET, url)?
+            .header("User-Agent", env!("CARGO_PKG_NAME"))?
+            .download_to_path(dest)
+            .await?;
+        Ok(())
+    })
 }
 
 /// Finds a font file in an extracted zip archive.
@@ -1229,6 +1516,35 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// A `FontFetch` stub for declarations that must never be downloaded.
+    fn must_not_download<'a>(
+        _url: &'a str,
+        _dest: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send + 'a>> {
+        panic!("this declaration has no download to perform")
+    }
+
+    /// A `FontFetch` stub that writes a fake font file to `dest`.
+    fn place_font<'a>(
+        url: &'a str,
+        dest: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send + 'a>> {
+        assert_eq!(url, "https://example.com/inter.ttf");
+        let dest = dest.to_path_buf();
+        Box::pin(async move {
+            std::fs::write(dest, b"font-bytes")?;
+            Ok(())
+        })
+    }
+
+    /// A `FontFetch` stub whose download always fails.
+    fn fail_download<'a>(
+        _url: &'a str,
+        _dest: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<()>> + Send + 'a>> {
+        Box::pin(async { Err(eyre::eyre!("connection refused")) })
+    }
+
     fn manifest_with_fonts(toml_fonts: &str) -> crate::project::Manifest {
         toml::from_str(&format!(
             "[package]\ntype = \"app\"\nname = \"Demo\"\n\
@@ -1292,8 +1608,8 @@ mod tests {
     }
 
     /// A remote declaration that is not already cached must fail naming the
-    /// font, the URL, and the cache directory — and tell the user to pre-seed
-    /// the cache, since builds never access the network.
+    /// font, the URL, and the cache directory — and name `water fetch`, the
+    /// command that downloads it, since builds never access the network.
     #[test]
     fn an_uncached_remote_font_names_the_font_url_and_cache_dir() {
         let cache_dir = tempdir().expect("temp cache dir");
@@ -1313,7 +1629,161 @@ mod tests {
             message.contains(&cache_dir.path().display().to_string()),
             "{message}"
         );
-        assert!(message.contains("pre-seed"), "{message}");
+        assert!(message.contains("water fetch"), "{message}");
+    }
+
+    /// `water fetch` downloads a missing remote font into the cache entry
+    /// the build looks for — `{sha256(url)}.ttf` — and the build's own probe
+    /// then resolves it. The downloader is a stub: a test never reaches the
+    /// real network.
+    #[test]
+    fn fetch_places_a_missing_remote_font_where_the_build_looks() {
+        let cache_dir = tempdir().expect("temp cache dir");
+        let url = "https://example.com/inter.ttf";
+        let expected = cache_dir.path().join(format!("{}.ttf", sha256_hex(url)));
+
+        let outcomes = smol::block_on(fetch_fonts(
+            vec![FontDeclaration {
+                name: "Inter".to_string(),
+                source: FontSource::Remote {
+                    url: url.to_string(),
+                },
+                crate_name: "some-theme".to_string(),
+            }],
+            cache_dir.path(),
+            place_font,
+        ))
+        .expect("fetch succeeds");
+
+        let [FetchOutcome::Fetched { name, path }] = outcomes.as_slice() else {
+            panic!("expected one Fetched outcome, got {outcomes:?}");
+        };
+        assert_eq!(name, "Inter");
+        assert_eq!(
+            path, &expected,
+            "the fetched font lands at the cache entry the build probes"
+        );
+        assert_eq!(
+            fs::read(&expected).expect("read cached font"),
+            b"font-bytes"
+        );
+
+        let resolved = smol::block_on(cached_font("Inter", url, cache_dir.path()))
+            .expect("the build resolves the font the fetch placed");
+        assert_eq!(resolved, expected);
+    }
+
+    /// `water fetch` is a no-op for a font that is already cached: the
+    /// downloader is never invoked and the outcome reports it satisfied.
+    #[test]
+    fn fetch_is_a_no_op_for_a_font_already_in_the_cache() {
+        let cache_dir = tempdir().expect("temp cache dir");
+        let url = "https://example.com/inter.ttf";
+        let cached = cache_dir.path().join(format!("{}.ttf", sha256_hex(url)));
+        fs::write(&cached, b"cached-font").expect("seed the cache entry");
+
+        let outcomes = smol::block_on(fetch_fonts(
+            vec![FontDeclaration {
+                name: "Inter".to_string(),
+                source: FontSource::Remote {
+                    url: url.to_string(),
+                },
+                crate_name: "some-theme".to_string(),
+            }],
+            cache_dir.path(),
+            must_not_download,
+        ))
+        .expect("fetch succeeds");
+
+        let [FetchOutcome::Satisfied { name, path }] = outcomes.as_slice() else {
+            panic!("expected one Satisfied outcome, got {outcomes:?}");
+        };
+        assert_eq!(name, "Inter");
+        assert_eq!(path, &cached);
+    }
+
+    /// A failed download is an error naming the font and its URL — never a
+    /// quiet skip that leaves the next build failing on the same font.
+    #[test]
+    fn a_failed_download_is_an_error_naming_the_font_and_url() {
+        let cache_dir = tempdir().expect("temp cache dir");
+
+        let error = smol::block_on(fetch_fonts(
+            vec![FontDeclaration {
+                name: "Inter".to_string(),
+                source: FontSource::Remote {
+                    url: "https://example.com/inter.ttf".to_string(),
+                },
+                crate_name: "some-theme".to_string(),
+            }],
+            cache_dir.path(),
+            fail_download,
+        ))
+        .expect_err("a failed download must be an error");
+        let message = format!("{error:#}");
+        assert!(message.contains("Inter"), "{message}");
+        assert!(
+            message.contains("https://example.com/inter.ttf"),
+            "{message}"
+        );
+        assert!(message.contains("connection refused"), "{message}");
+    }
+
+    /// A font declared by a name the registry does not know is reported
+    /// exactly as the build reports it — fetching cannot fix it.
+    #[test]
+    fn fetch_reports_an_unknown_builtin_name_the_way_the_build_does() {
+        let cache_dir = tempdir().expect("temp cache dir");
+
+        let outcomes = smol::block_on(fetch_fonts(
+            vec![FontDeclaration {
+                name: "No Such Family".to_string(),
+                source: FontSource::BuiltIn,
+                crate_name: "some-theme".to_string(),
+            }],
+            cache_dir.path(),
+            must_not_download,
+        ))
+        .expect("an unsatisfiable declaration is an outcome, not a fetch error");
+
+        let [FetchOutcome::Unsatisfiable { name, error }] = outcomes.as_slice() else {
+            panic!("expected one Unsatisfiable outcome, got {outcomes:?}");
+        };
+        assert_eq!(name, "No Such Family");
+        let message = format!("{error:#}");
+        assert!(message.contains("No Such Family"), "{message}");
+        assert!(message.contains("some-theme"), "{message}");
+        assert!(message.contains("built-in registry"), "{message}");
+    }
+
+    /// A crate-local font that is missing is reported exactly as the build
+    /// reports it — fetching cannot fix it, and saying so is the point.
+    #[test]
+    fn fetch_reports_a_missing_local_font_the_way_the_build_does() {
+        let cache_dir = tempdir().expect("temp cache dir");
+        let root = tempdir().expect("temp root");
+
+        let outcomes = smol::block_on(fetch_fonts(
+            vec![FontDeclaration {
+                name: "Roboto".to_string(),
+                source: FontSource::Local {
+                    crate_root: root.path().to_path_buf(),
+                    relative_path: PathBuf::from("assets/fonts/Roboto-Variable.ttf"),
+                },
+                crate_name: "some-theme".to_string(),
+            }],
+            cache_dir.path(),
+            must_not_download,
+        ))
+        .expect("an unsatisfiable declaration is an outcome, not a fetch error");
+
+        let [FetchOutcome::Unsatisfiable { name, error }] = outcomes.as_slice() else {
+            panic!("expected one Unsatisfiable outcome, got {outcomes:?}");
+        };
+        assert_eq!(name, "Roboto");
+        let message = format!("{error:#}");
+        assert!(message.contains("Roboto"), "{message}");
+        assert!(message.contains("Roboto-Variable.ttf"), "{message}");
     }
 
     #[test]
