@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3](https://github.com/water-rs/cli/compare/v0.4.2...v0.4.3) - 2026-09-21
+
+### Added
+
+- add water fetch to seed the asset cache ([#144](https://github.com/water-rs/cli/pull/144))
+
+### Fixed
+
+- *(macos)* give backend binaries an rpath that reaches the staged runtime ([#142](https://github.com/water-rs/cli/pull/142))
+- *(ci)* give the nightly preview leg the theme Hydrolysis requires ([#139](https://github.com/water-rs/cli/pull/139))
+- drop the font-manifest probe that scan_fonts replaced ([#141](https://github.com/water-rs/cli/pull/141))
+- *(preview)* call a pump the Hydrolysis runtime still has ([#138](https://github.com/water-rs/cli/pull/138))
+- *(assets)* make font declarations explicit and resolve fonts without network access ([#134](https://github.com/water-rs/cli/pull/134))
+- scan the built crate's manifest for permissions and features ([#137](https://github.com/water-rs/cli/pull/137))
+- *(ci)* make the MSRV job build with the declared floor ([#136](https://github.com/water-rs/cli/pull/136))
+- doctor detects MSVC build tools and dxc, fixes winget-less hosts ([#135](https://github.com/water-rs/cli/pull/135))
+- run macOS app bundles directly so launch crashes surface ([#132](https://github.com/water-rs/cli/pull/132))
+- first-run polish — checksum message, update source, single Project::open, target/package output ([#129](https://github.com/water-rs/cli/pull/129))
+- recover a shared dylib unit without dep-info and clean project units from the shared target ([#128](https://github.com/water-rs/cli/pull/128))
+- *(create)* keep video behind an opt-in `media` feature in the scaffold ([#130](https://github.com/water-rs/cli/pull/130))
+- *(doctor)* check the host's backends outside a project and group items by backend ([#120](https://github.com/water-rs/cli/pull/120))
+- initialise only the managed backends the command's platform needs ([#119](https://github.com/water-rs/cli/pull/119))
+- stage the shared runtime Cargo reported, never a directory probe ([#121](https://github.com/water-rs/cli/pull/121))
+
+### Other
+
+- lint on every OS, and fix the finding that hid behind not doing it ([#131](https://github.com/water-rs/cli/pull/131))
+
 ## [0.4.2](https://github.com/water-rs/cli/compare/v0.4.1...v0.4.2) - 2026-09-20
 
 ### Fixed
