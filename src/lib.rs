@@ -25,6 +25,7 @@ mod workflows;
 
 pub use dependencies::brew;
 pub use platforming::{backend, macos_bundle, package_output, platform};
+pub use project_model::assets::{FetchOutcome, seed_font_cache};
 pub(crate) use project_model::{assets, support_app, templates};
 pub use project_model::{framework, project, project_types, water_dir, web};
 pub use runtime::{build_info, utils};

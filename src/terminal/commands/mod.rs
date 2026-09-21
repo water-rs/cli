@@ -139,6 +139,7 @@ pub mod create;
 pub mod device;
 pub mod devices;
 pub mod doctor;
+pub mod fetch;
 pub mod gc;
 pub mod init;
 pub mod inspector;
