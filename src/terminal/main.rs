@@ -164,7 +164,7 @@ fn main() -> Result<()> {
                     Commands::Backend(args) => backend::run(&shell, args).await,
                     Commands::Run(args) => Box::pin(run::run(&shell, args)).await,
                     Commands::Bench(args) => bench::run(&shell, args).await,
-                    Commands::Build(args) => build::run(&shell, args).await,
+                    Commands::Build(args) => Box::pin(build::run(&shell, args)).await,
 
                     Commands::Package(args) => Box::pin(package::run(&shell, args)).await,
                     Commands::Clean(args) => clean::run(&shell, args).await,

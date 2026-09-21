@@ -3,7 +3,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use eyre::WrapErr as _;
 use smol::process::Command;
 
 use crate::{
@@ -41,7 +40,12 @@ use crate::{
 /// Returns an error when the socket directory under the user's Water home
 /// cannot be created or exists with permissions wider than `0700`.
 pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) -> eyre::Result<()> {
-    for (key, value) in compilation_cache_env(sccache_path)? {
+    let water_home = crate::project_model::water_dir::water_home_dir().ok();
+    #[cfg(unix)]
+    let env = compilation_cache_env_in(sccache_path, water_home.as_deref())?;
+    #[cfg(not(unix))]
+    let env = compilation_cache_env_in(sccache_path, water_home.as_deref());
+    for (key, value) in env {
         command.env(key, value);
     }
     Ok(())
@@ -49,31 +53,42 @@ pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) -
 
 /// The environment a compile command needs for per-user sccache routing, as
 /// `(key, value)` pairs so the whole contract is observable without spawning
-/// a process.
-fn compilation_cache_env(sccache_path: &Path) -> eyre::Result<Vec<(&'static str, OsString)>> {
-    let water_home = crate::project_model::water_dir::water_home_dir().ok();
-    compilation_cache_env_in(sccache_path, water_home.as_deref())
-}
-
-/// `compilation_cache_env` with the Water home supplied — tests inject a
-/// scratch directory so the contract is observable without touching the real
-/// `~/.water` or depending on the machine's home-path length.
+/// a process. The Water home is a parameter so tests can inject a scratch
+/// directory instead of touching the real `~/.water` or depending on the
+/// machine's home-path length. Only unix is fallible: it is the one host
+/// that adds a socket under that home.
+#[cfg(unix)]
 fn compilation_cache_env_in(
     sccache_path: &Path,
-    #[cfg_attr(not(unix), allow(unused))] water_home: Option<&Path>,
+    water_home: Option<&Path>,
 ) -> eyre::Result<Vec<(&'static str, OsString)>> {
-    let mut env = vec![
+    let mut env = base_compilation_cache_env(sccache_path);
+    if let Some(socket) = water_home.map(server_socket_path_in).transpose()?.flatten() {
+        env.push(("SCCACHE_SERVER_UDS", socket.into_os_string()));
+    }
+    Ok(env)
+}
+
+/// `compilation_cache_env_in` for hosts with no per-user socket: the
+/// contract is the fixed pair list, so nothing here can fail.
+#[cfg(not(unix))]
+fn compilation_cache_env_in(
+    sccache_path: &Path,
+    _water_home: Option<&Path>,
+) -> Vec<(&'static str, OsString)> {
+    base_compilation_cache_env(sccache_path)
+}
+
+/// The pairs every host sets: `RUSTC_WRAPPER` routes each compile through
+/// sccache and `SCCACHE_SERVER_PORT` namespaces its server to the user.
+fn base_compilation_cache_env(sccache_path: &Path) -> Vec<(&'static str, OsString)> {
+    vec![
         ("RUSTC_WRAPPER", sccache_path.as_os_str().to_os_string()),
         (
             "SCCACHE_SERVER_PORT",
             per_user_server_port().to_string().into(),
         ),
-    ];
-    #[cfg(unix)]
-    if let Some(socket) = water_home.map(server_socket_path_in).transpose()?.flatten() {
-        env.push(("SCCACHE_SERVER_UDS", socket.into_os_string()));
-    }
-    Ok(env)
+    ]
 }
 
 /// `sun_path` is 108 bytes on Linux and 104 on macOS/BSD, including the
@@ -108,6 +123,8 @@ fn server_socket_path_in(water_home: &Path) -> eyre::Result<Option<PathBuf>> {
 #[cfg(unix)]
 fn ensure_private_socket_dir(dir: &Path) -> eyre::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    use eyre::WrapErr as _;
 
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -186,20 +203,22 @@ fn user_identity() -> String {
     unsafe {
         let mut token = std::mem::zeroed();
         assert!(
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) != 0,
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) != 0,
             "OpenProcessToken failed: {}",
             io::Error::last_os_error()
         );
         let mut size = 0u32;
-        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
-        let mut buffer = vec![0u8; size as usize];
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut size);
+        // The buffer is read back as a TOKEN_USER, so it needs that struct's
+        // alignment — u64 elements guarantee it on every Windows target.
+        let mut buffer = vec![0u64; (size as usize).div_ceil(std::mem::size_of::<u64>())];
         let queried = size > 0
             && GetTokenInformation(
                 token,
                 TokenUser,
                 buffer.as_mut_ptr().cast(),
                 size,
-                &mut size,
+                &raw mut size,
             ) != 0;
         CloseHandle(token);
         assert!(
@@ -210,7 +229,7 @@ fn user_identity() -> String {
         let sid = (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid;
         let mut text = std::ptr::null_mut::<u16>();
         assert!(
-            ConvertSidToStringSidW(sid, &mut text) != 0,
+            ConvertSidToStringSidW(sid, &raw mut text) != 0,
             "ConvertSidToStringSidW failed: {}",
             io::Error::last_os_error()
         );
@@ -535,9 +554,13 @@ mod host_tests {
     #[test]
     fn compilation_cache_env_sets_wrapper_port_and_unix_socket() {
         let water_home = tempfile::tempdir().expect("water home");
+        #[cfg(unix)]
         let env =
             compilation_cache_env_in(Path::new("/toolchain/bin/sccache"), Some(water_home.path()))
                 .expect("a scratch Water home yields the env");
+        #[cfg(not(unix))]
+        let env =
+            compilation_cache_env_in(Path::new("/toolchain/bin/sccache"), Some(water_home.path()));
 
         assert!(
             env.contains(&("RUSTC_WRAPPER", OsString::from("/toolchain/bin/sccache"))),
