@@ -333,6 +333,25 @@ jobs:
             2>&1 | tee ../e2e-logs/package-app.log) || fail "water package failed"
           grep -q 'Packaged at' e2e-logs/package-app.log \
             || fail "water package produced no artifact line"
+
+          # `water preview` compiles a crate the CLI generates from its own
+          # templates against the framework the project resolves, which no
+          # other phase does: a template naming an API the framework has
+          # renamed compiles nowhere else, and shipped broken for exactly that
+          # reason. macOS is the only runner whose preview platform exists, and
+          # the Hydrolysis renderer is the template that has a runtime to drift
+          # from, so it runs there regardless of the leg's own backend.
+          if [ "$E2E_PLATFORM" = "macos" ]; then
+            phase "water preview e2eplay (hydrolysis)"
+            # The Hydrolysis renderer draws every widget itself, so it has no
+            # implicit theme to fall back on and refuses to guess one: the
+            # backend requires `--theme` and errors out without it.
+            (cd e2eplay && water preview main --platform macos --backend hydrolysis \
+              --theme material3 \
+              --output ../e2e-logs/preview.png 2>&1 | tee ../e2e-logs/preview.log) \
+              || fail "water preview failed"
+            [ -s e2e-logs/preview.png ] || fail "water preview wrote no PNG"
+          fi
           SCRIPT
 
       - name: Doctor, scaffold, build, package and run as the fresh user (Windows)

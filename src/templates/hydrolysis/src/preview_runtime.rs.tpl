@@ -117,7 +117,7 @@ fn settle(runtime: &mut HeadlessRuntime, at: Instant) {
 fn run_image(output_path: &Path, width: f32, height: f32) {
     let mut runtime = new_runtime(width, height);
     let frame_at = Instant::now();
-    let _ = runtime.pump_semantic_at(frame_at);
+    let _ = runtime.pump_at(false, frame_at);
     settle(&mut runtime, frame_at);
     let result = runtime.pump_at(true, frame_at);
     let snapshot = result
@@ -145,7 +145,7 @@ fn run_scenario(
     });
     let mut runtime = new_runtime(width, height);
     let started_at = Instant::now();
-    let _ = runtime.pump_semantic_at(started_at);
+    let _ = runtime.pump_at(false, started_at);
     let mut event_index = 0usize;
     for capture_ms in captures_ms {
         while event_index < events.len() && events[event_index].at_ms <= *capture_ms {

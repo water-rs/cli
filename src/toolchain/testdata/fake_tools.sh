@@ -395,6 +395,11 @@ cmake | meson | wasm-pack | sh | bash)
 brew)
     exit 0
     ;;
+vswhere)
+    # `-products * -requires ... -property installationPath -latest` answers
+    # with the install path, or nothing when no VC.Tools install exists.
+    respond_or_empty VSWHERE
+    ;;
 winget)
     case "$1 $2" in
         "list --id")

@@ -16,7 +16,7 @@ use smol::unblock;
 use tracing::info;
 
 use crate::{
-    build::{BuildOptions, BuildProgress},
+    build::{BuildOptions, BuildProgress, BuiltTarget},
     device::Artifact,
     esp32::{backend::Esp32Backend, chip::Esp32Chip},
     platform::{PackageOptions, TargetPlatform},
@@ -202,10 +202,6 @@ fn esp32_chip(project: &Project) -> eyre::Result<Esp32Chip> {
         .resolved_chip()
 }
 
-fn esp32_target_triple(project: &Project) -> eyre::Result<&'static str> {
-    Ok(esp32_chip(project)?.target_triple())
-}
-
 async fn espflash_path() -> eyre::Result<PathBuf> {
     which("espflash")
         .await
@@ -231,7 +227,7 @@ fn command_failure_details(output: &std::process::Output) -> String {
 /// # Errors
 /// Returns an error if the harness is missing, the Espressif toolchain is not
 /// installed, or Cargo fails.
-pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Result<PathBuf> {
+pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Result<BuiltTarget> {
     let backend_path = project.backend_path::<Esp32Backend>();
     let cargo_toml = backend_path.join("Cargo.toml");
     let backend_target_dir = project.toolchain_target_dir("esp32").await?;
@@ -290,41 +286,24 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
     // toolchain target directory hosts other projects' builds, so a bare
     // `<profile>/<name>` lookup is not evidence the file is this project's.
     let crate_name = project.esp32_backend_crate_name();
-    crate::build::reported_artifact(
+    let artifact = crate::build::reported_artifact(
         &output.stdout,
         &backend_path,
         crate::build::CargoTarget::Binary(crate_name.as_str()),
         None,
     )
-    .map_err(|error| eyre!("failed to resolve the built ESP32 firmware: {error}"))
-}
-
-/// Resolve the built ESP32 firmware ELF path for the given profile.
-///
-/// # Errors
-/// Returns an error if neither the canonical nor underscored firmware binary can be found.
-pub async fn built_esp32_binary_path(project: &Project, profile: &str) -> eyre::Result<PathBuf> {
-    let target_dir = project
-        .toolchain_target_dir("esp32")
-        .await?
-        .join(esp32_target_triple(project)?)
-        .join(profile);
-    let binary_name = project.esp32_backend_crate_name();
-    let binary_path = target_dir.join(binary_name.as_str());
-    if binary_path.exists() {
-        return Ok(binary_path);
-    }
-
-    let underscored_path = target_dir.join(binary_name.as_str().replace('-', "_"));
-    if underscored_path.exists() {
-        return Ok(underscored_path);
-    }
-
-    bail!(
-        "Built ESP32 firmware not found at {} or {}",
-        binary_path.display(),
-        underscored_path.display()
-    );
+    .map_err(|error| eyre!("failed to resolve the built ESP32 firmware: {error}"))?;
+    let profile_dir = artifact.parent().ok_or_else(|| {
+        eyre!(
+            "ESP32 firmware artifact has no profile directory: {}",
+            artifact.display()
+        )
+    })?;
+    Ok(BuiltTarget {
+        profile_dir: profile_dir.to_path_buf(),
+        artifact,
+        shared_runtime: None,
+    })
 }
 
 /// Build, then flash and monitor the firmware on a board, or emulate it.
@@ -346,19 +325,19 @@ pub async fn run_esp32(
     let elf = build_esp32(project, options).await?;
 
     match device {
-        Some("qemu") => qemu_esp32(project, chip, &elf).await,
-        Some(port) => flash_and_monitor(project, &elf, Some(port)).await,
+        Some("qemu") => qemu_esp32(project, chip, &elf.artifact).await,
+        Some(port) => flash_and_monitor(project, &elf.artifact, Some(port)).await,
         None => {
             #[cfg(feature = "esp32")]
             {
                 if let Some(port) = detect_esp_serial_port().await? {
                     info!("Flashing ESP32 board on {port}");
-                    return flash_and_monitor(project, &elf, Some(&port)).await;
+                    return flash_and_monitor(project, &elf.artifact, Some(&port)).await;
                 }
             }
             if locate_qemu(chip).await.is_some() {
                 info!("No ESP32 board connected; running under QEMU");
-                return qemu_esp32(project, chip, &elf).await;
+                return qemu_esp32(project, chip, &elf.artifact).await;
             }
             bail!(
                 "No ESP32 board connected and no QEMU for {chip_id} installed.\n\
@@ -528,13 +507,17 @@ async fn save_flash_image(
 ///
 /// # Errors
 /// Returns an error when the built ELF is missing or image merging fails.
-pub async fn package_esp32(project: &Project, options: PackageOptions) -> eyre::Result<Artifact> {
+pub async fn package_esp32(
+    project: &Project,
+    options: PackageOptions,
+    built: &BuiltTarget,
+) -> eyre::Result<Artifact> {
     let profile = if options.is_debug() {
         "debug"
     } else {
         "release"
     };
-    let elf = built_esp32_binary_path(project, profile).await?;
+    let elf = &built.artifact;
     let backend_path = project.backend_path::<Esp32Backend>();
     let chip = esp32_chip(project)?;
 
@@ -543,7 +526,7 @@ pub async fn package_esp32(project: &Project, options: PackageOptions) -> eyre::
     // The image ships under the product name; the tagged crate name is
     // internal to the shared Cargo target directory.
     let image_path = dist_dir.join(format!("{}.bin", project.esp32_binary_name()));
-    save_flash_image(&backend_path, chip, &elf, &image_path).await?;
+    save_flash_image(&backend_path, chip, elf, &image_path).await?;
 
     Ok(Artifact::new(project.bundle_identifier(), image_path))
 }

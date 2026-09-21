@@ -122,7 +122,7 @@ impl PreviewTool {
     /// Renders the requested preview, writes the PNG under the project's
     /// managed build cache, and returns it as image content.
     async fn render(&self, args: PreviewArgs) -> ToolResult {
-        match self.run(&args).await {
+        match Box::pin(self.run(&args)).await {
             Ok((output_path, bytes)) => {
                 info!(path = %output_path.display(), "preview rendered");
                 ToolResult::image(bytes, "image/png")
@@ -186,7 +186,7 @@ impl PreviewTool {
                         "Expression preview is currently supported only with the `hydrolysis` backend."
                     );
                 };
-                self.render_support_app(&request, function_path, symbol, &output_path)
+                Box::pin(self.render_support_app(&request, function_path, symbol, &output_path))
                     .await?;
             }
         }
@@ -258,7 +258,7 @@ impl Tool for PreviewTool {
     }
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
-        Ok(self.render(args).await)
+        Ok(Box::pin(self.render(args)).await)
     }
 }
 

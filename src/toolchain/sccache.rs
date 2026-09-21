@@ -3,7 +3,6 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use eyre::WrapErr as _;
 use smol::process::Command;
 
 use crate::{
@@ -11,6 +10,7 @@ use crate::{
     toolchain::linux::{
         LinuxPackageManagerError, has_supported_package_manager, install_named_packages,
     },
+    toolchain::managed_tool::{self, ManagedTool, ManagedToolError},
     toolchain::winget::{WingetInstallError, ensure_package_installed},
     toolchain::{Host, Installation, Toolchain, ToolchainError},
     utils::{CommandError, sccache_install_hint, sccache_upgrade_hint},
@@ -41,7 +41,12 @@ use crate::{
 /// Returns an error when the socket directory under the user's Water home
 /// cannot be created or exists with permissions wider than `0700`.
 pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) -> eyre::Result<()> {
-    for (key, value) in compilation_cache_env(sccache_path)? {
+    let water_home = crate::project_model::water_dir::water_home_dir().ok();
+    #[cfg(unix)]
+    let env = compilation_cache_env_in(sccache_path, water_home.as_deref())?;
+    #[cfg(not(unix))]
+    let env = compilation_cache_env_in(sccache_path, water_home.as_deref());
+    for (key, value) in env {
         command.env(key, value);
     }
     Ok(())
@@ -49,31 +54,42 @@ pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) -
 
 /// The environment a compile command needs for per-user sccache routing, as
 /// `(key, value)` pairs so the whole contract is observable without spawning
-/// a process.
-fn compilation_cache_env(sccache_path: &Path) -> eyre::Result<Vec<(&'static str, OsString)>> {
-    let water_home = crate::project_model::water_dir::water_home_dir().ok();
-    compilation_cache_env_in(sccache_path, water_home.as_deref())
-}
-
-/// `compilation_cache_env` with the Water home supplied — tests inject a
-/// scratch directory so the contract is observable without touching the real
-/// `~/.water` or depending on the machine's home-path length.
+/// a process. The Water home is a parameter so tests can inject a scratch
+/// directory instead of touching the real `~/.water` or depending on the
+/// machine's home-path length. Only unix is fallible: it is the one host
+/// that adds a socket under that home.
+#[cfg(unix)]
 fn compilation_cache_env_in(
     sccache_path: &Path,
-    #[cfg_attr(not(unix), allow(unused))] water_home: Option<&Path>,
+    water_home: Option<&Path>,
 ) -> eyre::Result<Vec<(&'static str, OsString)>> {
-    let mut env = vec![
+    let mut env = base_compilation_cache_env(sccache_path);
+    if let Some(socket) = water_home.map(server_socket_path_in).transpose()?.flatten() {
+        env.push(("SCCACHE_SERVER_UDS", socket.into_os_string()));
+    }
+    Ok(env)
+}
+
+/// `compilation_cache_env_in` for hosts with no per-user socket: the
+/// contract is the fixed pair list, so nothing here can fail.
+#[cfg(not(unix))]
+fn compilation_cache_env_in(
+    sccache_path: &Path,
+    _water_home: Option<&Path>,
+) -> Vec<(&'static str, OsString)> {
+    base_compilation_cache_env(sccache_path)
+}
+
+/// The pairs every host sets: `RUSTC_WRAPPER` routes each compile through
+/// sccache and `SCCACHE_SERVER_PORT` namespaces its server to the user.
+fn base_compilation_cache_env(sccache_path: &Path) -> Vec<(&'static str, OsString)> {
+    vec![
         ("RUSTC_WRAPPER", sccache_path.as_os_str().to_os_string()),
         (
             "SCCACHE_SERVER_PORT",
             per_user_server_port().to_string().into(),
         ),
-    ];
-    #[cfg(unix)]
-    if let Some(socket) = water_home.map(server_socket_path_in).transpose()?.flatten() {
-        env.push(("SCCACHE_SERVER_UDS", socket.into_os_string()));
-    }
-    Ok(env)
+    ]
 }
 
 /// `sun_path` is 108 bytes on Linux and 104 on macOS/BSD, including the
@@ -108,6 +124,8 @@ fn server_socket_path_in(water_home: &Path) -> eyre::Result<Option<PathBuf>> {
 #[cfg(unix)]
 fn ensure_private_socket_dir(dir: &Path) -> eyre::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    use eyre::WrapErr as _;
 
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -186,20 +204,22 @@ fn user_identity() -> String {
     unsafe {
         let mut token = std::mem::zeroed();
         assert!(
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) != 0,
+            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) != 0,
             "OpenProcessToken failed: {}",
             io::Error::last_os_error()
         );
         let mut size = 0u32;
-        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
-        let mut buffer = vec![0u8; size as usize];
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &raw mut size);
+        // The buffer is read back as a TOKEN_USER, so it needs that struct's
+        // alignment — u64 elements guarantee it on every Windows target.
+        let mut buffer = vec![0u64; (size as usize).div_ceil(std::mem::size_of::<u64>())];
         let queried = size > 0
             && GetTokenInformation(
                 token,
                 TokenUser,
                 buffer.as_mut_ptr().cast(),
                 size,
-                &mut size,
+                &raw mut size,
             ) != 0;
         CloseHandle(token);
         assert!(
@@ -210,7 +230,7 @@ fn user_identity() -> String {
         let sid = (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid;
         let mut text = std::ptr::null_mut::<u16>();
         assert!(
-            ConvertSidToStringSidW(sid, &mut text) != 0,
+            ConvertSidToStringSidW(sid, &raw mut text) != 0,
             "ConvertSidToStringSidW failed: {}",
             io::Error::last_os_error()
         );
@@ -239,10 +259,18 @@ pub struct Sccache;
 impl Sccache {
     /// Get the path to the `sccache` executable if available.
     ///
+    /// `PATH` first, then the managed install under `~/.water/tools`.
+    ///
     /// # Errors
-    /// Returns an error if `sccache` is not found in the system PATH.
+    /// Returns an error if `sccache` is not found in the system PATH or the
+    /// managed tools.
     pub async fn path(&self, host: &Host) -> Result<PathBuf, which::Error> {
-        host.which("sccache").await
+        match host.which("sccache").await {
+            Ok(path) => Ok(path),
+            Err(error) => managed_tool::sccache()
+                .and_then(|tool| tool.binary_path(host))
+                .ok_or(error),
+        }
     }
 
     /// Check if sccache is available on `host` without returning an error.
@@ -261,8 +289,14 @@ const MINIMUM_SCCACHE_VERSION: &str = "0.9.0";
 /// build gets the port fallback and keeps working, but a check that cannot
 /// name the installed version — or finds one below the floor — reports it
 /// instead of letting a quietly-shared host-wide server resurface.
-async fn check_sccache_version(host: &Host) -> Result<(), ToolchainError<SccacheInstallation>> {
-    let Ok(output) = host.output("sccache", ["--version"]).await else {
+///
+/// A managed install (`~/.water/tools`) is a pinned release — its version is
+/// known by construction, so only `PATH` copies need this probe.
+async fn check_sccache_version(
+    host: &Host,
+    sccache_path: PathBuf,
+) -> Result<(), ToolchainError<SccacheInstallation>> {
+    let Ok(output) = host.output(&sccache_path, ["--version"]).await else {
         return Err(ToolchainError::unfixable(
             "sccache is installed but `sccache --version` could not run",
             format!(
@@ -313,27 +347,43 @@ async fn check_sccache_version(host: &Host) -> Result<(), ToolchainError<Sccache
     Ok(())
 }
 
+/// What a missing `sccache` on Windows resolves to: `winget` when present,
+/// otherwise a pinned release archive unpacked under `~/.water/tools` — no
+/// package manager required.
+async fn missing_sccache_on_windows(host: &Host) -> ToolchainError<SccacheInstallation> {
+    if host.which("winget").await.is_ok() {
+        ToolchainError::fixable(SccacheInstallation::Winget)
+    } else if let Some(tool) = managed_tool::sccache() {
+        ToolchainError::fixable(SccacheInstallation::Managed(tool))
+    } else {
+        ToolchainError::unfixable(
+            "sccache is missing and this host has no usable installer",
+            format!(
+                "Install sccache manually with {} and ensure `sccache` is available in PATH.",
+                sccache_install_hint()
+            ),
+        )
+    }
+}
+
 impl Toolchain for Sccache {
     type Installation = SccacheInstallation;
 
     async fn check(&self, host: &Host) -> Result<(), ToolchainError<Self::Installation>> {
-        if host.which("sccache").await.is_ok() {
-            check_sccache_version(host).await
+        if let Ok(sccache_path) = host.which("sccache").await {
+            check_sccache_version(host, sccache_path).await
+        } else if managed_tool::sccache()
+            .and_then(|tool| tool.binary_path(host))
+            .is_some()
+        {
+            // A managed copy is a pinned, checksum-verified release — its
+            // version is known by construction.
+            Ok(())
         } else if cfg!(target_os = "windows") {
-            if host.which("winget").await.is_ok() {
-                Err(ToolchainError::fixable(SccacheInstallation))
-            } else {
-                Err(ToolchainError::unfixable(
-                    "sccache not found and winget is unavailable",
-                    format!(
-                        "Install Microsoft App Installer to provide winget, or install manually with {}.",
-                        sccache_install_hint()
-                    ),
-                ))
-            }
+            Err(missing_sccache_on_windows(host).await)
         } else if cfg!(target_os = "macos") {
             if host.which("brew").await.is_ok() {
-                Err(ToolchainError::fixable(SccacheInstallation))
+                Err(ToolchainError::fixable(SccacheInstallation::Brew))
             } else {
                 Err(ToolchainError::unfixable(
                     "sccache not found and Homebrew is unavailable",
@@ -345,7 +395,7 @@ impl Toolchain for Sccache {
             }
         } else if cfg!(target_os = "linux") {
             if has_supported_package_manager(host).await {
-                Err(ToolchainError::fixable(SccacheInstallation))
+                Err(ToolchainError::fixable(SccacheInstallation::PackageManager))
             } else {
                 Err(ToolchainError::unfixable(
                     "sccache is missing and no supported package manager was found",
@@ -364,9 +414,20 @@ impl Toolchain for Sccache {
     }
 }
 
-/// Installation plan for `sccache`.
+/// Installation plan for `sccache` — the strategy `check` selected for this
+/// host.
 #[derive(Debug, Clone)]
-pub struct SccacheInstallation;
+pub enum SccacheInstallation {
+    /// `brew install sccache`.
+    Brew,
+    /// `winget install Mozilla.sccache`.
+    Winget,
+    /// The host's Linux package manager.
+    PackageManager,
+    /// A pinned, checksum-verified release archive unpacked under
+    /// `~/.water/tools` — no package manager required.
+    Managed(ManagedTool),
+}
 
 /// Errors that can occur during `sccache` installation.
 #[derive(Debug, thiserror::Error)]
@@ -395,37 +456,34 @@ pub enum FailToInstallSccache {
     )]
     UnsupportedPackageManager,
 
-    /// Unsupported platform error.
-    #[error(
-        "Automatic installation of sccache is not supported on this platform. \
-         Install manually with: cargo install sccache"
-    )]
-    UnsupportedPlatform,
+    /// The managed archive install failed.
+    #[error(transparent)]
+    Managed(#[from] ManagedToolError),
 }
 
 impl Installation for SccacheInstallation {
     type Error = FailToInstallSccache;
 
     async fn install(&self, host: &Host) -> Result<(), Self::Error> {
-        if cfg!(target_os = "macos") {
-            let brew = Brew::default();
-
-            brew.check(host)
+        match self {
+            Self::Brew => {
+                let brew = Brew::default();
+                brew.check(host)
+                    .await
+                    .map_err(|_| FailToInstallSccache::BrewNotFound)?;
+                brew.install(host, "sccache").await?;
+                Ok(())
+            }
+            Self::Winget => ensure_package_installed(host, "Mozilla.sccache")
                 .await
-                .map_err(|_| FailToInstallSccache::BrewNotFound)?;
-            brew.install(host, "sccache").await?;
-
-            Ok(())
-        } else if cfg!(target_os = "windows") {
-            ensure_package_installed(host, "Mozilla.sccache")
+                .map_err(map_winget_error_for_sccache),
+            Self::PackageManager => install_named_packages(host, &["sccache"])
                 .await
-                .map_err(map_winget_error_for_sccache)
-        } else if cfg!(target_os = "linux") {
-            install_named_packages(host, &["sccache"])
-                .await
-                .map_err(map_linux_error_for_sccache)
-        } else {
-            Err(FailToInstallSccache::UnsupportedPlatform)
+                .map_err(map_linux_error_for_sccache),
+            Self::Managed(tool) => {
+                tool.install(host).await?;
+                Ok(())
+            }
         }
     }
 }
@@ -535,9 +593,13 @@ mod host_tests {
     #[test]
     fn compilation_cache_env_sets_wrapper_port_and_unix_socket() {
         let water_home = tempfile::tempdir().expect("water home");
+        #[cfg(unix)]
         let env =
             compilation_cache_env_in(Path::new("/toolchain/bin/sccache"), Some(water_home.path()))
                 .expect("a scratch Water home yields the env");
+        #[cfg(not(unix))]
+        let env =
+            compilation_cache_env_in(Path::new("/toolchain/bin/sccache"), Some(water_home.path()));
 
         assert!(
             env.contains(&("RUSTC_WRAPPER", OsString::from("/toolchain/bin/sccache"))),
@@ -641,9 +703,78 @@ mod host_tests {
     fn missing_without_installer_is_unfixable() {
         let machine = TestMachine::new();
         let result = check(&machine);
+        // Windows hosts have the managed-archive fallback, so a bare Windows
+        // machine is fixable even without winget; elsewhere no package
+        // manager means manual.
+        if cfg!(target_os = "windows") && crate::toolchain::managed_tool::sccache().is_some() {
+            assert!(
+                matches!(result, Err(ToolchainError::Fixable(_))),
+                "missing sccache on Windows without winget falls back to the managed archive: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ToolchainError::Unfixable(_))),
+                "missing sccache without a package manager must be unfixable: {result:?}"
+            );
+        }
+    }
+
+    /// A Windows host without `winget` gets the managed archive — fixable,
+    /// never a pointer at another prerequisite installer.
+    #[test]
+    fn windows_host_without_winget_is_fixable_managed() {
+        let machine = TestMachine::new();
+        let host = machine.host(Vec::<(String, String)>::new());
+        let result = smol::block_on(super::missing_sccache_on_windows(&host));
+        match crate::toolchain::managed_tool::sccache() {
+            Some(_) => assert!(
+                matches!(
+                    result,
+                    ToolchainError::Fixable(SccacheInstallation::Managed(_))
+                ),
+                "no winget must fall back to the managed archive: {result:?}"
+            ),
+            None => assert!(
+                matches!(result, ToolchainError::Unfixable(_)),
+                "no managed build for this architecture must be unfixable: {result:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn windows_host_with_winget_prefers_winget() {
+        let machine = TestMachine::new();
+        machine.install("winget");
+        let host = machine.host(Vec::<(String, String)>::new());
+        let result = smol::block_on(super::missing_sccache_on_windows(&host));
         assert!(
-            matches!(result, Err(ToolchainError::Unfixable(_))),
-            "missing sccache without a package manager must be unfixable: {result:?}"
+            matches!(result, ToolchainError::Fixable(SccacheInstallation::Winget)),
+            "winget stays preferred when present: {result:?}"
+        );
+    }
+
+    /// A pinned sccache unpacked under `~/.water/tools` satisfies the check
+    /// — its version is known by construction, so no `--version` run is
+    /// needed — even though nothing named `sccache` is on `PATH`.
+    #[test]
+    fn ok_when_sccache_is_managed() {
+        let machine = TestMachine::new();
+        let Some(tool) = crate::toolchain::managed_tool::sccache() else {
+            return; // this architecture has no managed build
+        };
+        let host = machine.host(Vec::<(String, String)>::new());
+        let install_dir = tool.install_dir(&host).unwrap();
+        machine.file(
+            install_dir
+                .join(&tool.binary)
+                .strip_prefix(machine.root())
+                .unwrap(),
+            "",
+        );
+        let result = smol::block_on(Sccache.check(&host));
+        assert!(
+            result.is_ok(),
+            "a managed sccache must satisfy the check: {result:?}"
         );
     }
 

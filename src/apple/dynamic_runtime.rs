@@ -1,24 +1,13 @@
 //! Shared `WaterUI` runtime linkage for dynamically loaded Apple modules.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use eyre::{Context as _, Result, bail};
 
 use crate::utils::run_command_os;
 
-pub const FILE_NAME: &str = "libwaterui_dylib.dylib";
 pub const INSTALL_NAME: &str = "@rpath/libwaterui_dylib.dylib";
-
-pub fn build_path(lib_dir: &Path) -> PathBuf {
-    // Cargo emits a dependency's final dylib artifact in `deps/` on stable and
-    // at the profile directory root on current nightlies; accept both.
-    let root = lib_dir.join(FILE_NAME);
-    if root.is_file() {
-        return root;
-    }
-    lib_dir.join("deps").join(FILE_NAME)
-}
 
 pub async fn prepare_host_runtime(path: &Path) -> Result<()> {
     require_runtime(path)?;
@@ -72,10 +61,9 @@ pub async fn set_rpath_install_name(path: &Path, file_name: &str) -> Result<()> 
     Ok(())
 }
 
-pub async fn retarget_module(module_path: &Path, build_lib_dir: &Path) -> Result<()> {
-    let runtime_path = build_path(build_lib_dir);
-    require_runtime(&runtime_path)?;
-    let current_install_name = install_name(&runtime_path).await?;
+pub async fn retarget_module(module_path: &Path, runtime_path: &Path) -> Result<()> {
+    require_runtime(runtime_path)?;
+    let current_install_name = install_name(runtime_path).await?;
     if current_install_name != INSTALL_NAME {
         run_command_os(
             "install_name_tool",

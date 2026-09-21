@@ -21,7 +21,9 @@ use crate::{
         toolchain::{AndroidNdk, AndroidSdk, Java, Kotlin, java_proxy_properties_from_env},
     },
     assets::{self, ResolvedFont},
-    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{
+        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
+    },
     device::Artifact,
     platform::{PackageOptions, TargetPlatform},
     project::Project,
@@ -409,7 +411,11 @@ impl AndroidPlatform {
     ///
     /// # Errors
     /// Returns an error if the build fails.
-    pub async fn build(&self, project: &Project, options: BuildOptions) -> eyre::Result<PathBuf> {
+    pub async fn build(
+        &self,
+        project: &Project,
+        options: BuildOptions,
+    ) -> eyre::Result<BuiltTarget> {
         // Only an app that will `dlopen` WaterUI modules — the preview support
         // app — ships the shared Rust runtime. `-Cprefer-dynamic` on Android
         // cannot resolve `std` to rustup's prebuilt `libstd.so` (its LOAD
@@ -422,9 +428,11 @@ impl AndroidPlatform {
         } else {
             options.with_static_runtime()
         };
-        // Resolve fonts BEFORE cargo build - this ensures icons.json is downloaded
+        // Resolve fonts BEFORE cargo build - this ensures icons.json is present
         // for crates like fontawesome7 that need it during build.rs
-        let font_declarations = crate::assets::scan_fonts(project).await?;
+        let font_declarations =
+            crate::assets::scan_fonts(project, &project.ffi_crate_path().join("Cargo.toml"))
+                .await?;
         let _resolved_fonts = crate::assets::resolve_fonts(font_declarations).await?;
 
         let abi = self.abi();
@@ -447,11 +455,10 @@ impl AndroidPlatform {
             &options,
             abi,
             &build_context.ndk_path,
-            &built_target.profile_dir,
-            &built_target.artifact,
+            &built_target,
         )
         .await?;
-        Ok(built_target.profile_dir)
+        Ok(built_target)
     }
 
     /// Clean all jniLibs directories to remove stale libraries from previous builds.
@@ -696,10 +703,16 @@ async fn resolve_android_sdk_paths(host: &Host) -> eyre::Result<(PathBuf, PathBu
 pub(crate) async fn android_ffi_dependency_features(
     project: &Project,
 ) -> eyre::Result<Vec<String>> {
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
     let mut features = vec!["waterui-ffi/android-jni".to_string()];
-    features.extend(crate::project_model::assets::capability_ffi_features(project).await?);
+    features.extend(
+        crate::project_model::assets::capability_ffi_features(project, &build_manifest).await?,
+    );
     // Android has no player or map WaterUI bridges, so it draws both itself.
-    features.extend(crate::project_model::assets::self_drawn_realization_features(project).await?);
+    features.extend(
+        crate::project_model::assets::self_drawn_realization_features(project, &build_manifest)
+            .await?,
+    );
     Ok(features)
 }
 
@@ -888,8 +901,7 @@ async fn copy_android_build_outputs(
     options: &BuildOptions,
     abi: AndroidAbi,
     ndk_path: &Path,
-    lib_dir: &Path,
-    source_lib: &Path,
+    built_target: &BuiltTarget,
 ) -> eyre::Result<()> {
     let output_dir = options.output_dir().map_or_else(
         || {
@@ -901,11 +913,15 @@ async fn copy_android_build_outputs(
         std::path::Path::to_path_buf,
     );
     fs::create_dir_all(&output_dir).await?;
-    copy_file(source_lib, &output_dir.join("libwaterui_app.so")).await?;
+    copy_file(
+        &built_target.artifact,
+        &output_dir.join("libwaterui_app.so"),
+    )
+    .await?;
 
     if options.linkage() == RustLinkage::SharedRuntime {
         let triple = AndroidPlatform::new(abi).triple();
-        let libraries = RustDynamicLibraries::resolve(lib_dir, &triple, project).await?;
+        let libraries = RustDynamicLibraries::resolve(built_target, &triple, project).await?;
         libraries.stage(&output_dir).await?;
     } else {
         RustDynamicLibraries::remove_staged(&output_dir, &AndroidPlatform::new(abi).triple())
@@ -1069,7 +1085,8 @@ async fn copy_assets_and_fonts(
     .await?;
 
     // Scan and resolve dependency fonts
-    let font_declarations = assets::scan_fonts(project).await?;
+    let font_declarations =
+        assets::scan_fonts(project, &project.ffi_crate_path().join("Cargo.toml")).await?;
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
 

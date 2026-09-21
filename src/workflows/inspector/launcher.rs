@@ -9,7 +9,7 @@ use tracing::info;
 use crate::build::{BuildOptions, BuildProfile, BuildProgress};
 use crate::device::{Device, Local, RunOptions, Running};
 use crate::platform::TargetPlatform;
-use crate::project::Project;
+use crate::project::{ManagedBackends, Project};
 use crate::runtime_compat::runtime_profile_tag;
 use crate::runtime_fingerprint::{compute_runtime_fingerprint, runtime_package_identity};
 use crate::support_app;
@@ -76,6 +76,27 @@ impl InspectorSession {
     }
 }
 
+/// The build target the inspector app runs on for `platform`.
+const fn inspector_target_platform(platform: InspectorPlatform) -> TargetPlatform {
+    match platform {
+        InspectorPlatform::Macos => TargetPlatform::MacOS,
+        InspectorPlatform::IosSimulator => TargetPlatform::IOSSimulator,
+        InspectorPlatform::Android => TargetPlatform::Android,
+    }
+}
+
+async fn open_inspector_project(
+    inspector_app_path: &Path,
+    platform: InspectorPlatform,
+) -> Result<Project> {
+    Project::open(
+        inspector_app_path,
+        ManagedBackends::for_platform(inspector_target_platform(platform)),
+    )
+    .await
+    .wrap_err("Failed to open inspector support app project")
+}
+
 /// Launch (or relaunch) an inspector support app.
 ///
 /// # Errors
@@ -91,9 +112,7 @@ pub async fn launch_inspector_session(
     let inspector_app_path = inspector_support_path()?;
     ensure_inspector_support_app(&inspector_app_path, &requirements).await?;
 
-    let project = Project::open(&inspector_app_path)
-        .await
-        .wrap_err("Failed to open inspector support app project")?;
+    let project = open_inspector_project(&inspector_app_path, platform).await?;
 
     let mut run_options = RunOptions::new();
     run_options.insert_env_var(

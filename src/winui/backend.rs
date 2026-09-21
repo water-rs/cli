@@ -131,7 +131,7 @@ impl Backend for WinUiBackend {
         project: &Project,
         _platform: TargetPlatform,
         options: BuildOptions,
-    ) -> eyre::Result<PathBuf> {
+    ) -> eyre::Result<crate::build::BuiltTarget> {
         build_winui(project, options).await
     }
 
@@ -140,8 +140,9 @@ impl Backend for WinUiBackend {
         project: &Project,
         _platform: TargetPlatform,
         options: PackageOptions,
+        built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
-        package_winui(project, options).await
+        package_winui(project, options, built).await
     }
 
     async fn clean(&self, project: &Project, _platform: TargetPlatform) -> eyre::Result<()> {

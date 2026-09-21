@@ -17,12 +17,12 @@ use waterui_cli::{
     apple::platform::build_rust_lib,
     apple::toolchain::AppleSdk,
     backend::reinit_backend,
-    build::{BuildOptions, BuildProfile},
+    build::{BuildOptions, BuildProfile, BuiltTarget},
     esp32::{backend::Esp32Backend, platform::build_esp32},
     gtk4::{backend::Gtk4Backend, platform::build_gtk4},
     hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
     platform::TargetPlatform as LibTargetPlatform,
-    project::{PackageType, Project},
+    project::{ManagedBackends, PackageType, Project},
     winui::{backend::WinUiBackend, platform::build_winui},
 };
 
@@ -140,7 +140,8 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
 
 async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<BuildContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let mut project = Project::open(&project_path).await?;
+    let managed_backends = ManagedBackends::for_platform(lib_platform(args.platform));
+    let mut project = Project::open(&project_path, managed_backends).await?;
     ensure_app_project(&project)?;
 
     let backend = resolve_and_validate_backend(args)?;
@@ -158,7 +159,7 @@ async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<Buil
         project.set_esp32_chip(chip).await?;
     }
 
-    let project = ensure_generated_backend_ready(shell, &project_path, project, backend).await?;
+    let project = ensure_generated_backend_ready(shell, project, backend).await?;
     let build_options = build_options(shell, args, backend).await;
 
     Ok(Some(BuildContext {
@@ -212,7 +213,6 @@ fn ensure_backend_configured(project: &Project, backend: TargetBackend) -> Resul
 
 async fn ensure_generated_backend_ready(
     shell: &Shell,
-    project_path: &PathBuf,
     project: Project,
     backend: TargetBackend,
 ) -> Result<Project> {
@@ -220,8 +220,7 @@ async fn ensure_generated_backend_ready(
         TargetBackend::Gtk4 if Gtk4Backend::requires_regeneration(&project).await? => {
             reinitialize_generated_backend::<Gtk4Backend>(
                 shell,
-                project_path,
-                &project,
+                project,
                 "Re-initializing GTK4 backend...",
                 "GTK4 backend re-initialized",
             )
@@ -230,8 +229,7 @@ async fn ensure_generated_backend_ready(
         TargetBackend::Hydrolysis if HydrolysisBackend::requires_regeneration(&project).await? => {
             reinitialize_generated_backend::<HydrolysisBackend>(
                 shell,
-                project_path,
-                &project,
+                project,
                 "Re-initializing hydrolysis backend...",
                 "Hydrolysis backend re-initialized",
             )
@@ -240,8 +238,7 @@ async fn ensure_generated_backend_ready(
         TargetBackend::WinUi if WinUiBackend::requires_regeneration(&project).await? => {
             reinitialize_generated_backend::<WinUiBackend>(
                 shell,
-                project_path,
-                &project,
+                project,
                 "Re-initializing WinUI backend...",
                 "WinUI backend re-initialized",
             )
@@ -250,8 +247,7 @@ async fn ensure_generated_backend_ready(
         TargetBackend::Dew if Esp32Backend::requires_regeneration(&project)? => {
             reinitialize_generated_backend::<Esp32Backend>(
                 shell,
-                project_path,
-                &project,
+                project,
                 "Re-initializing ESP32 backend...",
                 "ESP32 backend re-initialized",
             )
@@ -263,8 +259,7 @@ async fn ensure_generated_backend_ready(
 
 async fn reinitialize_generated_backend<T>(
     shell: &Shell,
-    project_path: &PathBuf,
-    project: &Project,
+    project: Project,
     spinner_message: &str,
     success_message: &str,
 ) -> Result<Project>
@@ -272,8 +267,7 @@ where
     T: waterui_cli::backend::Backend,
 {
     let spinner = shell.spinner(spinner_message);
-    reinit_backend::<T>(project).await?;
-    let project = Project::open(project_path).await?;
+    reinit_backend::<T>(&project).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -363,7 +357,7 @@ async fn check_build_toolchain(
     Ok(())
 }
 
-async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<PathBuf> {
+async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<BuiltTarget> {
     let spinner = shell.spinner("Compiling...");
     let result = shell
         .display_output(async {
@@ -411,12 +405,12 @@ async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Re
 
 fn handle_build_result(
     shell: &Shell,
-    result: Result<PathBuf>,
+    result: Result<BuiltTarget>,
     output_dir: Option<PathBuf>,
 ) -> Result<()> {
     match result {
-        Ok(output_path) => {
-            success!(shell, "Build output at {}", output_path.display());
+        Ok(built) => {
+            success!(shell, "Build output at {}", built.profile_dir.display());
             if let Some(output_dir) = output_dir {
                 success!(shell, "Copied library to {}", output_dir.display());
             }
@@ -578,7 +572,7 @@ async fn build_for_apple(
     platform: TargetPlatform,
     arch: Option<TargetArch>,
     options: BuildOptions,
-) -> Result<PathBuf> {
+) -> Result<BuiltTarget> {
     match (platform, arch) {
         (TargetPlatform::Ios, None | Some(TargetArch::Arm64)) => {
             build_rust_lib(project, LibTargetPlatform::IOS, options).await
@@ -625,7 +619,7 @@ async fn build_for_android(
     project: &Project,
     arch: Option<TargetArch>,
     options: BuildOptions,
-) -> Result<PathBuf> {
+) -> Result<BuiltTarget> {
     let abi = android_abi(arch.unwrap_or(TargetArch::Arm64));
     AndroidPlatform::new(abi).build(project, options).await
 }

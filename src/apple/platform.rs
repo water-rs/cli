@@ -21,7 +21,9 @@ use crate::{
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
     assets::{self, ResolvedFont},
-    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{
+        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
+    },
     device::Artifact,
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
@@ -70,14 +72,6 @@ impl AppleHostLibrary {
         match self {
             Self::Archive => "staticlib",
             Self::Dynamic => "cdylib",
-        }
-    }
-
-    /// Extension Cargo gives the built artifact.
-    const fn built_extension(self) -> &'static str {
-        match self {
-            Self::Archive => "a",
-            Self::Dynamic => "dylib",
         }
     }
 
@@ -139,8 +133,11 @@ pub(crate) async fn apple_ffi_dependency_features(
     project: &Project,
     browser_runtime: BrowserRuntimePlan,
 ) -> eyre::Result<Vec<String>> {
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
     let mut features = vec!["waterui-ffi/c-api".to_string()];
-    features.extend(crate::project_model::assets::capability_ffi_features(project).await?);
+    features.extend(
+        crate::project_model::assets::capability_ffi_features(project, &build_manifest).await?,
+    );
     if browser_runtime.chromium {
         features.push("waterui-ffi/chromium".to_string());
     }
@@ -170,10 +167,11 @@ pub async fn build_rust_lib(
     project: &Project,
     platform: TargetPlatform,
     options: BuildOptions,
-) -> eyre::Result<PathBuf> {
-    // Resolve fonts BEFORE cargo build - this ensures icons.json is downloaded
+) -> eyre::Result<BuiltTarget> {
+    // Resolve fonts BEFORE cargo build - this ensures icons.json is present
     // for crates like fontawesome7 that need it during build.rs
-    let font_declarations = crate::assets::scan_fonts(project).await?;
+    let font_declarations =
+        crate::assets::scan_fonts(project, &project.ffi_crate_path().join("Cargo.toml")).await?;
     let _resolved_fonts = crate::assets::resolve_fonts(font_declarations).await?;
     let browser_runtime_plan = project
         .browser_runtime_plan(platform, TargetBackend::Apple)
@@ -211,7 +209,6 @@ pub async fn build_rust_lib(
     }
     build = build.with_target_dir(project.water_target_dir(options.linkage()).await?);
     let built_target = build.build_lib(options.is_release()).await?;
-    let lib_dir = built_target.profile_dir.clone();
     // The helper `[[bin]]` exists only when the manifest declared it — the
     // application's linked engine, not chromium alone — so the build gates
     // on the manifest's own predicate or Cargo reports `no bin target`.
@@ -235,13 +232,13 @@ pub async fn build_rust_lib(
         copy_file(&built_target.artifact, &dest_lib).await?;
         remove_superseded_host_library(output_dir, host_library).await?;
         if options.linkage() == RustLinkage::SharedRuntime {
-            let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple, project).await?;
+            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
             dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
             libraries.stage(output_dir).await?;
         }
     }
 
-    Ok(lib_dir)
+    Ok(built_target)
 }
 
 /// Resolve the deployment-target environment variable an Apple build must carry.
@@ -606,6 +603,7 @@ pub async fn package_apple(
     project: &Project,
     platform: TargetPlatform,
     options: PackageOptions,
+    built: &BuiltTarget,
 ) -> eyre::Result<Artifact> {
     let backend = project
         .apple_backend()
@@ -652,14 +650,9 @@ pub async fn package_apple(
     } else {
         RustLinkage::Static
     };
-    let lib_dir = RustBuild::new(project.ffi_crate_path(), triple.clone())
-        .with_target_dir(project.water_target_dir(linkage).await?)
-        .lib_output_dir(!options.is_debug())
-        .await
-        .wrap_err("Failed to resolve native FFI crate target directory")?;
+    let lib_dir = &built.profile_dir;
     let host_library = AppleHostLibrary::for_linkage(linkage);
-    let lib_name = project.ffi_crate_name().replace('-', "_");
-    let source_lib = lib_dir.join(format!("lib{lib_name}.{}", host_library.built_extension()));
+    let source_lib = &built.artifact;
 
     // Get SDK name - must be an Apple platform
     let sdk_name = platform
@@ -693,7 +686,7 @@ pub async fn package_apple(
     }
 
     let shared_runtime = if options.uses_shared_rust_runtime() {
-        let libraries = RustDynamicLibraries::resolve(&lib_dir, &triple, project).await?;
+        let libraries = RustDynamicLibraries::resolve(built, &triple, project).await?;
         dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
         libraries.stage(&products_dir).await?;
         Some(libraries)
@@ -702,7 +695,7 @@ pub async fn package_apple(
         None
     };
 
-    let native_link_inputs = collect_apple_native_link_inputs(&lib_dir).await?;
+    let native_link_inputs = collect_apple_native_link_inputs(lib_dir).await?;
     for archive in &native_link_inputs.archives {
         let file_name = archive.file_name().ok_or_else(|| {
             eyre::eyre!(
@@ -833,12 +826,8 @@ pub async fn package_apple(
 
     #[cfg(target_os = "macos")]
     if platform == TargetPlatform::MacOS && browser_runtime_plan.requires_cef() {
-        browser_runtime::stage_macos_app(
-            browser_runtime_plan,
-            &lib_dir,
-            &app_path.join("Contents"),
-        )
-        .await?;
+        browser_runtime::stage_macos_app(browser_runtime_plan, lib_dir, &app_path.join("Contents"))
+            .await?;
         // Helper bundles wrap the helper `[[bin]]`, which the manifest
         // declares only when the application links the CEF engine crate —
         // chromium alone stages the runtime but builds no helper.
@@ -904,7 +893,8 @@ async fn copy_assets_and_fonts(
     .await?;
 
     // Scan and resolve dependency fonts
-    let font_declarations = assets::scan_fonts(project).await?;
+    let font_declarations =
+        assets::scan_fonts(project, &project.ffi_crate_path().join("Cargo.toml")).await?;
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
 
@@ -1010,14 +1000,19 @@ async fn apple_swift_conditions(project: &Project) -> eyre::Result<Vec<String>> 
     const DEFAULT_COMPONENTS: &[(&str, &str)] =
         &[("gpu", "WATERUI_NO_GPU"), ("media", "WATERUI_NO_MEDIA")];
 
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
     let mut conditions = Vec::new();
     for (capability, condition) in OPTIONAL_COMPONENTS {
-        if crate::project_model::assets::capability_enabled(project, capability).await? {
+        if crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
             conditions.push(format!("-D{condition}"));
         }
     }
     for (capability, condition) in DEFAULT_COMPONENTS {
-        if !crate::project_model::assets::capability_enabled(project, capability).await? {
+        if !crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
             conditions.push(format!("-D{condition}"));
         }
     }

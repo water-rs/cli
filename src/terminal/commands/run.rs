@@ -40,7 +40,7 @@ use waterui_cli::{
         },
     },
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
-    project::Project,
+    project::{ManagedBackends, Project},
     web,
     winui::{
         backend::WinUiBackend,
@@ -398,6 +398,25 @@ fn resolve_default_backend_for_project(
     backends[0]
 }
 
+/// The managed native backends a run on `platform` needs opened.
+///
+/// `--platform ios` covers both the physical device and the simulator; the
+/// device that decides between them is selected only after the project is
+/// open, and both build with the same Apple project.
+const fn managed_backends(platform: TargetPlatform) -> ManagedBackends {
+    match platform {
+        TargetPlatform::Ios => ManagedBackends::for_platform(LibTargetPlatform::IOS),
+        TargetPlatform::Macos => ManagedBackends::for_platform(LibTargetPlatform::MacOS),
+        TargetPlatform::Android => ManagedBackends::for_platform(LibTargetPlatform::Android),
+        TargetPlatform::Linux => ManagedBackends::for_platform(LibTargetPlatform::Linux),
+        TargetPlatform::Windows => ManagedBackends::for_platform(LibTargetPlatform::Windows),
+        TargetPlatform::Web => ManagedBackends::for_platform(LibTargetPlatform::Web),
+        TargetPlatform::Esp32s3 => ManagedBackends::for_platform(LibTargetPlatform::Esp32S3),
+        TargetPlatform::Esp32c3 => ManagedBackends::for_platform(LibTargetPlatform::Esp32C3),
+        TargetPlatform::Esp32p4 => ManagedBackends::for_platform(LibTargetPlatform::Esp32P4),
+    }
+}
+
 const fn resolve_platform(platform_override: Option<TargetPlatform>) -> TargetPlatform {
     if let Some(platform) = platform_override {
         return platform;
@@ -472,17 +491,16 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // The dev-server guard is held for the app's whole run: dropping it —
     // on app exit, normal return, or the Ctrl-C future-drop — kills the
     // bundler child (`kill_on_drop`).
-    let (running, _dev_server) = shell
-        .display_output(build_and_run(
-            shell,
-            &host,
-            &context.project,
-            context.platform,
-            context.backend,
-            selection,
-            config,
-        ))
-        .await?;
+    let (running, _dev_server) = Box::pin(shell.display_output(build_and_run(
+        shell,
+        &host,
+        &context.project,
+        context.platform,
+        context.backend,
+        selection,
+        config,
+    )))
+    .await?;
 
     line!(shell);
     note!(shell, "Press Ctrl+C to stop the application");
@@ -517,7 +535,7 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
     }
 
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let project = Project::open(&project_path).await?;
+    let project = Project::open(&project_path, ManagedBackends::NONE).await?;
     let launcher_dir = waterui_cli::tui::ensure_launcher(&project).await?;
 
     let sccache_path = detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await;
@@ -540,8 +558,9 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
 
 async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let mut project = Project::open(&project_path).await?;
     let platform = resolve_platform(args.platform);
+    let managed_backends = managed_backends(platform);
+    let mut project = Project::open(&project_path, managed_backends).await?;
     let backend = resolve_run_backend(&project, platform, args.backend)?;
 
     validate_desktop_backend_platform_on_host(platform, backend)?;
@@ -562,7 +581,7 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunCon
         project.set_esp32_chip(chip).await?;
     }
 
-    let project = ensure_generated_run_backend(shell, &project_path, project, backend).await?;
+    let project = ensure_generated_run_backend(shell, project, backend).await?;
 
     Ok(Some(RunContext {
         project,
@@ -631,7 +650,6 @@ fn ensure_run_backend_ready(project: &Project, backend: TargetBackend) -> Result
 
 async fn ensure_generated_run_backend(
     shell: &Shell,
-    project_path: &PathBuf,
     project: Project,
     backend: TargetBackend,
 ) -> Result<Project> {
@@ -640,7 +658,6 @@ async fn ensure_generated_run_backend(
             let needs_reinit = Gtk4Backend::requires_regeneration(&project).await?;
             ensure_generated_run_backend_impl::<Gtk4Backend>(
                 shell,
-                project_path,
                 project,
                 needs_reinit,
                 "Initializing GTK4 backend...",
@@ -652,7 +669,6 @@ async fn ensure_generated_run_backend(
             let needs_reinit = HydrolysisBackend::requires_regeneration(&project).await?;
             ensure_generated_run_backend_impl::<HydrolysisBackend>(
                 shell,
-                project_path,
                 project,
                 needs_reinit,
                 "Initializing hydrolysis backend...",
@@ -664,7 +680,6 @@ async fn ensure_generated_run_backend(
             let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
             ensure_generated_run_backend_impl::<WinUiBackend>(
                 shell,
-                project_path,
                 project,
                 needs_reinit,
                 "Initializing WinUI backend...",
@@ -677,7 +692,6 @@ async fn ensure_generated_run_backend(
                 project.esp32_backend().is_none() || Esp32Backend::requires_regeneration(&project)?;
             ensure_generated_run_backend_impl::<Esp32Backend>(
                 shell,
-                project_path,
                 project,
                 needs_reinit,
                 "Initializing ESP32 backend...",
@@ -691,7 +705,6 @@ async fn ensure_generated_run_backend(
 
 async fn ensure_generated_run_backend_impl<T>(
     shell: &Shell,
-    project_path: &PathBuf,
     project: Project,
     needs_reinit: bool,
     spinner_message: &str,
@@ -706,7 +719,6 @@ where
 
     let spinner = shell.spinner(spinner_message);
     reinit_backend::<T>(&project).await?;
-    let project = Project::open(project_path).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -938,7 +950,7 @@ async fn build_and_run(
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
     let _ = shell.status(">", "Building...");
-    build_for_backend(
+    let built = build_for_backend(
         project,
         backend,
         &build_plan,
@@ -961,6 +973,7 @@ async fn build_and_run(
         project,
         backend,
         &build_plan,
+        &built,
         config.profile.is_release(),
         dev_server.is_some(),
         Some(shell.build_progress()),
@@ -977,7 +990,7 @@ async fn build_and_run(
         apply_dev_url_handoff(&device, server.url(), &mut run_options)?;
     }
 
-    let _ = shell.status(">", "Running...");
+    let _ = shell.status(">", format!("Running {}", artifact.path().display()));
     let running = run_with_options(host, device, artifact, run_options).await?;
 
     Ok((running, dev_server))
@@ -1128,11 +1141,9 @@ async fn build_for_backend(
     backend: TargetBackend,
     plan: &BuildPlan,
     build_options: BuildOptions,
-) -> Result<()> {
+) -> Result<waterui_cli::build::BuiltTarget> {
     match backend {
-        TargetBackend::Apple => {
-            build_rust_lib(project, plan.lib_platform, build_options).await?;
-        }
+        TargetBackend::Apple => build_rust_lib(project, plan.lib_platform, build_options).await,
         TargetBackend::Android => {
             let abi = plan
                 .android_abi
@@ -1140,28 +1151,24 @@ async fn build_for_backend(
             AndroidPlatform::clean_jni_libs(project).await?;
             AndroidPlatform::new(abi)
                 .build(project, build_options)
-                .await?;
+                .await
         }
-        TargetBackend::Gtk4 => {
-            build_gtk4(project, build_options).await?;
-        }
+        TargetBackend::Gtk4 => build_gtk4(project, build_options).await,
         TargetBackend::Hydrolysis => {
-            build_hydrolysis(project, plan.lib_platform, build_options).await?;
+            build_hydrolysis(project, plan.lib_platform, build_options).await
         }
-        TargetBackend::WinUi => {
-            build_winui(project, build_options).await?;
-        }
+        TargetBackend::WinUi => build_winui(project, build_options).await,
         TargetBackend::Dew => {
             panic!("esp32 run should not enter build_and_run")
         }
     }
-    Ok(())
 }
 
 async fn package_for_backend(
     project: &Project,
     backend: TargetBackend,
     plan: &BuildPlan,
+    built: &waterui_cli::build::BuiltTarget,
     release: bool,
     dev_server: bool,
     progress: Option<BuildProgress>,
@@ -1173,18 +1180,20 @@ async fn package_for_backend(
         package_options = package_options.with_progress(progress);
     }
     match backend {
-        TargetBackend::Apple => package_apple(project, plan.lib_platform, package_options).await,
+        TargetBackend::Apple => {
+            package_apple(project, plan.lib_platform, package_options, built).await
+        }
         TargetBackend::Android => {
             let abi = plan
                 .android_abi
                 .ok_or_else(|| eyre::eyre!("Internal error: missing Android ABI for packaging"))?;
             AndroidPlatform::package_with_abis(project, package_options, &[abi]).await
         }
-        TargetBackend::Gtk4 => package_gtk4(project, package_options).await,
+        TargetBackend::Gtk4 => package_gtk4(project, package_options, built).await,
         TargetBackend::Hydrolysis => {
-            package_hydrolysis(project, plan.lib_platform, package_options).await
+            package_hydrolysis(project, plan.lib_platform, package_options, Some(built)).await
         }
-        TargetBackend::WinUi => package_winui(project, package_options).await,
+        TargetBackend::WinUi => package_winui(project, package_options, built).await,
         TargetBackend::Dew => panic!("esp32 run should not enter build_and_run"),
     }
 }
