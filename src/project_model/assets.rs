@@ -8,7 +8,7 @@
 //! - Copy assets to platform-specific locations
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use cargo_metadata::PackageId;
 use eyre::{Context, OptionExt};
@@ -250,7 +250,13 @@ fn manifest_font_declarations(
         let source = match (&font.local_path, &font.remote_path) {
             (Some(local_path), None) => {
                 let relative_path = PathBuf::from(local_path);
-                if relative_path.is_absolute() {
+                // A rooted path in any flavor — `/x`, `\x`, `C:\x`, `C:x` —
+                // escapes the project root on some platform, so reject it on
+                // all of them.
+                if matches!(
+                    relative_path.components().next(),
+                    Some(Component::Prefix(_) | Component::RootDir)
+                ) {
                     eyre::bail!(
                         "[[assets.font]] entry '{}' in Water.toml: local_path must be \
                          relative to the project root",
