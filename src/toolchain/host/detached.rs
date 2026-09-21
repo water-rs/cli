@@ -134,7 +134,7 @@ fn command_line(program: &OsStr, args: &[OsString]) -> Vec<u16> {
         let needs_quotes = units.is_empty()
             || units
                 .iter()
-                .any(|unit| [b' ', b'\t', b'"'].map(u16::from).contains(unit));
+                .any(|unit| b" \t\"".map(u16::from).contains(unit));
         if !needs_quotes {
             line.extend(units);
             continue;
@@ -201,8 +201,8 @@ mod tests {
     #[test]
     fn escapes_quotes_and_the_backslashes_before_them() {
         assert_eq!(line("x", &[r#"say "hi""#]), r#"x "say \"hi\"""#);
-        assert_eq!(line("x", &[r#"dir\"#]), r#"x dir\"#);
-        assert_eq!(line("x", &[r#"a dir\"#]), r#"x "a dir\\""#);
+        assert_eq!(line("x", &[r"dir\"]), r"x dir\");
+        assert_eq!(line("x", &[r"a dir\"]), r#"x "a dir\\""#);
         assert_eq!(line("x", &[r#"\\"q"#]), r#"x "\\\\\"q""#);
     }
 }
