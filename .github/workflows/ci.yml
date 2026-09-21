@@ -38,15 +38,26 @@ jobs:
       - run: cargo nextest run --locked --profile ci
 
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
+    # Most of this crate is behind `cfg(target_os = ...)`: the Apple backend,
+    # the Windows toolchain and process plumbing. Linting on one OS leaves all
+    # of it unlinted — `cargo nextest` compiles it on the other runners, so a
+    # compile error surfaces, but a clippy finding never does. Lint where the
+    # code is.
+    name: Lint / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
         with:
           components: clippy, rustfmt
       - uses: ./.github/actions/setup-linux-deps
+        if: runner.os == 'Linux'
       - run: cargo fmt --check
+        if: runner.os == 'Linux'
       - run: cargo clippy --all-targets -- -D warnings
 
   no-default-features:
@@ -62,6 +73,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Installing the toolchain is not the same as building with it.
+      # `dtolnay/rust-toolchain` only sets the rustup default, and this
+      # repository's `rust-toolchain.toml` overrides the default for every
+      # cargo invocation inside the checkout — so this job compiled on
+      # `stable` and proved nothing about the declared floor. `RUSTUP_TOOLCHAIN`
+      # is the one override that beats the file.
       - name: Read rust-version from Cargo.toml
         id: msrv
         shell: bash
@@ -73,11 +90,17 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
           cache: "false"
       - uses: ./.github/actions/setup-linux-deps
+      # Proof in the log that the floor is what compiled, so a future change
+      # to the pin or the action cannot quietly turn this back into a second
+      # stable run.
+      - name: Show the toolchain this job builds with
+        run: rustc --version && cargo --version
       # The shipped artifact is what MSRV bounds: dev-dependencies may
       # legitimately require newer, so check the package targets only.
       - run: cargo check --locked

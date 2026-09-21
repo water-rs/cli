@@ -26,10 +26,10 @@ use super::protocol::PreviewTcpConfig;
 use crate::build::BuildProgress;
 
 use crate::apple::dynamic_runtime;
-use crate::build::{BuildOptions, BuildProfile, RustBuild, RustLinkage};
+use crate::build::{BuildOptions, BuildProfile, BuiltTarget, RustBuild, RustLinkage};
 use crate::device::{Device, DeviceEvent, Local, LogLevel, RunOptions, Running};
 use crate::platform::TargetPlatform;
-use crate::project::Project;
+use crate::project::{ManagedBackends, Project};
 use crate::runtime_compat::{PREVIEW_RUNTIME_ENV_VARS, runtime_profile_tag};
 use crate::runtime_fingerprint::{compute_runtime_fingerprint, runtime_package_identity};
 use crate::support_app;
@@ -243,9 +243,12 @@ async fn configure_preview_module_build(
     target: TargetPlatform,
     link_mode: PreviewLinkMode,
 ) -> Result<(RustBuild, Option<String>)> {
-    let support_project = Project::open(&preview_support_path()?)
-        .await
-        .wrap_err("Failed to open the preview support project")?;
+    let support_project = Project::open(
+        &preview_support_path()?,
+        ManagedBackends::for_platform(target),
+    )
+    .await
+    .wrap_err("Failed to open the preview support project")?;
     let support_target_dir = support_project
         .water_target_dir(RustLinkage::SharedRuntime)
         .await?;
@@ -339,25 +342,20 @@ async fn build_preview_dylib(
     // exist — the "Failed to execute cargo build: No such file or directory"
     // that hit every first preview after switching workspaces.
     let scaffold_start = Instant::now();
-    let preview_crate_path = scaffold_preview_module(&project).await?;
+    let preview_crate_path = scaffold_preview_module(&project, platform).await?;
     info!(
         path = %preview_crate_path.display(),
         elapsed_ms = scaffold_start.elapsed().as_millis(),
         "Preview module scaffold is up to date"
     );
     let preview_crate_name = project.preview_dylib_crate_name();
-    let target = match platform {
-        PreviewPlatform::Macos => TargetPlatform::MacOS,
-        PreviewPlatform::IosSimulator => TargetPlatform::IOSSimulator,
-        PreviewPlatform::Ios => TargetPlatform::IOS,
-        PreviewPlatform::Android => TargetPlatform::Android,
-    };
+    let target = preview_target_platform(platform);
     let target_triple = target.triple().to_string();
     let link_mode = PreviewLinkMode::for_platform(platform);
 
     ensure_project_dev_feature_for_preview(&project).await?;
 
-    let (mut rust_build, toolchain_identity) =
+    let (rust_build, toolchain_identity) =
         configure_preview_module_build(&preview_crate_path, platform, target, link_mode).await?;
     let dylib_path_start = Instant::now();
     let expected_path = rust_build
@@ -383,28 +381,16 @@ async fn build_preview_dylib(
     let built_path = if dylib_is_up_to_date(&candidate_path, &dylib_signature).await? {
         candidate_path
     } else {
-        info!("Building dylib...");
-        if let Some(sccache) = sccache_path {
-            rust_build = rust_build.with_sccache(sccache.clone());
-        }
-        if link_mode.prefer_dynamic {
-            rust_build = rust_build.with_preferred_dynamic_linking();
-        }
-        let build_start = Instant::now();
-        let built_path = rust_build
-            .build_dylib(false)
-            .await
-            .wrap_err("Failed to build dylib")?;
-        prepare_preview_module_linkage(&built_path, link_mode, platform).await?;
-        write_dylib_signature(&built_path, &dylib_signature).await?;
-        info!(
-            build_crate_path = %preview_crate_path.display(),
-            build_crate_name = %preview_crate_name,
-            path = %built_path.display(),
-            elapsed_ms = build_start.elapsed().as_millis(),
-            "Preview built dylib"
-        );
-        built_path
+        build_preview_module_dylib(
+            rust_build,
+            sccache_path,
+            link_mode,
+            platform,
+            &dylib_signature,
+            &preview_crate_path,
+            &preview_crate_name,
+        )
+        .await?
     };
 
     *dylib_path = Some(built_path.clone());
@@ -423,8 +409,41 @@ async fn build_preview_dylib(
     })
 }
 
+async fn build_preview_module_dylib(
+    mut rust_build: RustBuild,
+    sccache_path: Option<&PathBuf>,
+    link_mode: PreviewLinkMode,
+    platform: PreviewPlatform,
+    dylib_signature: &str,
+    preview_crate_path: &Path,
+    preview_crate_name: &str,
+) -> Result<PathBuf> {
+    info!("Building dylib...");
+    if let Some(sccache) = sccache_path {
+        rust_build = rust_build.with_sccache(sccache.clone());
+    }
+    if link_mode.prefer_dynamic {
+        rust_build = rust_build.with_preferred_dynamic_linking();
+    }
+    let build_start = Instant::now();
+    let built = rust_build
+        .build_dylib(false)
+        .await
+        .wrap_err("Failed to build dylib")?;
+    prepare_preview_module_linkage(&built, link_mode, platform).await?;
+    write_dylib_signature(&built.artifact, dylib_signature).await?;
+    info!(
+        build_crate_path = %preview_crate_path.display(),
+        build_crate_name = %preview_crate_name,
+        path = %built.artifact.display(),
+        elapsed_ms = build_start.elapsed().as_millis(),
+        "Preview built dylib"
+    );
+    Ok(built.artifact)
+}
+
 async fn prepare_preview_module_linkage(
-    built_path: &Path,
+    built: &BuiltTarget,
     link_mode: PreviewLinkMode,
     platform: PreviewPlatform,
 ) -> Result<()> {
@@ -432,7 +451,7 @@ async fn prepare_preview_module_linkage(
         // The module is pushed to a device that may run 16 KB pages; a
         // 4 KB-aligned LOAD segment would fail `dlopen` there.
         return smol::unblock({
-            let built_path = built_path.to_path_buf();
+            let built_path = built.artifact.clone();
             move || crate::elf::require_aligned_load_segments(&built_path)
         })
         .await;
@@ -440,13 +459,7 @@ async fn prepare_preview_module_linkage(
     if !link_mode.prefer_dynamic {
         return Ok(());
     }
-    let build_lib_dir = built_path.parent().ok_or_else(|| {
-        eyre::eyre!(
-            "Preview dylib path has no output directory: {}",
-            built_path.display()
-        )
-    })?;
-    dynamic_runtime::retarget_module(built_path, build_lib_dir).await
+    dynamic_runtime::retarget_module(&built.artifact, built.shared_runtime()?).await
 }
 
 async fn ensure_project_dev_feature_for_preview(project: &Project) -> Result<()> {
@@ -629,7 +642,7 @@ pub async fn launch_preview_session(
         return Ok(session);
     }
 
-    let project = open_preview_support_project(&requirements).await?;
+    let project = open_preview_support_project(&requirements, platform).await?;
     let running =
         launch_preview_app_for_platform(&project, platform, tcp_config, progress.as_ref()).await?;
     build_preview_session_from_launch(
@@ -695,7 +708,20 @@ const fn preview_runtime_platform(platform: PreviewPlatform) -> PreviewRuntimePl
     }
 }
 
-async fn open_preview_support_project(requirements: &PreviewRequirements) -> Result<Project> {
+/// The build target a preview on `platform` links its module for.
+const fn preview_target_platform(platform: PreviewPlatform) -> TargetPlatform {
+    match platform {
+        PreviewPlatform::Macos => TargetPlatform::MacOS,
+        PreviewPlatform::IosSimulator => TargetPlatform::IOSSimulator,
+        PreviewPlatform::Ios => TargetPlatform::IOS,
+        PreviewPlatform::Android => TargetPlatform::Android,
+    }
+}
+
+async fn open_preview_support_project(
+    requirements: &PreviewRequirements,
+    platform: PreviewPlatform,
+) -> Result<Project> {
     info!("No preview app running, launching...");
     let preview_app_path = preview_support_path()?;
     let ensure_start = Instant::now();
@@ -706,9 +732,12 @@ async fn open_preview_support_project(requirements: &PreviewRequirements) -> Res
         "Preview support app scaffold is up to date"
     );
     let open_start = Instant::now();
-    let project = Project::open(&preview_app_path)
-        .await
-        .wrap_err("Failed to open preview app project")?;
+    let project = Project::open(
+        &preview_app_path,
+        ManagedBackends::for_platform(preview_target_platform(platform)),
+    )
+    .await
+    .wrap_err("Failed to open preview app project")?;
     info!(
         path = %preview_app_path.display(),
         elapsed_ms = open_start.elapsed().as_millis(),
@@ -1266,7 +1295,7 @@ async fn preview_support_ffi_crate_path() -> Result<PathBuf> {
 /// previewed project would still be a workspace member, and Cargo resolves every
 /// member of a workspace, so a stale one whose project has since moved or been
 /// deleted breaks the build of an unrelated preview.
-async fn scaffold_preview_module(project: &Project) -> Result<PathBuf> {
+async fn scaffold_preview_module(project: &Project, platform: PreviewPlatform) -> Result<PathBuf> {
     let support_path = preview_support_path()?;
     // Before anything reads the support runtime's workspace: one left over from
     // a different `WaterUI` checkout points its manifests at a path that may no
@@ -1306,9 +1335,12 @@ async fn scaffold_preview_module(project: &Project) -> Result<PathBuf> {
     // not declare it is rejected outright by Cargo, and the root lists whichever
     // modules it finds — so it has to be written after, never before.
     if support_path.join("Water.toml").is_file() {
-        Project::open(&support_path)
-            .await
-            .wrap_err("Failed to open the preview support project")?;
+        Project::open(
+            &support_path,
+            ManagedBackends::for_platform(preview_target_platform(platform)),
+        )
+        .await
+        .wrap_err("Failed to open the preview support project")?;
     }
     Ok(crate_path)
 }
@@ -1551,7 +1583,9 @@ async fn resolve_preview_metadata(
 ) -> Result<ResolvedPreviewMetadata> {
     let project = Project::open_for_preview_build(project_path).await?;
     ensure_project_dev_feature_for_preview(&project).await?;
-    let manifest_path = scaffold_preview_module(&project).await?.join("Cargo.toml");
+    let manifest_path = scaffold_preview_module(&project, platform)
+        .await?
+        .join("Cargo.toml");
     let app_crate_name = project.crate_name().clone();
     let app_path = project.root().to_path_buf();
     let metadata_start = Instant::now();

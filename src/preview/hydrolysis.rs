@@ -4,14 +4,13 @@ use askama::Template;
 use eyre::{Context as _, Result, bail};
 
 use crate::backend::reinit_backend;
-use crate::build::{BuildOptions, BuildProfile, BuildProgress, RustLinkage};
+use crate::build::{BuildOptions, BuildProfile, BuildProgress};
 use crate::hydrolysis::backend::HydrolysisBackend;
 use crate::hydrolysis::platform::{
-    build_hydrolysis_with_envs_and_features, built_hydrolysis_binary_path,
-    stage_hydrolysis_shared_runtime,
+    build_hydrolysis_with_envs_and_features, stage_hydrolysis_shared_runtime,
 };
-use crate::platform::TargetPlatform;
-use crate::project::Project;
+use crate::platform::{TargetBackend, TargetPlatform};
+use crate::project::{ManagedBackends, Project};
 use crate::project_model::assets;
 use crate::utils::command;
 
@@ -137,7 +136,7 @@ pub async fn render_preview_with_hydrolysis(
     if let Some(progress) = progress {
         build_options = build_options.with_progress(progress);
     }
-    build_hydrolysis_with_envs_and_features(
+    let built = build_hydrolysis_with_envs_and_features(
         &project,
         TargetPlatform::MacOS,
         build_options,
@@ -145,16 +144,16 @@ pub async fn render_preview_with_hydrolysis(
         &[HYDROLYSIS_PREVIEW_FEATURE],
     )
     .await?;
-
-    let binary_path = built_hydrolysis_binary_path(
+    stage_hydrolysis_shared_runtime(&project, &built, TargetPlatform::MacOS).await?;
+    run_preview_binary(
         &project,
-        TargetPlatform::MacOS,
-        "debug",
-        RustLinkage::SharedRuntime,
+        &built.artifact,
+        width,
+        height,
+        output_path,
+        scenario,
     )
-    .await?;
-    stage_hydrolysis_shared_runtime(&project, &binary_path, TargetPlatform::MacOS).await?;
-    run_preview_binary(&project, &binary_path, width, height, output_path, scenario).await
+    .await
 }
 
 /// Run a semantic preview test session via the managed Hydrolysis backend binary.
@@ -185,7 +184,7 @@ pub async fn test_preview_with_hydrolysis(
     if let Some(progress) = progress {
         build_options = build_options.with_progress(progress);
     }
-    build_hydrolysis_with_envs_and_features(
+    let built = build_hydrolysis_with_envs_and_features(
         &project,
         TargetPlatform::MacOS,
         build_options,
@@ -193,16 +192,8 @@ pub async fn test_preview_with_hydrolysis(
         &[HYDROLYSIS_PREVIEW_TEST_FEATURE],
     )
     .await?;
-
-    let binary_path = built_hydrolysis_binary_path(
-        &project,
-        TargetPlatform::MacOS,
-        "debug",
-        RustLinkage::SharedRuntime,
-    )
-    .await?;
-    stage_hydrolysis_shared_runtime(&project, &binary_path, TargetPlatform::MacOS).await?;
-    run_preview_test_binary(&project, &binary_path, width, height).await
+    stage_hydrolysis_shared_runtime(&project, &built, TargetPlatform::MacOS).await?;
+    run_preview_test_binary(&project, &built.artifact, width, height).await
 }
 
 /// Stages the project's assets and the selected theme's fonts into the
@@ -226,7 +217,9 @@ pub async fn stage_hydrolysis_resources(
     )
     .await?;
 
-    let mut font_declarations = assets::scan_fonts(project).await?;
+    let backend_path = project.backend_path::<HydrolysisBackend>();
+    let mut font_declarations =
+        assets::scan_fonts(project, &backend_path.join("Cargo.toml")).await?;
     font_declarations.extend(theme.font_declarations());
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
@@ -242,14 +235,17 @@ pub async fn stage_hydrolysis_resources(
 /// Opens the project and makes sure its managed Hydrolysis backend exists and
 /// matches the current templates. Shared by the preview and MCP flows.
 pub async fn ensure_hydrolysis_backend_ready(project_path: &Path) -> Result<Project> {
-    let mut project = Project::open(project_path).await?;
+    let project = Project::open(
+        project_path,
+        ManagedBackends::for_backend(TargetBackend::Hydrolysis),
+    )
+    .await?;
     if project.hydrolysis_backend().is_none() && !project.is_playground() {
         bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
     }
 
     if HydrolysisBackend::requires_regeneration(&project).await? {
         reinit_backend::<HydrolysisBackend>(&project).await?;
-        project = Project::open(project_path).await?;
     }
 
     Ok(project)

@@ -1136,117 +1136,52 @@ async fn prepare_macos_bundle_launch(
     })
 }
 
-/// A backstop against a wedged `LaunchServices` only, never a judgement about
-/// how fast a launch "should" be: readiness is the app's process appearing,
-/// failure is `open` exiting, and this bound is sized so it can never lose a
-/// race against a slow-but-healthy launch (Gatekeeper's first-run scan of a
-/// freshly built binary alone can take well past five seconds).
-#[cfg(target_os = "macos")]
-const MACOS_LAUNCH_BACKSTOP: Duration = Duration::from_secs(120);
-
-#[cfg(target_os = "macos")]
-async fn launch_macos_bundle_process(
-    host: &Host,
-    launch: &MacosBundleLaunchContext,
-    options: &RunOptions,
-) -> Result<(smol::process::Child, u32), FailToRun> {
-    use tracing::info;
-
-    if options.replace_existing_macos_app_instances() {
-        let existing_pids = list_conflicting_macos_app_pids(host, launch).await?;
-        terminate_pids(host, &existing_pids).await?;
-    }
-
-    let existing_pids = list_conflicting_macos_app_pids(host, launch)
-        .await?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    info!("Launching app on macOS: {}", launch.artifact_path.display());
-    let mut command = host.command("open");
-    command.arg("-W").arg("-n");
-    for (key, value) in options.env_vars() {
-        command.arg("--env").arg(format!("{key}={value}"));
-    }
-    command
-        .arg(&launch.artifact_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| {
-        FailToRun::Launch(eyre::eyre!(
-            "Failed to launch macOS app bundle '{}': {error}",
-            launch.artifact_path.display()
-        ))
-    })?;
-
-    // Readiness is decided by real signals, not a stopwatch: the app's process
-    // appearing means the launch succeeded, and `open` exiting before that
-    // means it failed — its status and stderr say why. A fixed five-second
-    // deadline used to stand in for both, and it killed launches that were
-    // about to work; see [`MACOS_LAUNCH_BACKSTOP`].
-    let deadline = Instant::now() + MACOS_LAUNCH_BACKSTOP;
-    while Instant::now() < deadline {
-        let new_pid = list_conflicting_macos_app_pids(host, launch)
-            .await?
-            .into_iter()
-            .find(|pid| !existing_pids.contains(pid));
-        if let Some(app_pid) = new_pid {
-            return Ok((child, app_pid));
-        }
-
-        // `open -W` outlives the app, so any exit before the process appeared
-        // is a launch that did not happen — report LaunchServices' own words
-        // instead of a timeout.
-        match child.try_status() {
-            Ok(Some(status)) => {
-                let mut stderr_text = String::new();
-                if let Some(stderr) = child.stderr.as_mut() {
-                    use smol::io::AsyncReadExt as _;
-                    let _ = stderr.read_to_string(&mut stderr_text).await;
-                }
-                let stderr_text = stderr_text.trim();
-                return Err(FailToRun::Launch(eyre::eyre!(
-                    "LaunchServices failed to start '{}': `open` exited with {status}{}{}",
-                    launch.artifact_path.display(),
-                    if stderr_text.is_empty() { "" } else { ": " },
-                    stderr_text,
-                )));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(FailToRun::Launch(eyre::eyre!(
-                    "Failed to supervise the `open` process for '{}': {error}",
-                    launch.artifact_path.display()
-                )));
-            }
-        }
-
-        Timer::after(Duration::from_millis(80)).await;
-    }
-
-    let _ = child.kill();
-    let _ = child.status().await;
-    Err(FailToRun::Launch(eyre::eyre!(
-        "LaunchServices neither started '{}' nor failed within {MACOS_LAUNCH_BACKSTOP:?}; \
-         `open` is still running with no matching app process",
-        launch.artifact_path.display()
-    )))
-}
-
-/// Run a macOS `.app` bundle through `LaunchServices`.
+/// Run a macOS `.app` bundle by spawning its executable directly.
 ///
-/// `open -W -n` gives the CLI a supervised proxy while launching through the
-/// bundle preserves the process identity required by macOS privacy, lifecycle,
-/// and application services. App logs are captured from unified logging by PID.
+/// `open -W` cannot supervise the app: `open` exits 0 once the launched
+/// process goes away regardless of how it died, and the app's stderr is
+/// handed to `LaunchServices` instead of the caller. Spawning
+/// `Contents/MacOS/<executable>` keeps the child supervised here — its exit
+/// status decides the run's, and its stderr reaches the user — while the
+/// process still runs inside its bundle, so its identity, resources, and
+/// unified-logging stream are unchanged. App logs are captured from unified
+/// logging by PID.
 #[cfg(target_os = "macos")]
 async fn run_macos_app(
     host: &Host,
     artifact: Artifact,
     options: RunOptions,
 ) -> Result<Running, FailToRun> {
+    use tracing::info;
+
     let launch = prepare_macos_bundle_launch(artifact).await?;
     let started_at = Instant::now();
-    let (child, app_pid) = launch_macos_bundle_process(host, &launch, &options).await?;
+
+    if options.replace_existing_macos_app_instances() {
+        let existing_pids = list_conflicting_macos_app_pids(host, &launch).await?;
+        terminate_pids(host, &existing_pids).await?;
+    }
+
+    info!("Launching app on macOS: {}", launch.artifact_path.display());
+    let mut command = host.command(&launch.executable_path);
+    for (key, value) in options.env_vars() {
+        command.env(key, value);
+    }
+    // Match the environment `open` gave the app: no inherited stdin and `/`
+    // as the working directory.
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir("/")
+        .kill_on_drop(true);
+    let child = command.spawn().map_err(|error| {
+        FailToRun::Launch(eyre::eyre!(
+            "Failed to launch '{}': {error}",
+            launch.executable_path.display()
+        ))
+    })?;
+    let app_pid = child.id();
     let (cancel_tx, cancel_rx) = smol::channel::bounded(1);
     let (mut running, sender) = Running::new(move || {
         let pid = nix::unistd::Pid::from_raw(

@@ -4,7 +4,7 @@
 //! These functions are used by `WinUiBackend` to implement the `Backend` trait.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use eyre::bail;
 use futures_util::StreamExt as _;
@@ -13,7 +13,9 @@ use tracing::info;
 
 use crate::{
     assets,
-    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{
+        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
+    },
     device::Artifact,
     platform::{PackageOptions, TargetPlatform},
     project::Project,
@@ -30,26 +32,11 @@ const WINUI_INIT_HINT: &str = "initialize WinUI backend on Windows";
 // Build Utilities
 // ============================================================================
 
-/// Cargo profile directory the `WinUI` backend's artifacts land in.
-///
-/// Build, clean and package must agree on this path, so all three go through here.
-async fn winui_profile_dir(
-    project: &Project,
-    profile: &str,
-    linkage: RustLinkage,
-) -> eyre::Result<PathBuf> {
-    Ok(project
-        .water_target_dir(linkage)
-        .await?
-        .join(TargetPlatform::Windows.triple().to_string())
-        .join(profile))
-}
-
 /// Build `WinUI` binary for the host platform.
 ///
 /// # Errors
 /// Returns an error if the backend manifest is missing, the host is unsupported, or Cargo fails.
-pub async fn build_winui(project: &Project, options: BuildOptions) -> eyre::Result<PathBuf> {
+pub async fn build_winui(project: &Project, options: BuildOptions) -> eyre::Result<BuiltTarget> {
     ensure_windows_host()?;
 
     let backend_path = project.backend_path::<WinUiBackend>();
@@ -79,7 +66,7 @@ pub async fn build_winui(project: &Project, options: BuildOptions) -> eyre::Resu
         .with_linkage(
             options.linkage(),
             &format!("{}/dev", project.crate_name()),
-            None,
+            &[],
         )
         .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
@@ -88,18 +75,14 @@ pub async fn build_winui(project: &Project, options: BuildOptions) -> eyre::Resu
     if let Some(progress) = options.progress() {
         build = build.with_progress(progress.clone());
     }
-    build
+    let built_target = build
         .build_binary(
             project.winui_backend_crate_name().as_str(),
             options.is_release(),
         )
         .await
         .map_err(|error| eyre::eyre!("Failed to build WinUI backend with cargo: {error}"))?;
-
-    build
-        .lib_output_dir(options.is_release())
-        .await
-        .map_err(Into::into)
+    Ok(built_target)
 }
 
 // ============================================================================
@@ -150,14 +133,13 @@ pub async fn clean_winui(project: &Project) -> eyre::Result<()> {
 ///
 /// # Errors
 /// Returns an error if the host is unsupported, assets cannot be staged, or the built binary is missing.
-pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::Result<Artifact> {
+pub async fn package_winui(
+    project: &Project,
+    options: PackageOptions,
+    built: &BuiltTarget,
+) -> eyre::Result<Artifact> {
     ensure_windows_host()?;
 
-    let profile = if options.is_debug() {
-        "debug"
-    } else {
-        "release"
-    };
     let backend_path = project.backend_path::<WinUiBackend>();
 
     // Copy project assets and dependency fonts
@@ -170,32 +152,11 @@ pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::
     )
     .await?;
 
-    let linkage = if options.uses_shared_rust_runtime() {
-        RustLinkage::SharedRuntime
+    let final_binary_path = &built.artifact;
+    let profile = if options.is_debug() {
+        "debug"
     } else {
-        RustLinkage::Static
-    };
-    let target_dir = winui_profile_dir(project, profile, linkage).await?;
-
-    // The binary name is the `WinUI` crate name (project-winui)
-    let binary_name = project.winui_backend_crate_name();
-
-    let binary_path = target_dir.join(format!("{binary_name}.exe"));
-
-    let final_binary_path = if binary_path.exists() {
-        binary_path
-    } else {
-        let alt_binary_name = binary_name.replace('-', "_");
-        let alt_binary_path = target_dir.join(format!("{alt_binary_name}.exe"));
-
-        if alt_binary_path.exists() {
-            alt_binary_path
-        } else {
-            bail!(
-                "Built WinUI binary not found at {}. Did you run build first?",
-                binary_path.display()
-            );
-        }
+        "release"
     };
 
     // The shipped binary and everything it resolves beside itself stage
@@ -214,7 +175,7 @@ pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::
     }
 
     if options.uses_shared_rust_runtime() {
-        RustDynamicLibraries::resolve(&target_dir, &TargetPlatform::Windows.triple(), project)
+        RustDynamicLibraries::resolve(built, &TargetPlatform::Windows.triple(), project)
             .await?
             .stage(&runtime_dir)
             .await?;
@@ -226,7 +187,7 @@ pub async fn package_winui(project: &Project, options: PackageOptions) -> eyre::
     // Ship the binary under the product name; the tagged Cargo artifact name
     // is internal to the shared target directory.
     let packaged_binary = crate::platforming::packaging::stage_binary_as(
-        &final_binary_path,
+        final_binary_path,
         &runtime_dir,
         &format!("{}.exe", project.winui_binary_name()),
     )
@@ -310,7 +271,7 @@ async fn copy_assets_and_fonts(
     .await?;
 
     // Scan and resolve dependency fonts
-    let font_declarations = assets::scan_fonts(project).await?;
+    let font_declarations = assets::scan_fonts(project, &backend_path.join("Cargo.toml")).await?;
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
 

@@ -11,6 +11,7 @@ use eyre::{Context as _, bail};
 use futures_util::StreamExt as _;
 use smol::{io::AsyncReadExt as _, process::Command, unblock};
 use target_lexicon::{Environment, OperatingSystem, Triple};
+use tracing::warn;
 
 use crate::project::Project;
 use crate::utils::{run_command, std_output_enabled};
@@ -127,6 +128,24 @@ pub struct BuiltTarget {
     /// its own `compiler-artifact` message, not a name reconstructed under
     /// the profile root.
     pub artifact: PathBuf,
+    /// The `waterui-dylib` dynamic library Cargo reported, when this build
+    /// produced one.
+    pub shared_runtime: Option<PathBuf>,
+}
+
+impl BuiltTarget {
+    /// Return the shared `WaterUI` runtime Cargo reported for this build.
+    ///
+    /// # Errors
+    /// Returns an error when this build did not produce a shared runtime.
+    pub fn shared_runtime(&self) -> eyre::Result<&Path> {
+        self.shared_runtime.as_deref().ok_or_else(|| {
+            eyre::eyre!(
+                "Cargo reported no `waterui-dylib` dynamic library for the build in {}; the shared WaterUI runtime was not built",
+                self.profile_dir.display()
+            )
+        })
+    }
 }
 
 /// Selects how Rust dependencies are linked into a native application.
@@ -157,6 +176,18 @@ pub fn configure_generated_crate_compilation(command: &mut Command) {
     command.env("CARGO_INCREMENTAL", "0");
 }
 
+/// Prepend the managed tool directories (`~/.water/tools/<name>/<version>`)
+/// to the build's `PATH` so build scripts resolve a pinned `dxc`, JDK, and
+/// friends by name — the user never edits `PATH`. A no-op when nothing is
+/// installed (or the paths cannot join), so ambient `PATH` passes through.
+fn with_managed_tools_path(command: &mut Command) {
+    if let Some((key, value)) =
+        crate::toolchain::managed_tool::managed_tools_path_env(&crate::toolchain::Host::current())
+    {
+        command.env(key, value);
+    }
+}
+
 /// Dynamic Rust libraries required by a shared-runtime development build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustDynamicLibraries {
@@ -176,24 +207,13 @@ impl RustDynamicLibraries {
     ///
     /// # Errors
     /// Returns an error when either required dynamic library is absent or ambiguous.
-    pub async fn resolve(lib_dir: &Path, triple: &Triple, project: &Project) -> eyre::Result<Self> {
-        let file_name = dynamic_library_file_name("waterui_dylib", triple);
-        // Cargo emits a dependency's final dylib artifact in `deps/` on stable
-        // and at the profile directory root on current nightlies; accept both.
-        // `deps/` wins: a copy an earlier `stage` left at the profile root must
-        // never mask the artifact the current build produced.
-        let waterui = [
-            lib_dir.join("deps").join(&file_name),
-            lib_dir.join(&file_name),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            eyre::eyre!(
-                "Shared WaterUI runtime was not built at {}",
-                lib_dir.join("deps").join(&file_name).display()
-            )
-        })?;
+    pub async fn resolve(
+        built: &BuiltTarget,
+        triple: &Triple,
+        project: &Project,
+    ) -> eyre::Result<Self> {
+        let waterui = built.shared_runtime()?.to_path_buf();
+        let lib_dir = &built.profile_dir;
 
         // A `-Zbuild-std` build publishes its freshly compiled `libstd` into
         // the profile's `deps/` directory via the rustc wrapper; that copy —
@@ -1061,14 +1081,19 @@ impl RustBuild {
     ///
     /// A shared-runtime development build enables the project's `dev` feature (which
     /// resolves the shared `waterui-dylib` runtime), prefers dynamic linking, and —
-    /// when the platform's loader needs one — embeds a loader search path into the
+    /// when the platform's loader needs them — embeds loader search paths into the
     /// final artifact only. A static packaging build needs none of this.
+    ///
+    /// A platform generally needs more than one: the binary is run both where it was
+    /// built, with the runtime staged beside it, and from inside a packaged artifact
+    /// that puts the runtime somewhere else. Each path becomes its own `-rpath`, and
+    /// the loader tries them in order.
     #[must_use]
     pub fn with_linkage(
         self,
         linkage: RustLinkage,
         development_feature: &str,
-        loader_search_path: Option<&str>,
+        loader_search_paths: &[&str],
     ) -> Self {
         if linkage == RustLinkage::Static {
             return self;
@@ -1076,10 +1101,9 @@ impl RustBuild {
         let build = self
             .with_feature(development_feature)
             .with_preferred_dynamic_linking();
-        match loader_search_path {
-            Some(path) => build.with_final_rustc_arg(format!("-Clink-arg=-Wl,-rpath,{path}")),
-            None => build,
-        }
+        loader_search_paths.iter().fold(build, |build, path| {
+            build.with_final_rustc_arg(format!("-Clink-arg=-Wl,-rpath,{path}"))
+        })
     }
 
     /// Override the library crate type passed to `rustc`.
@@ -1154,7 +1178,7 @@ impl RustBuild {
             .await
     }
 
-    /// Build a dynamic library (cdylib) and return the full path to the dylib file.
+    /// Build a dynamic library (cdylib) and return Cargo's reported build result.
     ///
     /// The path is Cargo's own `compiler-artifact` report, so the returned file
     /// is the one this build wrote even when another project's identically
@@ -1163,15 +1187,13 @@ impl RustBuild {
     /// # Errors
     /// - `RustBuildError::FailToExecuteCargoBuild`: If there was an error executing the cargo build command.
     /// - `RustBuildError::FailToBuildRustLibrary`: If the library was not found after building.
-    pub async fn build_dylib(&self, release: bool) -> Result<PathBuf, RustBuildError> {
-        let built = self
-            .build_inner(
-                release,
-                CargoTarget::Lib,
-                Some(lib_extension_for_triple(&self.triple)),
-            )
-            .await?;
-        Ok(built.artifact)
+    pub async fn build_dylib(&self, release: bool) -> Result<BuiltTarget, RustBuildError> {
+        self.build_inner(
+            release,
+            CargoTarget::Lib,
+            Some(lib_extension_for_triple(&self.triple)),
+        )
+        .await
     }
 
     /// Builds one named binary and returns its full output path.
@@ -1187,11 +1209,9 @@ impl RustBuild {
         &self,
         binary_name: &str,
         release: bool,
-    ) -> Result<PathBuf, RustBuildError> {
-        let built = self
-            .build_inner(release, CargoTarget::Binary(binary_name), None)
-            .await?;
-        Ok(built.artifact)
+    ) -> Result<BuiltTarget, RustBuildError> {
+        self.build_inner(release, CargoTarget::Binary(binary_name), None)
+            .await
     }
 
     /// Compute the expected dylib output path without building.
@@ -1267,13 +1287,22 @@ Automatic meson installation failed: {install_err}\n\n{}",
         // A `fresh` unit emits nothing yet still reports that path, which can
         // leave a different source's bytes where `water run` expects its own
         // runtime. The dep-info `.d` written alongside records the producing
-        // sources; when they are not this unit's, clean the package so the
-        // rebuild below emits this source's artifact.
+        // sources; when they are not this unit's — or when no dep-info exists
+        // to say — clean the package so the rebuild below emits this source's
+        // artifact. The rebuild compiles the cleaned package anew, so a unit
+        // it still reports `fresh` in the same state is a cache this CLI
+        // cannot repair by rebuilding, and that is reported instead of retried.
         let stale = stale_shared_dylib_packages(&output.stdout).await?;
         if !stale.is_empty() {
             let target_dir = self.target_directory().await?;
-            for package in &stale {
-                clean_cargo_package(&self.path, package, &target_dir).await?;
+            for unit in &stale {
+                warn!(
+                    package = unit.package,
+                    artifact = %unit.artifact.display(),
+                    "discarding a shared dylib unit and rebuilding it: {}",
+                    unit.reason
+                );
+                clean_cargo_package(&self.path, &unit.package, &target_dir).await?;
             }
             output = self.cargo_build_output(release, cargo_target).await?;
             if !output.status.success() {
@@ -1285,14 +1314,20 @@ Automatic meson installation failed: {install_err}\n\n{}",
                     )),
                 ));
             }
+            let unrecovered = stale_shared_dylib_packages(&output.stdout).await?;
+            if !unrecovered.is_empty() {
+                return Err(unrecoverable_shared_dylib_error(&unrecovered, &target_dir));
+            }
         }
 
         let artifact =
             reported_artifact(&output.stdout, &self.path, cargo_target, artifact_extension)?;
+        let shared_runtime = reported_shared_runtime(&output.stdout)?;
         let profile_dir = self.lib_output_dir(release).await?;
         Ok(BuiltTarget {
             profile_dir,
             artifact,
+            shared_runtime,
         })
     }
 
@@ -1392,15 +1427,13 @@ Automatic meson installation failed: {install_err}\n\n{}",
             .arg("--message-format=json-render-diagnostics")
             .args(cargo_target.cargo_args())
             .args(["--target", self.triple.to_string().as_str()])
+            .args(framework.is_some().then_some("--locked"))
             .current_dir(&self.path);
-        if framework.is_some() {
-            cmd = cmd.arg("--locked");
-        }
 
         if let Some(target_dir) = &self.target_dir {
             cmd = cmd.arg("--target-dir").arg(target_dir);
         }
-
+        with_managed_tools_path(cmd);
         // Apply extra environment variables (caller-provided values override defaults).
         for (key, value) in &self.envs {
             cmd.env(key, value);
@@ -1732,6 +1765,40 @@ pub(crate) fn compiler_artifacts(
     Ok(artifacts)
 }
 
+fn reported_shared_runtime(stdout: &[u8]) -> Result<Option<PathBuf>, RustBuildError> {
+    let mut reported = Vec::new();
+    for artifact in compiler_artifacts(stdout)? {
+        if artifact_package_name(&artifact.package_id) != "waterui-dylib"
+            || !artifact
+                .target
+                .kind
+                .contains(&cargo_metadata::TargetKind::DyLib)
+        {
+            continue;
+        }
+        for filename in &artifact.filenames {
+            let path = filename.as_std_path();
+            if is_dynamic_library(path) {
+                reported.push((path.to_path_buf(), artifact.manifest_path.clone()));
+            }
+        }
+    }
+    match reported.as_slice() {
+        [] => Ok(None),
+        [(path, _)] => Ok(Some(path.clone())),
+        _ => Err(RustBuildError::FailToBuildRustLibrary(io::Error::other(
+            format!(
+                "Cargo reported multiple `waterui-dylib` dynamic libraries: {}",
+                reported
+                    .iter()
+                    .map(|(_, manifest)| manifest.as_std_path().display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))),
+    }
+}
+
 /// Whether a `manifest_path` cargo reported is `expected`, the manifest of
 /// the crate this build ran. Cargo reports the path in the spelling its own
 /// working directory carried — a verbatim `\\?\` or an 8.3 short-name root on
@@ -1824,17 +1891,86 @@ fn reported_artifact_file(
     Ok(artifact)
 }
 
-/// Names of dependency packages whose `fresh` dynamic-library unit reports an
-/// artifact another source's build of the same-named package last wrote.
+/// Why a `fresh` shared dylib unit cannot be trusted as this project's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StaleSharedDylibReason {
+    /// The dep-info beside the artifact names no source under the unit's
+    /// manifest root: another source's build of the same-named package wrote
+    /// the file.
+    ForeignDepInfo { dep_info: PathBuf },
+    /// No dep-info exists beside the artifact or in its unit directory, so
+    /// nothing records which sources produced the bytes on disk.
+    MissingDepInfo { reported_files: Vec<PathBuf> },
+}
+
+impl std::fmt::Display for StaleSharedDylibReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ForeignDepInfo { dep_info } => write!(
+                f,
+                "its dep-info {} names no source under this unit's manifest root, so another source's build wrote it",
+                dep_info.display()
+            ),
+            Self::MissingDepInfo { reported_files } => write!(
+                f,
+                "no dep-info was found beside it or in its unit directory, so nothing records which sources produced it (reported files: {reported_files:?})"
+            ),
+        }
+    }
+}
+
+/// A `fresh` shared dylib unit whose artifact this build must not trust, and
+/// the package whose units are cleaned so the rebuild emits its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleSharedDylib {
+    package: String,
+    artifact: PathBuf,
+    reason: StaleSharedDylibReason,
+}
+
+/// The error a build reports when a cleaned and rebuilt package still comes
+/// back `fresh` in a state this CLI cannot trust: rebuilding once did not
+/// repair the cache, so it names the target directory to drop rather than
+/// rebuilding again.
+fn unrecoverable_shared_dylib_error(
+    stale: &[StaleSharedDylib],
+    target_dir: &Path,
+) -> RustBuildError {
+    let units = stale.iter().fold(String::new(), |mut units, unit| {
+        let _ = std::fmt::Write::write_fmt(
+            &mut units,
+            format_args!(
+                "\n  - {} ({}): {}",
+                unit.artifact.display(),
+                unit.package,
+                unit.reason
+            ),
+        );
+        units
+    });
+    let message = format!(
+        "Cargo still reports a shared dylib unit as fresh after its package was cleaned and rebuilt:{units}\nThe shared Cargo target directory {} cannot be repaired by rebuilding; remove it with `water gc build-cache --shared-target` and build again.",
+        target_dir.display()
+    );
+    RustBuildError::FailToBuildRustLibrary(io::Error::other(message))
+}
+
+/// Dependency packages whose `fresh` dynamic-library unit reports an artifact
+/// this build did not verifiably write, with the reason for each.
 ///
 /// Dep-info is the one record that names the producing sources: the `.d`
 /// Cargo writes beside an uplifted dylib lists the writer's inputs, while the
 /// unit's own `manifest_path` says which source *this* graph resolved. A
 /// dep-info that names no file under the unit's manifest root was produced by
 /// a different source's build, and the unhashed artifact it accompanies does
-/// not belong to this project.
-async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustBuildError> {
-    let mut stale = Vec::new();
+/// not belong to this project. An uplifted dylib with no dep-info at all is
+/// a cache state this CLI's own builds leave behind (observed on Windows),
+/// and it is flagged the same way so the caller rebuilds the package instead
+/// of trusting bytes nothing accounts for.
+async fn stale_shared_dylib_packages(
+    stdout: &[u8],
+) -> Result<Vec<StaleSharedDylib>, RustBuildError> {
+    let mut stale: Vec<StaleSharedDylib> = Vec::new();
     for artifact in compiler_artifacts(stdout)? {
         if !artifact.fresh {
             continue;
@@ -1851,21 +1987,26 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
             continue;
         }
         let manifest_root = dunce::simplified(manifest_dir);
-        let mut package_stale = false;
+        let package = artifact_package_name(&artifact.package_id);
+        let mut package_stale = None;
         for filename in &artifact.filenames {
             let file = filename.as_std_path();
             if !is_dynamic_library(file) {
                 continue;
             }
             let Some(dep_info) = dep_info_path(file, &artifact.filenames) else {
-                return Err(RustBuildError::FailToBuildRustLibrary(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "Cargo reported {} fresh but no dep-info was found beside it or in its unit directory (reported files: {:?})",
-                        file.display(),
-                        artifact.filenames
-                    ),
-                )));
+                package_stale = Some(StaleSharedDylib {
+                    package: package.to_owned(),
+                    artifact: file.to_path_buf(),
+                    reason: StaleSharedDylibReason::MissingDepInfo {
+                        reported_files: artifact
+                            .filenames
+                            .iter()
+                            .map(|reported| reported.as_std_path().to_path_buf())
+                            .collect(),
+                    },
+                });
+                break;
             };
             let contents = smol::fs::read_to_string(&dep_info).await.map_err(|error| {
                 RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
@@ -1885,15 +2026,21 @@ async fn stale_shared_dylib_packages(stdout: &[u8]) -> Result<Vec<String>, RustB
                 };
                 dunce::simplified(&source).starts_with(manifest_root)
             }) {
-                package_stale = true;
+                package_stale = Some(StaleSharedDylib {
+                    package: package.to_owned(),
+                    artifact: file.to_path_buf(),
+                    reason: StaleSharedDylibReason::ForeignDepInfo { dep_info },
+                });
+                break;
             }
         }
-        if package_stale {
-            stale.push(artifact_package_name(&artifact.package_id).to_owned());
+        if let Some(unit) = package_stale
+            && !stale.iter().any(|known| known.package == unit.package)
+        {
+            stale.push(unit);
         }
     }
-    stale.sort_unstable();
-    stale.dedup();
+    stale.sort_unstable_by(|left, right| left.package.cmp(&right.package));
     Ok(stale)
 }
 
@@ -2154,10 +2301,117 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        BuildOptions, BuildProfile, CargoTarget, CompileEvent, RustBuild, RustDynamicLibraries,
-        RustLinkage, classify_compile_line, dynamic_library_file_name, lib_extension_for_triple,
-        resolve_rust_standard_library_in,
+        BuildOptions, BuildProfile, BuiltTarget, CargoTarget, CompileEvent, RustBuild,
+        RustDynamicLibraries, RustLinkage, classify_compile_line, dynamic_library_file_name,
+        lib_extension_for_triple, reported_shared_runtime, resolve_rust_standard_library_in,
     };
+
+    fn shared_runtime_artifact_json(
+        manifest: &std::path::Path,
+        file: &std::path::Path,
+        package: &str,
+    ) -> String {
+        serde_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": format!("path+file:///x#{package}@0.1.0"),
+            "manifest_path": manifest,
+            "target": {
+                "kind": ["dylib"],
+                "crate_types": ["dylib"],
+                "name": package,
+                "src_path": manifest.parent().expect("manifest dir").join("src/lib.rs"),
+                "edition": "2021",
+                "doc": false,
+                "doctest": false,
+                "test": false,
+            },
+            "profile": {
+                "opt_level": "0",
+                "debuginfo": 0,
+                "debug_assertions": true,
+                "overflow_checks": true,
+                "test": false,
+            },
+            "features": [],
+            "filenames": [file],
+            "executable": null,
+            "fresh": true,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn reported_shared_runtime_selects_waterui_dylib_dynamic_artifact() {
+        let temporary = tempdir().expect("tempdir");
+        let manifest = temporary.path().join("waterui-dylib/Cargo.toml");
+        let runtime = temporary
+            .path()
+            .join("target/debug/deps/libwaterui_dylib.so");
+        let unrelated_manifest = temporary.path().join("app/Cargo.toml");
+        let unrelated = temporary.path().join("target/debug/app");
+        let stdout = format!(
+            "{}\n{}\n",
+            shared_runtime_artifact_json(&unrelated_manifest, &unrelated, "app"),
+            shared_runtime_artifact_json(&manifest, &runtime, "waterui-dylib"),
+        );
+
+        assert_eq!(
+            reported_shared_runtime(stdout.as_bytes()).expect("runtime report"),
+            Some(runtime)
+        );
+    }
+
+    #[test]
+    fn missing_shared_runtime_report_is_none_and_accessor_errors() {
+        let temporary = tempdir().expect("tempdir");
+        let stdout = shared_runtime_artifact_json(
+            &temporary.path().join("app/Cargo.toml"),
+            &temporary.path().join("target/debug/app"),
+            "app",
+        );
+        assert_eq!(
+            reported_shared_runtime(stdout.as_bytes()).expect("runtime report"),
+            None
+        );
+
+        let profile_dir = temporary.path().join("target/debug");
+        let error = BuiltTarget {
+            profile_dir: profile_dir.clone(),
+            artifact: temporary.path().join("app"),
+            shared_runtime: None,
+        }
+        .shared_runtime()
+        .expect_err("missing runtime should fail");
+        let message = error.to_string();
+        assert!(message.contains("waterui-dylib"));
+        assert!(message.contains(&profile_dir.display().to_string()));
+    }
+
+    #[test]
+    fn reported_shared_runtime_rejects_multiple_manifests() {
+        let temporary = tempdir().expect("tempdir");
+        let first_manifest = temporary.path().join("first/Cargo.toml");
+        let second_manifest = temporary.path().join("second/Cargo.toml");
+        let stdout = format!(
+            "{}\n{}\n",
+            shared_runtime_artifact_json(
+                &first_manifest,
+                &temporary.path().join("target/debug/libfirst.so"),
+                "waterui-dylib",
+            ),
+            shared_runtime_artifact_json(
+                &second_manifest,
+                &temporary.path().join("target/debug/libsecond.so"),
+                "waterui-dylib",
+            ),
+        );
+
+        let error =
+            reported_shared_runtime(stdout.as_bytes()).expect_err("ambiguous runtime report");
+        let message = error.to_string();
+        assert!(message.contains(&first_manifest.display().to_string()));
+        assert!(message.contains(&second_manifest.display().to_string()));
+    }
 
     fn triple(value: &str) -> Triple {
         value.parse().expect("test target triple must parse")
@@ -2512,7 +2766,8 @@ mod tests {
                     .with_target_dir(&shared_target)
                     .build_binary(package.as_str(), false)
                     .await
-                    .expect("the generated crate builds");
+                    .expect("the generated crate builds")
+                    .artifact;
                 assert!(artifact.is_file(), "the reported artifact exists");
                 artifacts.push(artifact);
             }
@@ -2688,7 +2943,16 @@ mod tests {
             let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
                 .await
                 .expect("scan");
-            assert_eq!(stale, ["waterui-dylib"]);
+            assert_eq!(
+                stale,
+                [super::StaleSharedDylib {
+                    package: "waterui-dylib".to_owned(),
+                    artifact: dylib.clone(),
+                    reason: super::StaleSharedDylibReason::ForeignDepInfo {
+                        dep_info: dep_info.clone(),
+                    },
+                }]
+            );
 
             // The same file written by this unit's own source is trusted.
             write_dep_info(&own_source);
@@ -2777,18 +3041,98 @@ mod tests {
             let stale = super::stale_shared_dylib_packages(stdout.as_bytes())
                 .await
                 .expect("scan");
-            assert_eq!(stale, ["waterui-dylib"]);
-
-            // Without any dep-info the check fails loudly rather than
-            // trusting the shared artifact.
-            std::fs::remove_file(unit_dir.join("waterui_dylib.d")).expect("remove dep-info");
-            let error = super::stale_shared_dylib_packages(stdout.as_bytes())
-                .await
-                .expect_err("a fresh dylib without dep-info is an error");
+            assert_eq!(stale.len(), 1, "{stale:?}");
+            assert_eq!(stale[0].package, "waterui-dylib");
             assert!(
-                error.to_string().contains("no dep-info was found"),
+                matches!(
+                    stale[0].reason,
+                    super::StaleSharedDylibReason::ForeignDepInfo { .. }
+                ),
+                "{:?}",
+                stale[0].reason
+            );
+        });
+    }
+
+    /// A fresh uplifted dylib with no dep-info beside it or in its unit
+    /// directory is a cache this CLI wrote and can no longer account for. It
+    /// is recovered — flagged so the package is cleaned and rebuilt — rather
+    /// than reported as an error, and the reason names the missing record.
+    #[test]
+    fn fresh_uplifted_dylib_without_dep_info_is_recovered_not_reported() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let profile = temporary
+                .path()
+                .join("target/shared/x86_64-pc-windows-msvc/debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir_all(&deps).expect("deps dir");
+            let dylib = profile.join("waterui_dylib.dll");
+            std::fs::write(&dylib, []).expect("dylib");
+            let import_lib = profile.join("waterui_dylib.dll.lib");
+            std::fs::write(&import_lib, []).expect("import lib");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+
+            let stdout = serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "path+file:///x#waterui-dylib@0.1.0",
+                "manifest_path": manifest,
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["dylib"],
+                    "name": "waterui_dylib",
+                    "src_path": ours.join("src/lib.rs"),
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true,
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 0,
+                    "debug_assertions": true,
+                    "overflow_checks": true,
+                    "test": false,
+                },
+                "features": [],
+                "filenames": [dylib, import_lib],
+                "executable": null,
+                "fresh": true,
+            })
+            .to_string();
+
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes())
+                .await
+                .expect("a fresh dylib without dep-info is recovered, not reported");
+            assert_eq!(
+                stale,
+                [super::StaleSharedDylib {
+                    package: "waterui-dylib".to_owned(),
+                    artifact: dylib.clone(),
+                    reason: super::StaleSharedDylibReason::MissingDepInfo {
+                        reported_files: vec![dylib.clone(), import_lib.clone()],
+                    },
+                }]
+            );
+            let reason = stale[0].reason.to_string();
+            assert!(reason.contains("no dep-info was found"), "{reason}");
+
+            // A second pass in the same state after the rebuild is the loud
+            // failure, naming the artifact, the package, and the target
+            // directory to drop.
+            let target_dir = temporary.path().join("target/shared");
+            let error = super::unrecoverable_shared_dylib_error(&stale, &target_dir).to_string();
+            assert!(
+                error.contains("after its package was cleaned and rebuilt"),
                 "{error}"
             );
+            assert!(error.contains("waterui-dylib"), "{error}");
+            assert!(error.contains(&dylib.display().to_string()), "{error}");
+            assert!(error.contains(&target_dir.display().to_string()), "{error}");
         });
     }
 

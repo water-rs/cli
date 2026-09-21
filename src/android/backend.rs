@@ -114,7 +114,12 @@ impl Backend for AndroidBackend {
 
         // Android is where a missing declaration actually breaks things, so
         // surface anything a dependency needs that the app has not enabled.
-        match crate::assets::scan_required_permissions(project).await {
+        // The audit resolves the FFI companion's graph — the crate the Android
+        // build compiles. On a first init the companion is not scaffolded yet,
+        // so the scan fails and the audit is skipped until the next reinit.
+        match crate::assets::scan_required_permissions(&project.ffi_crate_path().join("Cargo.toml"))
+            .await
+        {
             Ok(required) => crate::assets::warn_missing_permissions(project, &required, |key| {
                 key.android_permission_name().is_some()
             }),
@@ -168,7 +173,7 @@ impl Backend for AndroidBackend {
         project: &Project,
         platform: TargetPlatform,
         options: BuildOptions,
-    ) -> eyre::Result<PathBuf> {
+    ) -> eyre::Result<crate::build::BuiltTarget> {
         debug_assert_eq!(platform, TargetPlatform::Android);
         project
             .browser_runtime_plan(platform, TargetBackend::Android)
@@ -181,6 +186,7 @@ impl Backend for AndroidBackend {
         project: &Project,
         platform: TargetPlatform,
         options: PackageOptions,
+        _built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
         debug_assert_eq!(platform, TargetPlatform::Android);
         AndroidPlatform::package_with_abis(project, options, &[AndroidAbi::Arm64V8a]).await

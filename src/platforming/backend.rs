@@ -1,13 +1,13 @@
 //! Backend configuration and initialization for `WaterUI` projects.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     android::backend::AndroidBackend,
     apple::backend::AppleBackend,
-    build::BuildOptions,
+    build::{BuildOptions, BuiltTarget},
     device::Artifact,
     esp32::backend::Esp32Backend,
     gtk4::backend::Gtk4Backend,
@@ -230,13 +230,13 @@ pub trait Backend: Sized + Send + Sync {
 
     /// Build the Rust library for the target platform.
     ///
-    /// Returns the target directory path where the built library is located.
+    /// Returns the Cargo-reported target and artifacts from the build.
     fn build(
         &self,
         project: &Project,
         platform: TargetPlatform,
         options: BuildOptions,
-    ) -> impl Future<Output = eyre::Result<PathBuf>> + Send;
+    ) -> impl Future<Output = eyre::Result<BuiltTarget>> + Send;
 
     /// Package the project for the target platform.
     ///
@@ -246,6 +246,7 @@ pub trait Backend: Sized + Send + Sync {
         project: &Project,
         platform: TargetPlatform,
         options: PackageOptions,
+        built: &BuiltTarget,
     ) -> impl Future<Output = eyre::Result<Artifact>> + Send;
 
     /// Clean build artifacts for the platform.

@@ -17,6 +17,8 @@ use crate::{
         Host, Installation, Toolchain, ToolchainError,
         cmake::Cmake,
         doctor::{CheckStatus, doctor, ids},
+        dxc::Dxc,
+        msvc::MsvcBuildTools,
         web::web_toolchain,
         windows_arm64_llvm::WindowsArm64LlvmToolchain,
     },
@@ -288,6 +290,17 @@ pub async fn check_hydrolysis(host: &Host) -> Result<()> {
             "{}",
             toolchain_check_message("Windows ARM64 LLVM toolchain", &e)
         );
+    }
+    if cfg!(target_os = "windows") {
+        if let Err(e) = MsvcBuildTools.check(host).await {
+            bail!("{}", toolchain_check_message("MSVC C++ build tools", &e));
+        }
+        if let Err(e) = Dxc.check(host).await {
+            bail!(
+                "{}",
+                toolchain_check_message("DirectX Shader Compiler (dxc)", &e)
+            );
+        }
     }
     Ok(())
 }

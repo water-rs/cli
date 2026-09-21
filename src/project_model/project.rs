@@ -16,6 +16,82 @@ enum OpenMode {
     PreviewBuild,
 }
 
+/// The managed native backends a playground [`Project::open`] initialises.
+///
+/// A playground delegates its Apple and Android projects to the CLI, which
+/// scaffolds them into the build cache when the project is opened. Each
+/// scaffold costs time and leaves a generated project behind, so a command
+/// declares the platforms it is about to act on and only their backends are
+/// initialised. The other managed backends (GTK4, hydrolysis, `WinUI`, ESP32)
+/// are generated on demand by the command that runs them and are not part of
+/// this selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ManagedBackends {
+    apple: bool,
+    android: bool,
+}
+
+impl ManagedBackends {
+    /// No managed native backend.
+    pub const NONE: Self = Self {
+        apple: false,
+        android: false,
+    };
+
+    /// Every managed native backend, for commands that act on all of them.
+    pub const ALL: Self = Self {
+        apple: true,
+        android: true,
+    };
+
+    /// The backends `platform` builds with: Apple for the Apple platforms,
+    /// Android for Android, none for the rest.
+    #[must_use]
+    pub const fn for_platform(platform: TargetPlatform) -> Self {
+        Self {
+            apple: crate::apple::platform::is_apple_platform(platform),
+            android: crate::android::platform::is_android_platform(platform),
+        }
+    }
+
+    /// The union of [`Self::for_platform`] over `platforms`.
+    #[must_use]
+    pub fn for_platforms(platforms: &[TargetPlatform]) -> Self {
+        platforms.iter().fold(Self::NONE, |selected, platform| {
+            selected.union(Self::for_platform(*platform))
+        })
+    }
+
+    /// The managed backend `backend` itself is, if it is one: Apple or Android.
+    #[must_use]
+    pub const fn for_backend(backend: TargetBackend) -> Self {
+        Self {
+            apple: matches!(backend, TargetBackend::Apple),
+            android: matches!(backend, TargetBackend::Android),
+        }
+    }
+
+    #[must_use]
+    const fn union(self, other: Self) -> Self {
+        Self {
+            apple: self.apple || other.apple,
+            android: self.android || other.android,
+        }
+    }
+
+    /// Whether the Apple backend is selected.
+    #[must_use]
+    pub const fn apple(self) -> bool {
+        self.apple
+    }
+
+    /// Whether the Android backend is selected.
+    #[must_use]
+    pub const fn android(self) -> bool {
+        self.android
+    }
+}
+
 /// What `cargo metadata` reports about the tree a project builds in.
 ///
 /// Resolved once per [`Project`] and shared by everything that needs it, so
@@ -186,7 +262,7 @@ impl Project {
             build_options = build_options.with_progress(progress.clone());
         }
         // Build rust library for the target platform
-        backend
+        let built = backend
             .build(self, platform, build_options)
             .await
             .map_err(FailToRun::Build)?;
@@ -197,7 +273,7 @@ impl Project {
         }
         // Package the build artifacts for the target platform
         let artifact = backend
-            .package(self, platform, package_options)
+            .package(self, platform, package_options, &built)
             .await
             .map_err(FailToRun::Package)?;
 
@@ -835,13 +911,58 @@ impl Project {
         backend.clean(self, platform).await
     }
 
+    /// The names of every crate the CLI generates for this project: the
+    /// backend, FFI, preview and launcher crates. Each is tagged with this
+    /// project's root (see [`generated_crate_name`]) unless `[crates]`
+    /// overrides it, so their units in the shared Cargo target directory are
+    /// this project's alone.
+    #[must_use]
+    pub fn generated_crate_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = [
+            self.ffi_crate_name(),
+            self.preview_ffi_crate_name(),
+            self.gtk_backend_crate_name(),
+            self.hydrolysis_backend_crate_name(),
+            self.winui_backend_crate_name(),
+            self.esp32_backend_crate_name(),
+            self.tui_backend_crate_name(),
+        ]
+        .into_iter()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Remove this project's own units from the shared Cargo target directory.
+    ///
+    /// The shared target is one directory for every project on the machine,
+    /// so only units Cargo named after this project's generated crates go;
+    /// dependency artifacts stay for the other projects that resolve them.
+    async fn clean_shared_target_units(&self) -> Result<(), eyre::Report> {
+        let removed = crate::water_dir::remove_project_units_from_shared_target(
+            &self.generated_crate_names(),
+        )
+        .await?;
+        for path in &removed {
+            info!(path = %path.display(), "removed this project's unit from the shared target");
+        }
+        Ok(())
+    }
+
     /// Clean all build artifacts for the project.
     ///
     /// This cleans:
     /// - Rust target directory
+    /// - this project's own units in the shared Cargo target directory
     /// - Apple build artifacts (if backend configured)
     /// - Android build artifacts (if backend configured)
     /// - GTK4 build artifacts (if backend configured)
+    ///
+    /// Dependency artifacts in the shared Cargo target directory are left in
+    /// place: every project on the machine resolves them identically, and
+    /// `water gc build-cache --shared-target` drops them all.
     ///
     /// # Errors
     ///
@@ -854,12 +975,15 @@ impl Project {
         };
 
         if self.is_playground() {
+            // The generated backends' units go first: once the managed
+            // manifests below are gone, nothing else names them.
+            self.clean_shared_target_units().await?;
             crate::water_dir::remove_project_build_cache(self.root()).await?;
-            // Compiled artifacts live in the per-user shared target directory
-            // and outlive any single project, so they stay. What remains to
-            // sweep here is the `water-backends` subtree older CLI layouts
-            // left under the project's own Cargo target directory — never the
-            // user's other compiled artifacts.
+            // Dependency artifacts live in the per-user shared target
+            // directory and outlive any single project, so they stay. What
+            // remains to sweep here is the `water-backends` subtree older CLI
+            // layouts left under the project's own Cargo target directory —
+            // never the user's other compiled artifacts.
             let water_backends_root = self.target_dir().await?.join("water-backends");
             if water_backends_root.exists() {
                 smol::fs::remove_dir_all(&water_backends_root).await?;
@@ -872,6 +996,8 @@ impl Project {
         if target_dir.exists() {
             smol::fs::remove_dir_all(&target_dir).await?;
         }
+
+        self.clean_shared_target_units().await?;
 
         // Clean Apple backend if configured
         if self.apple_backend().is_some() {
@@ -921,8 +1047,9 @@ impl Project {
         backend: &B,
         platform: TargetPlatform,
         options: PackageOptions,
+        built: &crate::build::BuiltTarget,
     ) -> Result<Artifact, eyre::Report> {
-        backend.package(self, platform, options).await
+        backend.package(self, platform, options, built).await
     }
 
     fn app_crate_overrides(&self) -> Option<&AppCrates> {
@@ -1132,7 +1259,9 @@ impl CreateOptions {
 }
 
 impl Project {
-    async fn scaffold_ffi_companion(&self) -> Result<(), crate::backend::FailToInitBackend> {
+    pub(crate) async fn scaffold_ffi_companion(
+        &self,
+    ) -> Result<(), crate::backend::FailToInitBackend> {
         let manifest = self.manifest();
         let app_name = manifest
             .package
@@ -1366,6 +1495,7 @@ impl Project {
             web: options.web.as_ref().map(|scaffold| web::WebConfig {
                 package_manager: scaffold.package_manager,
             }),
+            assets: None,
         };
 
         // Save Water.toml
@@ -1680,14 +1810,19 @@ impl Project {
     /// Open a `WaterUI` project located at the specified path.
     ///
     /// This loads both the `Water.toml` manifest and the `Cargo.toml` file.
-    /// For playground projects, backends are automatically initialized if not configured.
+    /// For playground projects, the managed backends in `backends` — those the
+    /// caller's target platforms need — are initialised; the accessor of a
+    /// backend not selected returns `None`.
     ///
     /// # Errors
     /// - `FailToOpenProject::Manifest`: If there was an error opening the `Water.toml` manifest.
     /// - `FailToOpenProject::CargoManifest`: If there was an error reading the `Cargo.toml` file.
     /// - `FailToOpenProject::MissingCrateName`: If the crate name is missing in `Cargo.toml`.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, FailToOpenProject> {
-        Self::open_with_mode(path, OpenMode::Full).await
+    pub async fn open(
+        path: impl AsRef<Path>,
+        backends: ManagedBackends,
+    ) -> Result<Self, FailToOpenProject> {
+        Self::open_with_mode(path, OpenMode::Full, backends).await
     }
 
     /// Open a project for preview dylib builds without initializing native app backends.
@@ -1700,7 +1835,7 @@ impl Project {
     /// - `FailToOpenProject::CargoManifest`: If there was an error reading the `Cargo.toml` file.
     /// - `FailToOpenProject::MissingCrateName`: If the crate name is missing in `Cargo.toml`.
     pub async fn open_for_preview_build(path: impl AsRef<Path>) -> Result<Self, FailToOpenProject> {
-        Self::open_with_mode(path, OpenMode::PreviewBuild).await
+        Self::open_with_mode(path, OpenMode::PreviewBuild, ManagedBackends::NONE).await
     }
 
     /// Make a local-checkout project's `[patch]` tables the checkout's.
@@ -1764,6 +1899,7 @@ impl Project {
     async fn open_with_mode(
         path: impl AsRef<Path>,
         open_mode: OpenMode,
+        backends: ManagedBackends,
     ) -> Result<Self, FailToOpenProject> {
         use crate::backend::Backend;
 
@@ -1882,38 +2018,44 @@ impl Project {
             || std::env::var("XCODE_PRODUCT_BUILD_VERSION").is_ok();
 
         if is_playground && !skip_backend_init && open_mode == OpenMode::Full {
-            let apple_backend_start = std::time::Instant::now();
-            let apple_backend = AppleBackend::init(&project)
-                .await
-                .map_err(FailToOpenProject::BackendInit)?;
-            info!(
-                path = %project.root.display(),
-                elapsed_ms = apple_backend_start.elapsed().as_millis(),
-                "Project::open initialized Apple backend"
-            );
-            project.manifest.backends.set_apple(apple_backend);
+            if backends.apple() {
+                let apple_backend_start = std::time::Instant::now();
+                let apple_backend = AppleBackend::init(&project)
+                    .await
+                    .map_err(FailToOpenProject::BackendInit)?;
+                info!(
+                    path = %project.root.display(),
+                    elapsed_ms = apple_backend_start.elapsed().as_millis(),
+                    "Project::open initialized Apple backend"
+                );
+                project.manifest.backends.set_apple(apple_backend);
+            }
 
-            let android_backend_start = std::time::Instant::now();
-            let android_backend = AndroidBackend::init(&project)
-                .await
-                .map_err(FailToOpenProject::BackendInit)?;
-            info!(
-                path = %project.root.display(),
-                elapsed_ms = android_backend_start.elapsed().as_millis(),
-                "Project::open initialized Android backend"
-            );
-            project.manifest.backends.set_android(android_backend);
+            if backends.android() {
+                let android_backend_start = std::time::Instant::now();
+                let android_backend = AndroidBackend::init(&project)
+                    .await
+                    .map_err(FailToOpenProject::BackendInit)?;
+                info!(
+                    path = %project.root.display(),
+                    elapsed_ms = android_backend_start.elapsed().as_millis(),
+                    "Project::open initialized Android backend"
+                );
+                project.manifest.backends.set_android(android_backend);
+            }
 
-            let ffi_companion_start = std::time::Instant::now();
-            project
-                .scaffold_ffi_companion()
-                .await
-                .map_err(FailToOpenProject::BackendInit)?;
-            info!(
-                path = %project.root.display(),
-                elapsed_ms = ffi_companion_start.elapsed().as_millis(),
-                "Project::open scaffolded native ffi companion"
-            );
+            if project.apple_backend().is_some() || project.android_backend().is_some() {
+                let ffi_companion_start = std::time::Instant::now();
+                project
+                    .scaffold_ffi_companion()
+                    .await
+                    .map_err(FailToOpenProject::BackendInit)?;
+                info!(
+                    path = %project.root.display(),
+                    elapsed_ms = ffi_companion_start.elapsed().as_millis(),
+                    "Project::open scaffolded native ffi companion"
+                );
+            }
         }
 
         if !is_playground
@@ -2199,6 +2341,10 @@ pub struct Manifest {
     /// Web-frontend toolchain declarations (`[web]`); only the CLI reads this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<web::WebConfig>,
+    /// Assets the project bundles beyond what dependency crates declare for
+    /// themselves (`[assets]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<AssetsConfig>,
 }
 
 /// Permission entry for playground projects.
@@ -2301,6 +2447,7 @@ impl Manifest {
             theme: None,
             launch: None,
             web: None,
+            assets: None,
         }
     }
 }
@@ -2417,6 +2564,35 @@ pub struct UnsupportedWebViewBackend {
     backend: TargetBackend,
 }
 
+/// `[assets]` section in `Water.toml`: assets the project bundles beyond what
+/// dependency crates declare through `[package.metadata.waterui.assets]`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AssetsConfig {
+    /// Font families to bundle, one `[[assets.font]]` table per family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub font: Vec<FontConfig>,
+}
+
+/// One `[[assets.font]]` declaration in `Water.toml`.
+///
+/// `name` alone resolves through the CLI's built-in registry; `local_path`
+/// bundles a font file relative to the project root; `remote_path` names a
+/// face — or an archive containing it — that must already sit in the font
+/// cache, since builds perform no network access. A declaration sets at most
+/// one source.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FontConfig {
+    /// Font family name.
+    pub name: String,
+    /// Font file relative to the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
+    /// URL the font — or an archive containing it — is fetched from when
+    /// pre-seeding the font cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_path: Option<String>,
+}
+
 /// App-specific configuration in `Water.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AppConfig {
@@ -2517,6 +2693,82 @@ pub enum PackageType {
     /// A playground project for quick experimentation.
     /// Platform projects are created in a temporary directory.
     Playground,
+}
+
+#[cfg(test)]
+mod managed_backends_tests {
+    use super::{ManagedBackends, TargetBackend, TargetPlatform};
+
+    /// A macOS-only open scaffolds the Apple project and leaves no `android`
+    /// managed backend behind; an Android open the reverse.
+    #[test]
+    fn a_platform_selects_only_the_backend_it_builds_with() {
+        for platform in [
+            TargetPlatform::MacOS,
+            TargetPlatform::IOS,
+            TargetPlatform::IOSSimulator,
+        ] {
+            let selected = ManagedBackends::for_platform(platform);
+            assert!(selected.apple(), "{platform:?} builds with Apple");
+            assert!(!selected.android(), "{platform:?} leaves Android alone");
+        }
+        let selected = ManagedBackends::for_platform(TargetPlatform::Android);
+        assert!(selected.android());
+        assert!(!selected.apple());
+    }
+
+    /// The backends generated on demand (GTK4, hydrolysis, `WinUI`, ESP32) are
+    /// not initialised by `Project::open`, so their platforms select nothing.
+    #[test]
+    fn platforms_without_a_managed_native_backend_select_none() {
+        for platform in [
+            TargetPlatform::Linux,
+            TargetPlatform::Windows,
+            TargetPlatform::Web,
+            TargetPlatform::Esp32S3,
+            TargetPlatform::Esp32C3,
+            TargetPlatform::Esp32P4,
+        ] {
+            assert_eq!(
+                ManagedBackends::for_platform(platform),
+                ManagedBackends::NONE,
+                "{platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn several_platforms_select_the_union_of_their_backends() {
+        assert_eq!(
+            ManagedBackends::for_platforms(&[TargetPlatform::IOS, TargetPlatform::IOSSimulator]),
+            ManagedBackends::for_platform(TargetPlatform::MacOS)
+        );
+        assert_eq!(
+            ManagedBackends::for_platforms(&[TargetPlatform::MacOS, TargetPlatform::Android]),
+            ManagedBackends::ALL
+        );
+        assert_eq!(ManagedBackends::for_platforms(&[]), ManagedBackends::NONE);
+    }
+
+    #[test]
+    fn a_backend_selects_itself_when_it_is_managed_natively() {
+        assert!(ManagedBackends::for_backend(TargetBackend::Apple).apple());
+        assert!(!ManagedBackends::for_backend(TargetBackend::Apple).android());
+        assert!(ManagedBackends::for_backend(TargetBackend::Android).android());
+        assert!(!ManagedBackends::for_backend(TargetBackend::Android).apple());
+        for backend in [
+            TargetBackend::Gtk4,
+            TargetBackend::Hydrolysis,
+            TargetBackend::WinUi,
+            TargetBackend::Dew,
+        ] {
+            assert_eq!(
+                ManagedBackends::for_backend(backend),
+                ManagedBackends::NONE,
+                "{backend:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2858,7 +3110,9 @@ mod webview_backend_tests {
 mod scaffold_tests {
     use std::path::Path;
 
-    use super::{BundleIdentifier, CreateOptions, PackageType, Project, TargetBackend};
+    use super::{
+        BundleIdentifier, CreateOptions, ManagedBackends, PackageType, Project, TargetBackend,
+    };
 
     /// The documented `assets!` workflow requires the assets root to exist: the
     /// planner walks it recursively, so a missing directory fails the first
@@ -2998,6 +3252,76 @@ mod scaffold_tests {
                 tagged.as_str().len() - shipped.as_str().len(),
                 9,
                 "the tag is a dash plus eight hex digits: {tagged}"
+            );
+        }
+    }
+
+    fn create_playground(root: &Path) -> Project {
+        smol::block_on(Project::create(
+            root,
+            CreateOptions {
+                name: "Water Example".to_string(),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
+                    .expect("bundle identifier"),
+                package_type: PackageType::Playground,
+                waterui_path: None,
+                channel: None,
+                framework_manifest: None,
+                framework: Some(crate::framework::test_fixtures::stable_framework()),
+                author: "Lexo Liu".to_string(),
+                backends: Vec::new(),
+                web: None,
+            },
+        ))
+        .expect("project creation must succeed")
+    }
+
+    /// Opening a playground for one platform scaffolds the managed backend
+    /// that platform builds with and nothing else: a macOS open must not
+    /// leave an Android project behind, and an Android open no Apple project.
+    #[test]
+    fn opening_a_playground_scaffolds_only_the_platforms_managed_backend() {
+        use crate::android::backend::AndroidBackend;
+        use crate::apple::backend::AppleBackend;
+        use crate::platform::TargetPlatform;
+
+        for (platform, apple_expected) in [
+            (TargetPlatform::MacOS, true),
+            (TargetPlatform::Android, false),
+        ] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let root = dir.path().join("water-example");
+            create_playground(&root);
+
+            let project = smol::block_on(Project::open(
+                &root,
+                ManagedBackends::for_platform(platform),
+            ))
+            .expect("opening the playground must succeed");
+
+            let apple_path = project.backend_path::<AppleBackend>();
+            let android_path = project.backend_path::<AndroidBackend>();
+            assert_eq!(
+                project.apple_backend().is_some(),
+                apple_expected,
+                "{platform:?}: apple backend"
+            );
+            assert_eq!(
+                project.android_backend().is_some(),
+                !apple_expected,
+                "{platform:?}: android backend"
+            );
+            assert_eq!(
+                apple_path.exists(),
+                apple_expected,
+                "{platform:?}: {}",
+                apple_path.display()
+            );
+            assert_eq!(
+                android_path.exists(),
+                !apple_expected,
+                "{platform:?}: {}",
+                android_path.display()
             );
         }
     }

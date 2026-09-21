@@ -235,7 +235,7 @@ impl Backend for AppleBackend {
         project: &Project,
         platform: TargetPlatform,
         options: BuildOptions,
-    ) -> eyre::Result<PathBuf> {
+    ) -> eyre::Result<crate::build::BuiltTarget> {
         project
             .browser_runtime_plan(platform, TargetBackend::Apple)
             .await?;
@@ -247,8 +247,9 @@ impl Backend for AppleBackend {
         project: &Project,
         platform: TargetPlatform,
         options: PackageOptions,
+        built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
-        package_apple(project, platform, options).await
+        package_apple(project, platform, options, built).await
     }
 
     async fn clean(&self, project: &Project, _platform: TargetPlatform) -> eyre::Result<()> {

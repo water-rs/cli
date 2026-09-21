@@ -17,7 +17,9 @@ use tracing::info;
 
 use crate::{
     assets, browser_runtime,
-    build::{BuildOptions, BuildProgress, RustBuild, RustDynamicLibraries, RustLinkage},
+    build::{
+        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
+    },
     device::Artifact,
     hydrolysis::backend::HydrolysisBackend,
     platform::{PackageOptions, TargetPlatform},
@@ -43,26 +45,19 @@ const HYDROLYSIS_INIT_HINT: &str = "water run --platform windows --backend hydro
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const HYDROLYSIS_INIT_HINT: &str = "initialize hydrolysis backend on macOS, Linux, or Windows";
 
-/// Cargo profile directory the hydrolysis backend's artifacts land in.
-async fn hydrolysis_profile_dir(
-    project: &Project,
-    platform: TargetPlatform,
-    profile: &str,
-    linkage: RustLinkage,
-) -> eyre::Result<PathBuf> {
-    Ok(project
-        .water_target_dir(linkage)
-        .await?
-        .join(platform.triple().to_string())
-        .join(profile))
-}
-
-/// Loader search path the platform's dynamic linker resolves the shared runtime through.
-const fn hydrolysis_loader_search_path(platform: TargetPlatform) -> Option<&'static str> {
+/// Loader search paths the platform's dynamic linker resolves the shared runtime through.
+///
+/// Both situations a backend binary runs in need an entry. `water preview` and an
+/// unpackaged `water run` execute the binary where Cargo left it, with the shared
+/// runtime staged beside it — that is `@executable_path` on macOS and `$ORIGIN` on
+/// Linux. Packaging then moves the runtime into `Contents/Frameworks`, which only
+/// the bundle-relative entry reaches. macOS carried the bundle path alone, so a
+/// binary run in place could not load the runtime at all (#140).
+const fn hydrolysis_loader_search_paths(platform: TargetPlatform) -> &'static [&'static str] {
     match platform {
-        TargetPlatform::MacOS => Some("@executable_path/../Frameworks"),
-        TargetPlatform::Linux => Some("$ORIGIN"),
-        _ => None,
+        TargetPlatform::MacOS => &["@executable_path", "@executable_path/../Frameworks"],
+        TargetPlatform::Linux => &["$ORIGIN"],
+        _ => &[],
     }
 }
 
@@ -83,7 +78,7 @@ pub async fn build_hydrolysis(
     project: &Project,
     platform: TargetPlatform,
     options: BuildOptions,
-) -> eyre::Result<PathBuf> {
+) -> eyre::Result<BuiltTarget> {
     build_hydrolysis_with_envs_and_features(project, platform, options, &[], &[]).await
 }
 
@@ -96,7 +91,7 @@ pub async fn build_hydrolysis_with_envs(
     platform: TargetPlatform,
     options: BuildOptions,
     extra_envs: &[(String, OsString)],
-) -> eyre::Result<PathBuf> {
+) -> eyre::Result<BuiltTarget> {
     build_hydrolysis_with_envs_and_features(project, platform, options, extra_envs, &[]).await
 }
 
@@ -110,7 +105,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
     options: BuildOptions,
     extra_envs: &[(String, OsString)],
     extra_features: &[&str],
-) -> eyre::Result<PathBuf> {
+) -> eyre::Result<BuiltTarget> {
     if !is_hydrolysis_native_platform(platform) {
         bail!("Hydrolysis backend is only supported on macOS, Linux, and Windows");
     }
@@ -155,7 +150,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
         .with_linkage(
             options.linkage(),
             &format!("{}/dev", project.crate_name()),
-            hydrolysis_loader_search_path(platform),
+            hydrolysis_loader_search_paths(platform),
         )
         .with_envs(llvm_envs)
         .with_envs(options.cargo_envs().iter().cloned())
@@ -166,7 +161,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
     if let Some(progress) = options.progress() {
         build = build.with_progress(progress.clone());
     }
-    build
+    let built_target = build
         .build_binary(
             project.hydrolysis_backend_crate_name().as_str(),
             options.is_release(),
@@ -190,48 +185,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
             .wrap_err("Failed to build the hydrolysis CEF helper with cargo")?;
     }
 
-    build
-        .lib_output_dir(options.is_release())
-        .await
-        .map_err(Into::into)
-}
-
-/// Resolve the built hydrolysis backend binary path for the given profile.
-///
-/// # Errors
-/// Returns an error if neither the canonical nor underscored backend binary can be found.
-pub async fn built_hydrolysis_binary_path(
-    project: &Project,
-    platform: TargetPlatform,
-    profile: &str,
-    linkage: RustLinkage,
-) -> eyre::Result<PathBuf> {
-    let target_dir = hydrolysis_profile_dir(project, platform, profile, linkage).await?;
-    let binary_name = project.hydrolysis_backend_crate_name();
-    let binary_path = if cfg!(windows) {
-        target_dir.join(format!("{binary_name}.exe"))
-    } else {
-        target_dir.join(binary_name.as_ref())
-    };
-    if binary_path.exists() {
-        return Ok(binary_path);
-    }
-
-    let alt_binary_name = binary_name.replace('-', "_");
-    let underscored_path = if cfg!(windows) {
-        target_dir.join(format!("{alt_binary_name}.exe"))
-    } else {
-        target_dir.join(alt_binary_name)
-    };
-    if underscored_path.exists() {
-        return Ok(underscored_path);
-    }
-
-    bail!(
-        "Built hydrolysis binary not found at {} or {}",
-        binary_path.display(),
-        underscored_path.display()
-    );
+    Ok(built_target)
 }
 
 /// Stage the shared `WaterUI` runtime and Rust standard library next to a raw
@@ -246,19 +200,19 @@ pub async fn built_hydrolysis_binary_path(
 /// libraries cannot be resolved and staged.
 pub(crate) async fn stage_hydrolysis_shared_runtime(
     project: &Project,
-    binary_path: &Path,
+    built: &BuiltTarget,
     platform: TargetPlatform,
 ) -> eyre::Result<()> {
     if !is_hydrolysis_native_platform(platform) {
         bail!("Hydrolysis shared runtime can only be staged for macOS, Linux, and Windows");
     }
-    let runtime_dir = binary_path.parent().ok_or_else(|| {
+    let runtime_dir = built.artifact.parent().ok_or_else(|| {
         eyre::eyre!(
             "Hydrolysis binary path has no output directory: {}",
-            binary_path.display()
+            built.artifact.display()
         )
     })?;
-    let libraries = RustDynamicLibraries::resolve(runtime_dir, &platform.triple(), project).await?;
+    let libraries = RustDynamicLibraries::resolve(built, &platform.triple(), project).await?;
     synchronize_shared_runtime(runtime_dir, Some(&libraries), &platform.triple()).await
 }
 
@@ -315,11 +269,18 @@ pub async fn package_hydrolysis(
     project: &Project,
     platform: TargetPlatform,
     options: PackageOptions,
+    built: Option<&BuiltTarget>,
 ) -> eyre::Result<Artifact> {
     if platform == TargetPlatform::Web {
         let site_root = package_hydrolysis_web_site(project, options.is_debug(), false).await?;
         return Ok(Artifact::new(project.bundle_identifier(), site_root));
     }
+
+    let built = built.ok_or_else(|| {
+        eyre::eyre!(
+            "Hydrolysis packaging for {platform:?} needs the build result of the native backend binary"
+        )
+    })?;
 
     if !is_hydrolysis_native_platform(platform) {
         bail!(
@@ -342,30 +303,13 @@ pub async fn package_hydrolysis(
     )
     .await?;
 
-    let linkage = if options.uses_shared_rust_runtime() {
-        RustLinkage::SharedRuntime
-    } else {
-        RustLinkage::Static
-    };
-    let final_binary_path =
-        built_hydrolysis_binary_path(project, platform, profile, linkage).await?;
-    let profile_directory = final_binary_path.parent().ok_or_else(|| {
-        eyre::eyre!(
-            "Hydrolysis binary path has no profile directory: {}",
-            final_binary_path.display()
-        )
-    })?;
+    let final_binary_path = &built.artifact;
+    let profile_directory = built.profile_dir.as_path();
     let runtime_plan = project
         .browser_runtime_plan(platform, crate::platform::TargetBackend::Hydrolysis)
         .await?;
     let shared_libraries = if options.uses_shared_rust_runtime() {
-        let lib_dir = final_binary_path.parent().ok_or_else(|| {
-            eyre::eyre!(
-                "Hydrolysis binary path has no output directory: {}",
-                final_binary_path.display()
-            )
-        })?;
-        Some(RustDynamicLibraries::resolve(lib_dir, &platform.triple(), project).await?)
+        Some(RustDynamicLibraries::resolve(built, &platform.triple(), project).await?)
     } else {
         None
     };
@@ -377,7 +321,7 @@ pub async fn package_hydrolysis(
                 project,
                 platform,
                 &backend_path,
-                &final_binary_path,
+                final_binary_path,
                 profile_directory,
                 runtime_plan,
                 shared_libraries.as_ref(),
@@ -408,7 +352,7 @@ pub async fn package_hydrolysis(
         binary_name.to_string()
     };
     let packaged_binary = crate::platforming::packaging::stage_binary_as(
-        &final_binary_path,
+        final_binary_path,
         &runtime_dir,
         &shipped_name,
     )
@@ -573,8 +517,7 @@ async fn copy_assets_and_fonts(
     )
     .await?;
 
-    let mut font_declarations = assets::scan_fonts(project).await?;
-    font_declarations.extend(assets::hydrolysis_default_font_declarations());
+    let font_declarations = assets::scan_fonts(project, &backend_path.join("Cargo.toml")).await?;
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
     if !resolved_fonts.is_empty() {
@@ -705,7 +648,7 @@ async fn package_hydrolysis_web_site(
     // The shell is written after the bundle so the page knows the wasm size.
     build_hydrolysis_web_bundle(&backend_path, &site_root, debug).await?;
     super::web_launch::write_web_shell(project, &site_root).await?;
-    copy_web_assets_and_fonts(project, &site_root).await?;
+    copy_web_assets_and_fonts(project, &backend_path, &site_root).await?;
 
     Ok(site_root)
 }
@@ -757,9 +700,13 @@ async fn build_hydrolysis_web_bundle(
     Ok(())
 }
 
-async fn copy_web_assets_and_fonts(project: &Project, site_root: &Path) -> eyre::Result<()> {
+async fn copy_web_assets_and_fonts(
+    project: &Project,
+    backend_path: &Path,
+    site_root: &Path,
+) -> eyre::Result<()> {
     assets::stage_project_assets_for_web(project, site_root).await?;
-    assets::stage_hydrolysis_web_fonts(project, site_root).await?;
+    assets::stage_hydrolysis_web_fonts(project, backend_path, site_root).await?;
     Ok(())
 }
 

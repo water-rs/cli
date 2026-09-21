@@ -183,6 +183,17 @@ pub async fn shared_host_target_dir() -> eyre::Result<PathBuf> {
     Ok(shared_target_dir().await?.join("host"))
 }
 
+/// The path of the shared Cargo target directory, without creating it or
+/// touching its metadata — for messages that name it.
+///
+/// # Errors
+/// Returns an error if the Water home or the global config cannot be resolved.
+pub async fn shared_target_dir_path() -> eyre::Result<PathBuf> {
+    let water_home = water_home_dir()?;
+    let (_, cache_root) = resolved_build_cache_root_in(&water_home).await?;
+    Ok(cache_root.join(SHARED_TARGET_DIR_NAME))
+}
+
 async fn ensure_shared_target_dir_in(cache_root: &Path) -> eyre::Result<PathBuf> {
     let target_dir = cache_root.join(SHARED_TARGET_DIR_NAME);
     fs::create_dir_all(&target_dir).await.wrap_err_with(|| {
@@ -239,6 +250,134 @@ async fn remove_shared_target_dir_in(cache_root: &Path) -> eyre::Result<Option<u
         )
     })?;
     Ok(Some(bytes))
+}
+
+/// Remove one project's own units from the shared Cargo target directory,
+/// returning the paths removed.
+///
+/// `packages` are the project's generated crate names — tagged with the
+/// project root's hash (see `generated_crate_name`), so nothing another
+/// project compiled carries them. Every profile directory under the shared
+/// root (`<variant>/<triple>/<profile>`, at most three levels deep and marked
+/// by Cargo's `.cargo-lock`) is swept: the uplifted outputs in the profile
+/// directory itself and the entries in `deps/`, `.fingerprint/`, `build/` and
+/// `incremental/` that Cargo names after those packages. Dependency artifacts
+/// — the framework, the shared runtime, everything a package by another name
+/// produced — stay for the other projects that resolve them identically;
+/// `remove_shared_target_dir` is the only operation that drops those.
+///
+/// This is the filesystem effect of `cargo clean --package` for each name, done
+/// without Cargo because a playground's generated manifests are removed by
+/// the same clean and Cargo needs them — and their resolved dependency graph —
+/// to compute the units.
+///
+/// # Errors
+/// Returns an error if the cache root cannot be resolved, a Cargo build is
+/// using the directory, or an entry cannot be removed.
+pub async fn remove_project_units_from_shared_target(
+    packages: &[String],
+) -> eyre::Result<Vec<PathBuf>> {
+    remove_project_units_in(&shared_target_dir_path().await?, packages).await
+}
+
+async fn remove_project_units_in(
+    target_dir: &Path,
+    packages: &[String],
+) -> eyre::Result<Vec<PathBuf>> {
+    if !target_dir.exists() || packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    shared_target_in_use(target_dir).await?;
+    let target_dir = target_dir.to_path_buf();
+    let packages = packages.to_vec();
+    smol::unblock(move || -> eyre::Result<Vec<PathBuf>> {
+        let mut removed = Vec::new();
+        let mut pending = vec![(target_dir, 0usize)];
+        while let Some((dir, depth)) = pending.pop() {
+            if dir.join(".cargo-lock").is_file() {
+                removed.extend(remove_package_units_in_profile(&dir, &packages)?);
+                continue;
+            }
+            if depth == 3 {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir)
+                .wrap_err_with(|| format!("Failed to read {}", dir.display()))?
+            {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    pending.push((entry.path(), depth + 1));
+                }
+            }
+        }
+        removed.sort();
+        Ok(removed)
+    })
+    .await
+}
+
+/// Cargo's per-profile subdirectories whose direct children are named after
+/// the unit's package or target.
+const PROFILE_UNIT_DIRS: [&str; 4] = ["deps", ".fingerprint", "build", "incremental"];
+
+fn remove_package_units_in_profile(
+    profile_dir: &Path,
+    packages: &[String],
+) -> eyre::Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    let mut dirs = vec![profile_dir.to_path_buf()];
+    dirs.extend(
+        PROFILE_UNIT_DIRS
+            .iter()
+            .map(|name| profile_dir.join(name))
+            .filter(|dir| dir.is_dir()),
+    );
+    for dir in dirs {
+        for entry in
+            std::fs::read_dir(&dir).wrap_err_with(|| format!("Failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !packages
+                .iter()
+                .any(|package| unit_entry_belongs_to(name, package))
+            {
+                continue;
+            }
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
+            .wrap_err_with(|| format!("Failed to remove {}", path.display()))?;
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
+/// Whether a Cargo target-directory entry belongs to `package`.
+///
+/// Cargo spells a package `foo-bar` as `foo-bar-<hash>` in `.fingerprint/`
+/// and `build/`, and its targets as `foo_bar`, `foo_bar-<hash>` or
+/// `libfoo_bar-<hash>.<ext>` elsewhere; an uplifted output may carry an
+/// extension straight after the name (`foo_bar.exe`, `foo_bar.pdb`), and a
+/// further target of the same package extends the name with `_`
+/// (`foo_bar_cef_helper`). Any other continuation is a different name.
+fn unit_entry_belongs_to(entry_name: &str, package: &str) -> bool {
+    let target_name = package.replace('-', "_");
+    let stem = entry_name.strip_prefix("lib").unwrap_or(entry_name);
+    [entry_name, stem].into_iter().any(|candidate| {
+        [package, target_name.as_str()].into_iter().any(|name| {
+            candidate
+                .strip_prefix(name)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '.', '_']))
+        })
+    })
 }
 
 /// Refuse while a Cargo build holds a build-directory lock anywhere under
@@ -1327,6 +1466,153 @@ mod tests {
                 .expect("an unlocked target drops")
                 .expect("the target existed");
         });
+    }
+
+    /// A project clean removes exactly the units Cargo named after this
+    /// project's generated crates — uplifted outputs, `deps/`, `.fingerprint/`,
+    /// `build/` and `incremental/` entries, in every variant and profile — and
+    /// leaves every other project's units and the shared dependency artifacts,
+    /// the uplifted runtime dylib included, where they are.
+    #[test]
+    fn project_clean_removes_only_this_projects_units_from_the_shared_target() {
+        smol::block_on(async {
+            let cache_root = tempdir().expect("cache root");
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            let ours = "e2eapp-hydrolysis-1a2b3c4d";
+            let theirs = "e2eapp-hydrolysis-9f8e7d6c";
+            let mut kept = Vec::new();
+            let mut gone = Vec::new();
+            for profile in [
+                "shared/x86_64-pc-windows-msvc/debug",
+                "static/x86_64-pc-windows-msvc/release",
+                "host/debug",
+            ] {
+                let profile = target_dir.join(profile);
+                for dir in ["deps", ".fingerprint", "build", "incremental"] {
+                    std::fs::create_dir_all(profile.join(dir)).expect("profile dir");
+                }
+                std::fs::write(profile.join(".cargo-lock"), []).expect("cargo lock");
+                // (relative path, is a unit directory, belongs to `ours`)
+                let entries = [
+                    ("e2eapp_hydrolysis_1a2b3c4d.exe", false, true),
+                    ("e2eapp_hydrolysis_1a2b3c4d.pdb", false, true),
+                    ("e2eapp_hydrolysis_1a2b3c4d.d", false, true),
+                    ("e2eapp_hydrolysis_1a2b3c4d_cef_helper.exe", false, true),
+                    ("deps/e2eapp_hydrolysis_1a2b3c4d-0011.exe", false, true),
+                    ("deps/libe2eapp_hydrolysis_1a2b3c4d-0022.rlib", false, true),
+                    ("deps/e2eapp_hydrolysis_1a2b3c4d-0022.d", false, true),
+                    (".fingerprint/e2eapp-hydrolysis-1a2b3c4d-0011", true, true),
+                    ("build/e2eapp-hydrolysis-1a2b3c4d-0033", true, true),
+                    ("incremental/e2eapp_hydrolysis_1a2b3c4d-abc", true, true),
+                    ("e2eapp_hydrolysis_9f8e7d6c.exe", false, false),
+                    ("deps/libe2eapp_hydrolysis_9f8e7d6c-0044.rlib", false, false),
+                    (".fingerprint/e2eapp-hydrolysis-9f8e7d6c-0044", true, false),
+                    ("waterui_dylib.dll", false, false),
+                    ("deps/waterui_dylib-0055.dll", false, false),
+                    ("deps/libwaterui-0066.rlib", false, false),
+                    (".fingerprint/waterui-dylib-0055", true, false),
+                    ("build/waterui-chromium-0077", true, false),
+                ];
+                for (relative, is_dir, is_ours) in entries {
+                    let path = profile.join(relative);
+                    if is_dir {
+                        std::fs::create_dir_all(path.join("output")).expect("unit dir");
+                    } else {
+                        std::fs::write(&path, []).expect("unit file");
+                    }
+                    if is_ours { &mut gone } else { &mut kept }.push(path);
+                }
+            }
+            // A directory outside any profile is never inspected.
+            let metadata = target_dir.join("metadata.toml");
+            assert!(metadata.is_file(), "the shared target keeps its metadata");
+
+            let removed = super::remove_project_units_in(&target_dir, &[ours.to_owned()])
+                .await
+                .expect("clean this project's units");
+
+            gone.sort();
+            assert_eq!(removed, gone, "exactly this project's units are reported");
+            for path in &gone {
+                assert!(!path.exists(), "{} was removed", path.display());
+            }
+            for path in &kept {
+                assert!(path.exists(), "{} stays", path.display());
+            }
+            assert!(metadata.is_file());
+            assert!(
+                super::remove_project_units_in(&target_dir, &[theirs.to_owned()])
+                    .await
+                    .expect("clean the other project")
+                    .iter()
+                    .all(|path| kept.contains(path)),
+                "the other project's clean removes only what this one kept"
+            );
+            assert!(
+                super::remove_project_units_in(&target_dir, &[ours.to_owned()])
+                    .await
+                    .expect("a second clean")
+                    .is_empty(),
+                "a second clean finds nothing"
+            );
+        });
+    }
+
+    /// A project clean of the shared target refuses while a build holds
+    /// a profile's `.cargo-lock`, like the full drop does.
+    #[test]
+    fn project_clean_of_the_shared_target_refuses_while_a_build_lock_is_held() {
+        smol::block_on(async {
+            let cache_root = tempdir().expect("cache root");
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            let profile = target_dir.join("shared/aarch64-apple-darwin/debug");
+            std::fs::create_dir_all(&profile).expect("profile dir");
+            std::fs::write(profile.join("demo_hydrolysis_0000abcd"), []).expect("unit");
+            let lock_file =
+                std::fs::File::create(profile.join(".cargo-lock")).expect("create cargo lock");
+            fs4::FileExt::lock(&lock_file).expect("hold the build lock");
+
+            let packages = ["demo-hydrolysis-0000abcd".to_owned()];
+            let error = super::remove_project_units_in(&target_dir, &packages)
+                .await
+                .expect_err("a held build lock must refuse the clean");
+            assert!(error.to_string().contains("in use"), "{error}");
+            assert!(profile.join("demo_hydrolysis_0000abcd").is_file());
+
+            fs4::FileExt::unlock(&lock_file).expect("release the build lock");
+            let removed = super::remove_project_units_in(&target_dir, &packages)
+                .await
+                .expect("an unlocked target cleans");
+            assert_eq!(removed, [profile.join("demo_hydrolysis_0000abcd")]);
+        });
+    }
+
+    #[test]
+    fn unit_entries_belong_to_their_package_only() {
+        let package = "demo-hydrolysis-0000abcd";
+        for name in [
+            "demo-hydrolysis-0000abcd-1234",
+            "demo_hydrolysis_0000abcd",
+            "demo_hydrolysis_0000abcd.exe",
+            "demo_hydrolysis_0000abcd-1234.d",
+            "libdemo_hydrolysis_0000abcd-1234.rlib",
+            "demo_hydrolysis_0000abcd_cef_helper.pdb",
+        ] {
+            assert!(super::unit_entry_belongs_to(name, package), "{name}");
+        }
+        for name in [
+            "demo-hydrolysis-0000abcd1-1234",
+            "demo_hydrolysis_0000abce",
+            "demo_hydrolysis",
+            "waterui_dylib.dll",
+            "libdemo-0000.rlib",
+        ] {
+            assert!(!super::unit_entry_belongs_to(name, package), "{name}");
+        }
     }
 
     /// The survey reports the shared target, and an explicit drop removes it

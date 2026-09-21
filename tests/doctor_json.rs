@@ -6,7 +6,41 @@
 
 use std::process::Command;
 
-use waterui_cli::toolchain::doctor::{DoctorItemRecord, ids};
+use waterui_cli::toolchain::doctor::{DoctorGroup, DoctorItemRecord, ids};
+
+/// Status vocabulary, diagnostic presence, group label, and scope of one
+/// record. The fixture manifest selects no backend, so every backend group is
+/// optional and only the Rust toolchain and helpers are in scope.
+fn assert_item_schema(item: &DoctorItemRecord) {
+    assert!(
+        ["ok", "missing", "skipped"].contains(&item.status.as_ref()),
+        "unexpected status {:?} on {}",
+        item.status,
+        item.id
+    );
+    if item.status == "missing" {
+        assert!(
+            item.message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty()),
+            "missing item {} must carry a diagnostic",
+            item.id
+        );
+    }
+    let group = DoctorGroup::of(&item.id);
+    assert_eq!(
+        item.group,
+        group.as_str(),
+        "group label drifted on {}",
+        item.id
+    );
+    assert_eq!(
+        item.optional,
+        group.backend().is_some(),
+        "scope drifted on {}",
+        item.id
+    );
+}
 
 #[test]
 fn doctor_json_emits_typed_item_records_for_every_check() {
@@ -59,21 +93,7 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
     assert_eq!(emitted_ids, ids::ALL, "doctor item set/order drifted");
 
     for item in &items {
-        assert!(
-            ["ok", "missing", "skipped"].contains(&item.status.as_ref()),
-            "unexpected status {:?} on {}",
-            item.status,
-            item.id
-        );
-        if item.status == "missing" {
-            assert!(
-                item.message
-                    .as_deref()
-                    .is_some_and(|message| !message.is_empty()),
-                "missing item {} must carry a diagnostic",
-                item.id
-            );
-        }
+        assert_item_schema(item);
     }
 
     // Skipped identity is a `cfg!` property of the platform, not machine
@@ -96,7 +116,7 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
                     | ids::MACOS_SDK
             );
             let linux_item = matches!(*id, ids::LINUX_SYSTEM_PACKAGES | ids::GTK4);
-            let windows_item = matches!(*id, ids::WINUI);
+            let windows_item = matches!(*id, ids::WINUI | ids::MSVC_BUILD_TOOLS | ids::DXC);
             // The fixture manifest selects no backends, so every
             // project-gated item reports skipped on every host.
             let unselected_project_item = matches!(

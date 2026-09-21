@@ -99,6 +99,7 @@ if /i "%tool%"=="wasm-pack" goto :simple_version
 if /i "%tool%"=="sh" goto :simple_version
 if /i "%tool%"=="bash" goto :simple_version
 if /i "%tool%"=="brew" goto :exit_ok
+if /i "%tool%"=="vswhere" goto :vswhere
 if /i "%tool%"=="winget" goto :winget
 if /i "%tool%"=="apt-get" goto :exit_ok
 if /i "%tool%"=="dnf" goto :exit_ok
@@ -334,6 +335,10 @@ exit /b 0
 if "%1"=="--version" (echo %tool% 1.0.0 (waterui-test) & exit /b 0)
 if "%1"=="-version" (echo %tool% 1.0.0 (waterui-test) & exit /b 0)
 if "%1"=="-v" (echo %tool% 1.0.0 (waterui-test) & exit /b 0)
+exit /b 0
+
+:vswhere
+call :respond_or_empty VSWHERE
 exit /b 0
 
 :winget
