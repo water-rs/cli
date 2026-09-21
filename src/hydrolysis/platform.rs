@@ -510,8 +510,7 @@ async fn copy_assets_and_fonts(
     )
     .await?;
 
-    let mut font_declarations = assets::scan_fonts(project).await?;
-    font_declarations.extend(assets::hydrolysis_default_font_declarations());
+    let font_declarations = assets::scan_fonts(project, &backend_path.join("Cargo.toml")).await?;
     let mut resolved_fonts = assets::resolve_fonts(font_declarations).await?;
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
     if !resolved_fonts.is_empty() {
@@ -642,7 +641,7 @@ async fn package_hydrolysis_web_site(
     // The shell is written after the bundle so the page knows the wasm size.
     build_hydrolysis_web_bundle(&backend_path, &site_root, debug).await?;
     super::web_launch::write_web_shell(project, &site_root).await?;
-    copy_web_assets_and_fonts(project, &site_root).await?;
+    copy_web_assets_and_fonts(project, &backend_path, &site_root).await?;
 
     Ok(site_root)
 }
@@ -694,9 +693,13 @@ async fn build_hydrolysis_web_bundle(
     Ok(())
 }
 
-async fn copy_web_assets_and_fonts(project: &Project, site_root: &Path) -> eyre::Result<()> {
+async fn copy_web_assets_and_fonts(
+    project: &Project,
+    backend_path: &Path,
+    site_root: &Path,
+) -> eyre::Result<()> {
     assets::stage_project_assets_for_web(project, site_root).await?;
-    assets::stage_hydrolysis_web_fonts(project, site_root).await?;
+    assets::stage_hydrolysis_web_fonts(project, backend_path, site_root).await?;
     Ok(())
 }
 

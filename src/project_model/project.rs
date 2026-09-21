@@ -1493,6 +1493,7 @@ impl Project {
             web: options.web.as_ref().map(|scaffold| web::WebConfig {
                 package_manager: scaffold.package_manager,
             }),
+            assets: None,
         };
 
         // Save Water.toml
@@ -2338,6 +2339,10 @@ pub struct Manifest {
     /// Web-frontend toolchain declarations (`[web]`); only the CLI reads this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<web::WebConfig>,
+    /// Assets the project bundles beyond what dependency crates declare for
+    /// themselves (`[assets]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<AssetsConfig>,
 }
 
 /// Permission entry for playground projects.
@@ -2440,6 +2445,7 @@ impl Manifest {
             theme: None,
             launch: None,
             web: None,
+            assets: None,
         }
     }
 }
@@ -2554,6 +2560,35 @@ pub struct UnsupportedWebViewBackend {
     resolved: ResolvedWebViewBackend,
     platform: TargetPlatform,
     backend: TargetBackend,
+}
+
+/// `[assets]` section in `Water.toml`: assets the project bundles beyond what
+/// dependency crates declare through `[package.metadata.waterui.assets]`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AssetsConfig {
+    /// Font families to bundle, one `[[assets.font]]` table per family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub font: Vec<FontConfig>,
+}
+
+/// One `[[assets.font]]` declaration in `Water.toml`.
+///
+/// `name` alone resolves through the CLI's built-in registry; `local_path`
+/// bundles a font file relative to the project root; `remote_path` names a
+/// face — or an archive containing it — that must already sit in the font
+/// cache, since builds perform no network access. A declaration sets at most
+/// one source.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FontConfig {
+    /// Font family name.
+    pub name: String,
+    /// Font file relative to the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
+    /// URL the font — or an archive containing it — is fetched from when
+    /// pre-seeding the font cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_path: Option<String>,
 }
 
 /// App-specific configuration in `Water.toml`.
