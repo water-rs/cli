@@ -463,22 +463,25 @@ pub async fn resolve_fonts(declarations: Vec<FontDeclaration>) -> eyre::Result<V
                 relative_path,
             } => match resolve_local_font_path(crate_root, relative_path) {
                 Ok(Some(full_path)) => full_path,
-                Ok(None) => {
-                    warn!(
-                        "Font file not found: {} (declared by {})",
-                        crate_root.join(relative_path).display(),
-                        decl.crate_name
-                    );
-                    continue;
-                }
+                // A declaration that cannot be satisfied is an error, never a
+                // skip: skipping renders the app in whatever face the shaper
+                // falls back to, which is the silent wrong-typeface this
+                // module exists to rule out. A crate-local font missing at
+                // build time means the crate did not package what it
+                // declares — say so, with the path that was expected.
+                Ok(None) => eyre::bail!(
+                    "font '{name}' is declared by {} at '{}', which does not exist in that crate",
+                    decl.crate_name,
+                    crate_root.join(relative_path).display(),
+                ),
                 Err(e) => {
-                    warn!(
-                        "Skipping font '{}': invalid local path '{}' (declared by {}): {e}",
-                        name,
-                        relative_path.display(),
-                        decl.crate_name
-                    );
-                    continue;
+                    return Err(e).wrap_err_with(|| {
+                        format!(
+                            "font '{name}' has an invalid local path '{}' (declared by {})",
+                            relative_path.display(),
+                            decl.crate_name
+                        )
+                    });
                 }
             },
             FontSource::Remote { url } => cached_font(&name, url, &cache_dir).await?,
@@ -486,11 +489,16 @@ pub async fn resolve_fonts(declarations: Vec<FontDeclaration>) -> eyre::Result<V
                 if let Some(url) = registry.url(&name) {
                     cached_font(&name, url, &cache_dir).await?
                 } else {
-                    warn!(
-                        "Font '{}' not found in built-in registry (declared by {})",
-                        name, decl.crate_name
-                    );
-                    continue;
+                    // Declared by name alone and the registry has no such
+                    // family: nothing can satisfy it, so this fails here
+                    // rather than at the first glyph the shaper draws in
+                    // some other face.
+                    eyre::bail!(
+                        "font '{name}' is declared by {} by name alone, but no font of that name \
+                         is in the built-in registry — give the declaration a `local_path` or a \
+                         `remote_path`",
+                        decl.crate_name
+                    )
                 }
             }
         };
@@ -1431,6 +1439,34 @@ mod tests {
             .expect("reuse extracted cache");
 
         assert_eq!(resolved, extracted_font);
+    }
+
+    /// A crate that declares a font it does not ship must stop the build.
+    /// Skipping it renders the app in whatever face the shaper falls back to
+    /// — the silent wrong typeface, which is worse than a failed build
+    /// because nothing in the output says the declaration went unmet.
+    #[test]
+    fn a_declared_local_font_that_is_missing_fails_the_build() {
+        let root = tempdir().expect("temp root");
+        let error = smol::block_on(resolve_fonts(vec![FontDeclaration {
+            name: "Roboto".to_string(),
+            source: FontSource::Local {
+                crate_root: root.path().to_path_buf(),
+                relative_path: PathBuf::from("assets/fonts/Roboto-Variable.ttf"),
+            },
+            crate_name: "some-theme".to_string(),
+        }]))
+        .expect_err("a missing crate-local font must be an error");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Roboto") && message.contains("some-theme"),
+            "the error must name the font and the crate that declared it: {message}"
+        );
+        assert!(
+            message.contains("Roboto-Variable.ttf"),
+            "the error must name the path that was expected: {message}"
+        );
     }
 
     #[test]
