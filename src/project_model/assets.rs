@@ -196,41 +196,6 @@ struct FontMetadata {
     required_feature: Option<String>,
 }
 
-/// The manifest whose dependency graph is this app's true closure.
-///
-/// Resolving `cargo metadata` on the project root unions features across every
-/// member of the surrounding workspace, so one example enabling
-/// `waterui-graphics/gpu` would drag the GPU stack (and its fonts and
-/// permissions) into every other app in the repository. The generated FFI companion depends on exactly this
-/// app plus the waterui crates with no default features, so its graph answers
-/// "what does *this* app enable" precisely.
-///
-/// Only the Apple and Android backends scaffold that companion; every other
-/// generated backend crate depends on the app the same way, so the first
-/// manifest on disk beside `ffi/` answers the same question. A project with
-/// no backend crates at all falls back to its root manifest — weaker
-/// (workspace-unioned), but never a path that cannot exist.
-fn app_closure_manifest(project: &Project) -> std::path::PathBuf {
-    let ffi_manifest = project.ffi_crate_path().join("Cargo.toml");
-    if ffi_manifest.exists() {
-        return ffi_manifest;
-    }
-    if let Some(backends_root) = project.ffi_crate_path().parent()
-        && let Ok(entries) = std::fs::read_dir(backends_root)
-    {
-        let mut candidates: Vec<_> = entries
-            .flatten()
-            .map(|entry| entry.path().join("Cargo.toml"))
-            .filter(|path| path.is_file())
-            .collect();
-        candidates.sort();
-        if let Some(manifest) = candidates.into_iter().next() {
-            return manifest;
-        }
-    }
-    project.root().join("Cargo.toml")
-}
-
 /// Fonts the project itself declares as `[[assets.font]]` tables in
 /// `Water.toml`.
 ///
