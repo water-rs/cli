@@ -296,13 +296,19 @@ mod host_tests {
         let machine = TestMachine::new();
         let host = machine.host(Vec::<(String, String)>::new());
         let result = smol::block_on(missing_cmake_on_windows(&host));
-        assert!(
-            matches!(
-                result,
-                ToolchainError::Fixable(CmakeInstallation::Managed(_))
+        match crate::toolchain::managed_tool::cmake() {
+            Some(_) => assert!(
+                matches!(
+                    result,
+                    ToolchainError::Fixable(CmakeInstallation::Managed(_))
+                ),
+                "no winget must fall back to the managed archive: {result:?}"
             ),
-            "no winget must fall back to the managed archive: {result:?}"
-        );
+            None => assert!(
+                matches!(result, ToolchainError::Unfixable(_)),
+                "no managed build for this architecture must be unfixable: {result:?}"
+            ),
+        }
     }
 
     #[test]

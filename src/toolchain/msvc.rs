@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn ok_when_link_exe_on_path() {
         let machine = TestMachine::new();
-        machine.install("link.exe");
+        // `install("link.exe")` would produce `link.exe.cmd` on Windows,
+        // which `which("link.exe")` never resolves — the probe needs the
+        // literal `.exe` name, so stage it via `executable` instead.
+        machine.executable(Path::new("bin").join("link.exe"));
         let host = machine.host(Vec::<(String, String)>::new());
         smol::block_on(MsvcBuildTools.check(&host)).expect("link.exe on PATH must be ok");
     }

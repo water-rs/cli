@@ -3014,10 +3014,20 @@ mod host_tests {
         let machine = TestMachine::new();
         let host = machine.host(Vec::<(String, String)>::new());
         let result = smol::block_on(Java.check(&host));
-        assert!(
-            matches!(result, Err(ToolchainError::Unfixable(_))),
-            "no java and no installer must be unfixable: {result:?}"
-        );
+        // Windows hosts have the managed-Temurin fallback, so a bare Windows
+        // machine is fixable even without winget; elsewhere no package
+        // manager means manual.
+        if cfg!(target_os = "windows") && crate::toolchain::managed_tool::jdk().is_some() {
+            assert!(
+                matches!(result, Err(ToolchainError::Fixable(_))),
+                "no java on Windows without winget falls back to the managed JDK: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ToolchainError::Unfixable(_))),
+                "no java and no installer must be unfixable: {result:?}"
+            );
+        }
     }
 
     #[test]
