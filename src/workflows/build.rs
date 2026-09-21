@@ -176,6 +176,18 @@ pub fn configure_generated_crate_compilation(command: &mut Command) {
     command.env("CARGO_INCREMENTAL", "0");
 }
 
+/// Prepend the managed tool directories (`~/.water/tools/<name>/<version>`)
+/// to the build's `PATH` so build scripts resolve a pinned `dxc`, JDK, and
+/// friends by name — the user never edits `PATH`. A no-op when nothing is
+/// installed (or the paths cannot join), so ambient `PATH` passes through.
+fn with_managed_tools_path(command: &mut Command) {
+    if let Some((key, value)) =
+        crate::toolchain::managed_tool::managed_tools_path_env(&crate::toolchain::Host::current())
+    {
+        command.env(key, value);
+    }
+}
+
 /// Dynamic Rust libraries required by a shared-runtime development build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustDynamicLibraries {
@@ -1411,15 +1423,13 @@ Automatic meson installation failed: {install_err}\n\n{}",
             .arg("--message-format=json-render-diagnostics")
             .args(cargo_target.cargo_args())
             .args(["--target", self.triple.to_string().as_str()])
+            .args(framework.is_some().then_some("--locked"))
             .current_dir(&self.path);
-        if framework.is_some() {
-            cmd = cmd.arg("--locked");
-        }
 
         if let Some(target_dir) = &self.target_dir {
             cmd = cmd.arg("--target-dir").arg(target_dir);
         }
-
+        with_managed_tools_path(cmd);
         // Apply extra environment variables (caller-provided values override defaults).
         for (key, value) in &self.envs {
             cmd.env(key, value);
