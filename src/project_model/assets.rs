@@ -1,9 +1,10 @@
 //! Asset and font management for `WaterUI` projects.
 //!
 //! This module provides functionality to:
-//! - Scan dependency crates for font declarations in `[[package.metadata.waterui.assets.font]]`
-//! - Resolve fonts from local paths, remote URLs, or built-in registry
-//! - Download remote fonts with caching
+//! - Scan the project manifest (`[[assets.font]]` in `Water.toml`) and
+//!   dependency crates (`[[package.metadata.waterui.assets.font]]`) for font
+//!   declarations
+//! - Resolve fonts from local paths, the font cache, or the built-in registry
 //! - Copy assets to platform-specific locations
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use smol::fs;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
-use waterui_assets_core::{AtomicWriteOutcome, download_remote_bytes, write_bytes_atomically};
+
 use waterui_assets_planner::BundleManifest;
 
 use crate::build::BuildProgress;
@@ -39,10 +40,17 @@ struct RegistryFont {
 ///
 /// The list is data, so it lives in `assets/fonts.toml` rather than in Rust
 /// literals, and is parsed rather than compiled into a table. Fonts it offers
-/// can be declared in Cargo.toml with a name alone:
+/// can be declared by name alone — in a crate's Cargo.toml:
 ///
 /// ```toml
 /// [[package.metadata.waterui.assets.font]]
+/// name = "Inter"
+/// ```
+///
+/// or in the project's `Water.toml`:
+///
+/// ```toml
+/// [[assets.font]]
 /// name = "Inter"
 /// ```
 ///
@@ -72,24 +80,16 @@ impl FontRegistry {
 }
 const HYDROLYSIS_DEFAULT_FONT_FAMILY: &str = "Roboto";
 const HYDROLYSIS_WEB_FONT_MANIFEST_FILE_NAME: &str = "waterui-fonts.json";
-const HYDROLYSIS_DEFAULT_FONT_FAMILIES: &[&str] = &[
-    HYDROLYSIS_DEFAULT_FONT_FAMILY,
-    "Noto Sans CJK JP",
-    "Noto Sans CJK KR",
-    "Noto Sans CJK SC",
-    "Noto Sans CJK TC",
-    "Noto Sans Arabic",
-    "Noto Sans Hebrew",
-];
 
-/// Font declaration from a crate's Cargo.toml metadata.
+/// A font declaration — from `[[assets.font]]` in `Water.toml` or a crate's
+/// `[package.metadata.waterui.assets.font]` Cargo.toml metadata.
 #[derive(Debug, Clone)]
 pub struct FontDeclaration {
     /// Font family name (used as `font_family` in Text).
     pub name: String,
     /// Source of the font file.
     pub source: FontSource,
-    /// Crate that declared this font.
+    /// Crate or project that declared this font.
     pub crate_name: String,
 }
 
@@ -103,9 +103,9 @@ pub enum FontSource {
         /// Relative path within the crate.
         relative_path: PathBuf,
     },
-    /// Font to download from a URL.
+    /// Font that must be fetched out of band into the font cache.
     Remote {
-        /// URL to download the font from.
+        /// URL to fetch the font from when pre-seeding the cache.
         url: String,
     },
     /// Font from the built-in registry.
@@ -190,8 +190,8 @@ struct FontMetadata {
     #[serde(default)]
     remote_path: Option<String>,
     /// Optional feature that must be enabled for this font to be included.
-    /// If specified, the font will only be downloaded/bundled if this feature
-    /// is enabled for the declaring package.
+    /// If specified, the font will only be bundled if this feature is enabled
+    /// for the declaring package.
     #[serde(default, rename = "required-feature")]
     required_feature: Option<String>,
 }
@@ -231,19 +231,82 @@ fn app_closure_manifest(project: &Project) -> std::path::PathBuf {
     project.root().join("Cargo.toml")
 }
 
-/// Scans all dependencies for font declarations in their Cargo.toml metadata.
+/// Fonts the project itself declares as `[[assets.font]]` tables in
+/// `Water.toml`.
 ///
-/// Uses `cargo metadata` to find all packages and parse their
-/// `[package.metadata.waterui.assets.font]` sections.
+/// The fields mirror what a crate writes under
+/// `[package.metadata.waterui.assets.font]`; `local_path` is resolved against
+/// the project root rather than a crate root. A declaration is one source:
+/// setting both paths — or an absolute `local_path` — is a manifest error.
+fn manifest_font_declarations(
+    manifest: &crate::project::Manifest,
+    root: &Path,
+) -> eyre::Result<Vec<FontDeclaration>> {
+    let Some(assets) = manifest.assets.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut declarations = Vec::with_capacity(assets.font.len());
+    for font in &assets.font {
+        let source = match (&font.local_path, &font.remote_path) {
+            (Some(local_path), None) => {
+                let relative_path = PathBuf::from(local_path);
+                if relative_path.is_absolute() {
+                    eyre::bail!(
+                        "[[assets.font]] entry '{}' in Water.toml: local_path must be \
+                         relative to the project root",
+                        font.name
+                    );
+                }
+                FontSource::Local {
+                    crate_root: root.to_path_buf(),
+                    relative_path,
+                }
+            }
+            (None, Some(url)) => FontSource::Remote { url: url.clone() },
+            (None, None) => FontSource::BuiltIn,
+            (Some(_), Some(_)) => {
+                eyre::bail!(
+                    "[[assets.font]] entry '{}' in Water.toml sets both local_path and \
+                     remote_path; a declaration has exactly one source",
+                    font.name
+                );
+            }
+        };
+        declarations.push(FontDeclaration {
+            name: font.name.clone(),
+            source,
+            crate_name: manifest.package.name.clone(),
+        });
+    }
+    Ok(declarations)
+}
+
+/// Scans the project manifest and the built crate's dependencies for font
+/// declarations.
+///
+/// `[[assets.font]]` tables in `Water.toml` declare the app's own fonts and
+/// rank ahead of dependency declarations between equal sources. The dependency
+/// scan runs `cargo metadata` on `build_manifest` — the `Cargo.toml` of the
+/// crate this build compiles, i.e. the generated backend or FFI crate — and
+/// parses the `[package.metadata.waterui.assets.font]` sections of every
+/// package in its graph. That crate depends on the app, so the graph carries
+/// both the app's authored dependencies and the backend's own (the theme crate
+/// and friends); scanning the app manifest instead would miss the backend's
+/// declarations entirely.
 ///
 /// Fonts with a `required-feature` field will only be included if that feature
 /// is enabled for the declaring package (checked via cargo metadata's resolved graph).
-pub async fn scan_fonts(project: &Project) -> eyre::Result<Vec<FontDeclaration>> {
-    let manifest_path = app_closure_manifest(project);
-
-    debug!("Scanning fonts from dependencies via cargo metadata");
+pub async fn scan_fonts(
+    project: &Project,
+    build_manifest: &Path,
+) -> eyre::Result<Vec<FontDeclaration>> {
+    debug!(
+        "Scanning fonts from dependencies via cargo metadata on {}",
+        build_manifest.display()
+    );
 
     // Run cargo metadata to get all packages
+    let manifest_path = build_manifest.to_path_buf();
     let metadata = smol::unblock({
         let manifest_path = manifest_path.clone();
         move || {
@@ -253,7 +316,12 @@ pub async fn scan_fonts(project: &Project) -> eyre::Result<Vec<FontDeclaration>>
         }
     })
     .await
-    .wrap_err("Failed to run cargo metadata")?;
+    .wrap_err_with(|| {
+        format!(
+            "Failed to run cargo metadata on {}",
+            build_manifest.display()
+        )
+    })?;
 
     // Build map of package_id -> enabled features from resolved graph
     let enabled_features_map: HashMap<&PackageId, HashSet<&str>> = metadata
@@ -345,26 +413,21 @@ pub async fn scan_fonts(project: &Project) -> eyre::Result<Vec<FontDeclaration>>
     }
 
     info!("Found {} font declarations from dependencies", fonts.len());
-    Ok(fonts)
-}
-
-pub fn hydrolysis_default_font_declarations() -> Vec<FontDeclaration> {
-    HYDROLYSIS_DEFAULT_FONT_FAMILIES
-        .iter()
-        .map(|name| FontDeclaration {
-            name: (*name).to_string(),
-            source: FontSource::BuiltIn,
-            crate_name: "waterui-cli".to_string(),
-        })
-        .collect()
+    let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
+    declarations.extend(fonts);
+    Ok(declarations)
 }
 
 /// Resolves and deduplicates font declarations.
 ///
 /// Rules:
 /// - Same `name` → keep only one font
-/// - Priority: local > remote > built-in
-/// - Downloads remote/built-in fonts and caches them
+/// - Priority: local > remote > built-in; between equal sources the earlier
+///   declaration wins, so `Water.toml` overrides a dependency on a tie
+/// - Remote and built-in declarations resolve to files already in the font
+///   cache — a build performs no network access, so a declaration that is not
+///   already cached is an error naming the font, its URL and the cache
+///   directory to pre-seed
 pub async fn resolve_fonts(declarations: Vec<FontDeclaration>) -> eyre::Result<Vec<ResolvedFont>> {
     // Group by name
     let mut by_name: HashMap<String, Vec<FontDeclaration>> = HashMap::new();
@@ -412,10 +475,10 @@ pub async fn resolve_fonts(declarations: Vec<FontDeclaration>) -> eyre::Result<V
                     continue;
                 }
             },
-            FontSource::Remote { url } => download_font(&name, url, &cache_dir).await?,
+            FontSource::Remote { url } => cached_font(&name, url, &cache_dir).await?,
             FontSource::BuiltIn => {
                 if let Some(url) = registry.url(&name) {
-                    download_font(&name, url, &cache_dir).await?
+                    cached_font(&name, url, &cache_dir).await?
                 } else {
                     warn!(
                         "Font '{}' not found in built-in registry (declared by {})",
@@ -434,7 +497,7 @@ pub async fn resolve_fonts(declarations: Vec<FontDeclaration>) -> eyre::Result<V
     Ok(resolved)
 }
 
-/// Gets the cache directory for downloaded fonts.
+/// Gets the cache directory holding fonts fetched out of band.
 fn cache_dir() -> eyre::Result<PathBuf> {
     let cache = dirs::cache_dir()
         .map(|root| root.join("waterui").join("fonts"))
@@ -469,20 +532,19 @@ fn resolve_local_font_path(
     Ok(Some(canonical_path))
 }
 
-/// Downloads a font from a URL and caches it.
+/// Resolves a remotely-declared font to a file already in the font cache.
 ///
-/// If the font is already cached, returns the cached path.
-async fn download_font(name: &str, url: &str, cache_dir: &Path) -> eyre::Result<PathBuf> {
-    // Create cache directory if needed
-    fs::create_dir_all(cache_dir).await?;
-
+/// A build performs no network access: when the declaration is not already
+/// cached, this fails naming the font, its URL and the cache directory, so the
+/// user can pre-seed the cache out of band and retry the build.
+async fn cached_font(name: &str, url: &str, cache_dir: &Path) -> eyre::Result<PathBuf> {
     // Use URL hash as filename to avoid conflicts
     let hash = sha256_hex(url);
     if is_zip_url(url) {
-        return download_zip_font(name, url, cache_dir, &hash).await;
+        return cached_zip_font(name, url, cache_dir, &hash).await;
     }
 
-    download_file_font(name, url, cache_dir, &hash).await
+    cached_file_font(name, url, cache_dir, &hash).await
 }
 
 fn is_zip_url(url: &str) -> bool {
@@ -491,7 +553,7 @@ fn is_zip_url(url: &str) -> bool {
         .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("zip"))
 }
 
-async fn download_zip_font(
+async fn cached_zip_font(
     name: &str,
     url: &str,
     cache_dir: &Path,
@@ -522,11 +584,10 @@ async fn download_zip_font(
         }
     }
 
-    cache_downloaded_font(name, url, &cache_file).await?;
-    find_font_in_extracted_zip(&cache_file, name).await
+    Err(uncached_font_error(name, url, cache_dir, &cache_file))
 }
 
-async fn download_file_font(
+async fn cached_file_font(
     name: &str,
     url: &str,
     cache_dir: &Path,
@@ -534,7 +595,6 @@ async fn download_file_font(
 ) -> eyre::Result<PathBuf> {
     let cache_file = cache_dir.join(format!("{hash}.ttf"));
 
-    // If already cached, return the path
     if let Some(cache_len) = cached_file_len(name, &cache_file).await? {
         if cache_len == 0 {
             warn!(
@@ -549,9 +609,21 @@ async fn download_file_font(
         }
     }
 
-    cache_downloaded_font(name, url, &cache_file).await?;
+    Err(uncached_font_error(name, url, cache_dir, &cache_file))
+}
 
-    Ok(cache_file)
+/// The error for a remote font declaration that is not already in the font
+/// cache. Builds perform no network access, so the file has to be fetched out
+/// of band — the message names the font, the URL to fetch, the cache
+/// directory, and the exact cache entry to place it at.
+fn uncached_font_error(name: &str, url: &str, cache_dir: &Path, cache_file: &Path) -> eyre::Report {
+    eyre::eyre!(
+        "font '{name}' is declared remote ({url}) but is not in the font cache at {}; \
+         builds never access the network — pre-seed the cache by fetching that URL into \
+         {} and retry the build",
+        cache_dir.display(),
+        cache_file.display()
+    )
 }
 
 async fn cached_file_len(name: &str, cache_file: &Path) -> eyre::Result<Option<u64>> {
@@ -566,35 +638,6 @@ async fn cached_file_len(name: &str, cache_file: &Path) -> eyre::Result<Option<u
             )
         }),
     }
-}
-
-async fn cache_downloaded_font(name: &str, url: &str, cache_file: &Path) -> eyre::Result<()> {
-    info!("Downloading font '{}' from {}", name, url);
-    let bytes = download_remote_bytes(url)
-        .await
-        .map_err(eyre::Report::new)
-        .wrap_err_with(|| format!("Failed to download font from {url}"))?;
-
-    match write_bytes_atomically(cache_file, &bytes)
-        .await
-        .map_err(eyre::Report::new)
-        .wrap_err_with(|| {
-            format!(
-                "Failed to finalize cache file for '{}' at {}",
-                name,
-                cache_file.display()
-            )
-        })? {
-        AtomicWriteOutcome::Written => {}
-        AtomicWriteOutcome::ReusedExisting => {
-            debug!(
-                "Font cache race detected for '{}', reusing {}",
-                name,
-                cache_file.display()
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Finds a font file in an extracted zip archive.
@@ -897,27 +940,55 @@ pub async fn copy_fonts(fonts: &[ResolvedFont], dest: &Path) -> eyre::Result<()>
     Ok(())
 }
 
-/// Stage fonts for Hydrolysis web runtime using the existing CLI font pipeline.
+/// Stage fonts for the Hydrolysis web runtime using the existing CLI font pipeline.
 ///
-/// This always provisions a default text font so Web/WASM builds have a usable
-/// fallback even when the project does not declare any fonts.
-pub async fn stage_hydrolysis_web_fonts(project: &Project, site_root: &Path) -> eyre::Result<()> {
-    let mut declarations = scan_fonts(project).await?;
-    declarations.extend(hydrolysis_default_font_declarations());
+/// The web runtime discovers no system fonts — `load_web_fonts` fetches exactly
+/// what `waterui-fonts.json` lists and asserts its `default_family` registered
+/// — so the bundled set is whatever the project declared through
+/// `[[assets.font]]` in `Water.toml` or a dependency's
+/// `[package.metadata.waterui.assets.font]` entries. A project that declares no
+/// fonts cannot render text on the web at all, so staging fails fast rather
+/// than shipping a site that panics on startup.
+pub async fn stage_hydrolysis_web_fonts(
+    project: &Project,
+    backend_path: &Path,
+    site_root: &Path,
+) -> eyre::Result<()> {
+    let mut resolved_fonts =
+        resolve_fonts(scan_fonts(project, &backend_path.join("Cargo.toml")).await?).await?;
+    resolved_fonts.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let resolved_fonts = resolve_fonts(declarations).await?;
+    // `default_family` must name a face the manifest actually carries. Roboto
+    // stays the default when the project declares it — the same family the
+    // runtime's Material baseline was written against — otherwise the first
+    // declared family takes the slot.
+    let Some(default_family) = resolved_fonts
+        .iter()
+        .find(|font| font.name == HYDROLYSIS_DEFAULT_FONT_FAMILY)
+        .or_else(|| resolved_fonts.first())
+    else {
+        eyre::bail!(
+            "the Hydrolysis web runtime has no system fonts to fall back on, so a web \
+             build must bundle at least one declared font; declare one in Water.toml:\n\n\
+             \x20   [[assets.font]]\n\x20   name = \"{HYDROLYSIS_DEFAULT_FONT_FAMILY}\"\n\n\
+             or through `[package.metadata.waterui.assets.font]` in a dependency's \
+             Cargo.toml"
+        );
+    };
+    let default_family = default_family.name.clone();
+
     let fonts_dest = site_root.join("fonts");
     copy_fonts(&resolved_fonts, &fonts_dest).await?;
-    write_hydrolysis_web_font_manifest(&resolved_fonts, &fonts_dest).await?;
+    write_hydrolysis_web_font_manifest(&resolved_fonts, &fonts_dest, &default_family).await?;
     Ok(())
 }
 
 async fn write_hydrolysis_web_font_manifest(
     fonts: &[ResolvedFont],
     fonts_dest: &Path,
+    default_family: &str,
 ) -> eyre::Result<()> {
     let mut manifest_fonts = Vec::with_capacity(fonts.len());
-    let mut has_default_family = false;
 
     for font in fonts {
         let file_name = font
@@ -926,22 +997,14 @@ async fn write_hydrolysis_web_font_manifest(
             .ok_or_eyre("Font path has no filename")?
             .to_string_lossy()
             .into_owned();
-        if font.name == HYDROLYSIS_DEFAULT_FONT_FAMILY {
-            has_default_family = true;
-        }
         manifest_fonts.push(HydrolysisWebFontManifestEntry {
             name: font.name.clone(),
             file_name,
         });
     }
 
-    assert!(
-        has_default_family,
-        "hydrolysis web font staging must include default family `{HYDROLYSIS_DEFAULT_FONT_FAMILY}`"
-    );
-
     let manifest = HydrolysisWebFontManifest {
-        default_family: HYDROLYSIS_DEFAULT_FONT_FAMILY.to_string(),
+        default_family: default_family.to_string(),
         fonts: manifest_fonts,
     };
     let payload = serde_json::to_vec_pretty(&manifest)?;
@@ -1153,8 +1216,95 @@ pub async fn self_drawn_realization_features(project: &Project) -> eyre::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, fs};
+    use std::fs;
     use tempfile::tempdir;
+
+    fn manifest_with_fonts(toml_fonts: &str) -> crate::project::Manifest {
+        toml::from_str(&format!(
+            "[package]\ntype = \"app\"\nname = \"Demo\"\n\
+             bundle_identifier = \"dev.example.demo\"\n\n{toml_fonts}"
+        ))
+        .expect("manifest parses")
+    }
+
+    #[test]
+    fn water_toml_font_with_a_name_alone_uses_the_registry() {
+        let manifest = manifest_with_fonts("[[assets.font]]\nname = \"Inter\"");
+        let declarations =
+            manifest_font_declarations(&manifest, Path::new("/project")).expect("declarations");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "Inter");
+        assert_eq!(declarations[0].crate_name, "Demo");
+        assert!(matches!(declarations[0].source, FontSource::BuiltIn));
+    }
+
+    #[test]
+    fn water_toml_font_local_path_resolves_against_the_project_root() {
+        let manifest = manifest_with_fonts(
+            "[[assets.font]]\nname = \"My Font\"\nlocal_path = \"fonts/my.ttf\"",
+        );
+        let declarations =
+            manifest_font_declarations(&manifest, Path::new("/project")).expect("declarations");
+        let FontSource::Local {
+            crate_root,
+            relative_path,
+        } = &declarations[0].source
+        else {
+            panic!("expected a local font source");
+        };
+        assert_eq!(crate_root, Path::new("/project"));
+        assert_eq!(relative_path, Path::new("fonts/my.ttf"));
+    }
+
+    #[test]
+    fn water_toml_font_rejects_conflicting_sources() {
+        let manifest = manifest_with_fonts(
+            "[[assets.font]]\nname = \"X\"\nlocal_path = \"a.ttf\"\nremote_path = \"https://x\"",
+        );
+        assert!(manifest_font_declarations(&manifest, Path::new("/project")).is_err());
+    }
+
+    #[test]
+    fn water_toml_font_rejects_an_absolute_local_path() {
+        let manifest =
+            manifest_with_fonts("[[assets.font]]\nname = \"X\"\nlocal_path = \"/abs/x.ttf\"");
+        assert!(manifest_font_declarations(&manifest, Path::new("/project")).is_err());
+    }
+
+    #[test]
+    fn a_manifest_without_assets_declares_no_fonts() {
+        let manifest = manifest_with_fonts("");
+        assert!(
+            manifest_font_declarations(&manifest, Path::new("/project"))
+                .expect("declarations")
+                .is_empty()
+        );
+    }
+
+    /// A remote declaration that is not already cached must fail naming the
+    /// font, the URL, and the cache directory — and tell the user to pre-seed
+    /// the cache, since builds never access the network.
+    #[test]
+    fn an_uncached_remote_font_names_the_font_url_and_cache_dir() {
+        let cache_dir = tempdir().expect("temp cache dir");
+        let error = smol::block_on(cached_font(
+            "Inter",
+            "https://example.com/inter.ttf",
+            cache_dir.path(),
+        ))
+        .expect_err("an uncached remote font must surface as an error");
+        let message = error.to_string();
+        assert!(message.contains("Inter"), "{message}");
+        assert!(
+            message.contains("https://example.com/inter.ttf"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&cache_dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("pre-seed"), "{message}");
+    }
 
     #[test]
     fn test_font_registry_has_entries() {
@@ -1228,27 +1378,6 @@ mod tests {
     }
 
     #[test]
-    fn hydrolysis_default_fonts_include_material_base_and_script_fallbacks() {
-        let declarations = hydrolysis_default_font_declarations();
-        let names: HashSet<&str> = declarations
-            .iter()
-            .map(|declaration| declaration.name.as_str())
-            .collect();
-        assert!(names.contains("Roboto"));
-        assert!(names.contains("Noto Sans CJK JP"));
-        assert!(names.contains("Noto Sans CJK KR"));
-        assert!(names.contains("Noto Sans CJK SC"));
-        assert!(names.contains("Noto Sans CJK TC"));
-        assert!(names.contains("Noto Sans Arabic"));
-        assert!(names.contains("Noto Sans Hebrew"));
-        assert!(
-            declarations
-                .iter()
-                .all(|declaration| matches!(declaration.source, FontSource::BuiltIn))
-        );
-    }
-
-    #[test]
     fn test_sha256_hex() {
         let hash = sha256_hex("hello");
         assert_eq!(hash.len(), 64); // SHA256 = 32 bytes = 64 hex chars
@@ -1292,7 +1421,7 @@ mod tests {
         let extracted_font = extracted_dir.join("inter-regular.ttf");
         fs::write(&extracted_font, b"font").expect("write extracted font");
 
-        let resolved = smol::block_on(download_font("Inter", url, cache_dir.path()))
+        let resolved = smol::block_on(cached_font("Inter", url, cache_dir.path()))
             .expect("reuse extracted cache");
 
         assert_eq!(resolved, extracted_font);
