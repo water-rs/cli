@@ -1081,14 +1081,19 @@ impl RustBuild {
     ///
     /// A shared-runtime development build enables the project's `dev` feature (which
     /// resolves the shared `waterui-dylib` runtime), prefers dynamic linking, and —
-    /// when the platform's loader needs one — embeds a loader search path into the
+    /// when the platform's loader needs them — embeds loader search paths into the
     /// final artifact only. A static packaging build needs none of this.
+    ///
+    /// A platform generally needs more than one: the binary is run both where it was
+    /// built, with the runtime staged beside it, and from inside a packaged artifact
+    /// that puts the runtime somewhere else. Each path becomes its own `-rpath`, and
+    /// the loader tries them in order.
     #[must_use]
     pub fn with_linkage(
         self,
         linkage: RustLinkage,
         development_feature: &str,
-        loader_search_path: Option<&str>,
+        loader_search_paths: &[&str],
     ) -> Self {
         if linkage == RustLinkage::Static {
             return self;
@@ -1096,10 +1101,9 @@ impl RustBuild {
         let build = self
             .with_feature(development_feature)
             .with_preferred_dynamic_linking();
-        match loader_search_path {
-            Some(path) => build.with_final_rustc_arg(format!("-Clink-arg=-Wl,-rpath,{path}")),
-            None => build,
-        }
+        loader_search_paths.iter().fold(build, |build, path| {
+            build.with_final_rustc_arg(format!("-Clink-arg=-Wl,-rpath,{path}"))
+        })
     }
 
     /// Override the library crate type passed to `rustc`.
