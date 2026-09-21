@@ -45,12 +45,19 @@ const HYDROLYSIS_INIT_HINT: &str = "water run --platform windows --backend hydro
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const HYDROLYSIS_INIT_HINT: &str = "initialize hydrolysis backend on macOS, Linux, or Windows";
 
-/// Loader search path the platform's dynamic linker resolves the shared runtime through.
-const fn hydrolysis_loader_search_path(platform: TargetPlatform) -> Option<&'static str> {
+/// Loader search paths the platform's dynamic linker resolves the shared runtime through.
+///
+/// Both situations a backend binary runs in need an entry. `water preview` and an
+/// unpackaged `water run` execute the binary where Cargo left it, with the shared
+/// runtime staged beside it — that is `@executable_path` on macOS and `$ORIGIN` on
+/// Linux. Packaging then moves the runtime into `Contents/Frameworks`, which only
+/// the bundle-relative entry reaches. macOS carried the bundle path alone, so a
+/// binary run in place could not load the runtime at all (#140).
+const fn hydrolysis_loader_search_paths(platform: TargetPlatform) -> &'static [&'static str] {
     match platform {
-        TargetPlatform::MacOS => Some("@executable_path/../Frameworks"),
-        TargetPlatform::Linux => Some("$ORIGIN"),
-        _ => None,
+        TargetPlatform::MacOS => &["@executable_path", "@executable_path/../Frameworks"],
+        TargetPlatform::Linux => &["$ORIGIN"],
+        _ => &[],
     }
 }
 
@@ -143,7 +150,7 @@ pub async fn build_hydrolysis_with_envs_and_features(
         .with_linkage(
             options.linkage(),
             &format!("{}/dev", project.crate_name()),
-            hydrolysis_loader_search_path(platform),
+            hydrolysis_loader_search_paths(platform),
         )
         .with_envs(llvm_envs)
         .with_envs(options.cargo_envs().iter().cloned())
