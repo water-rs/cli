@@ -8,7 +8,8 @@ use eyre::{Result, bail, eyre};
 use heck::{ToKebabCase, ToSnakeCase};
 
 use crate::shell::Shell;
-use crate::{header, line, success};
+use crate::{header, line, success, warn};
+use waterui_cli::FetchOutcome;
 use waterui_cli::framework::FrameworkChannel;
 use waterui_cli::platform::TargetBackend;
 use waterui_cli::project::{CreateOptions, PackageType, Project, WebScaffold};
@@ -217,8 +218,47 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
             .await?;
     }
     initialize_requested_backends(shell, &mut project, &plan).await?;
+    // Seed the font cache while `create` is already on the network for the
+    // framework resolution, so the first build never meets an uncached font.
+    // It must not fail the scaffold — the project is valid either way, and
+    // `water fetch` repeats the seeding.
+    seed_declared_fonts(shell, &project).await;
     print_create_summary(shell, &plan);
     Ok(())
+}
+
+/// Fetches the new project's declared fonts into the font cache, reporting
+/// rather than failing when seeding cannot finish or a declaration is one
+/// fetching cannot fix — those are reported the same way a build reports
+/// them.
+async fn seed_declared_fonts(shell: &Shell, project: &Project) {
+    let spinner = shell.spinner("Fetching declared fonts...");
+    let outcomes = waterui_cli::seed_font_cache(project).await;
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+    match outcomes {
+        Ok(outcomes) => {
+            for outcome in outcomes {
+                match outcome {
+                    FetchOutcome::Satisfied { .. } => {}
+                    FetchOutcome::Fetched { name, path } => {
+                        success!(shell, "Fetched font '{name}' to {}", path.display());
+                    }
+                    FetchOutcome::Unsatisfiable { error, .. } => {
+                        warn!(shell, "{error:#}");
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            warn!(
+                shell,
+                "Declared fonts could not be fetched ({error:#}) — run `water fetch` inside \
+                 the project before building"
+            );
+        }
+    }
 }
 
 fn resolve_create_plan(shell: &Shell, args: &Args) -> Result<CreatePlan> {

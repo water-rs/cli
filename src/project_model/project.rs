@@ -1259,7 +1259,9 @@ impl CreateOptions {
 }
 
 impl Project {
-    async fn scaffold_ffi_companion(&self) -> Result<(), crate::backend::FailToInitBackend> {
+    pub(crate) async fn scaffold_ffi_companion(
+        &self,
+    ) -> Result<(), crate::backend::FailToInitBackend> {
         let manifest = self.manifest();
         let app_name = manifest
             .package
