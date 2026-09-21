@@ -24,6 +24,7 @@ use crate::{
             LinuxPackageManagerError, has_supported_package_manager, install_java_jdk,
             install_named_packages,
         },
+        managed_tool::{self, ManagedTool, ManagedToolError},
         rust::{RustTargetAdditions, SelectedToolchainTargets},
         winget::{WingetInstallError, ensure_package_installed},
     },
@@ -1464,7 +1465,7 @@ impl Toolchain for AndroidSdk {
                 Err(ToolchainError::unfixable(
                     "Android SDK not found and winget is unavailable",
                     format!(
-                        "Install Microsoft App Installer to provide winget, then retry `water doctor --fix`. {} {}",
+                        "Download Android Studio from https://developer.android.com/studio, then retry. {} {}",
                         android_cmdline_tools_suggestion(),
                         android_sdk_path_suggestion()
                     ),
@@ -2132,8 +2133,9 @@ impl Java {
     ///
     /// Priority order:
     /// 1. Android Studio's bundled JBR (guaranteed compatible with AGP)
-    /// 2. `JAVA_HOME` environment variable (may be incompatible)
-    /// 3. Java from the host `PATH`
+    /// 2. The managed JDK under `~/.water/tools` (a pinned Temurin build)
+    /// 3. `JAVA_HOME` environment variable (may be incompatible)
+    /// 4. Java from the host `PATH`
     pub async fn detect_path(host: &Host) -> Option<PathBuf> {
         if cfg!(target_os = "macos") {
             const ANDROID_STUDIO_JBRS: &[&str] = &[
@@ -2178,6 +2180,12 @@ impl Java {
             }
         }
 
+        if let Some(tool) = managed_tool::jdk()
+            && let Some(java_path) = tool.binary_path(host)
+        {
+            return Some(java_path);
+        }
+
         if let Some(home) = host.env_string("JAVA_HOME") {
             let java_path = PathBuf::from(home)
                 .join("bin")
@@ -2201,9 +2209,35 @@ impl Java {
     }
 }
 
-/// Java installation handler.
-#[derive(Debug, Clone, Default)]
-pub struct JavaInstallation;
+/// Java installation handler — the strategy `check` selected for this host.
+#[derive(Debug, Clone)]
+pub enum JavaInstallation {
+    /// `winget install Microsoft.OpenJDK.21`.
+    Winget,
+    /// `brew install --cask temurin`.
+    Brew,
+    /// The host's Linux package manager.
+    PackageManager,
+    /// A pinned, checksum-verified Temurin JDK unpacked under
+    /// `~/.water/tools` — no package manager required.
+    Managed(ManagedTool),
+}
+
+/// What a missing Java on Windows resolves to: `winget` when present,
+/// otherwise the pinned Temurin JDK unpacked under `~/.water/tools` — no
+/// package manager required.
+async fn missing_java_on_windows(host: &Host) -> ToolchainError<JavaInstallation> {
+    if host.which("winget").await.is_ok() {
+        ToolchainError::fixable(JavaInstallation::Winget)
+    } else if let Some(tool) = managed_tool::jdk() {
+        ToolchainError::fixable(JavaInstallation::Managed(tool))
+    } else {
+        ToolchainError::unfixable(
+            "Java runtime not found and this host has no usable installer",
+            "Download a JDK from https://adoptium.net/temurin/releases/?version=21 and set `JAVA_HOME`, then retry.",
+        )
+    }
+}
 
 /// Errors that can occur when installing Java.
 #[derive(Debug, thiserror::Error)]
@@ -2222,6 +2256,9 @@ pub enum FailToInstallJava {
     UnsupportedPackageManager,
     #[error("Failed to install Java: {0}")]
     InstallFailed(#[from] CommandError),
+    /// The managed JDK archive install failed.
+    #[error(transparent)]
+    Managed(#[from] ManagedToolError),
     #[error(
         "Automatic Java installation is not supported on this host. Install a JDK manually and set `JAVA_HOME`."
     )]
@@ -2235,26 +2272,19 @@ impl Toolchain for Java {
         if Self::detect_path(host).await.is_some() {
             Ok(())
         } else if cfg!(target_os = "windows") {
-            if host.which("winget").await.is_ok() {
-                Err(ToolchainError::fixable(JavaInstallation))
-            } else {
-                Err(ToolchainError::unfixable(
-                    "Java runtime not found and winget is unavailable",
-                    "Install Microsoft App Installer to provide winget, or install a JDK manually and set `JAVA_HOME`.",
-                ))
-            }
+            Err(missing_java_on_windows(host).await)
         } else if cfg!(target_os = "macos") {
             if host.which("brew").await.is_ok() {
-                Err(ToolchainError::fixable(JavaInstallation))
+                Err(ToolchainError::fixable(JavaInstallation::Brew))
             } else {
                 Err(ToolchainError::unfixable(
                     "Java runtime not found and Homebrew is unavailable",
-                    "Install Homebrew to enable automatic fixes, or install a JDK manually and set `JAVA_HOME`.",
+                    "Download a JDK from https://adoptium.net/temurin/releases/?version=21 (or install Homebrew) and set `JAVA_HOME`.",
                 ))
             }
         } else if cfg!(target_os = "linux") {
             if has_supported_package_manager(host).await {
-                Err(ToolchainError::fixable(JavaInstallation))
+                Err(ToolchainError::fixable(JavaInstallation::PackageManager))
             } else {
                 Err(ToolchainError::unfixable(
                     "Java runtime not found and no supported package manager was detected",
@@ -2274,24 +2304,26 @@ impl Installation for JavaInstallation {
     type Error = FailToInstallJava;
 
     async fn install(&self, host: &Host) -> Result<(), Self::Error> {
-        if cfg!(target_os = "windows") {
-            ensure_package_installed(host, "Microsoft.OpenJDK.21")
+        match self {
+            Self::Winget => ensure_package_installed(host, "Microsoft.OpenJDK.21")
                 .await
-                .map_err(map_winget_error_for_java)
-        } else if cfg!(target_os = "macos") {
-            let brew = Brew::default();
-            brew.check(host)
+                .map_err(map_winget_error_for_java),
+            Self::Brew => {
+                let brew = Brew::default();
+                brew.check(host)
+                    .await
+                    .map_err(|_| FailToInstallJava::BrewNotFound)?;
+                brew.install_cask(host, "temurin")
+                    .await
+                    .map_err(FailToInstallJava::InstallFailed)
+            }
+            Self::PackageManager => install_java_jdk(host)
                 .await
-                .map_err(|_| FailToInstallJava::BrewNotFound)?;
-            brew.install_cask(host, "temurin")
-                .await
-                .map_err(FailToInstallJava::InstallFailed)
-        } else if cfg!(target_os = "linux") {
-            install_java_jdk(host)
-                .await
-                .map_err(map_linux_error_for_java)
-        } else {
-            Err(FailToInstallJava::UnsupportedPlatform)
+                .map_err(map_linux_error_for_java),
+            Self::Managed(tool) => {
+                tool.install(host).await?;
+                Ok(())
+            }
         }
     }
 }

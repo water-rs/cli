@@ -39,7 +39,9 @@ use crate::{
         Host, Installation, Toolchain, ToolchainError, UnfixableToolchain,
         cargo_helpers::CargoHelpers,
         cmake::Cmake,
+        dxc::Dxc,
         linux::LinuxSystemToolchain,
+        msvc::MsvcBuildTools,
         rust::{CLI_MINIMUM_RUST_VERSION, RustToolchain},
         sccache::Sccache,
         web::{PackageManagerToolchain, WasmPack, wasm32_target},
@@ -178,6 +180,8 @@ impl DoctorGroup {
             | ids::MACOS_SDK
             | ids::APPLE_RUST_TARGETS => Self::Apple,
             ids::LINUX_SYSTEM_PACKAGES
+            | ids::MSVC_BUILD_TOOLS
+            | ids::DXC
             | ids::WINDOWS_ARM64_LLVM
             | ids::WASM32_TARGET
             | ids::WASM_PACK
@@ -265,6 +269,11 @@ pub struct DoctorItem {
     pub status: CheckStatus,
     /// Optional message with details or suggestions.
     pub message: Option<String>,
+    /// `true` when running the fix modifies the machine outside `~/.water`
+    /// (a system installer, `msiexec`, ...): `water doctor --fix` asks before
+    /// it runs unless `--yes` was passed or the shell is non-interactive
+    /// without consent semantics. Set from [`Installation::modifies_system`].
+    pub system_wide: bool,
     /// Optional installation function if the issue can be fixed automatically.
     pub install_fn: Option<BoxedInstallFn>,
 }
@@ -278,6 +287,7 @@ impl std::fmt::Debug for DoctorItem {
             .field("optional", &self.optional)
             .field("status", &self.status)
             .field("message", &self.message)
+            .field("system_wide", &self.system_wide)
             .field("install_fn", &self.install_fn.as_ref().map(|_| "..."))
             .finish()
     }
@@ -335,6 +345,7 @@ impl DoctorItem {
             optional: false,
             status: CheckStatus::Ok,
             message: None,
+            system_wide: false,
             install_fn: None,
         }
     }
@@ -347,6 +358,7 @@ impl DoctorItem {
             optional: false,
             status: CheckStatus::Missing,
             message: Some(message.into()),
+            system_wide: false,
             install_fn: None,
         }
     }
@@ -359,6 +371,7 @@ impl DoctorItem {
         host: &Host,
     ) -> Self {
         let host = host.clone();
+        let system_wide = installation.modifies_system();
         Self {
             id,
             name,
@@ -366,6 +379,7 @@ impl DoctorItem {
             optional: false,
             status: CheckStatus::Missing,
             message: Some(message.into()),
+            system_wide,
             install_fn: Some(Box::new(move || {
                 Box::pin(async move { installation.install(&host).await.map_err(Into::into) })
             })),
@@ -380,6 +394,7 @@ impl DoctorItem {
             optional: false,
             status: CheckStatus::Skipped,
             message: None,
+            system_wide: false,
             install_fn: None,
         }
     }
@@ -396,6 +411,7 @@ impl DoctorItem {
             optional: false,
             status: CheckStatus::Skipped,
             message: Some(message.into()),
+            system_wide: false,
             install_fn: None,
         }
     }
@@ -460,6 +476,10 @@ pub mod ids {
     pub const CARGO_HELPERS: &str = "cargo-helpers";
     /// Distribution packages the Linux backends build against.
     pub const LINUX_SYSTEM_PACKAGES: &str = "linux-system-packages";
+    /// MSVC C++ build tools (`link.exe`) required to link Windows binaries.
+    pub const MSVC_BUILD_TOOLS: &str = "msvc-build-tools";
+    /// `dxc` (DirectX Shader Compiler) for Hydrolysis shader builds.
+    pub const DXC: &str = "dxc";
     /// GTK4/pango pkg-config probes.
     pub const GTK4: &str = "gtk4";
     /// `WinUI` build prerequisites on Windows hosts.
@@ -484,6 +504,8 @@ pub mod ids {
         MACOS_SDK,
         APPLE_RUST_TARGETS,
         LINUX_SYSTEM_PACKAGES,
+        MSVC_BUILD_TOOLS,
+        DXC,
         WINDOWS_ARM64_LLVM,
         WASM32_TARGET,
         WASM_PACK,
@@ -957,8 +979,9 @@ async fn android_run_target_check(host: &Host) -> DoctorItem {
 }
 
 /// The Hydrolysis backend beyond the Linux system packages (probed with
-/// GTK4 in [`linux_checks`]): the Windows ARM64 LLVM pieces and the web
-/// target's `wasm32` target, `wasm-pack`, and declared package manager.
+/// GTK4 in [`linux_checks`]): the Windows-native prerequisites (`link.exe`,
+/// `dxc`, the ARM64 LLVM pieces) and the web target's `wasm32` target,
+/// `wasm-pack`, and declared package manager.
 async fn hydrolysis_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorItem> {
     let windows_arm64_llvm = async {
         if WindowsArm64LlvmToolchain::required_on_host() {
@@ -1013,14 +1036,52 @@ async fn hydrolysis_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorI
             )
         }
     };
-    let (windows_arm64_llvm, (wasm32, wasm_pack), web_package_manager) = join!(
+    let ((msvc_build_tools, dxc), windows_arm64_llvm, (wasm32, wasm_pack), web_package_manager) = join!(
+        windows_checks(host),
         windows_arm64_llvm,
         web,
         web_package_manager_check(host, project)
     );
-    let mut items = vec![windows_arm64_llvm, wasm32, wasm_pack];
+    let mut items = vec![msvc_build_tools, dxc, windows_arm64_llvm, wasm32, wasm_pack];
     items.extend(web_package_manager);
     items
+}
+
+/// The Windows-only prerequisites of a Hydrolysis build: the MSVC C++ build
+/// tools (linker) and `dxc` (shader compiler). Both are skipped items on
+/// other hosts.
+async fn windows_checks(host: &Host) -> (DoctorItem, DoctorItem) {
+    if cfg!(target_os = "windows") {
+        join!(
+            toolchain_check(
+                host,
+                ids::MSVC_BUILD_TOOLS,
+                "MSVC C++ build tools",
+                "MSVC C++ build tools are missing (`link.exe` is required to link Windows binaries). `--fix` downloads the Visual Studio Build Tools installer and adds the 'C++ build tools' workload (~2 GB download, ~6 GB installed, requires administrator rights and modifies the system outside ~/.water).",
+                MsvcBuildTools,
+            ),
+            toolchain_check(
+                host,
+                ids::DXC,
+                "DirectX Shader Compiler (dxc)",
+                "dxc is missing (Hydrolysis shader builds invoke it on Windows). `--fix` unpacks a pinned microsoft/DirectXShaderCompiler release into ~/.water/tools.",
+                Dxc,
+            ),
+        )
+    } else {
+        (
+            DoctorItem::skipped_with_message(
+                ids::MSVC_BUILD_TOOLS,
+                "MSVC C++ build tools",
+                "Only required on Windows hosts.",
+            ),
+            DoctorItem::skipped_with_message(
+                ids::DXC,
+                "DirectX Shader Compiler (dxc)",
+                "Only required on Windows hosts.",
+            ),
+        )
+    }
 }
 
 /// The Espressif-side toolchain — `esp` Rust fork, clang/GCC, `rust-src`,
