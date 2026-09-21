@@ -66,7 +66,7 @@ pub async fn build_winui(project: &Project, options: BuildOptions) -> eyre::Resu
         .with_linkage(
             options.linkage(),
             &format!("{}/dev", project.crate_name()),
-            None,
+            &[],
         )
         .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {

@@ -54,7 +54,7 @@ pub async fn build_gtk4(project: &Project, options: BuildOptions) -> eyre::Resul
         .with_linkage(
             options.linkage(),
             &format!("{}/dev", project.crate_name()),
-            Some("$ORIGIN"),
+            &["$ORIGIN"],
         )
         .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
