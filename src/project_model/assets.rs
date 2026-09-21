@@ -723,48 +723,148 @@ pub enum FetchOutcome {
 /// `water fetch` and the tail of `water create` share this one path:
 /// declarations resolve exactly as a build resolves them —
 /// [`manifest_font_declarations`] plus [`scan_crate_font_declarations`] over
-/// each generated crate manifest that exists, then [`resolve_declarations`]
+/// the manifest of each crate a build compiles, then [`resolve_declarations`]
 /// — and whatever the cache does not already hold is downloaded into the
 /// entry the build then looks for. Builds keep their no-network guarantee;
 /// this is the explicit, opt-in network step.
 ///
 /// # Errors
 ///
-/// Returns an error when a manifest cannot be scanned or a download fails —
-/// the error names the font and its URL. Declarations fetching can never
-/// satisfy arrive as [`FetchOutcome::Unsatisfiable`] instead, carrying the
-/// same report the build gives them.
+/// Returns an error when a backend crate cannot be scaffolded, a manifest
+/// cannot be scanned, or a download fails — the error names the backend, or
+/// the font and its URL. Declarations fetching can never satisfy arrive as
+/// [`FetchOutcome::Unsatisfiable`] instead, carrying the same report the
+/// build gives them.
 pub async fn seed_font_cache(project: &Project) -> eyre::Result<Vec<FetchOutcome>> {
     let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
-    for manifest in font_scan_manifests(project) {
+    for manifest in ensure_font_scan_manifests(project).await? {
         declarations.extend(scan_crate_font_declarations(&manifest).await?);
     }
     fetch_fonts(declarations, &cache_dir()?, download_font).await
 }
 
-/// The crate manifests whose dependency graphs a build of `project` scans
-/// for font declarations: the project crate itself, then each generated
-/// crate that exists under the managed backends root — the FFI companion the
-/// Apple and Android builds read, then the GTK4, Hydrolysis and `WinUI`
-/// backends. (The ESP32 harness declares its fonts as plain file paths, not
-/// crate metadata, so it has no manifest to scan here.)
+/// The crate manifests a build of `project` scans for font declarations —
+/// produced before they are scanned, the same way the build that compiles
+/// them produces them.
 ///
-/// A generated crate that does not exist yet contributes nothing: whatever
-/// generates it exposes `water fetch` again afterwards.
-fn font_scan_manifests(project: &Project) -> Vec<PathBuf> {
+/// The project crate is always scanned; beyond it, the manifests that matter
+/// are the generated crates': the theme crate's
+/// `[package.metadata.waterui.assets.font]` entries are reachable only
+/// through the backend manifest that depends on it. Apple and Android builds
+/// scan the FFI companion, which `Project::open` scaffolds whenever either
+/// backend is managed; if it is still absent it is scaffolded here. Each of
+/// the GTK4, Hydrolysis and `WinUI` crates is re-scaffolded with the
+/// current templates when missing or stale, exactly as the build and preview
+/// paths regenerate it. Scaffolding writes template files — nothing
+/// compiles. The ESP32 harness never takes part: no build scans it for
+/// fonts — `dew`'s fonts come from `[backends.esp32]` as plain files.
+///
+/// The scanned set follows the project: an app contributes the crates of the
+/// backends it has configured, a playground the crates for the backends this
+/// host can run — Hydrolysis anywhere, GTK4 on Linux, `WinUI` on Windows —
+/// since the CLI manages them all. A crate that cannot be produced is an
+/// error naming its backend — silently dropping it is how a build's font
+/// demand and a fetch's scan disagree.
+async fn ensure_font_scan_manifests(project: &Project) -> eyre::Result<Vec<PathBuf>> {
     let mut manifests = vec![project.root().join("Cargo.toml")];
-    for crate_dir in [
-        project.ffi_crate_path(),
-        project.backend_path::<crate::gtk4::backend::Gtk4Backend>(),
-        project.backend_path::<crate::hydrolysis::backend::HydrolysisBackend>(),
-        project.backend_path::<crate::winui::backend::WinUiBackend>(),
-    ] {
-        let manifest = crate_dir.join("Cargo.toml");
-        if manifest.is_file() {
-            manifests.push(manifest);
+
+    if project.is_playground()
+        || project.apple_backend().is_some()
+        || project.android_backend().is_some()
+    {
+        let manifest = project.ffi_crate_path().join("Cargo.toml");
+        if !manifest.is_file() {
+            project.scaffold_ffi_companion().await.map_err(|error| {
+                eyre::eyre!("could not scaffold the Apple/Android FFI companion crate: {error}")
+            })?;
         }
+        manifests.push(manifest);
     }
-    manifests
+
+    ensure_backend_manifest::<crate::gtk4::backend::Gtk4Backend>(project, &mut manifests).await?;
+    ensure_backend_manifest::<crate::hydrolysis::backend::HydrolysisBackend>(
+        project,
+        &mut manifests,
+    )
+    .await?;
+    ensure_backend_manifest::<crate::winui::backend::WinUiBackend>(project, &mut manifests).await?;
+
+    Ok(manifests)
+}
+
+/// A generated backend crate — GTK4, Hydrolysis or `WinUI` — whose manifest
+/// a build scans for font declarations.
+trait FontScanCrate: crate::backend::Backend {
+    /// The backend's name as `water backend` reports it.
+    const NAME: &'static str;
+    /// Whether a build of `project` can ever compile this crate: a
+    /// playground can run every backend this host supports — the CLI manages
+    /// all of them — while an app builds only the backends it has
+    /// configured.
+    fn wanted(project: &Project) -> bool;
+    /// Whether the crate on disk is missing or behind the current templates
+    /// — the check the build and preview paths apply before regenerating.
+    fn stale(project: &Project) -> impl Future<Output = eyre::Result<bool>> + Send;
+}
+
+/// Scaffolds `B`'s crate the way the build that compiles it would —
+/// [`crate::backend::reinit_backend`] when it is missing or stale — and
+/// pushes its `Cargo.toml` onto `manifests`. A crate that cannot be produced
+/// is an error naming the backend, never a skip.
+async fn ensure_backend_manifest<B: FontScanCrate>(
+    project: &Project,
+    manifests: &mut Vec<PathBuf>,
+) -> eyre::Result<()> {
+    if !B::wanted(project) {
+        return Ok(());
+    }
+    let stale = B::stale(project)
+        .await
+        .wrap_err_with(|| format!("could not inspect the {} backend crate", B::NAME))?;
+    if stale {
+        crate::backend::reinit_backend::<B>(project)
+            .await
+            .map_err(|error| {
+                eyre::eyre!("could not scaffold the {} backend crate: {error}", B::NAME)
+            })?;
+    }
+    manifests.push(project.backend_path::<B>().join("Cargo.toml"));
+    Ok(())
+}
+
+impl FontScanCrate for crate::gtk4::backend::Gtk4Backend {
+    const NAME: &'static str = "GTK4";
+    fn wanted(project: &Project) -> bool {
+        // GTK4 compiles on Linux hosts only, so a playground elsewhere never
+        // builds this crate.
+        project.gtk4_backend().is_some() || (project.is_playground() && cfg!(target_os = "linux"))
+    }
+    async fn stale(project: &Project) -> eyre::Result<bool> {
+        Self::requires_regeneration(project).await
+    }
+}
+
+impl FontScanCrate for crate::hydrolysis::backend::HydrolysisBackend {
+    const NAME: &'static str = "hydrolysis";
+    fn wanted(project: &Project) -> bool {
+        project.is_playground() || project.hydrolysis_backend().is_some()
+    }
+    async fn stale(project: &Project) -> eyre::Result<bool> {
+        Self::requires_regeneration(project).await
+    }
+}
+
+impl FontScanCrate for crate::winui::backend::WinUiBackend {
+    const NAME: &'static str = "WinUI";
+    fn wanted(project: &Project) -> bool {
+        // `WinUI` compiles on Windows hosts only, so a playground elsewhere
+        // never builds this crate.
+        project.winui_backend().is_some()
+            || (project.is_playground() && cfg!(target_os = "windows"))
+    }
+    async fn stale(project: &Project) -> eyre::Result<bool> {
+        Self::requires_regeneration(project).await
+    }
 }
 
 /// How `fetch_fonts` downloads one URL to a path — a seam a test closes
