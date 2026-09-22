@@ -6,6 +6,7 @@ pub mod cargo_helpers;
 pub mod cmake;
 pub mod doctor;
 pub mod dxc;
+pub mod git;
 pub mod host;
 pub mod linux;
 pub mod managed_tool;
