@@ -41,7 +41,7 @@ use crate::{
         cmake::Cmake,
         dxc::Dxc,
         git::Git,
-        linux::LinuxSystemToolchain,
+        linux::{CToolchain, LinuxSystemToolchain},
         msvc::MsvcBuildTools,
         rust::{CLI_MINIMUM_RUST_VERSION, RustToolchain},
         sccache::Sccache,
@@ -181,7 +181,7 @@ impl DoctorGroup {
     pub fn of(id: &str) -> Self {
         match id {
             ids::RUST => Self::Rust,
-            ids::GIT => Self::Host,
+            ids::GIT | ids::C_TOOLCHAIN => Self::Host,
             ids::XCODE
             | ids::IOS_SDK
             | ids::IOS_SIMULATOR_SDK
@@ -451,6 +451,8 @@ pub mod ids {
     pub const RUST: &str = "rust";
     /// `git`, required by `water create` to initialize the project repository.
     pub const GIT: &str = "git";
+    /// The C compiler driver (`cc`) and linker (`ld`) native builds invoke.
+    pub const C_TOOLCHAIN: &str = "c-toolchain";
     /// iOS device and simulator rustup targets on the selected toolchain.
     pub const APPLE_RUST_TARGETS: &str = "apple-rust-targets";
     /// Android SDK root + `sdkmanager`.
@@ -509,6 +511,7 @@ pub mod ids {
     pub const ALL: &[&str] = &[
         RUST,
         GIT,
+        C_TOOLCHAIN,
         XCODE,
         IOS_SDK,
         IOS_SIMULATOR_SDK,
@@ -1153,19 +1156,37 @@ async fn cargo_helpers_check(host: &Host) -> DoctorItem {
     }
 }
 
-/// Host-level tools every workflow needs regardless of backend: `git`,
-/// which `water create` invokes to initialize the scaffolded repository.
+/// Host-level tools every workflow needs regardless of backend: `git`, which
+/// `water create` invokes to initialize the scaffolded repository, and the C
+/// toolchain rustc links through.
+///
+/// The C toolchain is Linux-only here — macOS gets `cc`/`ld` from the Xcode
+/// Command Line Tools (the `apple` group) and Windows from MSVC/LLVM — but it
+/// still reports as a skipped item so every id in [`ids::ALL`] appears.
 async fn host_checks(host: &Host) -> Vec<DoctorItem> {
-    vec![
+    let git = toolchain_check(
+        host,
+        ids::GIT,
+        "git",
+        "git is missing — `water create` needs it to initialize the project repository",
+        Git,
+    )
+    .await;
+
+    let c_toolchain = if cfg!(target_os = "linux") {
         toolchain_check(
             host,
-            ids::GIT,
-            "git",
-            "git is missing — `water create` needs it to initialize the project repository",
-            Git,
+            ids::C_TOOLCHAIN,
+            "C toolchain",
+            "a C compiler (`cc`) and linker (`ld`) are missing — rustc links through `cc`",
+            CToolchain,
         )
-        .await,
-    ]
+        .await
+    } else {
+        DoctorItem::skipped(ids::C_TOOLCHAIN, "C toolchain")
+    };
+
+    vec![git, c_toolchain]
 }
 
 /// The Linux system packages and the GTK4 probe, as
