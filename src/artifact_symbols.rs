@@ -224,7 +224,7 @@ pub async fn build_host_rlib(
         .arg(target_dir)
         .current_dir(project_path);
     if let Some(sccache_path) = sccache_path {
-        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path)?;
+        crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path).await?;
     }
     // Stdout stays collected-only: it carries the JSON message stream parsed
     // below, so a progress sink must never mirror it to the terminal.
