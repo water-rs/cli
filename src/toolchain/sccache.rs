@@ -307,18 +307,17 @@ pub struct Sccache;
 impl Sccache {
     /// Get the path to the `sccache` executable if available.
     ///
-    /// `PATH` first, then the managed install under `~/.water/tools`.
+    /// The managed install under `~/.water/tools` first — a pinned copy can
+    /// never be the stale distribution package — then `PATH`.
     ///
     /// # Errors
-    /// Returns an error if `sccache` is not found in the system PATH or the
-    /// managed tools.
+    /// Returns an error if `sccache` is not found in the managed tools or the
+    /// system PATH.
     pub async fn path(&self, host: &Host) -> Result<PathBuf, which::Error> {
-        match host.which("sccache").await {
-            Ok(path) => Ok(path),
-            Err(error) => managed_tool::sccache()
-                .and_then(|tool| tool.binary_path(host))
-                .ok_or(error),
+        if let Some(path) = managed_tool::sccache().and_then(|tool| tool.binary_path(host)) {
+            return Ok(path);
         }
+        host.which("sccache").await
     }
 
     /// Check if sccache is available on `host` without returning an error.
@@ -418,20 +417,33 @@ impl Toolchain for Sccache {
     type Installation = SccacheInstallation;
 
     async fn check(&self, host: &Host) -> Result<(), ToolchainError<Self::Installation>> {
-        if let Ok(sccache_path) = host.which("sccache").await {
-            check_sccache_version(host, sccache_path).await
-        } else if managed_tool::sccache()
+        let managed = managed_tool::sccache();
+        if managed
+            .as_ref()
             .and_then(|tool| tool.binary_path(host))
             .is_some()
         {
             // A managed copy is a pinned, checksum-verified release — its
-            // version is known by construction.
+            // version is known by construction, and `path` resolves to it
+            // ahead of any stale PATH copy.
             Ok(())
+        } else if let Ok(sccache_path) = host.which("sccache").await {
+            match check_sccache_version(host, sccache_path).await {
+                Ok(()) => Ok(()),
+                // A package-manager install cannot express the upgrade a
+                // stale or broken PATH copy needs; the pinned release
+                // artifact lands a known-good build alongside it.
+                Err(error) => managed.map_or(Err(error), |tool| {
+                    Err(ToolchainError::fixable(SccacheInstallation::Managed(tool)))
+                }),
+            }
         } else if cfg!(target_os = "windows") {
             Err(missing_sccache_on_windows(host).await)
         } else if cfg!(target_os = "macos") {
             if host.which("brew").await.is_ok() {
                 Err(ToolchainError::fixable(SccacheInstallation::Brew))
+            } else if let Some(tool) = managed {
+                Err(ToolchainError::fixable(SccacheInstallation::Managed(tool)))
             } else {
                 Err(ToolchainError::unfixable(
                     "sccache not found and Homebrew is unavailable",
@@ -442,7 +454,13 @@ impl Toolchain for Sccache {
                 ))
             }
         } else if cfg!(target_os = "linux") {
-            if has_supported_package_manager(host).await {
+            // Distribution packages lag the 0.9.0 floor (apt carries 0.7.x,
+            // Fedora none at all), so the pinned release artifact is the
+            // repair; the package manager only remains for architectures
+            // upstream does not ship.
+            if let Some(tool) = managed {
+                Err(ToolchainError::fixable(SccacheInstallation::Managed(tool)))
+            } else if has_supported_package_manager(host).await {
                 Err(ToolchainError::fixable(SccacheInstallation::PackageManager))
             } else {
                 Err(ToolchainError::unfixable(
@@ -450,6 +468,8 @@ impl Toolchain for Sccache {
                     format!("Install manually with {}", sccache_install_hint()),
                 ))
             }
+        } else if let Some(tool) = managed {
+            Err(ToolchainError::fixable(SccacheInstallation::Managed(tool)))
         } else {
             Err(ToolchainError::unfixable(
                 "sccache not found",
@@ -589,18 +609,15 @@ mod host_tests {
         machine.install("sccache");
         let host = machine.host([("WATERUI_FAKE_SCCACHE_VERSION", "0.8.2")]);
         let result = smol::block_on(Sccache.check(&host));
-        let Err(ToolchainError::Unfixable(error)) = result else {
-            panic!("an sccache below the UDS floor must be unfixable: {result:?}");
-        };
+        // The pinned artifact repairs a stale PATH copy the package manager
+        // cannot upgrade, and every host this CLI supports has one — see
+        // `every_supported_host_has_a_pinned_artifact`.
         assert!(
-            error.message().contains("0.8.2"),
-            "the error names the installed version: {}",
-            error.message()
-        );
-        assert!(
-            error.message().contains("0.9.0"),
-            "the error names the required version: {}",
-            error.message()
+            matches!(
+                result,
+                Err(ToolchainError::Fixable(SccacheInstallation::Managed(_)))
+            ),
+            "an sccache below the UDS floor resolves to the managed artifact: {result:?}"
         );
     }
 
@@ -611,8 +628,11 @@ mod host_tests {
         let host = machine.host([("WATERUI_FAKE_SCCACHE_VERSION", "unknown")]);
         let result = smol::block_on(Sccache.check(&host));
         assert!(
-            matches!(result, Err(ToolchainError::Unfixable(_))),
-            "an sccache whose version cannot be read must be unfixable: {result:?}"
+            matches!(
+                result,
+                Err(ToolchainError::Fixable(SccacheInstallation::Managed(_)))
+            ),
+            "an sccache whose version cannot be read resolves to the managed artifact: {result:?}"
         );
     }
 
@@ -748,23 +768,24 @@ mod host_tests {
     }
 
     #[test]
-    fn missing_without_installer_is_unfixable() {
+    fn missing_without_installer_uses_the_release_artifact() {
         let machine = TestMachine::new();
         let result = check(&machine);
-        // Windows hosts have the managed-archive fallback, so a bare Windows
-        // machine is fixable even without winget; elsewhere no package
-        // manager means manual.
-        if cfg!(target_os = "windows") && crate::toolchain::managed_tool::sccache().is_some() {
-            assert!(
-                matches!(result, Err(ToolchainError::Fixable(_))),
-                "missing sccache on Windows without winget falls back to the managed archive: {result:?}"
-            );
-        } else {
-            assert!(
-                matches!(result, Err(ToolchainError::Unfixable(_))),
-                "missing sccache without a package manager must be unfixable: {result:?}"
-            );
-        }
+        // The pinned build is the repair wherever upstream publishes an
+        // artifact, because a distribution package can lag the floor.
+        assert!(
+            matches!(
+                result,
+                Err(ToolchainError::Fixable(SccacheInstallation::Managed(_)))
+            ),
+            "missing sccache resolves to the managed release artifact: {result:?}"
+        );
+
+        assert!(
+            crate::toolchain::managed_tool::sccache().is_some(),
+            "the assertions above hold because this host has a pinned artifact; \
+             a host without one falls back to the package manager or stays manual"
+        );
     }
 
     /// A Windows host without `winget` gets the managed archive — fixable,
@@ -804,6 +825,20 @@ mod host_tests {
     /// A pinned sccache unpacked under `~/.water/tools` satisfies the check
     /// — its version is known by construction, so no `--version` run is
     /// needed — even though nothing named `sccache` is on `PATH`.
+    /// The three checks above assert the managed artifact unconditionally, which
+    /// is only right because `managed_tool::sccache()` covers every triple this
+    /// CLI is built for. It is a `cfg!` cascade, so a new host target silently
+    /// returns `None` and would turn those assertions into a different test —
+    /// this one fails instead, and names the missing artifact.
+    #[test]
+    fn every_supported_host_has_a_pinned_artifact() {
+        assert!(
+            crate::toolchain::managed_tool::sccache().is_some(),
+            "no pinned sccache artifact for this host triple: add it to \
+             `managed_tool::sccache()` or the doctor cannot repair sccache here"
+        );
+    }
+
     #[test]
     fn ok_when_sccache_is_managed() {
         let machine = TestMachine::new();
@@ -823,6 +858,32 @@ mod host_tests {
         assert!(
             result.is_ok(),
             "a managed sccache must satisfy the check: {result:?}"
+        );
+    }
+
+    /// A managed install also satisfies the check when the PATH copy is
+    /// below the floor: `Sccache::path` resolves the managed binary first,
+    /// so the stale copy never serves a build.
+    #[test]
+    fn ok_when_managed_shadows_a_stale_path_copy() {
+        let machine = TestMachine::new();
+        let Some(tool) = crate::toolchain::managed_tool::sccache() else {
+            return; // this architecture has no managed build
+        };
+        machine.install("sccache");
+        let host = machine.host([("WATERUI_FAKE_SCCACHE_VERSION", "0.8.2")]);
+        let install_dir = tool.install_dir(&host).unwrap();
+        machine.file(
+            install_dir
+                .join(&tool.binary)
+                .strip_prefix(machine.root())
+                .unwrap(),
+            "",
+        );
+        let result = smol::block_on(Sccache.check(&host));
+        assert!(
+            result.is_ok(),
+            "the managed copy must shadow a stale PATH sccache: {result:?}"
         );
     }
 
