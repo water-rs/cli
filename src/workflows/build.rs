@@ -1453,11 +1453,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
 
         // Use sccache as rustc wrapper if configured
         if let Some(sccache_path) = &self.sccache_path {
-            crate::toolchain::sccache::configure_compilation_cache(cmd, sccache_path).map_err(
-                |error| {
+            crate::toolchain::sccache::configure_compilation_cache(cmd, sccache_path)
+                .await
+                .map_err(|error| {
                     RustBuildError::FailToBuildRustLibrary(std::io::Error::other(error.to_string()))
-                },
-            )?;
+                })?;
         }
 
         // A `-Zbuild-std` build runs the `water` binary itself as
