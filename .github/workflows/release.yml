@@ -296,6 +296,58 @@ jobs:
       - name: Build global release artifacts
         run: dist build --tag "${{ env.TAG }}" --artifacts=global
 
+      # cargo-dist generates the shell installer from a template compiled
+      # into the dist binary, and exposes no config hook for prerequisite
+      # checks (the `shell` installer layer only carries the common options),
+      # so the generated script is patched in place here — the same approach
+      # as the Homebrew formula below. The anchors and the trailing greps are
+      # load-bearing: if dist's template ever changes shape, the release fails
+      # here rather than silently shipping an unpatched installer.
+      #
+      # The loop must name every external command the script forks that dist
+      # does not already check itself (#150): `tar xf` execs xz for .tar.xz
+      # archives, check_glibc() pipes `ldd --version` through awk, the receipt
+      # and rc-file rewriting runs sed, install() moves binaries with mv,
+      # get_home() falls back to getent/cut/id when HOME and USER are unset,
+      # and the pinned checksum verification needs sha256sum.
+      - name: Inject prerequisite checks into the shell installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          installer=target/distrib/waterui-cli-installer.sh
+
+          test "$(grep -c '^    need_cmd cat$' "$installer")" = "1"
+
+          block="$(mktemp)"
+          cat > "$block" <<'EOF'
+              # Every external command this script forks beyond cargo-dist's own
+              # checks above. Each failure names the command and the package
+              # that provides it:
+              #   xz              - the decompressor `tar xf` execs for .tar.xz
+              #   ldd, awk        - check_glibc() parses `ldd --version` via awk
+              #   sed             - install receipt and rc-file rewriting
+              #   mv              - install() moves binaries into place
+              #   getent, cut, id - get_home() when HOME and USER are both unset
+              #   sha256sum       - the pinned SHA-256 checksum verification
+              for _dep in "xz:xz-utils or xz" "awk:gawk or mawk" \
+                          "ldd:glibc or libc-bin" "sed:sed" "mv:coreutils" \
+                          "getent:libc-bin or glibc" "cut:coreutils" \
+                          "id:coreutils" "sha256sum:coreutils"; do
+                  check_cmd "${_dep%%:*}" \
+                      || err "need '${_dep%%:*}' (command not found; install '${_dep##*:}')"
+              done
+          EOF
+          sed -i '/^    need_cmd cat$/r '"$block" "$installer"
+          rm -f "$block"
+          grep -q 'for _dep in "xz:xz-utils or xz"' "$installer"
+
+          # `unzip` is only required when the selected archive is a .zip, so it
+          # is guarded inside that case branch rather than the loop above.
+          sed -i 's|^\( *\)ensure unzip -q "\$_file" -d "\$_dir"$|\1need_cmd unzip\n&|' "$installer"
+          grep -q 'need_cmd unzip' "$installer"
+
+          sh -n "$installer"
+
       # The patterns must not overlap. `*.tar.*` also matched every
       # `…tar.xz.sha256`, which `*.sha256` matched again, so each checksum
       # beside a tarball was listed twice; the action then issued two deletes
