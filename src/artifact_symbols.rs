@@ -223,6 +223,10 @@ pub async fn build_host_rlib(
         .arg("--target-dir")
         .arg(target_dir)
         .current_dir(project_path);
+    // Build scripts in the host rlib's graph resolve managed tools by name —
+    // `shaderloom` invokes `dxc` — so the same `PATH` every other CLI build
+    // uses applies here too.
+    crate::build::with_managed_tools_path(&mut cargo);
     if let Some(sccache_path) = sccache_path {
         crate::toolchain::sccache::configure_compilation_cache(&mut cargo, sccache_path).await?;
     }
