@@ -85,6 +85,10 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] } 
 # packages, browser runtimes, asset catalogs — is stored or deflated, so the
 # bzip2/lzma/zstd/xz/ppmd/AES codecs `default` also pulls are never reached.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Gzipped-tar extraction for managed tools whose upstream releases ship
+# `.tar.gz` (sccache on Linux and macOS).
+flate2 = "1"
+tar = "0.4"
 roxmltree = "0.21"            # Android SDK repository XML parsing
 fs_extra = "1.3"
 askama = "0.16"

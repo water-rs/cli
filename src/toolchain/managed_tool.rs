@@ -23,6 +23,15 @@ use crate::{
     toolchain::Host,
 };
 
+/// The compression format of a [`ManagedTool`]'s release archive.
+#[derive(Debug, Clone, Copy)]
+pub enum ArchiveKind {
+    /// A `.zip` archive.
+    Zip,
+    /// A gzipped `.tar` archive.
+    TarGz,
+}
+
 /// A pinned release archive that unpacks under `~/.water/tools/<name>/<version>/`.
 #[derive(Debug, Clone)]
 pub struct ManagedTool {
@@ -36,6 +45,8 @@ pub struct ManagedTool {
     pub sha256: &'static str,
     /// Path of the tool binary inside the unpacked tree.
     pub binary: String,
+    /// The archive's compression format.
+    pub archive: ArchiveKind,
 }
 
 impl ManagedTool {
@@ -98,24 +109,53 @@ impl ManagedTool {
             }
         })
         .await?;
-        let archive_path = staging.path().join("archive.zip");
+        let archive_path = staging.path().join("archive");
         fetch_pinned(&self.url, self.sha256, &archive_path).await?;
 
         let extract_dir = staging.path().join("extract");
+        let archive = self.archive;
         smol::unblock({
             let archive_path = archive_path.clone();
             let extract_dir = extract_dir.clone();
             move || -> Result<(), ManagedToolError> {
                 std::fs::create_dir_all(&extract_dir)?;
                 let file = std::fs::File::open(&archive_path)?;
-                zip::ZipArchive::new(file)?.extract(&extract_dir)?;
+                match archive {
+                    ArchiveKind::Zip => {
+                        zip::ZipArchive::new(file)?.extract(&extract_dir)?;
+                    }
+                    ArchiveKind::TarGz => {
+                        tar::Archive::new(flate2::read::GzDecoder::new(file))
+                            .unpack(&extract_dir)?;
+                    }
+                }
                 Ok(())
             }
         })
         .await?;
 
         remove_directory_if_exists(&install_dir).await?;
-        smol::unblock(move || std::fs::rename(&extract_dir, &install_dir)).await?;
+        smol::unblock({
+            let install_dir = install_dir.clone();
+            move || std::fs::rename(&extract_dir, &install_dir)
+        })
+        .await?;
+
+        // Tar archives can carry non-executable modes; guarantee the shipped
+        // binary can run.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let binary_path = install_dir.join(&self.binary);
+            if binary_path.is_file() {
+                smol::unblock(move || {
+                    let mut permissions = std::fs::metadata(&binary_path)?.permissions();
+                    permissions.set_mode(permissions.mode() | 0o111);
+                    std::fs::set_permissions(&binary_path, permissions)
+                })
+                .await?;
+            }
+        }
 
         self.binary_dir(host)
             .ok_or_else(|| ManagedToolError::ArchiveLayout {
@@ -143,6 +183,7 @@ pub fn dxc() -> ManagedTool {
             .to_string(),
         sha256: "9ad895a6b039e3a8f8c22a1009f866800b840a74b50db9218d13319e215ea8a4",
         binary: binary.to_string(),
+        archive: ArchiveKind::Zip,
     }
 }
 
@@ -174,32 +215,105 @@ pub fn cmake() -> Option<ManagedTool> {
         url: format!("https://github.com/Kitware/CMake/releases/download/v4.4.3/{package}.zip"),
         sha256,
         binary: format!("{package}/bin/cmake.exe"),
+        archive: ArchiveKind::Zip,
     })
 }
 
-/// `sccache` for a Windows host without a package manager, from the pinned
-/// Mozilla release zip. Upstream publishes no x86 build.
+/// `sccache` from the pinned Mozilla release artifact.
+///
+/// A zip on Windows, a gzipped tar on Linux and macOS. Distribution
+/// packages lag the 0.9.0 floor the cache protocol needs (apt carries
+/// 0.7.x, Fedora none), so the pinned artifact is the repair wherever
+/// upstream publishes one. Upstream publishes no Windows x86 build.
 #[must_use]
 pub fn sccache() -> Option<ManagedTool> {
-    let (package, sha256) = if cfg!(target_arch = "x86_64") {
+    let (triple, sha256, archive) = if cfg!(all(windows, target_arch = "x86_64")) {
         (
-            "sccache-v0.18.0-x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc",
             "8965c74d5e8a225244f741e18ad2f3f504f48228dc1bac948fc22761a348363d",
+            ArchiveKind::Zip,
         )
-    } else if cfg!(target_arch = "aarch64") {
+    } else if cfg!(all(windows, target_arch = "aarch64")) {
         (
-            "sccache-v0.18.0-aarch64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
             "205d613fa74a9a0525e41a5ace77b1c71907d5bd4a5e668bad79111776829290",
+            ArchiveKind::Zip,
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        (
+            "x86_64-unknown-linux-musl",
+            "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        (
+            "aarch64-unknown-linux-musl",
+            "2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "arm",
+        target_abi = "eabihf"
+    )) {
+        (
+            "armv7-unknown-linux-musleabi",
+            "5e1b69e95cee1b19f0d0669eb1b1597f51770fc602e4321adfea99143cac6ce9",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "x86")) {
+        (
+            "i686-unknown-linux-musl",
+            "e23e961b549c3c40ac0d504e0d4a63a5da2ef1b44ac253c55bef55e755fdf340",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "riscv64")) {
+        (
+            "riscv64gc-unknown-linux-musl",
+            "ee204961bae9c7033971a7a65e93e66431c8e2ca4af9123330ac3e94afacd4de",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "s390x")) {
+        (
+            "s390x-unknown-linux-musl",
+            "c7e532bc7f2e6e1f27c9087172a95faf3b85672256775fde3e8cf26d9934f4fe",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "loongarch64")) {
+        (
+            "loongarch64-unknown-linux-musl",
+            "2c165dd599675a31be5d0e100e8df2bb22919d75ac711f9060acd96fcb7c6626",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        (
+            "x86_64-apple-darwin",
+            "1dade83cc49eeb42337565eccd534b05982820a8e44b851bd7937467a18c7aef",
+            ArchiveKind::TarGz,
+        )
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        (
+            "aarch64-apple-darwin",
+            "308184519b646f5125289e8515b36f6ca65a13a041923994aebe702348674e8e",
+            ArchiveKind::TarGz,
         )
     } else {
         return None;
     };
+    let package = format!("sccache-v0.18.0-{triple}");
+    let (extension, binary) = match archive {
+        ArchiveKind::Zip => ("zip", format!("{package}/sccache.exe")),
+        ArchiveKind::TarGz => ("tar.gz", format!("{package}/sccache")),
+    };
     Some(ManagedTool {
         name: "sccache",
         version: "0.18.0",
-        url: format!("https://github.com/mozilla/sccache/releases/download/v0.18.0/{package}.zip"),
+        url: format!(
+            "https://github.com/mozilla/sccache/releases/download/v0.18.0/{package}.{extension}"
+        ),
         sha256,
-        binary: format!("{package}/sccache.exe"),
+        binary,
+        archive,
     })
 }
 
@@ -228,6 +342,7 @@ pub fn jdk() -> Option<ManagedTool> {
         ),
         sha256,
         binary: "jdk-21.0.12.1+1/bin/java.exe".to_string(),
+        archive: ArchiveKind::Zip,
     })
 }
 

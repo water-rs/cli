@@ -1309,7 +1309,7 @@ pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
             host,
             ids::SCCACHE,
             "sccache",
-            "sccache not found (recommended for faster builds)",
+            "sccache is missing or too old — 0.9.0 or newer is recommended for faster builds",
             Sccache,
         )),
         Box::pin(cargo_helpers_check(host)),
