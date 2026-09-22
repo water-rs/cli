@@ -195,7 +195,7 @@ mod host_tests {
     mod linux {
         use super::*;
 
-        const APT_PACKAGES: &str = "pkg-config libgtk-4-dev libpango1.0-dev libwayland-dev \
+        const APT_PACKAGES: &str = "build-essential pkg-config libgtk-4-dev libpango1.0-dev libwayland-dev \
              wayland-protocols libasound2-dev libva-dev libgbm-dev libxcb1-dev \
              libclang-dev libfontconfig-dev";
 

@@ -180,6 +180,49 @@ impl Toolchain for LinuxSystemToolchain {
     }
 }
 
+/// The C toolchain every native Linux build invokes.
+///
+/// rustc shells out to `cc` to drive the linker, so a host carrying
+/// development headers without a compiler driver — Ubuntu's package set
+/// historically installed `libclang-dev` yet no `cc`, `gcc`, `clang`, or
+/// `ld` — dies at first link with `error: linker \'cc\' not found`. Both
+/// probes must pass; the repair installs the distribution's compiler
+/// bundle, which always provides `cc` and `ld` on the supported managers.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CToolchain;
+
+impl Toolchain for CToolchain {
+    type Installation = LinuxSystemPackagesInstallation;
+
+    async fn check(&self, host: &Host) -> Result<(), ToolchainError<Self::Installation>> {
+        if !cfg!(target_os = "linux") {
+            return Ok(());
+        }
+
+        if host.which("cc").await.is_ok() && host.which("ld").await.is_ok() {
+            return Ok(());
+        }
+
+        let Some(manager) = LinuxPackageManager::detect(host).await else {
+            return Err(ToolchainError::unfixable(
+                "a C compiler (`cc`) and linker (`ld`) are missing and no supported package manager was found",
+                "Install a C toolchain with your distribution's package manager (`build-essential` on Debian/Ubuntu, `gcc` and `binutils` elsewhere) and ensure `cc` and `ld` are on PATH.",
+            ));
+        };
+
+        Err(ToolchainError::fixable(
+            LinuxSystemPackagesInstallation::new(
+                manager,
+                manager
+                    .c_toolchain_packages()
+                    .iter()
+                    .map(|package| (*package).to_string())
+                    .collect(),
+            ),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LinuxPackageManager {
     Apt,
@@ -216,9 +259,21 @@ impl LinuxPackageManager {
         }
     }
 
+    /// Packages providing the C compiler driver (`cc`) and linker (`ld`)
+    /// a native build invokes — probed separately by [`CToolchain`].
+    const fn c_toolchain_packages(self) -> &'static [&'static str] {
+        match self {
+            Self::Apt => &["build-essential"],
+            Self::Dnf | Self::Zypper => &["gcc", "binutils", "glibc-devel"],
+            Self::Pacman => &["gcc", "binutils"],
+            Self::Apk => &["build-base"],
+        }
+    }
+
     const fn required_packages(self) -> &'static [&'static str] {
         match self {
             Self::Apt => &[
+                "build-essential",
                 "pkg-config",
                 "libgtk-4-dev",
                 "libpango1.0-dev",
@@ -232,6 +287,9 @@ impl LinuxPackageManager {
                 "libfontconfig-dev",
             ],
             Self::Dnf => &[
+                "gcc",
+                "binutils",
+                "glibc-devel",
                 "pkgconf-pkg-config",
                 "gtk4-devel",
                 "pango-devel",
@@ -245,6 +303,8 @@ impl LinuxPackageManager {
                 "fontconfig-devel",
             ],
             Self::Pacman => &[
+                "gcc",
+                "binutils",
                 "pkgconf",
                 "gtk4",
                 "pango",
@@ -258,6 +318,9 @@ impl LinuxPackageManager {
                 "fontconfig",
             ],
             Self::Zypper => &[
+                "gcc",
+                "binutils",
+                "glibc-devel",
                 "pkg-config",
                 "gtk4-devel",
                 "pango-devel",
@@ -271,6 +334,7 @@ impl LinuxPackageManager {
                 "fontconfig-devel",
             ],
             Self::Apk => &[
+                "build-base",
                 "pkgconf",
                 "gtk4.0-dev",
                 "pango-dev",
@@ -1056,7 +1120,7 @@ mod host_tests {
     use crate::toolchain::testing::TestMachine;
     use crate::toolchain::{Toolchain, ToolchainError};
 
-    const APT_PACKAGES: &str = "pkg-config libgtk-4-dev libpango1.0-dev libwayland-dev \
+    const APT_PACKAGES: &str = "build-essential pkg-config libgtk-4-dev libpango1.0-dev libwayland-dev \
          wayland-protocols libasound2-dev libva-dev libgbm-dev libxcb1-dev \
          libclang-dev libfontconfig-dev";
 
@@ -1168,6 +1232,45 @@ mod host_tests {
         assert_eq!(
             installation.missing_packages(),
             &[String::from("libpipewire-0.3-dev")]
+        );
+    }
+
+    #[test]
+    fn c_toolchain_ok_when_cc_and_ld_on_path() {
+        let machine = TestMachine::new();
+        machine.install("cc");
+        machine.install("ld");
+        let host = machine.host(Vec::<(String, String)>::new());
+        smol::block_on(super::CToolchain.check(&host))
+            .expect("cc and ld on PATH must satisfy the C toolchain check");
+    }
+
+    #[test]
+    fn c_toolchain_fixable_with_package_manager() {
+        let machine = TestMachine::new();
+        machine.install("apt-get");
+        machine.install("dpkg-query");
+        let host = machine.host(Vec::<(String, String)>::new());
+        let Err(ToolchainError::Fixable(installation)) =
+            smol::block_on(super::CToolchain.check(&host))
+        else {
+            panic!("a missing C toolchain on a managed host must be fixable");
+        };
+        assert_eq!(installation.package_manager_name(), "apt-get");
+        assert_eq!(
+            installation.missing_packages(),
+            &[String::from("build-essential")]
+        );
+    }
+
+    #[test]
+    fn c_toolchain_unfixable_without_package_manager() {
+        let machine = TestMachine::new();
+        let host = machine.host(Vec::<(String, String)>::new());
+        let result = smol::block_on(super::CToolchain.check(&host));
+        assert!(
+            matches!(result, Err(ToolchainError::Unfixable(_))),
+            "a missing C toolchain without a package manager must be unfixable: {result:?}"
         );
     }
 }
