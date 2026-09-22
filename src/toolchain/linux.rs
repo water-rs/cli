@@ -176,7 +176,7 @@ impl Toolchain for LinuxSystemToolchain {
             ));
         }
 
-        check_versioned_native_libraries(host, manager).await
+        check_native_libraries(host, manager).await
     }
 }
 
@@ -258,14 +258,19 @@ impl LinuxPackageManager {
                 "fontconfig",
             ],
             Self::Zypper => &[
-                "pkg-config",
+                // Tumbleweed has no `pkg-config` package name; the pkgconf shim
+                // is what provides /usr/bin/pkg-config, and `rpm -q` checks the
+                // package name, not the capability.
+                "pkgconf-pkg-config",
                 "gtk4-devel",
                 "pango-devel",
                 "wayland-devel",
                 "wayland-protocols-devel",
                 "alsa-devel",
                 "libva-devel",
-                "Mesa-libgbm-devel",
+                // Tumbleweed renamed Mesa's split packages: gbm dropped the
+                // `Mesa-` prefix while EGL kept it (`Mesa-libEGL-devel`).
+                "libgbm-devel",
                 "libxcb-devel",
                 "clang-devel",
                 "fontconfig-devel",
@@ -331,8 +336,8 @@ impl LinuxPackageManager {
         None
     }
 
-    /// Package that provides the development files for a version-checked
-    /// pkg-config module.
+    /// Package that provides the development files for a probed pkg-config
+    /// module.
     const fn package_for_native_library(self, module: &str) -> Option<&'static str> {
         match module.as_bytes() {
             b"libva" => Some(match self {
@@ -345,6 +350,13 @@ impl LinuxPackageManager {
                 Self::Dnf | Self::Zypper => "pipewire-devel",
                 Self::Pacman => "libpipewire",
                 Self::Apk => "pipewire-dev",
+            }),
+            b"egl" => Some(match self {
+                Self::Apt => "libegl-dev",
+                Self::Dnf => "mesa-libEGL-devel",
+                Self::Zypper => "Mesa-libEGL-devel",
+                Self::Pacman => "mesa",
+                Self::Apk => "mesa-dev",
             }),
             _ => None,
         }
@@ -437,6 +449,16 @@ const VERSIONED_NATIVE_LIBRARIES: &[VersionedNativeLibrary] = &[
     },
 ];
 
+/// pkg-config modules a desktop build needs present, with no version floor.
+///
+/// `khronos-egl`'s build script locates EGL through `pkg-config --exists egl`
+/// and fails with `Package 'egl' not found` when no `.pc` file is installed —
+/// the failure in <https://github.com/water-rs/cli/issues/155> on Fedora,
+/// where nothing else pulls `mesa-libEGL-devel` in. Presence is the whole
+/// check: any provider of `egl.pc` satisfies it, whether it came from the
+/// distribution's Mesa package or a source build on `PKG_CONFIG_PATH`.
+const REQUIRED_NATIVE_MODULES: &[&str] = &["egl"];
+
 /// Outcome of probing one [`VersionedNativeLibrary`] with `pkg-config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NativeLibraryStatus {
@@ -493,8 +515,16 @@ impl VersionedNativeLibrary {
     }
 }
 
-/// Check the native libraries whose Rust bindings have a minimum version.
-async fn check_versioned_native_libraries(
+/// Check the probed native libraries: the version-floored ones and the
+/// presence-only ones.
+///
+/// Every missing module collects into one fixable installation, and a missing
+/// module outranks an outdated library: an unfixable `TooOld` used to return
+/// immediately, which hid every fixable gap behind it — Debian 12's libva is
+/// below the `cros-libva` floor, so its missing `libpipewire-0.3-dev` never
+/// surfaced (<https://github.com/water-rs/cli/issues/155>). The outdated
+/// diagnostic is still reported once nothing installable remains.
+async fn check_native_libraries(
     host: &Host,
     manager: LinuxPackageManager,
 ) -> Result<(), ToolchainError<LinuxSystemPackagesInstallation>> {
@@ -506,6 +536,7 @@ async fn check_versioned_native_libraries(
     }
 
     let mut missing_packages = Vec::new();
+    let mut outdated = None;
     for &library in VERSIONED_NATIVE_LIBRARIES {
         let package = manager.package_for_native_library(library.module);
         let status = probe_native_library(host, library).await.map_err(|error| {
@@ -538,21 +569,53 @@ async fn check_versioned_native_libraries(
                 }
             }
             NativeLibraryStatus::TooOld { installed, release } => {
-                return Err(ToolchainError::unfixable(
-                    library.outdated_message(&installed, release.as_deref()),
-                    library.outdated_suggestion(package),
-                ));
+                if outdated.is_none() {
+                    outdated = Some((library, installed, release));
+                }
             }
         }
     }
 
-    if missing_packages.is_empty() {
-        Ok(())
-    } else {
-        Err(ToolchainError::fixable(
-            LinuxSystemPackagesInstallation::new(manager, missing_packages),
-        ))
+    for &module in REQUIRED_NATIVE_MODULES {
+        let present = pkg_config_module_present(host, module)
+            .await
+            .map_err(|error| {
+                ToolchainError::unfixable(
+                    format!("Failed checking `{module}` with pkg-config: {error}"),
+                    format!(
+                        "Ensure `pkg-config --exists {module}` works, then re-run `water doctor`."
+                    ),
+                )
+            })?;
+        if present {
+            continue;
+        }
+        let package = manager.package_for_native_library(module).ok_or_else(|| {
+            ToolchainError::unfixable(
+                format!("`{module}` is not known to pkg-config"),
+                format!("Install the development package providing `{module}` for this distribution, then re-run `water doctor`."),
+            )
+        })?;
+        if !missing_packages.iter().any(|existing| existing == package) {
+            missing_packages.push(package.to_owned());
+        }
     }
+
+    if !missing_packages.is_empty() {
+        return Err(ToolchainError::fixable(
+            LinuxSystemPackagesInstallation::new(manager, missing_packages),
+        ));
+    }
+
+    if let Some((library, installed, release)) = outdated {
+        let package = manager.package_for_native_library(library.module);
+        return Err(ToolchainError::unfixable(
+            library.outdated_message(&installed, release.as_deref()),
+            library.outdated_suggestion(package),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Returns `true` when `pkg-config` can be executed.
@@ -560,6 +623,15 @@ async fn pkg_config_available(host: &Host) -> bool {
     host.output("pkg-config", ["--version"])
         .await
         .is_ok_and(|output| output.status.success())
+}
+
+/// Returns `true` when `pkg-config` knows the module at all.
+async fn pkg_config_module_present(host: &Host, module: &str) -> Result<bool, CommandError> {
+    Ok(host
+        .output("pkg-config", ["--exists", module])
+        .await?
+        .status
+        .success())
 }
 
 /// Ask `pkg-config` for a module's version and compare it against the floor.
@@ -826,7 +898,10 @@ pub async fn install_java_jdk(host: &Host) -> Result<(), LinuxPackageManagerErro
     };
 
     let packages: Vec<String> = match manager {
-        LinuxPackageManager::Apt => vec![String::from("openjdk-21-jdk")],
+        // Debian 12 and Ubuntu 22.04 have no `openjdk-21-jdk`; 17 is the
+        // newest JDK name all apt targets share, and satisfies the JDK 17
+        // floor the Android toolchain needs.
+        LinuxPackageManager::Apt => vec![String::from("openjdk-17-jdk")],
         LinuxPackageManager::Dnf | LinuxPackageManager::Zypper => {
             vec![String::from("java-21-openjdk-devel")]
         }
@@ -841,8 +916,8 @@ pub async fn install_java_jdk(host: &Host) -> Result<(), LinuxPackageManagerErro
 #[cfg(test)]
 mod tests {
     use super::{
-        LinuxPackageManager, NativeLibraryStatus, VERSIONED_NATIVE_LIBRARIES,
-        VersionedNativeLibrary, version_at_least,
+        LinuxPackageManager, NativeLibraryStatus, REQUIRED_NATIVE_MODULES,
+        VERSIONED_NATIVE_LIBRARIES, VersionedNativeLibrary, version_at_least,
     };
 
     /// Stand-in for `pkg-config --modversion` / `--variable=…` on a machine that
@@ -954,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn every_manager_maps_the_version_checked_modules() {
+    fn every_manager_maps_the_probed_modules() {
         for manager in [
             LinuxPackageManager::Apt,
             LinuxPackageManager::Dnf,
@@ -970,7 +1045,32 @@ mod tests {
                     library.module
                 );
             }
+            for &module in REQUIRED_NATIVE_MODULES {
+                assert!(
+                    manager.package_for_native_library(module).is_some(),
+                    "{} has no package mapping for {module}",
+                    manager.name(),
+                );
+            }
         }
+    }
+
+    #[test]
+    fn egl_maps_to_the_distro_specific_mesa_package() {
+        // The module is the same everywhere; the package that owns `egl.pc`
+        // is not — Tumbleweed kept the `Mesa-` prefix Fedora dropped for gbm.
+        assert_eq!(
+            LinuxPackageManager::Apt.package_for_native_library("egl"),
+            Some("libegl-dev")
+        );
+        assert_eq!(
+            LinuxPackageManager::Dnf.package_for_native_library("egl"),
+            Some("mesa-libEGL-devel")
+        );
+        assert_eq!(
+            LinuxPackageManager::Zypper.package_for_native_library("egl"),
+            Some("Mesa-libEGL-devel")
+        );
     }
 
     /// The floors are read out of specific crate versions, so the versions the
@@ -1011,6 +1111,18 @@ mod tests {
         assert!(required.contains(&"alsa-lib-devel"));
         assert!(required.contains(&"clang-devel"));
         assert!(required.contains(&"fontconfig-devel"));
+    }
+
+    #[test]
+    fn zypper_packages_use_tumbleweed_names() {
+        // Verified against `zypper` on openSUSE Tumbleweed: the distribution
+        // has no `pkg-config` or `Mesa-libgbm-devel` package — a name that
+        // only resolves as a capability still fails `rpm -q` forever.
+        let required = LinuxPackageManager::Zypper.required_packages();
+        assert!(required.contains(&"pkgconf-pkg-config"));
+        assert!(required.contains(&"libgbm-devel"));
+        assert!(!required.contains(&"pkg-config"));
+        assert!(!required.contains(&"Mesa-libgbm-devel"));
     }
 
     #[test]
@@ -1061,7 +1173,8 @@ mod host_tests {
          libclang-dev libfontconfig-dev";
 
     /// A machine whose apt package set is complete and whose pkg-config
-    /// reports in-range versions for the version-checked native libraries.
+    /// reports in-range versions for the version-checked native libraries and
+    /// knows every presence-only module.
     fn complete_apt_machine() -> TestMachine {
         let machine = TestMachine::new();
         for tool in ["apt-get", "dpkg-query", "pkg-config"] {
@@ -1070,6 +1183,7 @@ mod host_tests {
         machine.respond_pkg_config_module("libva", "1.20.0");
         machine.respond_pkg_config_var("libva_version", "2.20.0");
         machine.respond_pkg_config_module("libpipewire-0.3", "0.3.65");
+        machine.respond_pkg_config_module("egl", "1.5.0");
         machine
     }
 
@@ -1153,9 +1267,10 @@ mod host_tests {
         for tool in ["apt-get", "dpkg-query", "pkg-config"] {
             machine.install(tool);
         }
-        // Only libva is staged; libpipewire-0.3 is unknown to pkg-config.
+        // libva and egl are staged; libpipewire-0.3 is unknown to pkg-config.
         machine.respond_pkg_config_module("libva", "1.20.0");
         machine.respond_pkg_config_var("libva_version", "2.20.0");
+        machine.respond_pkg_config_module("egl", "1.5.0");
         let host = machine.host([(
             String::from("WATERUI_FAKE_DPKG_INSTALLED"),
             APT_PACKAGES.to_string(),
@@ -1164,6 +1279,54 @@ mod host_tests {
             smol::block_on(LinuxSystemToolchain.check(&host))
         else {
             panic!("an absent libpipewire module must map to an installable package");
+        };
+        assert_eq!(
+            installation.missing_packages(),
+            &[String::from("libpipewire-0.3-dev")]
+        );
+    }
+
+    #[test]
+    fn fixable_when_presence_module_absent_from_pkg_config() {
+        let machine = complete_apt_machine();
+        // Drop the staged egl response: `pkg-config --exists egl` fails.
+        std::fs::remove_file(machine.responses().join("PKG_CONFIG_egl"))
+            .expect("remove the staged egl module");
+        let host = machine.host([(
+            String::from("WATERUI_FAKE_DPKG_INSTALLED"),
+            APT_PACKAGES.to_string(),
+        )]);
+        let Err(ToolchainError::Fixable(installation)) =
+            smol::block_on(LinuxSystemToolchain.check(&host))
+        else {
+            panic!("an absent egl module must map to an installable package");
+        };
+        assert_eq!(
+            installation.missing_packages(),
+            &[String::from("libegl-dev")]
+        );
+    }
+
+    #[test]
+    fn missing_module_stays_fixable_when_another_library_is_too_old() {
+        // Debian 12: libva is below the cros-libva floor, and libpipewire-0.3
+        // is not installed at all. The outdated library must not mask the
+        // installable package behind an unfixable verdict.
+        let machine = TestMachine::new();
+        for tool in ["apt-get", "dpkg-query", "pkg-config"] {
+            machine.install(tool);
+        }
+        machine.respond_pkg_config_module("libva", "1.14.0");
+        machine.respond_pkg_config_var("libva_version", "2.14.0");
+        machine.respond_pkg_config_module("egl", "1.5.0");
+        let host = machine.host([(
+            String::from("WATERUI_FAKE_DPKG_INSTALLED"),
+            APT_PACKAGES.to_string(),
+        )]);
+        let Err(ToolchainError::Fixable(installation)) =
+            smol::block_on(LinuxSystemToolchain.check(&host))
+        else {
+            panic!("a missing module must outrank an unrelated outdated library");
         };
         assert_eq!(
             installation.missing_packages(),
