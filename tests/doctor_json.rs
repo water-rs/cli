@@ -115,7 +115,10 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
                     | ids::IOS_SIMULATORS
                     | ids::MACOS_SDK
             );
-            let linux_item = matches!(*id, ids::LINUX_SYSTEM_PACKAGES | ids::GTK4);
+            let linux_item = matches!(
+                *id,
+                ids::C_TOOLCHAIN | ids::LINUX_SYSTEM_PACKAGES | ids::GTK4
+            );
             let windows_item = matches!(*id, ids::WINUI | ids::MSVC_BUILD_TOOLS | ids::DXC);
             // The fixture manifest selects no backends, so every
             // project-gated item reports skipped on every host.

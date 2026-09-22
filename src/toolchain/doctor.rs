@@ -40,7 +40,7 @@ use crate::{
         cargo_helpers::CargoHelpers,
         cmake::Cmake,
         dxc::Dxc,
-        linux::LinuxSystemToolchain,
+        linux::{CToolchain, LinuxSystemToolchain},
         msvc::MsvcBuildTools,
         rust::{CLI_MINIMUM_RUST_VERSION, RustToolchain},
         sccache::Sccache,
@@ -82,13 +82,17 @@ pub type BoxedInstallFn =
 
 /// The heading an item is reported under.
 ///
-/// The Rust toolchain, one backend, or the build helpers. Backends a host
-/// builds for by default come before the optional ones in
-/// [`DoctorGroup::ORDER`], the order a new user needs them.
+/// The Rust toolchain, the host-level tools every workflow needs, one
+/// backend, or the build helpers. Backends a host builds for by default
+/// come before the optional ones in [`DoctorGroup::ORDER`], the order a
+/// new user needs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DoctorGroup {
     /// The rustup-managed Rust toolchain every backend builds with.
     Rust,
+    /// Tools the host itself must supply (`git`, a C toolchain) independent
+    /// of any backend.
+    Host,
     /// Xcode, Apple SDKs, simulators, and the Apple rustup targets.
     Apple,
     /// The Hydrolysis renderer: native desktop prerequisites and the web pieces.
@@ -106,10 +110,11 @@ pub enum DoctorGroup {
 }
 
 impl DoctorGroup {
-    /// Every group in report order: Rust, the backends (host-capable ones
-    /// first), then helpers.
+    /// Every group in report order: Rust, host tools, the backends
+    /// (host-capable ones first), then helpers.
     pub const ORDER: &[Self] = &[
         Self::Rust,
+        Self::Host,
         Self::Apple,
         Self::Hydrolysis,
         Self::WinUi,
@@ -124,6 +129,7 @@ impl DoctorGroup {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Rust => "rust",
+            Self::Host => "host",
             Self::Apple => "apple",
             Self::Hydrolysis => "hydrolysis",
             Self::WinUi => "winui",
@@ -139,6 +145,7 @@ impl DoctorGroup {
     pub const fn title(&self) -> &'static str {
         match self {
             Self::Rust => "Rust toolchain",
+            Self::Host => "Host tools",
             Self::Apple => "Apple (iOS, macOS)",
             Self::Hydrolysis => "Hydrolysis (desktop, web)",
             Self::WinUi => "WinUI",
@@ -149,12 +156,12 @@ impl DoctorGroup {
         }
     }
 
-    /// The backend the group checks for; `None` for the Rust toolchain and
-    /// the helpers, which are always in scope.
+    /// The backend the group checks for; `None` for the Rust toolchain,
+    /// host tools, and the helpers, which are always in scope.
     #[must_use]
     pub const fn backend(&self) -> Option<TargetBackend> {
         match self {
-            Self::Rust | Self::Helpers => None,
+            Self::Rust | Self::Host | Self::Helpers => None,
             Self::Apple => Some(TargetBackend::Apple),
             Self::Hydrolysis => Some(TargetBackend::Hydrolysis),
             Self::WinUi => Some(TargetBackend::WinUi),
@@ -173,6 +180,7 @@ impl DoctorGroup {
     pub fn of(id: &str) -> Self {
         match id {
             ids::RUST => Self::Rust,
+            ids::C_TOOLCHAIN => Self::Host,
             ids::XCODE
             | ids::IOS_SDK
             | ids::IOS_SIMULATOR_SDK
@@ -440,6 +448,8 @@ pub mod ids {
     pub const MACOS_SDK: &str = "macos-sdk";
     /// rustup-managed Rust toolchain, version floor, and host target.
     pub const RUST: &str = "rust";
+    /// The C compiler driver (`cc`) and linker (`ld`) native builds invoke.
+    pub const C_TOOLCHAIN: &str = "c-toolchain";
     /// iOS device and simulator rustup targets on the selected toolchain.
     pub const APPLE_RUST_TARGETS: &str = "apple-rust-targets";
     /// Android SDK root + `sdkmanager`.
@@ -497,6 +507,7 @@ pub mod ids {
     /// the `water doctor --json` integration test all assert against it.
     pub const ALL: &[&str] = &[
         RUST,
+        C_TOOLCHAIN,
         XCODE,
         IOS_SDK,
         IOS_SIMULATOR_SDK,
@@ -1141,6 +1152,25 @@ async fn cargo_helpers_check(host: &Host) -> DoctorItem {
     }
 }
 
+/// Host-level tools every workflow needs regardless of backend: the C
+/// toolchain rustc links with. Linux-only — macOS gets `cc`/`ld` from the
+/// Xcode Command Line Tools (the `apple` group), Windows from MSVC/LLVM.
+async fn host_checks(host: &Host) -> Vec<DoctorItem> {
+    if !cfg!(target_os = "linux") {
+        return vec![DoctorItem::skipped(ids::C_TOOLCHAIN, "C toolchain")];
+    }
+    vec![
+        toolchain_check(
+            host,
+            ids::C_TOOLCHAIN,
+            "C toolchain",
+            "a C compiler (`cc`) and linker (`ld`) are missing — rustc links through `cc`",
+            CToolchain,
+        )
+        .await,
+    ]
+}
+
 /// The Linux system packages and the GTK4 probe, as
 /// `(linux_system_packages, gtk4)`: the GTK4 diagnosis names the package
 /// install when the packages are what is missing.
@@ -1239,6 +1269,7 @@ pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
     let project = project_context(host).await;
     let (
         rust,
+        host_tools,
         apple,
         (linux_system_packages, gtk4),
         hydrolysis,
@@ -1249,6 +1280,7 @@ pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
         cargo_helpers,
     ) = join!(
         Box::pin(rust_toolchain_check(host, &project)),
+        Box::pin(host_checks(host)),
         Box::pin(apple_checks(host, &project)),
         Box::pin(linux_checks(host)),
         Box::pin(hydrolysis_checks(host, &project)),
@@ -1266,6 +1298,7 @@ pub async fn doctor(host: &Host) -> Vec<DoctorItem> {
     );
 
     let mut items = vec![rust];
+    items.extend(host_tools);
     items.extend(apple);
     items.push(linux_system_packages);
     items.extend(hydrolysis);
