@@ -37,18 +37,66 @@ use crate::{
 /// ≥ 0.9.0 prefers it when both are set; the port is still set unconditionally
 /// because older builds ignore the socket variable entirely and would fall
 /// back to the shared default address.
+/// Configuring the cache also brings the server up, because Cargo cannot.
+/// Cargo starts its rustc jobs and build scripts in parallel and every one of
+/// them is an sccache client that starts the server itself when none is
+/// listening; racing to create the socket, the losers die with
+/// `Server startup failed: File exists (os error 17)` and rustc reports a
+/// failed build. One client of our own beforehand is the serialization point:
+/// once it returns, the socket is bound and every client Cargo spawns
+/// connects to it instead of trying to create it.
+///
 /// # Errors
 /// Returns an error when the socket directory under the user's Water home
-/// cannot be created or exists with permissions wider than `0700`.
-pub fn configure_compilation_cache(command: &mut Command, sccache_path: &Path) -> eyre::Result<()> {
+/// cannot be created or exists with permissions wider than `0700`, or when
+/// the server does not come up — every compile would fail on the same thing,
+/// so it fails here where the reason is still legible.
+pub async fn configure_compilation_cache(
+    command: &mut Command,
+    sccache_path: &Path,
+) -> eyre::Result<()> {
     let water_home = crate::project_model::water_dir::water_home_dir().ok();
     #[cfg(unix)]
     let env = compilation_cache_env_in(sccache_path, water_home.as_deref())?;
     #[cfg(not(unix))]
     let env = compilation_cache_env_in(sccache_path, water_home.as_deref());
-    for (key, value) in env {
+    for (key, value) in &env {
         command.env(key, value);
     }
+    start_server(sccache_path, &env).await
+}
+
+/// Connect to the per-user server, starting it when it is not listening.
+///
+/// `--show-stats` is sccache's connect-or-start path, and it runs under the
+/// same address environment the build is about to use — a server reached on
+/// any other address is not the one Cargo would find.
+///
+/// # Errors
+/// Returns an error when the client cannot be spawned, or when it reports
+/// that the server is not available.
+async fn start_server(sccache_path: &Path, env: &[(&'static str, OsString)]) -> eyre::Result<()> {
+    use eyre::WrapErr as _;
+
+    let mut client = Command::new(sccache_path);
+    client
+        .arg("--show-stats")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in env {
+        client.env(key, value);
+    }
+    let output = client
+        .output()
+        .await
+        .wrap_err_with(|| format!("Failed to run {}", sccache_path.display()))?;
+    eyre::ensure!(
+        output.status.success(),
+        "the sccache server did not come up, so every compile of this build would \
+         fail the same way: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     Ok(())
 }
 
