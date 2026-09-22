@@ -20,8 +20,11 @@ installers = ["homebrew", "shell", "powershell"]
 tap = "water-rs/homebrew-water"
 formula = "water"
 publish-jobs = ["homebrew"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"]
+# Target platforms to build apps for (Rust target-triple syntax). The musl
+# target is what makes Alpine installable: dist offers a `*-linux-musl`
+# archive to `*-linux-musl-dynamic` hosts natively and keeps it as the
+# fallback for `*-linux-gnu` hosts whose glibc is below `min-glibc-version`.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"]
 # `release.yml` is ours rather than dist-generated: it calls `dist build`
 # per target inside the tag-triggered jobs. Without this, `dist build`
 # refuses to run until release.yml matches dist's own template.

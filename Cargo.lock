@@ -2998,13 +2998,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "reflink"
-version = "0.1.3"
+name = "reflink-copy"
+version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc585ec28b565b4c28977ce8363a6636cedc280351ba25a7915f6c9f37f68cbe"
+checksum = "d9dd7ab4af0363d5ccfd2838d782a28196cf32a5cc2e4fe3c5dc83f2be588b8b"
 dependencies = [
+ "cfg-if",
  "libc",
- "winapi",
+ "rustix",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -4479,7 +4481,7 @@ dependencies = [
  "object",
  "pathdiff",
  "plist",
- "reflink",
+ "reflink-copy",
  "remove_dir_all",
  "resvg",
  "roxmltree 0.21.1",

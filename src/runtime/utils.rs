@@ -303,7 +303,7 @@ pub(crate) fn parse_whitespace_separated_u32s(input: &str) -> Vec<u32> {
 pub async fn copy_file(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     let from = from.as_ref().to_path_buf();
     let to = to.as_ref().to_path_buf();
-    unblock(move || reflink::reflink_or_copy(from, to).map(|_| ())).await
+    unblock(move || reflink_copy::reflink_or_copy(from, to).map(|_| ())).await
 }
 
 #[cfg(test)]
