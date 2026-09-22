@@ -85,19 +85,27 @@ fn print_section_heading(shell: &Shell, section: &DoctorSection) {
     }
 }
 
-/// Install every fixable item; returns how many installations failed.
+/// Install every fixable item; returns the `(id, name)` of each install that
+/// failed.
 ///
-/// A skipped or failed install leaves the item missing, which the
-/// re-diagnosis pass observes — the count exists only so the loop can stop
-/// retrying when fixes themselves are failing.
+/// Every item is attempted even when an earlier install failed — the fixes
+/// are independent, so one broken package manager transaction must degrade
+/// only its own item, not the rest of the queue. A skipped or failed install
+/// leaves the item missing, which the re-diagnosis pass observes; the loop
+/// uses the returned ids to keep a failed item out of the retry set instead
+/// of giving up on everything else.
 ///
 /// `system_wide` items modify the machine outside `~/.water`, so before
 /// installing one the exact payload is stated again (the item's message
 /// carries what will be installed and roughly how large it is) and consent
 /// is required: `--yes`, or the interactive prompt. A non-interactive run
 /// without `--yes` skips them.
-async fn install_fixable_items(shell: &Shell, items: Vec<DoctorItem>, yes: bool) -> usize {
-    let mut failures = 0usize;
+async fn install_fixable_items(
+    shell: &Shell,
+    items: Vec<DoctorItem>,
+    yes: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut failures = Vec::new();
     for item in items {
         let name = item.name;
         if let Some(install_fn) = item.install_fn {
@@ -139,7 +147,7 @@ async fn install_fixable_items(shell: &Shell, items: Vec<DoctorItem>, yes: bool)
             match result {
                 Ok(()) => success!(shell, "Installed {name}"),
                 Err(e) => {
-                    failures += 1;
+                    failures.push((item.id, name));
                     error!(shell, "Failed to install {name}: {e}");
                 }
             }
@@ -303,10 +311,13 @@ async fn attempt_auto_fix_loop<F, Fut>(
     Fut: Future<Output = Vec<DoctorItem>> + Send,
 {
     let mut pass = 1usize;
+    // Every install that ever failed, so a failed item degrades out of the
+    // retry set while the fixes queued behind it keep running.
+    let mut failed: Vec<(&'static str, &'static str)> = Vec::new();
 
     loop {
         print_auto_fix_header(shell, pass, pending_fixable.len());
-        let failures = install_fixable_items(shell, pending_fixable, yes).await;
+        failed.extend(install_fixable_items(shell, pending_fixable, yes).await);
         line!(shell);
 
         let verification_items =
@@ -317,17 +328,14 @@ async fn attempt_auto_fix_loop<F, Fut>(
         // as still missing; keeping it in the retry set would only re-skip
         // it on every remaining pass.
         next_fixable.retain(|item| !item.system_wide || yes || shell.is_interactive());
+        // An install that failed fails deterministically on retry (the same
+        // package manager, the same package list), so it leaves the retry
+        // set — the re-diagnosis still reports it missing, and the failures
+        // are named in the report after the loop.
+        next_fixable.retain(|item| !failed.iter().any(|(id, _)| *id == item.id));
 
         if remaining_missing == 0 {
             success!(shell, "All detected issues were fixed.");
-            break;
-        }
-
-        if failures > 0 {
-            warn!(
-                shell,
-                "Stopping auto-fix: {failures} installation(s) failed this pass. Inspect the errors above, then re-run `water doctor --fix`."
-            );
             break;
         }
 
@@ -344,6 +352,19 @@ async fn attempt_auto_fix_loop<F, Fut>(
         pending_fixable = next_fixable;
         pass += 1;
         line!(shell);
+    }
+
+    if !failed.is_empty() {
+        let names = failed
+            .iter()
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            shell,
+            "{} installation(s) failed: {names}. Inspect the errors above, then re-run `water doctor --fix`.",
+            failed.len()
+        );
     }
 }
 
@@ -554,9 +575,40 @@ mod tests {
         assert_eq!(
             taken(&installs),
             vec!["a"],
-            "a failed install must stop the loop instead of retrying"
+            "a failed install leaves the retry set instead of being retried"
         );
         assert_eq!(diagnose_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fix_loop_continues_past_a_failed_install() {
+        let installs = install_log();
+        // "a" fails while "b" succeeds and "c" only surfaces on re-diagnosis;
+        // the failure must degrade just "a", not abandon "b" and "c".
+        let (diagnose, diagnose_calls) = scripted(vec![
+            vec![
+                fixable_item("a", &installs, Err(eyre::eyre!("boom"))),
+                fixable_item("b", &installs, Ok(())),
+            ],
+            vec![
+                fixable_item("a", &installs, Err(eyre::eyre!("boom"))),
+                ok_item("b"),
+                fixable_item("c", &installs, Ok(())),
+            ],
+            vec![
+                fixable_item("a", &installs, Err(eyre::eyre!("boom"))),
+                ok_item("b"),
+                ok_item("c"),
+            ],
+        ]);
+        smol::block_on(run_with_diagnose(&test_shell(), true, false, diagnose))
+            .expect("doctor run must succeed");
+        assert_eq!(
+            taken(&installs),
+            vec!["a", "b", "c"],
+            "every fixable item is attempted; only the failed one is never retried"
+        );
+        assert_eq!(diagnose_calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
