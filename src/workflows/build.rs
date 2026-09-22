@@ -212,8 +212,21 @@ impl RustDynamicLibraries {
         triple: &Triple,
         project: &Project,
     ) -> eyre::Result<Self> {
-        let waterui = built.shared_runtime()?.to_path_buf();
         let lib_dir = &built.profile_dir;
+        let deps_dir = lib_dir.join("deps");
+
+        // rustc links a `dylib` dependency through cargo's hashed `deps/`
+        // artifact, so a Windows binary imports
+        // `waterui_dylib-<metadata>.dll` by name — the staged copy must carry
+        // exactly that name. Cargo's compiler-artifact report points at the
+        // unhashed profile-root uplift instead; shipping that filename leaves
+        // the binary unloadable (`STATUS_DLL_NOT_FOUND` at launch).
+        let waterui = if triple.operating_system == OperatingSystem::Windows {
+            let deps_dir = deps_dir.clone();
+            unblock(move || resolve_waterui_dylib_in(&deps_dir)).await?
+        } else {
+            built.shared_runtime()?.to_path_buf()
+        };
 
         // A `-Zbuild-std` build publishes its freshly compiled `libstd` into
         // the profile's `deps/` directory via the rustc wrapper; that copy —
@@ -221,7 +234,6 @@ impl RustDynamicLibraries {
         // so it is the one that has to ship. The prebuilt lookup below is the
         // fallback for builds that never built `std` from source.
         let resolution_triple = triple.clone();
-        let deps_dir = lib_dir.join("deps");
         let staged =
             unblock(move || resolve_rust_standard_library_in(&deps_dir, &resolution_triple)).await;
         let standard_library = match staged {
@@ -339,7 +351,14 @@ impl RustDynamicLibraries {
             }
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            if file_name == waterui
+            // Windows stages the hashed `waterui_dylib-<metadata>.dll` the
+            // binary imports, so an earlier stage's copy under an older hash
+            // must be removed as well.
+            let is_waterui = file_name == waterui
+                || (triple.operating_system == OperatingSystem::Windows
+                    && file_name.starts_with("waterui_dylib-")
+                    && entry.path().extension().and_then(|value| value.to_str()) == Some("dll"));
+            if is_waterui
                 || (file_name.starts_with(standard_library_prefix)
                     && entry.path().extension().and_then(|value| value.to_str()) == Some(extension))
             {
@@ -369,6 +388,34 @@ fn resolve_rust_standard_library_in(libdir: &Path, triple: &Triple) -> std::io::
     } else {
         ("libstd-", lib_extension_for_triple(triple))
     };
+    resolve_dynamic_library_in(
+        libdir,
+        prefix,
+        extension,
+        &format!("dynamic standard library for {triple}"),
+    )
+}
+
+/// Find the hashed `deps/` shared `WaterUI` runtime a Windows binary imports.
+///
+/// A missing directory or an empty match set is `NotFound`; several
+/// candidates is an error — the caller cannot tell which copy the build
+/// linked.
+fn resolve_waterui_dylib_in(deps_dir: &Path) -> std::io::Result<PathBuf> {
+    resolve_dynamic_library_in(deps_dir, "waterui_dylib-", "dll", "hashed waterui_dylib")
+}
+
+/// Find the single `{prefix}*.{extension}` dynamic library in `libdir`.
+///
+/// A missing directory or an empty match set is `NotFound`; several
+/// candidates is an error — the caller cannot tell which library the build
+/// actually linked.
+fn resolve_dynamic_library_in(
+    libdir: &Path,
+    prefix: &str,
+    extension: &str,
+    name: &str,
+) -> std::io::Result<PathBuf> {
     let entries = match std::fs::read_dir(libdir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -396,13 +443,10 @@ fn resolve_rust_standard_library_in(libdir: &Path, triple: &Triple) -> std::io::
         [path] => Ok(path.clone()),
         [] => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!(
-                "Rust target libdir {} contains no dynamic standard library for {triple}",
-                libdir.display()
-            ),
+            format!("{} contains no {name}", libdir.display()),
         )),
         _ => Err(std::io::Error::other(format!(
-            "Rust target libdir {} contains multiple dynamic standard libraries for {triple}: {}",
+            "{} contains multiple {name}: {}",
             libdir.display(),
             matches
                 .iter()
@@ -2304,6 +2348,7 @@ mod tests {
         BuildOptions, BuildProfile, BuiltTarget, CargoTarget, CompileEvent, RustBuild,
         RustDynamicLibraries, RustLinkage, classify_compile_line, dynamic_library_file_name,
         lib_extension_for_triple, reported_shared_runtime, resolve_rust_standard_library_in,
+        resolve_waterui_dylib_in,
     };
 
     fn shared_runtime_artifact_json(
@@ -2655,6 +2700,41 @@ mod tests {
             dynamic_library_file_name("waterui_dylib", &triple("x86_64-pc-windows-msvc")),
             "waterui_dylib.dll"
         );
+    }
+
+    #[test]
+    fn windows_shared_runtime_resolves_the_hashed_deps_copy() {
+        let directory = tempdir().expect("temporary deps dir");
+        let hashed = directory.path().join("waterui_dylib-246439c000a74198.dll");
+        std::fs::write(&hashed, []).expect("write hashed dylib");
+        std::fs::write(
+            directory
+                .path()
+                .join("waterui_dylib-246439c000a74198.dll.lib"),
+            [],
+        )
+        .expect("write import library");
+        std::fs::write(directory.path().join("waterui_dylib.dll"), [])
+            .expect("write unhashed uplift");
+
+        assert_eq!(
+            resolve_waterui_dylib_in(directory.path()).expect("resolve hashed dylib"),
+            hashed
+        );
+    }
+
+    #[test]
+    fn windows_shared_runtime_rejects_multiple_hashed_copies() {
+        let directory = tempdir().expect("temporary deps dir");
+        for name in [
+            "waterui_dylib-aaaaaaaaaaaaaaaa.dll",
+            "waterui_dylib-bbbbbbbbbbbbbbbb.dll",
+        ] {
+            std::fs::write(directory.path().join(name), []).expect("write hashed dylib");
+        }
+
+        let error = resolve_waterui_dylib_in(directory.path()).expect_err("ambiguous hashed dylib");
+        assert!(error.to_string().contains("multiple"), "{error}");
     }
 
     #[test]
