@@ -75,10 +75,7 @@ pub async fn configure_compilation_cache(
 /// # Errors
 /// Returns an error when the client cannot be spawned, or when it reports
 /// that the server is not available.
-async fn start_server(
-    sccache_path: &Path,
-    env: &[(&'static str, OsString)],
-) -> eyre::Result<()> {
+async fn start_server(sccache_path: &Path, env: &[(&'static str, OsString)]) -> eyre::Result<()> {
     use eyre::WrapErr as _;
 
     let mut client = Command::new(sccache_path);
