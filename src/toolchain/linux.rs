@@ -230,6 +230,7 @@ impl LinuxPackageManager {
                 "libxcb1-dev",
                 "libclang-dev",
                 "libfontconfig-dev",
+                "ca-certificates",
             ],
             Self::Dnf => &[
                 "pkgconf-pkg-config",
@@ -243,6 +244,7 @@ impl LinuxPackageManager {
                 "libxcb-devel",
                 "clang-devel",
                 "fontconfig-devel",
+                "ca-certificates",
             ],
             Self::Pacman => &[
                 "pkgconf",
@@ -256,6 +258,7 @@ impl LinuxPackageManager {
                 "libxcb",
                 "clang",
                 "fontconfig",
+                "ca-certificates",
             ],
             Self::Zypper => &[
                 "pkg-config",
@@ -269,6 +272,7 @@ impl LinuxPackageManager {
                 "libxcb-devel",
                 "clang-devel",
                 "fontconfig-devel",
+                "ca-certificates",
             ],
             Self::Apk => &[
                 "pkgconf",
@@ -282,6 +286,7 @@ impl LinuxPackageManager {
                 "libxcb-dev",
                 "clang-dev",
                 "fontconfig-dev",
+                "ca-certificates",
             ],
         }
     }
@@ -1058,7 +1063,7 @@ mod host_tests {
 
     const APT_PACKAGES: &str = "pkg-config libgtk-4-dev libpango1.0-dev libwayland-dev \
          wayland-protocols libasound2-dev libva-dev libgbm-dev libxcb1-dev \
-         libclang-dev libfontconfig-dev";
+         libclang-dev libfontconfig-dev ca-certificates";
 
     /// A machine whose apt package set is complete and whose pkg-config
     /// reports in-range versions for the version-checked native libraries.

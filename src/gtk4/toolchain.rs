@@ -197,7 +197,7 @@ mod host_tests {
 
         const APT_PACKAGES: &str = "pkg-config libgtk-4-dev libpango1.0-dev libwayland-dev \
              wayland-protocols libasound2-dev libva-dev libgbm-dev libxcb1-dev \
-             libclang-dev libfontconfig-dev";
+             libclang-dev libfontconfig-dev ca-certificates";
 
         /// Machine with pkg-config and both GTK probes satisfied, and an apt
         /// package set that leaves `LinuxSystemToolchain` satisfied as well.
