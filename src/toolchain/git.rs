@@ -192,6 +192,22 @@ mod host_tests {
         );
     }
 
+    /// The fake `winget` accepts `install` but never reports the package
+    /// afterwards, so the post-install verification must fail fast instead of
+    /// reporting success — the same contract `cmake` is held to.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn install_fails_when_winget_leaves_the_package_missing() {
+        let machine = TestMachine::new();
+        machine.install("winget");
+        let host = machine.host(Vec::<(String, String)>::new());
+        let result = smol::block_on(GitInstallation::Winget.install(&host));
+        assert!(
+            matches!(result, Err(super::FailToInstallGit::WingetInstallFailed(_))),
+            "a package still missing after winget install must be an error: {result:?}"
+        );
+    }
+
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn install_runs_the_package_manager() {
