@@ -120,10 +120,11 @@ pub struct ResolvedFramework {
     metadata: toml::Table,
     scaffold: BTreeMap<String, String>,
     /// The scaffold packages the selected channel withholds: a git-pinned
-    /// requirement has no registry release `stable` can resolve, so a stable
-    /// manifest omits its `scaffold` entries and records the pin under
-    /// `experimental-packages` instead. Empty on `dev`/`nightly` and on a
-    /// local checkout — they distribute every scaffold package.
+    /// requirement is not one `stable` distributes, whatever the registry
+    /// holds for that name, so a stable manifest omits its `scaffold`
+    /// entries and records the pin under `experimental-packages` instead.
+    /// Empty on `dev`/`nightly` and on a local checkout — they distribute
+    /// every scaffold package.
     #[serde(
         default,
         rename = "experimental-packages",
@@ -513,8 +514,9 @@ impl ResolvedFramework {
             .map_or_else(|| "local".to_owned(), |channel| channel.to_string());
         bail!(
             "`{name}` is an experimental package the {channel} framework channel does not \
-             distribute — it is pinned to {} at {} with no registry release. \
-             Scaffold it on `--channel dev` or `--channel nightly`.",
+             distribute: this framework revision pins it to {} at {}, and the {channel} \
+             channel distributes only registry requirements. Scaffold it on \
+             `--channel dev` or `--channel nightly`.",
             package.git,
             package.rev,
         );
@@ -1095,8 +1097,8 @@ impl ResolvedFramework {
         let channel = certification
             .as_ref()
             .map_or(FrameworkChannel::Dev, |certification| certification.channel);
-        // A scaffold package pinned to a git revision has no registry
-        // release the stable channel could resolve: its scaffold entries are
+        // A scaffold package the framework pins to a git revision is not
+        // one the stable channel distributes: its scaffold entries are
         // withheld and the pin recorded under `experimental-packages`, the
         // same split `channel_scaffold` in `framework_manifest.py` makes for
         // the manifest. `dev`/`nightly` distribute it through `scaffold`.
@@ -1503,15 +1505,15 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
 
 /// Move every git-pinned scaffold package out of `scaffold` — the split
 /// `channel_scaffold` in `framework_manifest.py` makes for `stable`: a
-/// package pinned to a git revision has no registry release the channel can
-/// resolve, so its `{name}-*` entries leave the scaffold table and the pin
+/// package the framework pins to a git revision is not one the channel
+/// distributes, so its `{name}-*` entries leave the scaffold table and the pin
 /// is recorded by name instead.
 fn split_experimental_packages(
     scaffold: &mut BTreeMap<String, String>,
 ) -> BTreeMap<String, ExperimentalPackage> {
     let mut experimental = BTreeMap::new();
-    // `-git` is the marker: a `{name}-git` scaffold entry is a git pin with
-    // no registry release; its `-rev`/`-version` siblings are lifted out in
+    // `-git` is the marker: a `{name}-git` scaffold entry is a git pin the
+    // stable channel withholds; its `-rev`/`-version` siblings are lifted out in
     // the second pass.
     for (key, value) in std::mem::take(scaffold) {
         if let Some(name) = key.strip_suffix("-git") {
@@ -2039,7 +2041,7 @@ pub(crate) mod test_fixtures {
 
     /// The git-pinned scaffold packages the checkout fixture's
     /// `[workspace.dependencies]` declares — `waterui-dew`, `waterui-gtk` and
-    /// `waterui-winui` have no registry release, so `stable` withholds them
+    /// `waterui-winui` are git pins, so `stable` withholds them
     /// under `experimental-packages` while `dev`/`nightly` distribute the
     /// pins through `scaffold`.
     fn experimental_scaffold_packages() -> BTreeMap<String, ExperimentalPackage> {
@@ -2968,8 +2970,8 @@ mod tests {
 
     #[test]
     fn stable_withholds_the_git_pinned_scaffold_packages() {
-        // `waterui-dew`, `waterui-gtk` and `waterui-winui` have no registry
-        // release, so a stable manifest withholds them — recorded under
+        // `waterui-dew`, `waterui-gtk` and `waterui-winui` are git pins, so a
+        // stable manifest withholds them — recorded under
         // `experimental-packages`, absent from `scaffold` — and scaffolding
         // one fails naming the package, the channel and the fix.
         let framework = stable_framework();
@@ -2985,6 +2987,11 @@ mod tests {
             assert!(error.contains(name), "{error}");
             assert!(error.contains("stable"), "{error}");
             assert!(error.contains(&package.git), "{error}");
+            assert!(error.contains(&package.rev), "{error}");
+            // The gate checks the pin, not the registry, so the refusal must
+            // not claim the package is unreleased — `waterui-gtk` is on
+            // crates.io while the framework still pins it by revision.
+            assert!(!error.contains("registry release"), "{error}");
             assert!(error.contains("--channel dev"), "{error}");
             assert!(error.contains("--channel nightly"), "{error}");
         }

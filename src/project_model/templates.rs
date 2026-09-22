@@ -2194,7 +2194,7 @@ mod tests {
 
     #[test]
     fn winui_scaffold_pins_the_backend_and_its_vendored_patch_to_one_source() {
-        // `waterui-winui` has no registry release — `stable` withholds it —
+        // `waterui-winui` is a git pin — `stable` withholds it —
         // so the scaffold resolves the pin `dev` carries.
         let mut ctx = app_ctx();
         ctx.framework = dev_framework();
