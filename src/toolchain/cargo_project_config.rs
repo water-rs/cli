@@ -246,6 +246,16 @@ fn write_flag_config(out_dir: &Path, sections: &[(Vec<String>, Vec<String>)]) ->
 mod tests {
     use super::*;
 
+    /// A temporary directory and its canonical path. The implementation
+    /// canonicalizes the project and build directories, so expected paths
+    /// must be built from the same form: macOS temp dirs live behind the
+    /// `/var` → `/private/var` symlink and Windows hands out 8.3 short names.
+    fn temp_root() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        (temp, root)
+    }
+
     fn write(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().expect("file has a parent")).unwrap();
         std::fs::write(path, contents).unwrap();
@@ -266,10 +276,10 @@ mod tests {
 
     #[test]
     fn empty_when_the_build_runs_inside_the_project() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("proj");
+        let (_temp, root) = temp_root();
+        let project = root.join("proj");
         write(
-            &project.join(".cargo/config.toml"),
+            &project.join(".cargo").join("config.toml"),
             "[build]\nrustflags = [\"--cfg\", \"water_config_probe\"]\n",
         );
         // The managed crate living under the project keeps pure discovery.
@@ -281,17 +291,17 @@ mod tests {
 
     #[test]
     fn lists_the_whole_hierarchy_in_precedence_order() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("outer/inner/proj");
+        let (_temp, root) = temp_root();
+        let project = root.join("outer").join("inner").join("proj");
         write(
-            &project.join(".cargo/config.toml"),
+            &project.join(".cargo").join("config.toml"),
             "[build]\nrustflags = [\"--cfg\", \"water_config_probe\"]\n",
         );
         write(
-            &temp.path().join("outer/.cargo/config.toml"),
+            &root.join("outer").join(".cargo").join("config.toml"),
             "[build]\nrustflags = [\"--cfg\", \"outer_marker\"]\n",
         );
-        let build = temp.path().join("cache/backend");
+        let build = root.join("cache").join("backend");
         std::fs::create_dir_all(&build).unwrap();
 
         let args = cargo_config_args(&project, &build).unwrap();
@@ -299,8 +309,8 @@ mod tests {
             .iter()
             .filter_map(|a| a.clone().into_string().ok())
             .collect();
-        let outer = temp.path().join("outer/.cargo/config.toml");
-        let own = project.join(".cargo/config.toml");
+        let outer = root.join("outer").join(".cargo").join("config.toml");
+        let own = project.join(".cargo").join("config.toml");
         let outer_pos = flags.iter().position(|f| Path::new(f) == outer).unwrap();
         let own_pos = flags.iter().position(|f| Path::new(f) == own).unwrap();
         // Ancestors are listed first; the project's own file is last = highest
@@ -309,44 +319,45 @@ mod tests {
         // No `-L` paths → no generated flag file.
         assert!(
             !build
-                .join(".water-cargo-config/project-flags.toml")
+                .join(".water-cargo-config")
+                .join("project-flags.toml")
                 .exists()
         );
     }
 
     #[test]
     fn build_cache_config_keeps_precedence() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("proj");
+        let (_temp, root) = temp_root();
+        let project = root.join("proj");
         write(
-            &project.join(".cargo/config.toml"),
+            &project.join(".cargo").join("config.toml"),
             "[build]\nrustflags = []\n",
         );
-        let build = temp.path().join("cache/backend");
+        let build = root.join("cache").join("backend");
         write(
-            &build.join(".cargo/config.toml"),
+            &build.join(".cargo").join("config.toml"),
             "[build]\nrustflags = [\"--cfg\", \"harness_marker\"]\n",
         );
 
         let args = cargo_config_args(&project, &build).unwrap();
-        let own = build.join(".cargo/config.toml").into_os_string();
+        let own = build.join(".cargo").join("config.toml");
         // The managed crate's config is the final --config = top precedence.
-        assert_eq!(args.last(), Some(&own));
+        assert_eq!(args.last().map(Path::new), Some(own.as_path()));
     }
 
     #[test]
     fn cwd_relative_flag_paths_are_rebased_to_absolute() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("proj");
+        let (_temp, root) = temp_root();
+        let project = root.join("proj");
         write(
-            &project.join(".cargo/config.toml"),
+            &project.join(".cargo").join("config.toml"),
             "[build]\nrustflags = [\"-L\", \"native=./libs\", \"-Lframework=./fw\", \"--extern\", \"helper=./rlib/libhelper.rlib\"]\n",
         );
-        let build = temp.path().join("cache/backend");
+        let build = root.join("cache").join("backend");
         std::fs::create_dir_all(&build).unwrap();
 
         let args = cargo_config_args(&project, &build).unwrap();
-        let generated = build.join(".water-cargo-config/project-flags.toml");
+        let generated = build.join(".water-cargo-config").join("project-flags.toml");
         assert!(args.iter().any(|a| Path::new(a) == generated));
         let contents = std::fs::read_to_string(&generated).unwrap();
         for relative in ["libs", "fw", "rlib/libhelper.rlib"] {
@@ -363,13 +374,13 @@ mod tests {
     /// would.
     #[test]
     fn managed_build_receives_the_project_rustflags() {
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("proj");
+        let (_temp, root) = temp_root();
+        let project = root.join("proj");
         write(
-            &project.join(".cargo/config.toml"),
+            &project.join(".cargo").join("config.toml"),
             "[build]\nrustflags = [\"--cfg\", \"water_config_probe\"]\n",
         );
-        let build = temp.path().join("build_cache/backend");
+        let build = root.join("build_cache").join("backend");
         probe_crate(&build);
 
         let args = cargo_config_args(&project, &build).unwrap();
