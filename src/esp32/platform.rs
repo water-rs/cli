@@ -244,6 +244,14 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
     let mut cargo = smol::process::Command::new("cargo");
     cargo.current_dir(&backend_path);
     cargo.arg("build");
+    // The harness lives outside the project, so Cargo's discovery never
+    // reaches `<project>/.cargo/config.toml`; the args restore the project's
+    // hierarchy. The harness's own `.cargo/config.toml` (Xtensa target,
+    // ESP-IDF env) is listed last and keeps precedence.
+    cargo.args(crate::toolchain::cargo_project_config::cargo_config_args(
+        project.root(),
+        &backend_path,
+    )?);
     cargo.arg("--message-format=json-render-diagnostics");
     cargo.arg("--target-dir").arg(&backend_target_dir);
     crate::build::configure_generated_crate_compilation(&mut cargo);
