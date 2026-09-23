@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 
 pub mod cargo_helpers;
+pub mod cargo_project_config;
 pub mod cmake;
 pub mod doctor;
 pub mod dxc;
