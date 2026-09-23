@@ -1376,6 +1376,19 @@ Automatic meson installation failed: {install_err}\n\n{}",
         Ok(removed > 0)
     }
 
+    /// `--config` argument pairs restoring the project's Cargo-config
+    /// hierarchy on this build. Empty when the crate builds inside the
+    /// project, where discovery already reaches its config files.
+    fn project_cargo_config_args(&self) -> Result<Vec<OsString>, RustBuildError> {
+        let Some(project) = self.project.as_ref() else {
+            return Ok(Vec::new());
+        };
+        crate::toolchain::cargo_project_config::cargo_config_args(project.root(), &self.path)
+            .map_err(|error| {
+                RustBuildError::FailToBuildRustLibrary(io::Error::other(error.to_string()))
+            })
+    }
+
     async fn cargo_build_output(
         &self,
         release: bool,
@@ -1429,6 +1442,10 @@ Automatic meson installation failed: {install_err}\n\n{}",
             .args(["--target", self.triple.to_string().as_str()])
             .args(framework.is_some().then_some("--locked"))
             .current_dir(&self.path);
+
+        // A managed crate builds outside the project, so Cargo's config
+        // discovery never reaches `<project>/.cargo/config.toml`.
+        cmd = cmd.args(self.project_cargo_config_args()?);
 
         if let Some(target_dir) = &self.target_dir {
             cmd = cmd.arg("--target-dir").arg(target_dir);
