@@ -1,0 +1,6 @@
+waterui_path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui"
+
+[package]
+type = "playground"
+name = "play"
+bundle_identifier = "dev.waterui.play"

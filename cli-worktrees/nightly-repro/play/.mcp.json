@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "app": {
+      "command": "water",
+      "args": [
+        "mcp"
+      ]
+    }
+  }
+}

@@ -1,0 +1,204 @@
+[package]
+name = "play"
+version = "0.1.0"
+edition = "2024"
+authors = ["lexoliu"]
+
+[lib]
+crate-type = ["lib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+[features]
+dev = ["waterui/dynamic_linking"]
+
+[dependencies.waterui]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui"
+default-features = false
+
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "espidf")))'.dependencies.waterui]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui"
+default-features = false
+features = [
+    "assets",
+    "media",
+    "flow-markdown",
+]
+
+[workspace]
+
+[patch.crates-io.block]
+git = "https://github.com/Dicklesworthstone/rust-block"
+rev = "b39ae859d1ee8e8cb5eef6a516471f1578d26b96"
+
+[patch.crates-io.glifo]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.hydrolysis]
+git = "https://github.com/water-rs/hydrolysis"
+rev = "452aea58b2e63edc889f1c8a2f3f8f7f1a4c6bb0"
+
+[patch.crates-io.hydrolysis-m3]
+git = "https://github.com/water-rs/hydrolysis-m3"
+rev = "14a35e3ef69ced36557a3c7ab11d52e0afb53ad5"
+
+[patch.crates-io.vello]
+git = "https://github.com/lexoliu/vello"
+rev = "5e5f538556be16527f67379b105af82f408b747d"
+
+[patch.crates-io.vello_common]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.vello_hybrid]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.vello_sparse_shaders]
+git = "https://github.com/lexoliu/vello"
+rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639"
+
+[patch.crates-io.waterui]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/."
+
+[patch.crates-io.waterui-assets]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/assets/runtime"
+
+[patch.crates-io.waterui-assets-core]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/assets/core"
+
+[patch.crates-io.waterui-backend-core]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/backends/core"
+
+[patch.crates-io.waterui-chart]
+git = "https://github.com/water-rs/chart"
+rev = "4877ca036d5fdaabc9930357223fcb2f86df6fbb"
+
+[patch.crates-io.waterui-controls]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/controls"
+
+[patch.crates-io.waterui-core]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/core"
+
+[patch.crates-io.waterui-form]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/form"
+
+[patch.crates-io.waterui-graphics]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/visual/graphics"
+
+[patch.crates-io.waterui-icon]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/icon"
+
+[patch.crates-io.waterui-inspector-protocol]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/devtools/inspector/protocol"
+
+[patch.crates-io.waterui-layout]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/layout"
+
+[patch.crates-io.waterui-locale]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/utils/locale"
+
+[patch.crates-io.waterui-macros]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/macros"
+
+[patch.crates-io.waterui-map]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/data/map"
+
+[patch.crates-io.waterui-map-gpu]
+git = "https://github.com/water-rs/map-gpu"
+rev = "e2211b5"
+
+[patch.crates-io.waterui-navigation]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/navigation"
+
+[patch.crates-io.waterui-shape]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/shape"
+
+[patch.crates-io.waterui-text]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/text"
+
+[patch.crates-io.waterui-url]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/utils/url"
+
+[patch.crates-io.waterui-video]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/multimedia/video"
+
+[patch.crates-io.waterui-webview]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/platform/webview"
+
+[patch.crates-io.xcb]
+git = "https://github.com/rust-x-bindings/rust-xcb"
+rev = "ae3b2cd080e78173223038ccbebdc644eaf4a9ad"
+
+[patch."https://github.com/water-rs/waterui".waterui]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/."
+
+[patch."https://github.com/water-rs/waterui".waterui-assets]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/assets/runtime"
+
+[patch."https://github.com/water-rs/waterui".waterui-assets-core]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/assets/core"
+
+[patch."https://github.com/water-rs/waterui".waterui-backend-core]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/backends/core"
+
+[patch."https://github.com/water-rs/waterui".waterui-controls]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/controls"
+
+[patch."https://github.com/water-rs/waterui".waterui-core]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/core"
+
+[patch."https://github.com/water-rs/waterui".waterui-form]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/form"
+
+[patch."https://github.com/water-rs/waterui".waterui-graphics]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/visual/graphics"
+
+[patch."https://github.com/water-rs/waterui".waterui-icon]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/icon"
+
+[patch."https://github.com/water-rs/waterui".waterui-inspector-protocol]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/devtools/inspector/protocol"
+
+[patch."https://github.com/water-rs/waterui".waterui-layout]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/layout"
+
+[patch."https://github.com/water-rs/waterui".waterui-locale]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/utils/locale"
+
+[patch."https://github.com/water-rs/waterui".waterui-macros]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/macros"
+
+[patch."https://github.com/water-rs/waterui".waterui-map]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/data/map"
+
+[patch."https://github.com/water-rs/waterui".waterui-navigation]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/navigation"
+
+[patch."https://github.com/water-rs/waterui".waterui-shape]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/shape"
+
+[patch."https://github.com/water-rs/waterui".waterui-text]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/foundation/text"
+
+[patch."https://github.com/water-rs/waterui".waterui-url]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/utils/url"
+
+[patch."https://github.com/water-rs/waterui".waterui-video]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/multimedia/video"
+
+[patch."https://github.com/water-rs/waterui".waterui-webview]
+path = "/Users/lexoliu/Coding/water-rs/cli/cli-worktrees/nightly-repro/waterui/components/platform/webview"
