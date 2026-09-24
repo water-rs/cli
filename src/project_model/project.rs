@@ -1305,7 +1305,7 @@ impl Project {
             .lockfile_path()
             .await
             .map_err(crate::backend::FailToInitBackend::Config)?;
-        templates::ffi::seed_lockfile(&self.ffi_crate_path(), &lockfile)
+        templates::seed_lockfile(&self.ffi_crate_path(), &lockfile)
             .await
             .map_err(crate::backend::FailToInitBackend::Io)
     }

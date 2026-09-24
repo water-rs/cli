@@ -2508,6 +2508,69 @@ mod tests {
         assert!(gtk.get("git").is_none());
     }
 
+    /// The managed hydrolysis crate is its own workspace root inside the
+    /// build cache, and Cargo honours `[patch]` only from the root of the
+    /// workspace being built — so the tables governing the application's own
+    /// `cargo build` are carried into the generated manifest (#178). For a
+    /// workspace member that is the root's table, never the member's inert
+    /// one.
+    #[test]
+    fn hydrolysis_manifest_propagates_the_app_workspaces_patch_table() {
+        let tempdir = tempdir().expect("temporary workspace dir");
+        let workspace = tempdir.path();
+        std::fs::create_dir_all(workspace.join("app")).expect("member dir");
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\n[patch.crates-io]\n\
+             nami-core = { git = \"https://github.com/water-rs/nami\", rev = \"0123abcd\" }\n\
+             vendored-fork = { path = \"vendor/fork\" }\n",
+        )
+        .expect("workspace manifest");
+        std::fs::write(
+            workspace.join("app/Cargo.toml"),
+            "[package]\nname = \"patched-app\"\nversion = \"0.1.0\"\n\n[patch.crates-io]\n\
+             inert-member-patch = { git = \"https://example.com/ignored\", rev = \"f\" }\n",
+        )
+        .expect("member manifest");
+
+        let hydrolysis_ctx = ctx(
+            None,
+            Some(PathBuf::from("managed_backends/hydrolysis")),
+            Some(workspace.join("app")),
+            crate::project::PackageType::Playground,
+        );
+        let cargo_toml = crate::templates::hydrolysis::rendered_outputs(
+            &hydrolysis_ctx,
+            "patched-app-hydrolysis",
+        )
+        .expect("hydrolysis outputs should render")
+        .into_iter()
+        .find_map(|(path, content)| {
+            (path == std::path::Path::new("Cargo.toml"))
+                .then(|| String::from_utf8(content).expect("Cargo.toml must be UTF-8"))
+        })
+        .expect("hydrolysis Cargo.toml output should exist");
+        let manifest = cargo_toml
+            .parse::<toml::Table>()
+            .expect("hydrolysis Cargo.toml should parse");
+        let crates_io = &manifest["patch"]["crates-io"];
+        assert_eq!(
+            crates_io["nami-core"]["git"].as_str(),
+            Some("https://github.com/water-rs/nami"),
+            "the app's git pin must reach the generated manifest"
+        );
+        assert_eq!(crates_io["nami-core"]["rev"].as_str(), Some("0123abcd"));
+        assert_eq!(
+            crates_io["vendored-fork"]["path"].as_str(),
+            Some(normalize_path_for_config(&workspace.join("vendor/fork")).as_str()),
+            "a path patch is rebased onto the workspace root it was read from"
+        );
+        assert!(
+            crates_io.get("inert-member-patch").is_none(),
+            "a member's inert [patch] table is not the governing one"
+        );
+    }
+
     #[test]
     fn preview_scaffold_uses_embedded_workspace_version() {
         let tempdir = tempdir().expect("temporary preview scaffold dir");
@@ -2644,11 +2707,8 @@ mod tests {
         std::fs::create_dir_all(&ffi_dir).expect("ffi dir");
         let managed_lock = ffi_dir.join("Cargo.lock");
         let seed = || {
-            smol::block_on(crate::templates::ffi::seed_lockfile(
-                &ffi_dir,
-                &project_lock,
-            ))
-            .expect("seeding the managed lockfile should succeed");
+            smol::block_on(crate::templates::seed_lockfile(&ffi_dir, &project_lock))
+                .expect("seeding the managed lockfile should succeed");
         };
         let managed = || std::fs::read_to_string(&managed_lock).expect("managed Cargo.lock");
 
@@ -4342,7 +4402,7 @@ pub mod hydrolysis {
     ) -> io::Result<Vec<(std::path::PathBuf, Vec<u8>)>> {
         let mut outputs =
             super::render_dir_outputs(TemplateNamespace::Hydrolysis, &embedded::HYDROLYSIS, ctx)?;
-        let patch = super::generated_crate_patches(ctx)?;
+        let patch = generated_patch_set(ctx)?;
         outputs.push((
             std::path::PathBuf::from("Cargo.toml"),
             super::render_generated_cargo_toml(&generated_manifest(ctx, package_name, patch)?)?
@@ -4432,14 +4492,32 @@ pub mod hydrolysis {
         ctx.cef_runtime_enabled()
     }
 
+    /// The `[patch]` tables the generated crate resolves with.
+    ///
+    /// The crate is its own workspace root inside the build cache, and Cargo
+    /// honours `[patch]` only from the root of the workspace being built, so
+    /// the tables governing the application's own `cargo build` are carried
+    /// over from the application root — the same copy
+    /// [`super::propagate_workspace_patches`] makes for the FFI companion.
+    /// Without them an app that patches a crate, a fork carrying an
+    /// unreleased fix say, silently links the unpatched source into the
+    /// binary `water run` builds (#178). The checkout's or channel's tables
+    /// stand in when no application root is recorded.
+    fn generated_patch_set(ctx: &TemplateContext) -> io::Result<cargo_toml::PatchSet> {
+        ctx.project_root_path.as_deref().map_or_else(
+            || super::generated_crate_patches(ctx),
+            super::collect_workspace_patches,
+        )
+    }
+
     async fn generate_cargo_toml(
         base_dir: &Path,
         ctx: &TemplateContext,
         package_name: &str,
     ) -> io::Result<()> {
-        let patch = match ctx.waterui_workspace_root() {
-            Some(root) => smol::unblock(move || super::collect_workspace_patches(&root)).await?,
-            None => ctx.framework.patches(),
+        let patch = {
+            let ctx = TemplateContext::clone(ctx);
+            smol::unblock(move || generated_patch_set(&ctx)).await?
         };
         let manifest = generated_manifest(ctx, package_name, patch)?;
         write_generated_cargo_toml(base_dir, super::render_generated_cargo_toml(&manifest)?).await
@@ -4906,7 +4984,8 @@ async fn propagate_workspace_patches(
 }
 
 /// Reads the `[patch]` tables from the workspace root that governs a build
-/// rooted at `project_root`, with path patches made absolute.
+/// rooted at `project_root`, with path patches made absolute and normalized
+/// for config files the same way every other path the crate renders is.
 pub fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::PatchSet> {
     let Some((workspace_dir, source)) = find_workspace_manifest(project_root)? else {
         return Ok(cargo_toml::PatchSet::default());
@@ -4918,7 +4997,7 @@ pub fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::
             if let cargo_toml::Dependency::Detailed(detail) = dependency
                 && let Some(path) = detail.path.take()
             {
-                detail.path = Some(workspace_dir.join(path).to_string_lossy().into_owned());
+                detail.path = Some(normalize_path_for_config(&workspace_dir.join(path)));
             }
         }
     }
@@ -4985,6 +5064,61 @@ fn generated_crate_patches(ctx: &TemplateContext) -> io::Result<cargo_toml::Patc
         || Ok(ctx.framework.patches()),
         |root| collect_workspace_patches(&root),
     )
+}
+
+/// The copy of the application's lockfile a managed crate was last seeded
+/// from, kept beside the crate's own `Cargo.lock`.
+pub const LOCKFILE_SEED: &str = "Cargo.lock.seed";
+
+/// Seed a managed crate's `Cargo.lock` from the application's lockfile.
+///
+/// A managed crate is its own Cargo workspace, so left alone it resolves its
+/// dependency graph fresh from the registry the first time it is built, and
+/// the application ships with versions nothing in the project pins or tests
+/// (#312). Copying the project's lockfile in before Cargo resolves keeps
+/// every version the project already pins; Cargo then only adds the entries
+/// the managed crate needs on top and prunes the ones it does not use.
+///
+/// Cargo rewrites `Cargo.lock` on every resolution, so the seed cannot be
+/// compared against it. A copy of the seed is kept as [`LOCKFILE_SEED`]
+/// instead, and the crate is re-seeded only when the project's lockfile
+/// differs from that copy, or when the crate has no `Cargo.lock` at all.
+/// A project without a lockfile has nothing to pin yet and is left to
+/// resolve on its own.
+///
+/// # Errors
+///
+/// Returns an error when the lockfiles cannot be read or written.
+pub async fn seed_lockfile(base_dir: &Path, project_lockfile: &Path) -> io::Result<()> {
+    let seed = match fs::read(project_lockfile).await {
+        Ok(seed) => seed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            tracing::debug!(
+                lockfile = %project_lockfile.display(),
+                "project has no lockfile; the managed crate resolves on its own"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    let seed_copy = base_dir.join(LOCKFILE_SEED);
+    let managed_lockfile = base_dir.join("Cargo.lock");
+    let seeded_from = match fs::read(&seed_copy).await {
+        Ok(previous) => previous == seed,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if seeded_from && managed_lockfile.exists() {
+        return Ok(());
+    }
+
+    tracing::debug!(
+        lockfile = %project_lockfile.display(),
+        "seeding the managed crate's Cargo.lock from the project lockfile"
+    );
+    fs::write(&managed_lockfile, &seed).await?;
+    fs::write(&seed_copy, &seed).await
 }
 
 /// The `[patch]` tables of the `WaterUI` checkout at `waterui_path`, rebased
@@ -5215,62 +5349,6 @@ pub mod ffi {
     ) -> io::Result<()> {
         generate_cargo_toml(base_dir, ctx, package_name).await?;
         scaffold_dir(TemplateNamespace::Ffi, &embedded::FFI, base_dir, ctx).await
-    }
-
-    /// The copy of the application's lockfile the managed crate was last
-    /// seeded from, kept beside the crate's own `Cargo.lock`.
-    pub const LOCKFILE_SEED: &str = "Cargo.lock.seed";
-
-    /// Seed the managed crate's `Cargo.lock` from the application's lockfile.
-    ///
-    /// The managed crate is its own Cargo workspace, so left alone it resolves
-    /// its dependency graph fresh from the registry the first time it is built,
-    /// and the application ships with versions nothing in the project pins or
-    /// tests (#312). Copying the project's lockfile in before Cargo resolves
-    /// keeps every version the project already pins; Cargo then only adds the
-    /// entries the managed crate needs on top (`waterui-ffi` and its own
-    /// dependencies) and prunes the ones it does not use.
-    ///
-    /// Cargo rewrites `Cargo.lock` on every resolution, so the seed cannot be
-    /// compared against it. A copy of the seed is kept as [`LOCKFILE_SEED`]
-    /// instead, and the crate is re-seeded only when the project's lockfile
-    /// differs from that copy, or when the crate has no `Cargo.lock` at all.
-    /// A project without a lockfile has nothing to pin yet and is left to
-    /// resolve on its own.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the lockfiles cannot be read or written.
-    pub async fn seed_lockfile(base_dir: &Path, project_lockfile: &Path) -> io::Result<()> {
-        let seed = match fs::read(project_lockfile).await {
-            Ok(seed) => seed,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                tracing::debug!(
-                    lockfile = %project_lockfile.display(),
-                    "project has no lockfile; the managed FFI crate resolves on its own"
-                );
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-
-        let seed_copy = base_dir.join(LOCKFILE_SEED);
-        let managed_lockfile = base_dir.join("Cargo.lock");
-        let seeded_from = match fs::read(&seed_copy).await {
-            Ok(previous) => previous == seed,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error),
-        };
-        if seeded_from && managed_lockfile.exists() {
-            return Ok(());
-        }
-
-        tracing::debug!(
-            lockfile = %project_lockfile.display(),
-            "seeding the managed FFI crate's Cargo.lock from the project lockfile"
-        );
-        fs::write(&managed_lockfile, &seed).await?;
-        fs::write(&seed_copy, &seed).await
     }
 
     async fn generate_cargo_toml(

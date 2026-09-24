@@ -120,6 +120,14 @@ pub async fn build_hydrolysis_with_envs_and_features(
         );
     }
 
+    // The managed crate is its own workspace root, so its `Cargo.lock` is
+    // re-seeded from the application's lockfile before every resolution —
+    // the binary built here must resolve the same graph the application's
+    // own `cargo build` does (#178). `prepare_build` merges the same
+    // lockfile into the managed lock again for channel-resolved projects;
+    // this seed is the carrier when `waterui_path` pins a checkout instead.
+    crate::templates::seed_lockfile(&backend_path, &project.lockfile_path().await?).await?;
+
     // Stage assets and the Windows icon resource before the backend is built.
     // The generated `build.rs` expects `app-icon.ico` to exist when targeting Windows.
     copy_assets_and_fonts(

@@ -112,8 +112,10 @@ impl Backend for HydrolysisBackend {
 
     // The build cache lives in the repository `target/`; the lockfile is
     // dependency state, not generated content, and survives regeneration so
-    // resolved versions stay stable across template updates.
-    const CACHE_PATHS: &'static [&'static str] = &["Cargo.lock"];
+    // resolved versions stay stable across template updates. The `.seed`
+    // copy records which application lockfile last seeded it, so it is
+    // preserved on the same grounds.
+    const CACHE_PATHS: &'static [&'static str] = &["Cargo.lock", templates::LOCKFILE_SEED];
 
     fn path(&self) -> &Path {
         &self.project_path
