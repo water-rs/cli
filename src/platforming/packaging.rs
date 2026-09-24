@@ -39,6 +39,47 @@ pub fn dist_dir(backend_path: &Path, platform: &str, profile: Option<&str>) -> P
     dir
 }
 
+/// Copy the backend's staged `resources/` tree beside a packaged binary.
+///
+/// Backends stage assets and fonts under `<backend>/resources`, next to the
+/// generated manifest, but a Hydrolysis runner resolves `resources/`
+/// relative to the executable it was handed — `exe_dir/resources`, and
+/// `cwd/resources` only when the launcher happens to run from the backend
+/// directory. Shipping the tree only beside the manifest therefore leaves a
+/// binary launched from `dist/<platform>/<profile>` searching a directory
+/// that never exists (water-rs/hydrolysis#182). The tree the build staged
+/// belongs inside the same dist directory the executable ships in.
+///
+/// # Errors
+/// Returns an error when the backend's staged `resources/` is missing or a
+/// file cannot be copied.
+pub async fn stage_backend_resources(
+    backend_path: &Path,
+    runtime_dir: &Path,
+) -> eyre::Result<PathBuf> {
+    let source = backend_path.join("resources");
+    if !source.is_dir() {
+        eyre::bail!(
+            "staged backend resources are missing at {}",
+            source.display()
+        );
+    }
+    let destination = runtime_dir.join("resources");
+    let source_dir = source.clone();
+    let destination_dir = destination.clone();
+    smol::unblock(move || {
+        if destination_dir.exists() {
+            std::fs::remove_dir_all(&destination_dir)?;
+        }
+        std::fs::create_dir_all(&destination_dir)?;
+        let options = fs_extra::dir::CopyOptions::new().content_only(true);
+        fs_extra::dir::copy(&source_dir, &destination_dir, &options)?;
+        Ok::<_, eyre::Report>(())
+    })
+    .await?;
+    Ok(destination)
+}
+
 #[cfg(test)]
 mod tests {
     /// The packaged path is the product name; the tagged Cargo artifact it
