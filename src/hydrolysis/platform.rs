@@ -366,6 +366,12 @@ pub async fn package_hydrolysis(
     )
     .await?;
 
+    // The runner enumerates `resources/` relative to the launched
+    // executable — `exe_dir/resources` — never the managed manifest's own
+    // `resources/` the build staged into, so the staged tree ships beside
+    // the binary inside the dist directory (water-rs/hydrolysis#182).
+    crate::platforming::packaging::stage_backend_resources(&backend_path, &runtime_dir).await?;
+
     if platform == TargetPlatform::Linux {
         crate::platforming::linux_share::write_linux_share_material(
             project,
@@ -915,6 +921,105 @@ mod tests {
             bin_names.contains(&package_name.to_string()),
             "the main binary must remain declared too: {bin_names:?}"
         );
+    }
+
+    /// water-rs/hydrolysis#182: `native_resource_fonts` resolves
+    /// `<exe_dir>/resources/fonts` — the directory beside the executable the
+    /// CLI launches — and never beside the managed backend's `Cargo.toml`,
+    /// which is where the build stages `resources/`. A packaged app
+    /// therefore ships the staged tree inside `dist/<platform>/<profile>`,
+    /// or the launched binary finds no fonts at all.
+    #[test]
+    fn a_packaged_app_ships_staged_fonts_beside_the_launched_executable() {
+        smol::block_on(async {
+            use crate::{
+                platforming::platform::PackageOptions,
+                project::{ManagedBackends, Project},
+                project_model::project_types::{CrateName, generated_crate_name},
+            };
+            use tempfile::tempdir;
+
+            let temporary = tempdir().expect("tempdir");
+            let root = temporary.path().join("fixture");
+            std::fs::create_dir_all(root.join("src")).expect("crate src");
+            std::fs::write(
+                root.join("Water.toml"),
+                "[package]\ntype = \"app\"\nname = \"Fixture\"\n\
+                 bundle_identifier = \"dev.waterui.fixture\"\n\n\
+                 [backends]\npath = \"managed_backends\"\n\n\
+                 [[assets.font]]\nname = \"Fixture Sans\"\n\
+                 local_path = \"assets/fonts/FixtureSans.ttf\"\n",
+            )
+            .expect("Water.toml");
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .expect("Cargo.toml");
+            std::fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+
+            // A `resources/fonts` face the app bundles.
+            std::fs::create_dir_all(root.join("assets/fonts")).expect("assets dir");
+            std::fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/fonts/Roboto-Regular.ttf"),
+                root.join("assets/fonts/FixtureSans.ttf"),
+            )
+            .expect("fixture font");
+
+            // The managed backend crate the build compiles, kept dependency-
+            // free so its `cargo metadata` resolves without the network.
+            let backend_path = root.join("managed_backends/hydrolysis");
+            std::fs::create_dir_all(backend_path.join("src")).expect("backend src");
+            let backend_crate = generated_crate_name(
+                &CrateName::try_from("fixture").expect("crate name"),
+                "hydrolysis",
+                &root,
+            );
+            std::fs::write(
+                backend_path.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{backend_crate}\"\nversion = \"0.1.0\"\n\
+                     edition = \"2021\"\n\n\
+                     [[bin]]\nname = \"{backend_crate}\"\npath = \"src/main.rs\"\n"
+                ),
+            )
+            .expect("backend manifest");
+            std::fs::write(backend_path.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+
+            let project = Project::open(&root, ManagedBackends::NONE)
+                .await
+                .expect("fixture project opens");
+            let built = crate::build::RustBuild::new(&backend_path, target_lexicon::Triple::host())
+                .with_target_dir(temporary.path().join("target"))
+                .build_binary(backend_crate.as_str(), false)
+                .await
+                .expect("fixture backend builds");
+            let artifact = super::package_hydrolysis(
+                &project,
+                crate::platform::TargetPlatform::Linux,
+                PackageOptions::packaging(false, true),
+                Some(&built),
+            )
+            .await
+            .expect("packaging succeeds");
+
+            // The face ships at the path the runner searches relative to the
+            // launched executable: `<exe_dir>/resources/fonts`.
+            let executable = artifact.path().to_path_buf();
+            let searched = executable
+                .parent()
+                .expect("packaged executable has a directory")
+                .join("resources")
+                .join("fonts")
+                .join("FixtureSans.ttf");
+            assert!(
+                searched.is_file(),
+                "the packaged app ships the staged font beside the executable {}: {}",
+                executable.display(),
+                searched.display()
+            );
+        });
     }
 
     /// The build compiles the helper under
