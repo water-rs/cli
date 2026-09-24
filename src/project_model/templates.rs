@@ -4984,7 +4984,8 @@ async fn propagate_workspace_patches(
 }
 
 /// Reads the `[patch]` tables from the workspace root that governs a build
-/// rooted at `project_root`, with path patches made absolute.
+/// rooted at `project_root`, with path patches made absolute and normalized
+/// for config files the same way every other path the crate renders is.
 pub fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::PatchSet> {
     let Some((workspace_dir, source)) = find_workspace_manifest(project_root)? else {
         return Ok(cargo_toml::PatchSet::default());
@@ -4996,7 +4997,7 @@ pub fn collect_workspace_patches(project_root: &Path) -> io::Result<cargo_toml::
             if let cargo_toml::Dependency::Detailed(detail) = dependency
                 && let Some(path) = detail.path.take()
             {
-                detail.path = Some(workspace_dir.join(path).to_string_lossy().into_owned());
+                detail.path = Some(normalize_path_for_config(&workspace_dir.join(path)));
             }
         }
     }
