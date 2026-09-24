@@ -298,12 +298,27 @@ pub(crate) fn parse_whitespace_separated_u32s(input: &str) -> Vec<u32> {
 ///
 /// This is more efficient than regular copy on filesystems that support reflinks (APFS, Btrfs).
 ///
+/// An existing destination is replaced, matching `fs::copy` semantics:
+/// callers stage build outputs into directories that persist across runs,
+/// like the `DerivedData` products directory `CACHE_PATHS` keeps between
+/// packages.
+///
 /// # Errors
 /// - If the copy operation fails.
 pub async fn copy_file(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     let from = from.as_ref().to_path_buf();
     let to = to.as_ref().to_path_buf();
-    unblock(move || reflink_copy::reflink_or_copy(from, to).map(|_| ())).await
+    unblock(move || {
+        // `reflink_or_copy` refuses to overwrite; every caller expects the
+        // staged file at `to` to carry `from`'s contents afterwards.
+        match std::fs::remove_file(&to) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        reflink_copy::reflink_or_copy(from, to).map(|_| ())
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -382,5 +397,30 @@ mod tests {
     fn ignores_non_numeric_tokens() {
         let parsed = parse_whitespace_separated_u32s("foo 42 bar\n");
         assert_eq!(parsed, vec![42]);
+    }
+
+    #[test]
+    fn copy_file_replaces_an_existing_destination() {
+        // Restaging over the products a preserved `DerivedData` still holds
+        // is what a second `water package` does; the copy must overwrite.
+        smol::block_on(async {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let source = dir.path().join("lib.a");
+            let dest = dir.path().join("staged/lib.a");
+            std::fs::create_dir_all(dest.parent().expect("the dest has a parent"))
+                .expect("create the staging dir");
+            std::fs::write(&source, "built from revision 1").expect("write source");
+            super::copy_file(&source, &dest).await.expect("first stage");
+
+            std::fs::write(&source, "built from revision 2").expect("rewrite source");
+            super::copy_file(&source, &dest)
+                .await
+                .expect("restaging must not fail on the previous build's file");
+            assert_eq!(
+                std::fs::read_to_string(&dest).expect("read staged file"),
+                "built from revision 2",
+                "the staged file must carry the fresh build's contents"
+            );
+        });
     }
 }
