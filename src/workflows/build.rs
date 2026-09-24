@@ -1360,9 +1360,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
         cargo_target: CargoTarget<'_>,
         profile_dir: &Path,
     ) -> Result<PathBuf, RustBuildError> {
+        let suffix = executable_suffix(&self.triple);
         let deps_artifact = profile_dir.join("deps").join(marked_binary_file_name(
             binary_name,
             &self.artifact_marker(release, cargo_target),
+            suffix,
         ));
         if !deps_artifact.is_file() {
             return Err(RustBuildError::FailToBuildRustLibrary(io::Error::new(
@@ -1377,7 +1379,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
         // Re-issue the unhashed uplift on every build so `<profile>/<name>` —
         // the path every packager and launcher consumes — aliases this
         // build's own output rather than whatever wrote there last.
-        uplift_binary(&deps_artifact, &profile_dir.join(binary_name)).await?;
+        uplift_binary(
+            &deps_artifact,
+            &profile_dir.join(format!("{binary_name}{suffix}")),
+        )
+        .await?;
         reported_artifact(&output.stdout, &self.path, cargo_target, None)
     }
 
@@ -2340,9 +2346,23 @@ async fn clean_cargo_package(
 }
 
 /// The `deps/` filename rustc writes for a `--bin` unit built with
-/// `-Cextra-filename=-<marker>`: `<underscored target name>-<marker>`.
-fn marked_binary_file_name(binary_name: &str, marker: &str) -> String {
-    format!("{}-{marker}", binary_name.replace('-', "_"))
+/// `-Cextra-filename=-<marker>`: `<underscored target name>-<marker><suffix>`.
+fn marked_binary_file_name(binary_name: &str, marker: &str, suffix: &str) -> String {
+    format!("{}-{marker}{suffix}", binary_name.replace('-', "_"))
+}
+
+/// The file extension rustc gives an executable for `triple`: `.exe` on
+/// Windows, `.wasm` on a bare `wasm32` target, none elsewhere.
+fn executable_suffix(triple: &Triple) -> &'static str {
+    if triple.operating_system == OperatingSystem::Windows {
+        ".exe"
+    } else if matches!(triple.architecture, target_lexicon::Architecture::Wasm32)
+        && triple.operating_system != OperatingSystem::Emscripten
+    {
+        ".wasm"
+    } else {
+        ""
+    }
 }
 
 /// Replace `destination` with `artifact` — Cargo's own uplift mechanics: a
