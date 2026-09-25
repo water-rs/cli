@@ -30,6 +30,10 @@ path = "src/terminal/main.rs"
 # reports; `dunce` gives the plain one and is `canonicalize` elsewhere.
 dunce = "1.0"
 cargo_metadata = "0.23.1"
+# Cargo configuration load and resolution — the same hierarchical merge,
+# environment and `target.<triple>`/`target.<cfg>` precedence Cargo applies,
+# resolving the rustflags a build's flag set joins.
+cargo-config2 = "0.1.45"
 # Icon and asset pipeline: reads a project's source icon (PNG/JPEG/WebP) and
 # writes PNG plus the Windows ICO container. `default-formats` additionally
 # pulls `image`'s AVIF *encoder* (ravif -> rav1e), which nothing here calls.

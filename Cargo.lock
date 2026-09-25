@@ -623,6 +623,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cargo-config2"
+version = "0.1.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "855d1b74d8faf6c56e02ddbb8a60f6eae479bba5ee6ee29cddee73fe9484f261"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
 name = "cargo-lock"
 version = "10.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4467,6 +4478,7 @@ dependencies = [
  "async-lock",
  "axoupdater",
  "base64 0.23.1",
+ "cargo-config2",
  "cargo-lock",
  "cargo_metadata",
  "cargo_toml",
