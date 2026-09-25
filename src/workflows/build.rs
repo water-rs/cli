@@ -1328,8 +1328,18 @@ Automatic meson installation failed: {install_err}\n\n{}",
                 reported_artifact(&output.stdout, &self.path, cargo_target, artifact_extension)?
             }
             CargoTarget::Binary(name) => {
-                self.binary_artifact(&output, name, release, cargo_target, &profile_dir)
-                    .await?
+                let user_rustflags = self
+                    .user_rustflags(&self.project_cargo_config_files()?)
+                    .await?;
+                self.binary_artifact(
+                    &output,
+                    name,
+                    release,
+                    cargo_target,
+                    &profile_dir,
+                    &user_rustflags,
+                )
+                .await?
             }
         };
         Ok(BuiltTarget {
@@ -1359,11 +1369,12 @@ Automatic meson installation failed: {install_err}\n\n{}",
         release: bool,
         cargo_target: CargoTarget<'_>,
         profile_dir: &Path,
+        user_rustflags: &[String],
     ) -> Result<PathBuf, RustBuildError> {
         let suffix = executable_suffix(&self.triple);
         let deps_artifact = profile_dir.join("deps").join(marked_binary_file_name(
             binary_name,
-            &self.artifact_marker(release, cargo_target),
+            &self.artifact_marker(release, cargo_target, user_rustflags),
             suffix,
         ));
         if !deps_artifact.is_file() {
@@ -1432,17 +1443,132 @@ Automatic meson installation failed: {install_err}\n\n{}",
         Ok(removed > 0)
     }
 
-    /// `--config` argument pairs restoring the project's Cargo-config
-    /// hierarchy on this build. Empty when the crate builds inside the
-    /// project, where discovery already reaches its config files.
-    fn project_cargo_config_args(&self) -> Result<Vec<OsString>, RustBuildError> {
+    /// The `--config` files restoring the project's Cargo-config hierarchy
+    /// on this build, in Cargo's precedence order. Empty when the crate
+    /// builds inside the project, where discovery already reaches its
+    /// config files.
+    fn project_cargo_config_files(&self) -> Result<Vec<PathBuf>, RustBuildError> {
         let Some(project) = self.project.as_ref() else {
             return Ok(Vec::new());
         };
-        crate::toolchain::cargo_project_config::cargo_config_args(project.root(), &self.path)
+        crate::toolchain::cargo_project_config::cargo_config_files(project.root(), &self.path)
             .map_err(|error| {
                 RustBuildError::FailToBuildRustLibrary(io::Error::other(error.to_string()))
             })
+    }
+
+    /// The rustflags Cargo resolves for this build before the CLI's own
+    /// `rustc_flags`, over the environment the spawned cargo actually sees:
+    /// this process's variables overlaid by `self.envs`, last entry per key
+    /// winning — the same order `Command::env` applies.
+    ///
+    /// [`cargo_config2::Config::rustflags`] resolves Cargo's precedence
+    /// (`CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, the `target` table's
+    /// `target.<triple>` / `CARGO_TARGET_<triple>_RUSTFLAGS` / matching
+    /// `target.<cfg>` keys, or `build.rustflags`), evaluating `target.<cfg>`
+    /// keys against `rustc --print cfg` for the toolchain this build runs
+    /// under. The `--config` files Cargo also sees have no resolver channel,
+    /// so they are laid down as a `.cargo/config.toml` chain the discovery
+    /// walk reaches at `--config` depth.
+    async fn user_rustflags(
+        &self,
+        cargo_config_files: &[PathBuf],
+    ) -> Result<Vec<String>, RustBuildError> {
+        let mut host = crate::toolchain::Host::current().with_cwd(&self.path);
+        for (key, value) in &self.envs {
+            host = host.with_env(key, value);
+        }
+        // Cargo's `$CARGO_HOME` resolution: absolute, anchored at the
+        // working directory when relative, `~/.cargo` when unset.
+        let cargo_home = host
+            .env(std::ffi::OsStr::new("CARGO_HOME"))
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+            .map(|home| {
+                if home.is_absolute() {
+                    home
+                } else {
+                    self.path.join(home)
+                }
+            })
+            .or_else(|| host.home_dir().map(|home| home.join(".cargo")));
+        let crate_dir = if cargo_config_files.is_empty() {
+            self.path.clone()
+        } else {
+            crate::toolchain::cargo_project_config::config_chain_dir(&self.path, cargo_config_files)
+                .map_err(rustflags_resolution_error)?
+        };
+        let options = cargo_config2::ResolveOptions::default()
+            .env(
+                host.envs()
+                    .map(|(k, v)| (k.to_os_string(), v.to_os_string())),
+            )
+            .rustc(self.toolchain_rustc().await?)
+            .cargo_home(cargo_home);
+        let config = cargo_config2::Config::load_with_options(&crate_dir, options)
+            .map_err(rustflags_resolution_error)?;
+        let flags = config
+            .rustflags(self.triple.to_string().as_str())
+            .map_err(rustflags_resolution_error)?;
+        Ok(flags.map(|flags| flags.flags).unwrap_or_default())
+    }
+
+    /// `rustc` resolving to the toolchain the cargo invocation runs under:
+    /// `rustup run` for the `-Zbuild-std` nightly or the project's toolchain,
+    /// else the bare `rustc` shim — the same resolution cargo's own `rustc`
+    /// applies in this directory.
+    async fn toolchain_rustc(&self) -> Result<cargo_config2::PathAndArgs, RustBuildError> {
+        let toolchain = if let Some(toolchain) = &self.build_std_toolchain {
+            Some(toolchain.clone())
+        } else if let Some(project) = &self.project {
+            Some(
+                project_toolchain(project)
+                    .await
+                    .map_err(rustflags_resolution_error)?,
+            )
+        } else {
+            None
+        };
+        Ok(toolchain.map_or_else(
+            || cargo_config2::PathAndArgs::new("rustc"),
+            |toolchain| {
+                let mut rustc = cargo_config2::PathAndArgs::new("rustup");
+                rustc.args(["run", toolchain.as_str(), "rustc"]);
+                rustc
+            },
+        ))
+    }
+
+    /// The union of the user's resolved rustflags and this build's own
+    /// `rustc_flags`, handed to cargo through `CARGO_ENCODED_RUSTFLAGS`.
+    /// Returns the resolved user set for the artifact marker.
+    ///
+    /// Cargo resolves rustflags from mutually exclusive sources — an
+    /// `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` value discards every
+    /// config-file flag, so the CLI's own flags cannot join the user's
+    /// set that way. Instead resolve the union Cargo itself would pick
+    /// and hand it back through `CARGO_ENCODED_RUSTFLAGS`: Cargo's own
+    /// precedence decides what applies, the CLI's flags append on top,
+    /// the encoded form survives spaces in either set, and the whole
+    /// value lands in every unit fingerprint Cargo computes.
+    async fn apply_rustflags(
+        &self,
+        cmd: &mut Command,
+        cargo_config_files: &[PathBuf],
+    ) -> Result<Vec<String>, RustBuildError> {
+        let user_rustflags = self.user_rustflags(cargo_config_files).await?;
+        if self.rustc_flags.is_empty() {
+            return Ok(user_rustflags);
+        }
+        let mut flags = cargo_config2::Flags::default();
+        for flag in user_rustflags.iter().chain(&self.rustc_flags) {
+            flags.push(flag.clone());
+        }
+        cmd.env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            flags.encode().map_err(rustflags_resolution_error)?,
+        );
+        Ok(user_rustflags)
     }
 
     async fn cargo_build_output(
@@ -1505,7 +1631,12 @@ Automatic meson installation failed: {install_err}\n\n{}",
 
         // A managed crate builds outside the project, so Cargo's config
         // discovery never reaches `<project>/.cargo/config.toml`.
-        cmd = cmd.args(self.project_cargo_config_args()?);
+        let cargo_config_files = self.project_cargo_config_files()?;
+        cmd = cmd.args(
+            cargo_config_files
+                .iter()
+                .flat_map(|path| [OsString::from("--config"), path.clone().into_os_string()]),
+        );
 
         if let Some(target_dir) = &self.target_dir {
             cmd = cmd.arg("--target-dir").arg(target_dir);
@@ -1517,14 +1648,7 @@ Automatic meson installation failed: {install_err}\n\n{}",
         }
         let mut cmd = self.with_project_toolchain_env(cmd).await?;
 
-        if !self.rustc_flags.is_empty() {
-            let mut rustflags = std::env::var_os("RUSTFLAGS").unwrap_or_default();
-            if !rustflags.is_empty() {
-                rustflags.push(" ");
-            }
-            rustflags.push(self.rustc_flags.join(" "));
-            cmd = cmd.env("RUSTFLAGS", rustflags);
-        }
+        let user_rustflags = self.apply_rustflags(cmd, &cargo_config_files).await?;
 
         configure_generated_crate_compilation(cmd);
 
@@ -1571,7 +1695,7 @@ Automatic meson installation failed: {install_err}\n\n{}",
             cmd = cmd.args(["--features", &self.features.join(",")]);
         }
 
-        let trailing_args = self.trailing_rustc_args(release, cargo_target);
+        let trailing_args = self.trailing_rustc_args(release, cargo_target, &user_rustflags);
         if !trailing_args.is_empty() {
             cmd = cmd.arg("--").args(trailing_args);
         }
@@ -1598,7 +1722,12 @@ Automatic meson installation failed: {install_err}\n\n{}",
     /// name to this build so its artifact is never resolved through the
     /// unhashed `<profile>/<name>` uplift that aliases whatever build wrote
     /// there last.
-    fn trailing_rustc_args(&self, release: bool, cargo_target: CargoTarget<'_>) -> Vec<String> {
+    fn trailing_rustc_args(
+        &self,
+        release: bool,
+        cargo_target: CargoTarget<'_>,
+        user_rustflags: &[String],
+    ) -> Vec<String> {
         let mut args = Vec::new();
         if let Some(crate_type) = &self.crate_type_override {
             args.push("--crate-type".to_owned());
@@ -1608,7 +1737,7 @@ Automatic meson installation failed: {install_err}\n\n{}",
         if matches!(cargo_target, CargoTarget::Binary(_)) {
             args.push(format!(
                 "-Cextra-filename=-{}",
-                self.artifact_marker(release, cargo_target)
+                self.artifact_marker(release, cargo_target, user_rustflags)
             ));
         }
         args
@@ -1715,12 +1844,17 @@ Automatic meson installation failed: {install_err}\n\n{}",
     /// The `deps/` filename suffix `-Cextra-filename` gives a `--bin` unit's
     /// own rustc output: a hash of the crate directory, the target and the
     /// profile, the binary's name, and every compiler-shaping option this
-    /// build carries — features, `RUSTFLAGS` content, environment overrides
-    /// and the trailing `cargo rustc` arguments. Two builds of the same crate
-    /// that differ in any of those never share the marker, so their `deps/`
-    /// outputs cannot alias one another the way the unhashed
+    /// build carries — features, the resolved rustflags set, environment
+    /// overrides and the trailing `cargo rustc` arguments. Two builds of the
+    /// same crate that differ in any of those never share the marker, so
+    /// their `deps/` outputs cannot alias one another the way the unhashed
     /// `<profile>/<name>` uplift does.
-    fn artifact_marker(&self, release: bool, cargo_target: CargoTarget<'_>) -> String {
+    fn artifact_marker(
+        &self,
+        release: bool,
+        cargo_target: CargoTarget<'_>,
+        user_rustflags: &[String],
+    ) -> String {
         use sha2::Digest as _;
         let mut signature = Vec::new();
         let mut feed = |bytes: &[u8]| {
@@ -1739,6 +1873,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
         for feature in &self.features {
             feed(feature.as_bytes());
         }
+        // The rustflags rustc receives, in application order: the user's
+        // resolved set first, then this build's own flags appended.
+        for flag in user_rustflags {
+            feed(flag.as_bytes());
+        }
         for flag in &self.rustc_flags {
             feed(flag.as_bytes());
         }
@@ -1748,9 +1887,6 @@ Automatic meson installation failed: {install_err}\n\n{}",
         for (key, value) in &self.envs {
             feed(key.as_bytes());
             feed(value.as_encoded_bytes());
-        }
-        if let Some(rustflags) = std::env::var_os("RUSTFLAGS") {
-            feed(rustflags.as_encoded_bytes());
         }
         let digest = sha2::Sha256::digest(&signature);
         hex::encode(&digest[..4])
@@ -2351,6 +2487,13 @@ fn marked_binary_file_name(binary_name: &str, marker: &str, suffix: &str) -> Str
     format!("{}-{marker}{suffix}", binary_name.replace('-', "_"))
 }
 
+/// `RustBuildError` for the rustflags-resolution path: a malformed Cargo
+/// config file, a failed `rustc --print cfg`, or a flag that cannot be
+/// encoded.
+fn rustflags_resolution_error(error: impl std::fmt::Display) -> RustBuildError {
+    RustBuildError::FailToBuildRustLibrary(io::Error::other(error.to_string()))
+}
+
 /// The file extension rustc gives an executable for `triple`: `.exe` on
 /// Windows, `.wasm` on a bare `wasm32` target, none elsewhere.
 fn executable_suffix(triple: &Triple) -> &'static str {
@@ -2492,8 +2635,9 @@ mod tests {
 
     use super::{
         BuildOptions, BuildProfile, BuiltTarget, CargoTarget, CompileEvent, RustBuild,
-        RustDynamicLibraries, RustLinkage, classify_compile_line, dynamic_library_file_name,
-        lib_extension_for_triple, reported_shared_runtime, resolve_rust_standard_library_in,
+        RustDynamicLibraries, RustLinkage, classify_compile_line, combined_build_output,
+        dynamic_library_file_name, lib_extension_for_triple, reported_shared_runtime,
+        resolve_rust_standard_library_in,
     };
 
     fn shared_runtime_artifact_json(
@@ -3424,6 +3568,176 @@ mod tests {
             assert!(!directory.path().join("libstd-old.so").exists());
             assert!(directory.path().join("libwaterui_app.so").exists());
             assert!(directory.path().join("libc++_shared.so").exists());
+        });
+    }
+
+    /// The crate proving a rustflags source reaches rustc: its `lib`
+    /// compiles only when `--cfg <probe>` arrives, and its build script
+    /// echoes the `CARGO_ENCODED_RUSTFLAGS` the build was handed — the union
+    /// ordering and content in one marker.
+    fn rustflags_probe_crate(crate_dir: &std::path::Path, probe: &str) {
+        std::fs::create_dir_all(crate_dir.join("src")).expect("crate dir");
+        std::fs::write(
+            crate_dir.join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            crate_dir.join("build.rs"),
+            "fn main() {\n    println!(\n        \"cargo:warning=RFPROBE={}\",\n        std::env::var(\"CARGO_ENCODED_RUSTFLAGS\").unwrap_or_default()\n    );\n}\n",
+        )
+        .expect("build script");
+        std::fs::write(
+            crate_dir.join("src/lib.rs"),
+            format!(
+                "#[cfg(not({probe}))]\ncompile_error!(\"a rustflags source was dropped by the build\");\n"
+            ),
+        )
+        .expect("lib.rs");
+    }
+
+    /// An empty `$CARGO_HOME` keeps a real user configuration out of the
+    /// resolution; an ambient `RUSTFLAGS` in the test process's environment
+    /// still applies — exactly as it would to a real cargo build.
+    fn rustflags_probe_build(
+        crate_dir: &std::path::Path,
+        cargo_home: &std::path::Path,
+    ) -> super::RustBuild {
+        super::RustBuild::new(crate_dir, Triple::host())
+            .with_preferred_dynamic_linking()
+            .with_env("CARGO_HOME", cargo_home)
+    }
+
+    /// The `RFPROBE=` marker's encoded value from the build output.
+    fn probed_rustflags(output: &std::process::Output) -> String {
+        let log = combined_build_output(output);
+        assert!(output.status.success(), "{log}");
+        let marker = log
+            .find("RFPROBE=")
+            .expect("the build script echo reached the output");
+        log[marker + "RFPROBE=".len()..]
+            .chars()
+            .take_while(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    /// `[build] rustflags` in a project's `.cargo/config.toml` joins the
+    /// CLI's own `-Cprefer-dynamic`/`-Crpath` instead of being shadowed by
+    /// them — the probe compiles and both halves of the union reach rustc.
+    #[test]
+    fn build_rustflags_join_the_cli_flags() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let fixture = temporary.path().join("fixture");
+            let crate_dir = fixture.join("crate");
+            rustflags_probe_crate(&crate_dir, "water_config_probe");
+            std::fs::create_dir_all(fixture.join(".cargo")).expect("config dir");
+            std::fs::write(
+                fixture.join(".cargo").join("config.toml"),
+                "[build]\nrustflags = [\"--cfg=water_config_probe\"]\n",
+            )
+            .expect("config");
+
+            let output = rustflags_probe_build(&crate_dir, &temporary.path().join("cargo-home"))
+                .cargo_build_output(false, CargoTarget::Lib)
+                .await
+                .expect("the probe crate builds");
+
+            let rustflags = probed_rustflags(&output);
+            let config = rustflags.find("--cfg=water_config_probe");
+            let prefer_dynamic = rustflags.find("-Cprefer-dynamic");
+            assert!(
+                config.is_some() && prefer_dynamic.is_some(),
+                "the union carries both flag sets: {rustflags}"
+            );
+            assert!(
+                config < prefer_dynamic,
+                "the user's resolved flags apply before the CLI's: {rustflags}"
+            );
+        });
+    }
+
+    /// `[target.<host triple>] rustflags` reaches the build the same way —
+    /// the target table's flags join the union ahead of the CLI's own.
+    #[test]
+    fn target_rustflags_join_the_cli_flags() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let fixture = temporary.path().join("fixture");
+            let crate_dir = fixture.join("crate");
+            rustflags_probe_crate(&crate_dir, "water_target_probe");
+            let host_triple = Triple::host().to_string();
+            std::fs::create_dir_all(fixture.join(".cargo")).expect("config dir");
+            std::fs::write(
+                fixture.join(".cargo").join("config.toml"),
+                format!("[target.'{host_triple}']\nrustflags = [\"--cfg=water_target_probe\"]\n"),
+            )
+            .expect("config");
+
+            let output = rustflags_probe_build(&crate_dir, &temporary.path().join("cargo-home"))
+                .cargo_build_output(false, CargoTarget::Lib)
+                .await
+                .expect("the probe crate builds");
+
+            let rustflags = probed_rustflags(&output);
+            assert!(
+                rustflags.contains("--cfg=water_target_probe")
+                    && rustflags.contains("-Cprefer-dynamic"),
+                "the union carries both flag sets: {rustflags}"
+            );
+        });
+    }
+
+    /// `RUSTFLAGS` in the build's environment — a `with_env` entry the old
+    /// code overwrote when it wrote its own `RUSTFLAGS` — survives alongside
+    /// the CLI's flags.
+    #[test]
+    fn env_rustflags_join_the_cli_flags() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let crate_dir = temporary.path().join("crate");
+            rustflags_probe_crate(&crate_dir, "water_env_probe");
+
+            let output = rustflags_probe_build(&crate_dir, &temporary.path().join("cargo-home"))
+                .with_env("RUSTFLAGS", "--cfg=water_env_probe")
+                .cargo_build_output(false, CargoTarget::Lib)
+                .await
+                .expect("the probe crate builds");
+
+            let rustflags = probed_rustflags(&output);
+            assert!(
+                rustflags.contains("--cfg=water_env_probe")
+                    && rustflags.contains("-Cprefer-dynamic"),
+                "the union carries both flag sets: {rustflags}"
+            );
+        });
+    }
+
+    /// The `--config` files a managed build passes — the project config
+    /// hierarchy the managed crate sits outside of — feed the resolution the
+    /// same way discovered files do.
+    #[test]
+    fn cli_config_files_feed_the_resolution() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let project = temporary.path().join("project");
+            std::fs::create_dir_all(project.join(".cargo")).expect("config dir");
+            let config = project.join(".cargo").join("config.toml");
+            std::fs::write(
+                &config,
+                "[build]\nrustflags = [\"--cfg=water_cli_probe\"]\n",
+            )
+            .expect("config");
+            let crate_dir = temporary.path().join("crate");
+            std::fs::create_dir_all(&crate_dir).expect("crate dir");
+
+            let flags = super::RustBuild::new(&crate_dir, Triple::host())
+                .with_env("CARGO_HOME", temporary.path().join("cargo-home"))
+                .user_rustflags(&[config])
+                .await
+                .expect("the cli config layer resolves");
+
+            assert_eq!(flags, ["--cfg=water_cli_probe"]);
         });
     }
 }
