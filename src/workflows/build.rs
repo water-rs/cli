@@ -180,7 +180,7 @@ pub fn configure_generated_crate_compilation(command: &mut Command) {
 /// to the build's `PATH` so build scripts resolve a pinned `dxc`, JDK, and
 /// friends by name — the user never edits `PATH`. A no-op when nothing is
 /// installed (or the paths cannot join), so ambient `PATH` passes through.
-fn with_managed_tools_path(command: &mut Command) {
+pub(crate) fn with_managed_tools_path(command: &mut Command) {
     if let Some((key, value)) =
         crate::toolchain::managed_tool::managed_tools_path_env(&crate::toolchain::Host::current())
     {
