@@ -207,6 +207,15 @@ impl Host {
         host
     }
 
+    /// Every environment variable on this host, in map order.
+    ///
+    /// For resolvers that take the whole environment at once rather than
+    /// probing one variable at a time — [`cargo_config2::ResolveOptions::env`]
+    /// being the one in-tree caller.
+    pub fn envs(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.env.iter().map(|(k, v)| (k.as_os_str(), v.as_os_str()))
+    }
+
     /// A [`Command`] that runs `program` under this host's environment.
     ///
     /// The child sees exactly this host's variables and starts in

@@ -40,21 +40,38 @@ use color_eyre::eyre::{Context as _, Result};
 /// directory is `build_dir` see the same Cargo configuration as a `cargo`
 /// invocation made inside `project_root`.
 ///
+/// # Errors
+/// Fails when a config file exists but cannot be read or parsed — Cargo
+/// would fail the same way inside the project.
+pub fn cargo_config_args(project_root: &Path, build_dir: &Path) -> Result<Vec<OsString>> {
+    Ok(cargo_config_files(project_root, build_dir)?
+        .into_iter()
+        .flat_map(|path| [OsString::from("--config"), path.into_os_string()])
+        .collect())
+}
+
+/// The Cargo configuration files [`cargo_config_args`] passes via
+/// `--config`, in the same ascending precedence order.
+///
 /// The list is empty when `build_dir` sits inside `project_root`: discovery
-/// already reaches the project files. Otherwise it contains, in ascending
-/// precedence order, every `<ancestor>/.cargo/config.toml` (or the legacy
-/// `.cargo/config`) on `project_root`'s chain, then a generated file
-/// carrying the cwd-relative `-L`/`--extern` paths rebased to absolute, then
-/// the `build_dir` crate's own `.cargo/config.toml` when one exists so a
+/// already reaches the project files. Otherwise it contains every
+/// `<ancestor>/.cargo/config.toml` (or the legacy `.cargo/config`) on
+/// `project_root`'s chain shallow→deep, then a generated file carrying the
+/// cwd-relative `-L`/`--extern` paths rebased to absolute, then the
+/// `build_dir` crate's own `.cargo/config.toml` when one exists so a
 /// generated crate-level configuration keeps the highest precedence.
 ///
 /// `$CARGO_HOME/config.toml` needs no entry: Cargo reads it for every
 /// invocation regardless of working directory.
 ///
+/// Resolvers that mirror Cargo's layering — like
+/// [`crate::toolchain::cargo_rustflags`] — need this file list itself, not
+/// just the argument pairs.
+///
 /// # Errors
 /// Fails when a config file exists but cannot be read or parsed — Cargo
 /// would fail the same way inside the project.
-pub fn cargo_config_args(project_root: &Path, build_dir: &Path) -> Result<Vec<OsString>> {
+pub fn cargo_config_files(project_root: &Path, build_dir: &Path) -> Result<Vec<PathBuf>> {
     let project_root = &dunce::canonicalize(project_root)
         .wrap_err_with(|| format!("cannot resolve project root {}", project_root.display()))?;
     let build_dir = &dunce::canonicalize(build_dir)
@@ -69,31 +86,68 @@ pub fn cargo_config_args(project_root: &Path, build_dir: &Path) -> Result<Vec<Os
     // The flag file rebases `-L`/`--extern` entries that rustc resolves
     // against the managed crate's directory instead of the project.
     let mut flag_sections: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-    let mut args: Vec<OsString> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
     for dir in &ancestors {
         let Some(path) = discovered_config_file(dir) else {
             continue;
         };
         let table = read_config(&path)?;
         collect_flag_paths(&table, dir, &mut flag_sections);
-        args.push(OsString::from("--config"));
-        args.push(path.into_os_string());
+        files.push(path);
     }
 
     if flag_sections.iter().any(|(_, flags)| !flags.is_empty()) {
-        let generated = write_flag_config(&build_dir.join(".water-cargo-config"), &flag_sections)?;
-        args.push(OsString::from("--config"));
-        args.push(generated.into_os_string());
+        files.push(write_flag_config(
+            &build_dir.join(".water-cargo-config"),
+            &flag_sections,
+        )?);
     }
 
     // A config file the generated crate itself ships keeps precedence over
     // everything imported from the project's hierarchy.
     if let Some(path) = discovered_config_file(build_dir) {
-        args.push(OsString::from("--config"));
-        args.push(path.into_os_string());
+        files.push(path);
     }
 
-    Ok(args)
+    Ok(files)
+}
+
+/// Lay the `--config` layers [`cargo_config_files`] returns down as a chain
+/// of `.cargo/config.toml` files under `build_dir`.
+///
+/// Returns the directory to resolve config from to see the files at Cargo's
+/// `--config` precedence. Cargo's `--config` arguments sit above every auto-discovered file —
+/// including the crate's own `.cargo/config.toml` — and merge with the same
+/// rules. Resolvers that discover config hierarchically (like
+/// `cargo_config2::Config::load_with_options`) have no `--config` channel, so
+/// the files are materialized where discovery reaches them: `files[i]` is
+/// copied to `config-chain/d/…/d/.cargo/config.toml`, `i` directories deep,
+/// preserving the ascending precedence of the input list. Anything deeper
+/// than `build_dir`'s own hierarchy outranks it, matching `--config`.
+///
+/// The copies live under `.water-cargo-config`, the generated directory the
+/// `-L` rebase already uses; contents are rewritten on every call so a stale
+/// chain never lingers.
+///
+/// # Errors
+/// Fails when a directory cannot be created or a file cannot be copied —
+/// the build would fail resolving configuration anyway.
+pub fn config_chain_dir(build_dir: &Path, files: &[PathBuf]) -> Result<PathBuf> {
+    let chain = build_dir.join(".water-cargo-config").join("config-chain");
+    if chain.is_dir() {
+        std::fs::remove_dir_all(&chain)
+            .wrap_err_with(|| format!("cannot refresh config chain {}", chain.display()))?;
+    }
+    let mut dir = chain;
+    for file in files {
+        dir = dir.join("d");
+        let cargo_dir = dir.join(".cargo");
+        std::fs::create_dir_all(&cargo_dir)
+            .wrap_err_with(|| format!("cannot create config chain dir {}", cargo_dir.display()))?;
+        std::fs::copy(file, cargo_dir.join("config.toml"))
+            .wrap_err_with(|| format!("cannot copy {} into the config chain", file.display()))?;
+    }
+    Ok(dir)
 }
 
 /// The config file Cargo would read inside `dir`: `.cargo/config.toml`, or
