@@ -188,16 +188,63 @@ fn with_managed_tools_path(command: &mut Command) {
     }
 }
 
+/// A shared Rust library staged with an artifact: the build's own output to
+/// copy, and the file name the copy must carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StagedDynamicLibrary {
+    /// The file this build produced.
+    source: PathBuf,
+    /// The name the staged copy carries.
+    staged_name: OsString,
+}
+
+impl StagedDynamicLibrary {
+    /// Stage `source` under the file name it already has — the behavior for a
+    /// library the artifact records no dynamic dependency on.
+    fn reported(source: PathBuf) -> eyre::Result<Self> {
+        let staged_name = source.file_name().map(ToOwned::to_owned).ok_or_else(|| {
+            eyre::eyre!(
+                "Dynamic library path has no file name: {}",
+                source.display()
+            )
+        })?;
+        Ok(Self {
+            source,
+            staged_name,
+        })
+    }
+
+    /// Stage `source` under `needed_name` — the basename of the dynamic
+    /// dependency the packaged artifact records.
+    fn needed(needed_name: &str, source: PathBuf) -> Self {
+        Self {
+            source,
+            staged_name: OsString::from(needed_file_name(needed_name)),
+        }
+    }
+}
+
 /// Dynamic Rust libraries required by a shared-runtime development build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustDynamicLibraries {
-    waterui: PathBuf,
-    standard_library: PathBuf,
+    waterui: StagedDynamicLibrary,
+    standard_library: StagedDynamicLibrary,
     triple: Triple,
 }
 
 impl RustDynamicLibraries {
     /// Resolve the shared `WaterUI` runtime and target Rust standard library.
+    ///
+    /// Each library is staged under the name the artifact's own dynamic
+    /// section records: a `dylib` unit from a git or registry source compiles
+    /// as `deps/libwaterui_dylib-<metadata>.so`, and `DT_NEEDED` (the PE
+    /// import descriptor / `LC_LOAD_DYLIB` on the other platforms) records
+    /// that hashed name — not the unhashed `<profile>/libwaterui_dylib.so`
+    /// alias Cargo uplifts and its artifact report names. The loader only
+    /// ever resolves the recorded name, so a needed library that is not found
+    /// under it is a packaging error naming what was searched for and where
+    /// (water-rs/cli#184). An artifact that records no matching dependency —
+    /// a statically linked runtime — keeps the reported path's own name.
     ///
     /// The prebuilt `libstd` comes from the toolchain `project` selects — the
     /// one [`RustBuild`] compiled the runtime under — so the runtime and the
@@ -206,36 +253,88 @@ impl RustDynamicLibraries {
     /// library hash.
     ///
     /// # Errors
-    /// Returns an error when either required dynamic library is absent or ambiguous.
+    /// Returns an error when a needed dynamic library is absent, ambiguous, or
+    /// the artifact's dynamic dependencies cannot be read.
     pub async fn resolve(
         built: &BuiltTarget,
         triple: &Triple,
         project: &Project,
     ) -> eyre::Result<Self> {
-        let waterui = built.shared_runtime()?.to_path_buf();
+        let reported = built.shared_runtime()?.to_path_buf();
         let lib_dir = &built.profile_dir;
+        let deps_dir = lib_dir.join("deps");
+        let needed = unblock({
+            let artifact = built.artifact.clone();
+            move || needed_shared_libraries(&artifact)
+        })
+        .await
+        .map_err(|error| {
+            eyre::eyre!(
+                "failed to read the dynamic dependencies of {}: {error}",
+                built.artifact.display()
+            )
+        })?;
+
+        let waterui = match needed
+            .iter()
+            .find(|name| needed_library_matches(name, "waterui_dylib"))
+        {
+            Some(name) => {
+                let source = needed_library_source(
+                    name,
+                    &[deps_dir.clone(), lib_dir.clone()],
+                    &built.artifact,
+                )?;
+                StagedDynamicLibrary::needed(name, source)
+            }
+            None => StagedDynamicLibrary::reported(reported)?,
+        };
 
         // A `-Zbuild-std` build publishes its freshly compiled `libstd` into
         // the profile's `deps/` directory via the rustc wrapper; that copy —
         // not the toolchain's prebuilt one — is what the build linked against,
-        // so it is the one that has to ship. The prebuilt lookup below is the
-        // fallback for builds that never built `std` from source.
-        let resolution_triple = triple.clone();
-        let deps_dir = lib_dir.join("deps");
-        let staged =
-            unblock(move || resolve_rust_standard_library_in(&deps_dir, &resolution_triple)).await;
-        let standard_library = match staged {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        // so it is the one that has to ship. The needed-name lookups below
+        // search the same two directories in that order; the prefix scan is
+        // the fallback for an artifact that records no `libstd` at all (a
+        // Mach-O binary, whose `libstd` dependency is the runtime dylib's own).
+        let needed_std = needed.iter().find(|name| is_rust_standard_library(name));
+        let standard_library = match needed_std {
+            Some(name) if deps_dir.join(needed_file_name(name)).is_file() => {
+                StagedDynamicLibrary::needed(name, deps_dir.join(needed_file_name(name)))
+            }
+            Some(name) => {
                 let toolchain = project_toolchain(project).await?;
                 let target_libdir = rust_target_libdir(triple, &toolchain).await?;
-                let resolution_triple = triple.clone();
-                unblock(move || {
-                    resolve_rust_standard_library_in(&target_libdir, &resolution_triple)
-                })
-                .await?
+                StagedDynamicLibrary::needed(
+                    name,
+                    needed_library_source(
+                        name,
+                        &[deps_dir.clone(), target_libdir],
+                        &built.artifact,
+                    )?,
+                )
             }
-            Err(error) => return Err(error.into()),
+            None => {
+                let resolution_triple = triple.clone();
+                let staged = unblock(move || {
+                    resolve_rust_standard_library_in(&deps_dir, &resolution_triple)
+                })
+                .await;
+                match staged {
+                    Ok(path) => StagedDynamicLibrary::reported(path)?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let toolchain = project_toolchain(project).await?;
+                        let target_libdir = rust_target_libdir(triple, &toolchain).await?;
+                        let resolution_triple = triple.clone();
+                        let path = unblock(move || {
+                            resolve_rust_standard_library_in(&target_libdir, &resolution_triple)
+                        })
+                        .await?;
+                        StagedDynamicLibrary::reported(path)?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
         };
 
         Ok(Self {
@@ -248,18 +347,20 @@ impl RustDynamicLibraries {
     /// Shared `WaterUI` runtime path.
     #[must_use]
     pub fn waterui(&self) -> &Path {
-        &self.waterui
+        &self.waterui.source
     }
 
     /// Target Rust standard-library dynamic library path.
     #[must_use]
     pub fn standard_library(&self) -> &Path {
-        &self.standard_library
+        &self.standard_library.source
     }
 
     /// Iterate over every library that must be staged with the application.
     pub fn iter(&self) -> impl Iterator<Item = &Path> {
-        [self.waterui(), self.standard_library()].into_iter()
+        [&self.waterui, &self.standard_library]
+            .into_iter()
+            .map(|library| library.source.as_path())
     }
 
     /// Copy all required dynamic libraries into a runtime search directory.
@@ -275,28 +376,26 @@ impl RustDynamicLibraries {
     pub async fn stage(&self, destination: &Path) -> eyre::Result<()> {
         smol::fs::create_dir_all(destination).await?;
         // A resolved source can already live inside the destination — the
-        // profile-root dylib a nightly emits — so the staged-copy cleanup must
-        // leave sources alone and the copy must not rewrite a library over
-        // itself.
-        let sources: Vec<PathBuf> = self.iter().map(|path| (*path).to_path_buf()).collect();
+        // hashed `deps/` dylib staged beside a binary that lives there too —
+        // so the staged-copy cleanup must leave sources alone and the copy
+        // must not rewrite a library over itself.
+        let libraries = [&self.waterui, &self.standard_library];
+        let sources: Vec<PathBuf> = libraries
+            .iter()
+            .map(|library| library.source.clone())
+            .collect();
         Self::remove_staged_except(destination, &self.triple, &sources).await?;
-        for source in &sources {
-            let file_name = source.file_name().ok_or_else(|| {
-                eyre::eyre!(
-                    "Dynamic library path has no file name: {}",
-                    source.display()
-                )
-            })?;
-            let staged = destination.join(file_name);
-            if *source == staged {
+        for library in &libraries {
+            let staged = destination.join(&library.staged_name);
+            if library.source == staged {
                 continue;
             }
-            crate::utils::copy_file(source, &staged)
+            crate::utils::copy_file(&library.source, &staged)
                 .await
                 .wrap_err_with(|| {
                     format!(
                         "Failed to stage {} to {}",
-                        source.display(),
+                        library.source.display(),
                         staged.display()
                     )
                 })?;
@@ -324,13 +423,12 @@ impl RustDynamicLibraries {
             return Ok(());
         }
 
-        let waterui = dynamic_library_file_name("waterui_dylib", triple);
-        let (standard_library_prefix, extension) =
-            if triple.operating_system == OperatingSystem::Windows {
-                ("std-", "dll")
-            } else {
-                ("libstd-", lib_extension_for_triple(triple))
-            };
+        let extension = lib_extension_for_triple(triple);
+        let standard_library_prefix = if triple.operating_system == OperatingSystem::Windows {
+            "std-"
+        } else {
+            "libstd-"
+        };
         let mut entries = smol::fs::read_dir(destination).await?;
         while let Some(entry) = entries.next().await {
             let entry = entry?;
@@ -339,9 +437,13 @@ impl RustDynamicLibraries {
             }
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            if file_name == waterui
-                || (file_name.starts_with(standard_library_prefix)
-                    && entry.path().extension().and_then(|value| value.to_str()) == Some(extension))
+            let has_dynamic_extension =
+                entry.path().extension().and_then(|value| value.to_str()) == Some(extension);
+            // `waterui_dylib` matches with or without a `-<metadata>` suffix
+            // so a superseded hashed staging is removed with the unhashed one.
+            if has_dynamic_extension
+                && (is_waterui_dylib_file_name(&file_name)
+                    || file_name.starts_with(standard_library_prefix))
             {
                 smol::fs::remove_file(entry.path()).await?;
             }
@@ -350,6 +452,203 @@ impl RustDynamicLibraries {
     }
 }
 
+/// The file name a recorded dynamic dependency carries: the basename for a
+/// Mach-O install name like `@rpath/libwaterui_dylib.dylib`, the name itself
+/// for a `DT_NEEDED` or PE import entry.
+fn needed_file_name(recorded_name: &str) -> &str {
+    recorded_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(recorded_name)
+}
+
+/// Whether `file_name` — an already validated library name, `lib` prefix and
+/// platform extension included — names `waterui_dylib`, optionally carrying a
+/// `-<metadata>` hash.
+fn is_waterui_dylib_file_name(file_name: &str) -> bool {
+    let Some((stem, _)) = file_name.rsplit_once('.') else {
+        return false;
+    };
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    stem == "waterui_dylib" || stem.starts_with("waterui_dylib-")
+}
+
+/// Whether a recorded dynamic dependency names the `crate_name` library —
+/// `libwaterui_dylib-0123abcd.so`, `waterui_dylib.dll`, or the Mach-O install
+/// name `@rpath/libwaterui_dylib.dylib` for `waterui_dylib`.
+fn needed_library_matches(recorded_name: &str, crate_name: &str) -> bool {
+    let stem = needed_file_name(recorded_name).to_ascii_lowercase();
+    let Some((stem, _)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    stem == crate_name || stem.starts_with(&format!("{crate_name}-"))
+}
+
+/// Whether a recorded dynamic dependency names the Rust standard library —
+/// `libstd-<hash>.so`/`libstd-<hash>.dylib`/`std-<hash>.dll`.
+fn is_rust_standard_library(recorded_name: &str) -> bool {
+    let stem = needed_file_name(recorded_name).to_ascii_lowercase();
+    let Some((stem, _)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    stem.strip_prefix("lib").unwrap_or(stem).starts_with("std-")
+}
+
+/// The build output a recorded needed library name resolves to: the file of
+/// that exact name in one of `search_dirs`, or an error naming the needed
+/// name, the directories searched, and the artifact that records it.
+fn needed_library_source(
+    needed_name: &str,
+    search_dirs: &[PathBuf],
+    artifact: &Path,
+) -> eyre::Result<PathBuf> {
+    let file_name = needed_file_name(needed_name);
+    for dir in search_dirs {
+        let candidate = dir.join(file_name);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(eyre::eyre!(
+        "{} records a dynamic dependency on `{needed_name}` but no file named {file_name} was found in {}",
+        artifact.display(),
+        search_dirs
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// The shared-library names `artifact` records — [`needed_shared_libraries`]
+/// off the blocking pool. A static archive or other unlinked artifact yields
+/// an empty list.
+async fn needed_libraries_of(artifact: &Path) -> Result<Vec<String>, RustBuildError> {
+    let path = artifact.to_path_buf();
+    unblock(move || needed_shared_libraries(&path))
+        .await
+        .map_err(|error| {
+            RustBuildError::FailToBuildRustLibrary(io::Error::other(format!(
+                "failed to read the dynamic dependencies of {}: {error}",
+                artifact.display()
+            )))
+        })
+}
+
+/// The shared libraries an artifact's dynamic section records.
+///
+/// `DT_NEEDED` on ELF, the import descriptors on PE, the `LC_*_DYLIB` load
+/// commands on Mach-O — the names the platform loader searches for when the
+/// artifact runs. Mach-O entries carry the dylib's recorded install name
+/// (typically an `@rpath/` path); `needed_file_name` reduces any entry to
+/// the file name the loader resolves against its search paths. An artifact
+/// that records no dynamic dependencies — a static archive, an object file —
+/// yields an empty list.
+///
+/// # Errors
+/// Returns an error when `path` cannot be read or its dynamic records are
+/// malformed.
+pub fn needed_shared_libraries(path: &Path) -> std::io::Result<Vec<String>> {
+    let data = std::fs::read(path)?;
+    let invalid =
+        |error: object::read::Error| io::Error::new(io::ErrorKind::InvalidData, error.to_string());
+    match object::FileKind::parse(&*data).map_err(invalid)? {
+        object::FileKind::Elf32 => {
+            elf_needed_libraries::<object::elf::FileHeader32<object::Endianness>>(&data)
+        }
+        object::FileKind::Elf64 => {
+            elf_needed_libraries::<object::elf::FileHeader64<object::Endianness>>(&data)
+        }
+        object::FileKind::Pe32 => pe_needed_libraries::<object::pe::ImageNtHeaders32>(&data),
+        object::FileKind::Pe64 => pe_needed_libraries::<object::pe::ImageNtHeaders64>(&data),
+        object::FileKind::MachO32 => {
+            macho_needed_libraries::<object::macho::MachHeader32<object::Endianness>>(&data)
+        }
+        object::FileKind::MachO64 => {
+            macho_needed_libraries::<object::macho::MachHeader64<object::Endianness>>(&data)
+        }
+        // A static archive or any other artifact records no dynamic
+        // dependencies; the caller resolves libraries as before.
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// `DT_NEEDED` entries an ELF image's dynamic section records.
+fn elf_needed_libraries<Elf>(data: &[u8]) -> std::io::Result<Vec<String>>
+where
+    Elf: object::read::elf::FileHeader<Endian = object::Endianness>,
+{
+    use object::read::elf::{Dyn as _, ElfFile};
+
+    let invalid =
+        |error: object::read::Error| io::Error::new(io::ErrorKind::InvalidData, error.to_string());
+    let file = ElfFile::<Elf>::parse(data).map_err(invalid)?;
+    let endian = file.endian();
+    let sections = file.elf_section_table();
+    let Some((dyns, strings_index)) = sections.dynamic(endian, data).map_err(invalid)? else {
+        return Ok(Vec::new());
+    };
+    let strings = sections
+        .strings(endian, data, strings_index)
+        .map_err(invalid)?;
+    Ok(dyns
+        .iter()
+        .filter(|d| d.tag32(endian) == Some(object::elf::DT_NEEDED))
+        .filter_map(|d| d.string(endian, strings).ok())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect())
+}
+
+/// The DLL names a PE image's import descriptors record.
+fn pe_needed_libraries<Pe>(data: &[u8]) -> std::io::Result<Vec<String>>
+where
+    Pe: object::read::pe::ImageNtHeaders,
+{
+    use object::LittleEndian;
+
+    let invalid =
+        |error: object::read::Error| io::Error::new(io::ErrorKind::InvalidData, error.to_string());
+    let file = object::read::pe::PeFile::<Pe>::parse(data).map_err(invalid)?;
+    let Some(import_table) = file.import_table().map_err(invalid)? else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    let mut descriptors = import_table.descriptors().map_err(invalid)?;
+    while let Some(descriptor) = descriptors.next().map_err(invalid)? {
+        let name = import_table
+            .name(descriptor.name.get(LittleEndian))
+            .map_err(invalid)?;
+        names.push(String::from_utf8_lossy(name).into_owned());
+    }
+    Ok(names)
+}
+
+/// The names a Mach-O image's `LC_*_DYLIB` load commands record — its own
+/// `LC_ID_DYLIB` identity is a separate load command and never included.
+fn macho_needed_libraries<Mach>(data: &[u8]) -> std::io::Result<Vec<String>>
+where
+    Mach: object::read::macho::MachHeader,
+{
+    let invalid =
+        |error: object::read::Error| io::Error::new(io::ErrorKind::InvalidData, error.to_string());
+    let file = object::read::macho::MachOFile::<Mach>::parse(data).map_err(invalid)?;
+    let endian = file.endian();
+    let mut commands = file.macho_load_commands().map_err(invalid)?;
+    let mut names = Vec::new();
+    while let Some(command) = commands.next().map_err(invalid)? {
+        if let Some(dylib) = command.dylib().map_err(invalid)? {
+            let name = command.string(endian, dylib.dylib.name).map_err(invalid)?;
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    Ok(names)
+}
+
+/// The unhashed profile-root spelling a `dylib` unit uplifts to — the name a
+/// path-sourced unit carries; git- and registry-sourced units record hashed
+/// `deps/` names instead (cli#184).
+#[cfg(test)]
 fn dynamic_library_file_name(crate_name: &str, triple: &Triple) -> String {
     if triple.operating_system == OperatingSystem::Windows {
         format!("{crate_name}.dll")
@@ -1282,6 +1581,17 @@ Automatic meson installation failed: {install_err}\n\n{}",
             ));
         }
 
+        let profile_dir = self.lib_output_dir(release).await?;
+        let mut artifact = self
+            .select_artifact(
+                &output,
+                cargo_target,
+                release,
+                artifact_extension,
+                &profile_dir,
+            )
+            .await?;
+
         // A dependency's final `dylib`/`cdylib` artifact uplifts to an
         // unhashed name (`deps/libwaterui_dylib.so`), so one filename serves
         // every same-named package sharing this target — last writer wins.
@@ -1293,7 +1603,8 @@ Automatic meson installation failed: {install_err}\n\n{}",
         // artifact. The rebuild compiles the cleaned package anew, so a unit
         // it still reports `fresh` in the same state is a cache this CLI
         // cannot repair by rebuilding, and that is reported instead of retried.
-        let stale = stale_shared_dylib_packages(&output.stdout).await?;
+        let needed = needed_libraries_of(&artifact).await?;
+        let stale = stale_shared_dylib_packages(&output.stdout, &needed).await?;
         if !stale.is_empty() {
             let target_dir = self.target_directory().await?;
             for unit in &stale {
@@ -1315,33 +1626,23 @@ Automatic meson installation failed: {install_err}\n\n{}",
                     )),
                 ));
             }
-            let unrecovered = stale_shared_dylib_packages(&output.stdout).await?;
+            artifact = self
+                .select_artifact(
+                    &output,
+                    cargo_target,
+                    release,
+                    artifact_extension,
+                    &profile_dir,
+                )
+                .await?;
+            let needed = needed_libraries_of(&artifact).await?;
+            let unrecovered = stale_shared_dylib_packages(&output.stdout, &needed).await?;
             if !unrecovered.is_empty() {
                 return Err(unrecoverable_shared_dylib_error(&unrecovered, &target_dir));
             }
         }
 
         let shared_runtime = reported_shared_runtime(&output.stdout)?;
-        let profile_dir = self.lib_output_dir(release).await?;
-        let artifact = match cargo_target {
-            CargoTarget::Lib => {
-                reported_artifact(&output.stdout, &self.path, cargo_target, artifact_extension)?
-            }
-            CargoTarget::Binary(name) => {
-                let user_rustflags = self
-                    .user_rustflags(&self.project_cargo_config_files()?)
-                    .await?;
-                self.binary_artifact(
-                    &output,
-                    name,
-                    release,
-                    cargo_target,
-                    &profile_dir,
-                    &user_rustflags,
-                )
-                .await?
-            }
-        };
         Ok(BuiltTarget {
             profile_dir,
             artifact,
@@ -1396,6 +1697,38 @@ Automatic meson installation failed: {install_err}\n\n{}",
         )
         .await?;
         reported_artifact(&output.stdout, &self.path, cargo_target, None)
+    }
+
+    /// The artifact the selected target produced in `output` — the library
+    /// Cargo reported for `--lib`, or this build's own rustc output for
+    /// `--bin` (see [`Self::binary_artifact`]).
+    async fn select_artifact(
+        &self,
+        output: &std::process::Output,
+        cargo_target: CargoTarget<'_>,
+        release: bool,
+        artifact_extension: Option<&'static str>,
+        profile_dir: &Path,
+    ) -> Result<PathBuf, RustBuildError> {
+        match cargo_target {
+            CargoTarget::Lib => {
+                reported_artifact(&output.stdout, &self.path, cargo_target, artifact_extension)
+            }
+            CargoTarget::Binary(name) => {
+                let user_rustflags = self
+                    .user_rustflags(&self.project_cargo_config_files()?)
+                    .await?;
+                self.binary_artifact(
+                    output,
+                    name,
+                    release,
+                    cargo_target,
+                    profile_dir,
+                    &user_rustflags,
+                )
+                .await
+            }
+        }
     }
 
     /// The artifact extension this build's `--crate-type` override produces,
@@ -2243,8 +2576,13 @@ fn unrecoverable_shared_dylib_error(
 /// a cache state this CLI's own builds leave behind (observed on Windows),
 /// and it is flagged the same way so the caller rebuilds the package instead
 /// of trusting bytes nothing accounts for.
+///
+/// `needed` is the selected artifact's recorded shared-library names — the
+/// same records [`RustDynamicLibraries::resolve`] stages under — empty when
+/// the artifact is not a linked image; see [`dep_info_path`].
 async fn stale_shared_dylib_packages(
     stdout: &[u8],
+    needed: &[String],
 ) -> Result<Vec<StaleSharedDylib>, RustBuildError> {
     let mut stale: Vec<StaleSharedDylib> = Vec::new();
     for artifact in compiler_artifacts(stdout)? {
@@ -2270,7 +2608,7 @@ async fn stale_shared_dylib_packages(
             if !is_dynamic_library(file) {
                 continue;
             }
-            let Some(dep_info) = dep_info_path(file, &artifact.filenames) else {
+            let Some(dep_info) = dep_info_path(file, needed, &artifact.filenames) else {
                 package_stale = Some(StaleSharedDylib {
                     package: package.to_owned(),
                     artifact: file.to_path_buf(),
@@ -2339,35 +2677,54 @@ fn uplifts_dynamic_library(target: &cargo_metadata::Target) -> bool {
     })
 }
 
-/// The dep-info `.d` cargo wrote for the unit that produced `artifact_file`,
-/// found where each cargo layout puts it.
+/// The dep-info `.d` cargo wrote for the unit that produced `artifact_file`.
 ///
-/// Measured on a `dylib` dependency and a `cdylib` root unit (cargo 1.98
-/// stable and the 1.100 nightly build-dir layout, `--message-format=json`):
+/// The name a linked consumer records for a needed library already carries
+/// the `-C metadata` hash the dep-info is named for: a git- or
+/// registry-sourced `dylib` unit compiles as `deps/lib<crate>-<metadata>.so`,
+/// the artifact's `DT_NEEDED` (PE import / Mach-O `LC_LOAD_DYLIB`) records
+/// that hashed name, and rustc writes the dep-info as
+/// `deps/<crate>-<metadata>.d` — the recorded name minus its platform `lib`
+/// prefix and shared-library suffix. `needed` is the selected artifact's own
+/// record, so `deps/<stem>.d` names one exact file — never a
+/// `deps/<crate>-*.d` enumeration, which several coexisting metadata hashes
+/// could collide in (water-rs/cli#184).
 ///
-/// - stable writes `<profile>/deps/<name>.d` for both, beside the hashed
-///   copy, and uplifts the root unit's as `<profile>/lib<name>.d`;
-/// - the build-dir layout writes `<name>.d` in the unit's own
-///   `build/<package>/<hash>/out/` directory — a directory the message names
-///   only through the unit's other outputs (the `.rmeta`/`.rlib` a dependency
-///   emits) — and still uplifts the root unit's as `<profile>/lib<name>.d`.
+/// When no linked artifact records the unit — the build's selected artifact
+/// is a static archive, which carries no dynamic section — the dylib's own
+/// `DT_SONAME` / `LC_ID_DYLIB` supplies the same string, since a consumer
+/// simply re-records it.
 ///
-/// `sibling_files` are the unit's reported filenames; the first candidate
-/// that exists wins, and no candidate means the caller reports the miss.
+/// The candidates after those are Cargo's documented spellings for a unit
+/// whose names carry no metadata hash: the uplifted `<profile>/lib<name>.d`,
+/// the stable `deps/<name>.d`, the unit directory a sibling output names
+/// under the build-dir layout (a `<name>.d` beside the `.rmeta`/`out/` dir),
+/// and a bare `<name>.d` beside the artifact.
 fn dep_info_path(
     artifact_file: &Path,
+    needed: &[String],
     sibling_files: &[cargo_metadata::camino::Utf8PathBuf],
 ) -> Option<PathBuf> {
     let file_stem = artifact_file.file_stem()?.to_str()?;
     let name = file_stem.strip_prefix("lib").unwrap_or(file_stem);
     let dir = artifact_file.parent()?;
-    // Most specific first: the uplifted `lib<name>.d`, the stable `deps/`
-    // copy, the unit directory a sibling output names, and only then a bare
-    // `<name>.d` beside the artifact (which the hashed proc-macro layout
-    // spells that way, and which a same-named bin would also write).
+    let deps = dir.join("deps");
+    // The recorded name — the consumer's record first, then the library's
+    // own when nothing linked it — names `deps/<stem>.d` exactly.
+    let recorded = needed
+        .iter()
+        .find(|needed_name| needed_library_matches(needed_name, name))
+        .cloned()
+        .or_else(|| recorded_library_name(artifact_file));
+    if let Some(dep_info) = recorded
+        .and_then(|recorded_name| recorded_dep_info(&deps, &recorded_name))
+        .filter(|candidate| candidate.is_file())
+    {
+        return Some(dep_info);
+    }
     let mut candidates = vec![
         dir.join(format!("{file_stem}.d")),
-        dir.join("deps").join(format!("{name}.d")),
+        deps.join(format!("{name}.d")),
     ];
     candidates.extend(
         sibling_files
@@ -2378,6 +2735,79 @@ fn dep_info_path(
     );
     candidates.push(dir.join(format!("{name}.d")));
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+/// `deps/<stem>.d` for a recorded library name — `DT_NEEDED`, PE import,
+/// `LC_LOAD_DYLIB`, `DT_SONAME` or `LC_ID_DYLIB` — whose `lib` prefix and
+/// shared-library suffix the dep-info's stem drops.
+fn recorded_dep_info(deps_dir: &Path, recorded_name: &str) -> Option<PathBuf> {
+    let stem = Path::new(needed_file_name(recorded_name))
+        .file_stem()?
+        .to_str()?;
+    let stem = stem.strip_prefix("lib").unwrap_or(stem);
+    Some(deps_dir.join(format!("{stem}.d")))
+}
+
+/// The name a dynamic library records for itself — `DT_SONAME` on ELF,
+/// `LC_ID_DYLIB` on Mach-O — the same string a consumer's records then
+/// carry. A PE image records no self-name, and a file that is not a dynamic
+/// library records none either.
+fn recorded_library_name(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    match object::FileKind::parse(&*data).ok()? {
+        object::FileKind::Elf32 => {
+            elf_recorded_name::<object::elf::FileHeader32<object::Endianness>>(&data)
+        }
+        object::FileKind::Elf64 => {
+            elf_recorded_name::<object::elf::FileHeader64<object::Endianness>>(&data)
+        }
+        object::FileKind::MachO32 => {
+            macho_recorded_name::<object::macho::MachHeader32<object::Endianness>>(&data)
+        }
+        object::FileKind::MachO64 => {
+            macho_recorded_name::<object::macho::MachHeader64<object::Endianness>>(&data)
+        }
+        _ => None,
+    }
+}
+
+/// The `DT_SONAME` an ELF image's dynamic section records for itself.
+fn elf_recorded_name<Elf>(data: &[u8]) -> Option<String>
+where
+    Elf: object::read::elf::FileHeader<Endian = object::Endianness>,
+{
+    use object::read::elf::{Dyn as _, ElfFile};
+
+    let file = ElfFile::<Elf>::parse(data).ok()?;
+    let endian = file.endian();
+    let sections = file.elf_section_table();
+    let (dyns, strings_index) = sections.dynamic(endian, data).ok()??;
+    let strings = sections.strings(endian, data, strings_index).ok()?;
+    dyns.iter()
+        .find(|d| d.tag32(endian) == Some(object::elf::DT_SONAME))
+        .and_then(|d| d.string(endian, strings).ok())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+}
+
+/// The `LC_ID_DYLIB` install name a Mach-O image records for itself.
+fn macho_recorded_name<Mach>(data: &[u8]) -> Option<String>
+where
+    Mach: object::read::macho::MachHeader,
+{
+    use object::read::macho::LoadCommandVariant;
+
+    let file = object::read::macho::MachOFile::<Mach>::parse(data).ok()?;
+    let endian = file.endian();
+    let mut commands = file.macho_load_commands().ok()?;
+    while let Ok(Some(command)) = commands.next() {
+        if let Ok(LoadCommandVariant::IdDylib(dylib)) = command.variant() {
+            return command
+                .string(endian, dylib.dylib.name)
+                .ok()
+                .map(|name| String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    None
 }
 
 /// The prerequisite paths a dep-info `.d` lists.
@@ -3327,7 +3757,8 @@ mod tests {
 
             // A `fresh` unit whose dep-info names another source's checkout.
             write_dep_info(&foreign_source);
-            let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
+            let needed = vec!["libwaterui_dylib.so".to_string()];
+            let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes(), &needed)
                 .await
                 .expect("scan");
             assert_eq!(
@@ -3343,17 +3774,231 @@ mod tests {
 
             // The same file written by this unit's own source is trusted.
             write_dep_info(&own_source);
-            let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes())
+            let stale = super::stale_shared_dylib_packages(artifact(true).as_bytes(), &needed)
                 .await
                 .expect("scan");
             assert!(stale.is_empty(), "our own artifact is never stale");
 
             // A unit cargo just emitted needs no dep-info check at all.
             write_dep_info(&foreign_source);
-            let stale = super::stale_shared_dylib_packages(artifact(false).as_bytes())
+            let stale = super::stale_shared_dylib_packages(artifact(false).as_bytes(), &needed)
                 .await
                 .expect("scan");
             assert!(stale.is_empty(), "a non-fresh unit wrote the file itself");
+        });
+    }
+
+    /// A git- or registry-sourced `dylib` dependency hashes its metadata into
+    /// every `deps/` name: rustc writes `deps/lib<crate>-<metadata>.so` and
+    /// `deps/<crate>-<metadata>.d`, and the report names the unhashed uplift
+    /// `<profile>/lib<crate>.so`. The name the consumer's records carry — the
+    /// needed name the artifact's dynamic section reports — spells
+    /// `deps/<crate>-<metadata>.d` exactly; missing it flags `MissingDepInfo`
+    /// on every build, and the clean-and-rebuild remedy loops forever
+    /// (water-rs/cli#184).
+    #[test]
+    fn stale_check_finds_the_hashed_dep_info_the_needed_name_records() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let profile = temporary.path().join("debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir_all(&deps).expect("deps dir");
+            // The layout a git-sourced `dylib`+`rlib` unit leaves (measured,
+            // cargo 1.98): the reported files are the unhashed uplift and the
+            // hashed rlib; the hashed dylib itself is never reported.
+            let dylib = profile.join("libwaterui_dylib.so");
+            std::fs::write(&dylib, []).expect("dylib");
+            let rlib = deps.join("libwaterui_dylib-0123456789abcdef.rlib");
+            std::fs::write(&rlib, []).expect("rlib");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+            let own_source = ours.join("src/lib.rs");
+            std::fs::write(&own_source, "").expect("own source");
+            let dep_info = deps.join("waterui_dylib-0123456789abcdef.d");
+            std::fs::write(
+                &dep_info,
+                format!("{}: {}\n", dylib.display(), own_source.display()),
+            )
+            .expect("dep-info");
+
+            let stdout = serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "registry+https://x#waterui-dylib@0.1.0",
+                "manifest_path": manifest,
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["dylib", "rlib"],
+                    "name": "waterui_dylib",
+                    "src_path": own_source,
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true,
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 0,
+                    "debug_assertions": true,
+                    "overflow_checks": true,
+                    "test": false,
+                },
+                "features": [],
+                "filenames": [dylib, rlib],
+                "executable": null,
+                "fresh": true,
+            })
+            .to_string();
+
+            let needed = vec!["libwaterui_dylib-0123456789abcdef.so".to_string()];
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes(), &needed)
+                .await
+                .expect("scan");
+            assert!(
+                stale.is_empty(),
+                "a fresh dylib whose hashed dep-info names its own sources is trusted: {stale:?}"
+            );
+        });
+    }
+
+    /// The hashed dep-info a `dylib`-only unit leaves — the report names
+    /// only the unhashed uplift, no hashed sibling at all — is found through
+    /// the needed name the consumer records, whether Cargo's uplift aliased
+    /// the `deps/` output as a hardlink or, on filesystems without links, a
+    /// copy.
+    #[test]
+    fn stale_check_finds_dep_info_when_the_uplift_is_a_hardlink() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let profile = temporary.path().join("debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir_all(&deps).expect("deps dir");
+            // rustc's own output is `deps/lib<crate>-<metadata>.so`; cargo's
+            // uplift is the same inode under the unhashed name.
+            let deps_dylib = deps.join("libwaterui_dylib-0123456789abcdef.so");
+            std::fs::write(&deps_dylib, []).expect("deps dylib");
+            let dylib = profile.join("libwaterui_dylib.so");
+            std::fs::hard_link(&deps_dylib, &dylib).expect("uplift hardlink");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+            let own_source = ours.join("src/lib.rs");
+            std::fs::write(&own_source, "").expect("own source");
+            std::fs::write(
+                deps.join("waterui_dylib-0123456789abcdef.d"),
+                format!("{}: {}\n", deps_dylib.display(), own_source.display()),
+            )
+            .expect("dep-info");
+
+            let stdout = serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "registry+https://x#waterui-dylib@0.1.0",
+                "manifest_path": manifest,
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["dylib"],
+                    "name": "waterui_dylib",
+                    "src_path": own_source,
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true,
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 0,
+                    "debug_assertions": true,
+                    "overflow_checks": true,
+                    "test": false,
+                },
+                "features": [],
+                "filenames": [dylib],
+                "executable": null,
+                "fresh": true,
+            })
+            .to_string();
+
+            let needed = vec!["libwaterui_dylib-0123456789abcdef.so".to_string()];
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes(), &needed)
+                .await
+                .expect("scan");
+            assert!(
+                stale.is_empty(),
+                "the needed name spells the hashed dep-info a hardlinked uplift leaves: {stale:?}"
+            );
+        });
+    }
+
+    /// Cargo's uplift falls back to copying where a hardlink is impossible;
+    /// the needed name still spells `deps/<crate>-<metadata>.d` — the lookup
+    /// never touched the uplift's link status.
+    #[test]
+    fn stale_check_finds_dep_info_when_the_uplift_is_a_copy() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let profile = temporary.path().join("debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir_all(&deps).expect("deps dir");
+            // rustc's own output is `deps/lib<crate>-<metadata>.so`; where
+            // links are unavailable cargo's uplift copies it under the
+            // unhashed name — a different inode sharing only the bytes.
+            let deps_dylib = deps.join("libwaterui_dylib-0123456789abcdef.so");
+            std::fs::write(&deps_dylib, []).expect("deps dylib");
+            let dylib = profile.join("libwaterui_dylib.so");
+            std::fs::copy(&deps_dylib, &dylib).expect("uplift copy");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+            let own_source = ours.join("src/lib.rs");
+            std::fs::write(&own_source, "").expect("own source");
+            std::fs::write(
+                deps.join("waterui_dylib-0123456789abcdef.d"),
+                format!("{}: {}\n", deps_dylib.display(), own_source.display()),
+            )
+            .expect("dep-info");
+
+            let stdout = serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "registry+https://x#waterui-dylib@0.1.0",
+                "manifest_path": manifest,
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["dylib"],
+                    "name": "waterui_dylib",
+                    "src_path": own_source,
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true,
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 0,
+                    "debug_assertions": true,
+                    "overflow_checks": true,
+                    "test": false,
+                },
+                "features": [],
+                "filenames": [dylib],
+                "executable": null,
+                "fresh": true,
+            })
+            .to_string();
+
+            let needed = vec!["libwaterui_dylib-0123456789abcdef.so".to_string()];
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes(), &needed)
+                .await
+                .expect("scan");
+            assert!(
+                stale.is_empty(),
+                "the needed name spells the hashed dep-info a copied uplift leaves: {stale:?}"
+            );
         });
     }
 
@@ -3425,7 +4070,10 @@ mod tests {
                 unit("thiserror-impl", "proc-macro", vec![&macro_dylib]),
                 unit("waterui-dylib", "dylib", vec![&dylib, &rmeta]),
             );
-            let stale = super::stale_shared_dylib_packages(stdout.as_bytes())
+            // No linked artifact records the unit here — a static archive
+            // carries no dynamic section — so the unhashed unit-directory
+            // spelling is the record found.
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes(), &[])
                 .await
                 .expect("scan");
             assert_eq!(stale.len(), 1, "{stale:?}");
@@ -3492,7 +4140,7 @@ mod tests {
             })
             .to_string();
 
-            let stale = super::stale_shared_dylib_packages(stdout.as_bytes())
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes(), &[])
                 .await
                 .expect("a fresh dylib without dep-info is recovered, not reported");
             assert_eq!(
