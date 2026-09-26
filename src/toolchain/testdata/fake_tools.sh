@@ -366,6 +366,13 @@ emulator)
     esac
     ;;
 java | javac)
+    case "$*" in
+        -version | --version)
+            # Real java prints `openjdk version "X"` on stderr; the check
+            # reads combined output, so stdout works the same.
+            printf 'openjdk version "%s" 2026-01-01\n' "${WATERUI_FAKE_JAVA_VERSION:-99.0.0}"
+            ;;
+    esac
     exit 0
     ;;
 kotlinc)

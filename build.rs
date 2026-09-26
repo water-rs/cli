@@ -33,14 +33,14 @@ fn main() {
     let manifest = manifest_value(&manifest_path);
     let scaffold_metadata = &manifest["package"]["metadata"]["waterui-scaffold"];
 
-    // `android-kotlin-version` is the table's only legitimate key. A
-    // framework-owned key landing here would shadow the framework manifest's
-    // value for every reader that does not know the difference, so the build
-    // stops with the place it belongs instead.
+    // `android-kotlin-version` and `android-jdk-version` are the table's only
+    // legitimate keys. A framework-owned key landing here would shadow the
+    // framework manifest's value for every reader that does not know the
+    // difference, so the build stops with the place it belongs instead.
     if let Some(table) = scaffold_metadata.as_table() {
         for key in table.keys() {
             assert!(
-                key == "android-kotlin-version",
+                key == "android-kotlin-version" || key == "android-jdk-version",
                 "Cargo.toml [package.metadata.waterui-scaffold].{key} is \
                  framework-owned: declare it in the water-rs/waterui root \
                  manifest's [package.metadata.waterui] table instead"
@@ -49,6 +49,8 @@ fn main() {
     }
     let kotlin_version = manifest_scaffold_string(scaffold_metadata, "android-kotlin-version");
     println!("cargo:rustc-env=WATERUI_CLI_ANDROID_KOTLIN_VERSION={kotlin_version}");
+    let jdk_version = manifest_scaffold_string(scaffold_metadata, "android-jdk-version");
+    println!("cargo:rustc-env=WATERUI_CLI_ANDROID_JDK_VERSION={jdk_version}");
 
     println!(
         "cargo:rustc-env=WATERUI_FRAMEWORK_REPOSITORY={}",
