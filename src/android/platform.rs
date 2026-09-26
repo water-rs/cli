@@ -21,9 +21,7 @@ use crate::{
         toolchain::{AndroidNdk, AndroidSdk, Java, Kotlin, java_proxy_properties_from_env},
     },
     assets::{self, ResolvedFont},
-    build::{
-        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
-    },
+    build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     platform::{PackageOptions, TargetPlatform},
     project::Project,
@@ -481,12 +479,16 @@ impl AndroidPlatform {
     /// This is used when building for multiple architectures. The ABIs parameter
     /// controls which native libraries are included in the final APK.
     ///
+    /// `built` is the build's target result — its `app_symbols()` carry the
+    /// `waterui_meta_bundle_*` statics that declare the asset mounts.
+    ///
     /// # Errors
     /// Returns an error if Gradle build fails.
     pub async fn package_with_abis(
         project: &Project,
         options: PackageOptions,
         abis: &[AndroidAbi],
+        built: &BuiltTarget,
     ) -> eyre::Result<Artifact> {
         let backend_path = project.backend_path::<AndroidBackend>();
 
@@ -494,9 +496,8 @@ impl AndroidPlatform {
         copy_assets_and_fonts(
             project,
             &backend_path,
-            None,
+            &built.app_symbols()?,
             options.uses_dev_server(),
-            options.progress(),
         )
         .await?;
 
@@ -1065,24 +1066,20 @@ pub const fn is_android_platform(platform: TargetPlatform) -> bool {
 // ============================================================================
 
 /// Copy project assets and dependency fonts to the Android assets directory.
+/// `symbols` is the app library artifact the target build produced, whose
+/// `waterui_meta_bundle_*` statics declare the asset mounts.
 async fn copy_assets_and_fonts(
     project: &Project,
     backend_path: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     let assets_dir = backend_path.join("app/src/main/assets");
 
     // Stage project assets using platform-native conventions.
-    let manifest = assets::stage_project_assets_for_android(
-        project,
-        backend_path,
-        sccache_path,
-        dev_server,
-        progress,
-    )
-    .await?;
+    let manifest =
+        assets::stage_project_assets_for_android(project, backend_path, symbols, dev_server)
+            .await?;
 
     // Scan and resolve dependency fonts
     let font_declarations =

@@ -190,10 +190,10 @@ impl Backend for AndroidBackend {
         project: &Project,
         platform: TargetPlatform,
         options: PackageOptions,
-        _built: &crate::build::BuiltTarget,
+        built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
         debug_assert_eq!(platform, TargetPlatform::Android);
-        AndroidPlatform::package_with_abis(project, options, &[AndroidAbi::Arm64V8a]).await
+        AndroidPlatform::package_with_abis(project, options, &[AndroidAbi::Arm64V8a], built).await
     }
 
     async fn clean(&self, project: &Project, _platform: TargetPlatform) -> eyre::Result<()> {

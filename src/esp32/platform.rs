@@ -311,6 +311,10 @@ pub async fn build_esp32(project: &Project, options: BuildOptions) -> eyre::Resu
         profile_dir: profile_dir.to_path_buf(),
         artifact,
         shared_runtime: None,
+        app_library: crate::build::app_library_artifact(
+            &output.stdout,
+            &project.root().join("Cargo.toml"),
+        )?,
     })
 }
 

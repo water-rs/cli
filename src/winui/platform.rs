@@ -13,9 +13,7 @@ use tracing::info;
 
 use crate::{
     assets,
-    build::{
-        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
-    },
+    build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     platform::{PackageOptions, TargetPlatform},
     project::Project,
@@ -49,14 +47,14 @@ pub async fn build_winui(project: &Project, options: BuildOptions) -> eyre::Resu
         );
     }
 
-    // Stage assets and the Windows icon resource before the backend is built.
-    // The generated `build.rs` expects `app-icon.ico` to exist when targeting Windows.
-    copy_assets_and_fonts(
-        project,
-        &backend_path,
-        options.sccache_path(),
-        options.uses_dev_server(),
-        options.progress(),
+    // The generated `build.rs` embeds `app-icon.ico` into the executable's
+    // resources when targeting Windows, so it has to exist before the
+    // backend compiles. Assets and fonts stage after the build instead: the
+    // mount metadata they need is read from the library artifact this build
+    // produces.
+    fs::write(
+        backend_path.join("app-icon.ico"),
+        assets::project_windows_ico(project)?,
     )
     .await?;
 
@@ -82,6 +80,14 @@ pub async fn build_winui(project: &Project, options: BuildOptions) -> eyre::Resu
         )
         .await
         .map_err(|error| eyre::eyre!("Failed to build WinUI backend with cargo: {error}"))?;
+
+    copy_assets_and_fonts(
+        project,
+        &backend_path,
+        &built_target.app_symbols()?,
+        options.uses_dev_server(),
+    )
+    .await?;
     Ok(built_target)
 }
 
@@ -146,9 +152,8 @@ pub async fn package_winui(
     copy_assets_and_fonts(
         project,
         &backend_path,
-        None,
+        &built.app_symbols()?,
         options.uses_dev_server(),
-        options.progress(),
     )
     .await?;
 
@@ -242,33 +247,22 @@ async fn copy_dir(source: &Path, destination: &Path) -> eyre::Result<()> {
 /// For `WinUI`, assets and fonts are placed alongside the binary in a `resources/`
 /// directory. The binary locates them through the runtime's executable-relative
 /// bundle lookup at startup.
+/// Stage the project's assets and fonts under the backend's `resources`
+/// directory. Runs after the backend build: `symbols` is the app library
+/// artifact it produced, whose `waterui_meta_bundle_*` statics declare the
+/// asset mounts.
 async fn copy_assets_and_fonts(
     project: &Project,
     backend_path: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     let resources_dir = backend_path.join("resources");
     fs::create_dir_all(&resources_dir).await?;
 
     // Stage project assets using platform-native conventions.
-    let manifest = assets::stage_project_assets_for_gtk(
-        project,
-        &resources_dir,
-        sccache_path,
-        dev_server,
-        progress,
-    )
-    .await?;
-
-    // The generated crate's build script embeds this into the executable's
-    // resources when targeting Windows.
-    fs::write(
-        backend_path.join("app-icon.ico"),
-        assets::project_windows_ico(project)?,
-    )
-    .await?;
+    let manifest =
+        assets::stage_project_assets_for_gtk(project, &resources_dir, symbols, dev_server).await?;
 
     // Scan and resolve dependency fonts
     let font_declarations = assets::scan_fonts(project, &backend_path.join("Cargo.toml")).await?;

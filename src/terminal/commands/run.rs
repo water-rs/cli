@@ -963,7 +963,7 @@ async fn build_and_run(
     // from the compiled metadata) and before packaging, so the packaged app
     // stages no web output.
     let dev_server = if config.dev_server {
-        start_web_dev_server(shell, project, config.sccache_path.as_deref(), physical_ios).await?
+        start_web_dev_server(shell, project, &built, physical_ios).await?
     } else {
         None
     };
@@ -997,15 +997,16 @@ async fn build_and_run(
 }
 
 /// Spawn the declared frontend's dev server for a debug run, when the
-/// compiled library mounts one with `include_web!`.
+/// compiled library mounts one with `include_web!`. `built` is the build the
+/// run just produced — its app library's `waterui_meta_bundle_*` statics
+/// declare the mount.
 async fn start_web_dev_server(
     shell: &Shell,
     project: &Project,
-    sccache_path: Option<&std::path::Path>,
+    built: &waterui_cli::build::BuiltTarget,
     expose_on_lan: bool,
 ) -> Result<Option<web::WebDevServer>> {
-    let Some(meta) = web::web_mount(project, sccache_path, Some(&shell.build_progress())).await?
-    else {
+    let Some(meta) = web::web_mount(&built.app_symbols()?)? else {
         return Ok(None);
     };
     let root = meta
@@ -1187,7 +1188,7 @@ async fn package_for_backend(
             let abi = plan
                 .android_abi
                 .ok_or_else(|| eyre::eyre!("Internal error: missing Android ABI for packaging"))?;
-            AndroidPlatform::package_with_abis(project, package_options, &[abi]).await
+            AndroidPlatform::package_with_abis(project, package_options, &[abi], built).await
         }
         TargetBackend::Gtk4 => package_gtk4(project, package_options, built).await,
         TargetBackend::Hydrolysis => {

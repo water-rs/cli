@@ -171,18 +171,6 @@ pub async fn shared_target_dir() -> eyre::Result<PathBuf> {
     ensure_shared_target_dir_in(&cache_root).await
 }
 
-/// Return the shared target directory host-side rlib builds use.
-///
-/// `build_host_rlib` compiles the project's library for the host to read its
-/// `waterui_meta_*` symbols; the dependency graph it compiles is the same for
-/// every project on the machine, so it shares the per-user target root.
-///
-/// # Errors
-/// Returns an error if the shared build-cache directory cannot be resolved.
-pub async fn shared_host_target_dir() -> eyre::Result<PathBuf> {
-    Ok(shared_target_dir().await?.join("host"))
-}
-
 /// The path of the shared Cargo target directory, without creating it or
 /// touching its metadata — for messages that name it.
 ///

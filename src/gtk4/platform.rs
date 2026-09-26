@@ -12,9 +12,7 @@ use tracing::info;
 
 use crate::{
     assets, browser_runtime,
-    build::{
-        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
-    },
+    build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     gtk4::backend::Gtk4Backend,
     platform::{PackageOptions, TargetPlatform},
@@ -136,9 +134,8 @@ pub async fn package_gtk4(
     copy_assets_and_fonts(
         project,
         &backend_path,
-        None,
+        &built.app_symbols()?,
         options.uses_dev_server(),
-        options.progress(),
     )
     .await?;
 
@@ -217,25 +214,21 @@ fn ensure_linux_host() -> eyre::Result<()> {
 ///
 /// For GTK4, assets and fonts are placed alongside the binary in a `resources/`
 /// directory. The binary should load fonts via fontconfig or Pango at runtime.
+/// Stage the project's assets and fonts under the backend's `resources`
+/// directory. `symbols` is the app library artifact the target build
+/// produced, whose `waterui_meta_bundle_*` statics declare the asset mounts.
 async fn copy_assets_and_fonts(
     project: &Project,
     backend_path: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     let resources_dir = backend_path.join("resources");
     fs::create_dir_all(&resources_dir).await?;
 
     // Stage project assets using platform-native conventions.
-    let manifest = assets::stage_project_assets_for_gtk(
-        project,
-        &resources_dir,
-        sccache_path,
-        dev_server,
-        progress,
-    )
-    .await?;
+    let manifest =
+        assets::stage_project_assets_for_gtk(project, &resources_dir, symbols, dev_server).await?;
     assets::stage_hicolor_icons(project, &resources_dir.join("icons")).await?;
 
     // Scan and resolve dependency fonts

@@ -29,7 +29,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+      # `artifact_symbols` tests build a wasm rlib fixture: the web backend's
+      # metadata is read from a wasm32 artifact.
       - uses: ./.github/actions/setup-rust
+        with:
+          targets: wasm32-unknown-unknown
       - uses: ./.github/actions/setup-linux-deps
         if: runner.os == 'Linux'
       - uses: taiki-e/install-action@nextest

@@ -20,8 +20,7 @@ use super::icon::{
     IconSource, LINUX_HICOLOR_SIZES, WINDOW_ICON_SIZE, encode_png, render_android_foreground,
     render_apple_icon,
 };
-use crate::artifact_symbols::{ArtifactSymbols, build_host_rlib};
-use crate::build::BuildProgress;
+use crate::artifact_symbols::ArtifactSymbols;
 use crate::project::Project;
 
 const ASSET_ROOT_DIR: &str = "waterui_assets";
@@ -43,14 +42,17 @@ const ANDROID_MIPMAP_DIRS: &[(&str, u32)] = &[
     ("mipmap-xxxhdpi", 192),
 ];
 
+/// Stage the project's assets for an Apple bundle. `symbols` comes from the
+/// library artifact the target build already produced
+/// (`crate::build::BuiltTarget::app_symbols`): the `waterui_meta_bundle_*`
+/// statics it carries declare the `include_bundle!`/`include_web!` mounts.
 pub async fn stage_for_apple(
     project: &Project,
     dest_dir: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    let manifest = build_manifest(project, sccache_path, dev_server, progress).await?;
+    let manifest = build_manifest(project, symbols, dev_server).await?;
     let assets_dest = dest_dir.join(ASSET_ROOT_DIR);
     reset_dir(&assets_dest).await?;
     copy_manifest_assets(&manifest, &assets_dest).await?;
@@ -184,14 +186,16 @@ fn load_project_icon(manifest: &BundleManifest) -> eyre::Result<IconSource> {
     )
 }
 
+/// Stage the project's assets under the Android backend's `res`/`assets`
+/// tree. `symbols` is the target build's app library — see
+/// [`stage_for_apple`].
 pub async fn stage_for_android(
     project: &Project,
     backend_path: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    let manifest = build_manifest(project, sccache_path, dev_server, progress).await?;
+    let manifest = build_manifest(project, symbols, dev_server).await?;
     let assets_dest = backend_path
         .join("app/src/main/assets")
         .join(ASSET_ROOT_DIR);
@@ -248,14 +252,15 @@ pub fn windows_ico(project: &Project) -> eyre::Result<Vec<u8>> {
     super::icon::encode_windows_ico(&icon)
 }
 
+/// Stage the project's assets under a GTK-style resources directory.
+/// `symbols` is the target build's app library — see [`stage_for_apple`].
 pub async fn stage_for_gtk(
     project: &Project,
     resources_dir: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    let manifest = build_manifest(project, sccache_path, dev_server, progress).await?;
+    let manifest = build_manifest(project, symbols, dev_server).await?;
     let assets_dest = resources_dir.join(ASSET_ROOT_DIR);
     reset_dir(&assets_dest).await?;
     copy_manifest_assets(&manifest, &assets_dest).await?;
@@ -331,23 +336,16 @@ fn plan_main_assets(project: &Project) -> eyre::Result<Vec<PlannedAsset>> {
 
 /// Plans the full manifest: the main asset root plus every `include_bundle!`
 /// mount enumerated from the compiled library's `waterui_meta_bundle_*`
-/// statics.
+/// statics. `symbols` is the library artifact the target build produced for
+/// the project crate — planning runs after the build, so nothing here spawns
+/// a compile of its own.
 async fn build_manifest(
     project: &Project,
-    sccache_path: Option<&Path>,
+    symbols: &ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
     let mut assets = plan_main_assets(project)?;
 
-    let rlib = build_host_rlib(
-        project.root(),
-        &project.host_target_dir().await?,
-        sccache_path,
-        progress,
-    )
-    .await?;
-    let symbols = ArtifactSymbols::read(&rlib)?;
     // The declared frontend toolchain is a manifest concern: `[web]` absent
     // means bun, and the declared manager is never substituted.
     let package_manager = project

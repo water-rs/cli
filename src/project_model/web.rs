@@ -15,9 +15,7 @@ use serde::{Deserialize, Serialize};
 use smol::process::Command;
 use waterui_assets_planner::{BUNDLE_META_PREFIX, BundleMountMeta};
 
-use crate::artifact_symbols::{ArtifactSymbols, build_host_rlib};
-use crate::build::BuildProgress;
-use crate::project::Project;
+use crate::artifact_symbols::ArtifactSymbols;
 use crate::project_model::templates::embedded;
 
 /// The JavaScript package manager a project declares in
@@ -126,27 +124,15 @@ pub struct WebConfig {
 
 /// The `include_web!` mount declared by the project's compiled library.
 ///
-/// Read from the `waterui_meta_bundle_*` statics in the host rlib, which is
-/// ground truth for what the application actually declared.
+/// Read from the `waterui_meta_bundle_*` statics in `symbols` — the library
+/// artifact the target build already produced — which is ground truth for
+/// what the application actually declared.
 ///
 /// # Errors
 ///
-/// Returns an error when the host build fails, the rlib cannot be read, or a
-/// declared mount's payload does not decode.
-pub async fn web_mount(
-    project: &Project,
-    sccache_path: Option<&Path>,
-    progress: Option<&BuildProgress>,
-) -> eyre::Result<Option<BundleMountMeta>> {
-    let rlib = build_host_rlib(
-        project.root(),
-        &project.host_target_dir().await?,
-        sccache_path,
-        progress,
-    )
-    .await?;
-    let symbols = ArtifactSymbols::read(&rlib)?;
-    decode_web_mount(&symbols)
+/// Returns an error when a declared mount's payload does not decode.
+pub fn web_mount(symbols: &ArtifactSymbols) -> eyre::Result<Option<BundleMountMeta>> {
+    decode_web_mount(symbols)
 }
 
 /// Decode the `web` mount — the single mount a `project` field marks as a

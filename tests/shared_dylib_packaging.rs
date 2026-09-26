@@ -427,6 +427,7 @@ fn packaged_binary_finds_every_shared_library_it_records() {
             profile_dir: profile_dir.clone(),
             artifact: executable.clone(),
             shared_runtime: Some(shared_runtime),
+            app_library: None,
         };
         let project = Project::open(&app_dir, ManagedBackends::NONE)
             .await

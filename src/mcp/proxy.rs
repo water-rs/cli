@@ -294,13 +294,6 @@ async fn build_and_drive(
 async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)> {
     let platform = host_platform();
     let project = ensure_hydrolysis_backend_ready(&config.project_path).await?;
-    stage_hydrolysis_resources(
-        &project,
-        HydrolysisPreviewTheme::Material3,
-        config.sccache_path.as_deref(),
-        None,
-    )
-    .await?;
 
     let mut build_options = BuildOptions::development(BuildProfile::Debug);
     if let Some(sccache_path) = &config.sccache_path {
@@ -312,6 +305,12 @@ async fn build_and_spawn(config: &ChildConfig) -> Result<(ChildTransport, Child)
         build_options,
         &[],
         &[HYDROLYSIS_MCP_FEATURE],
+    )
+    .await?;
+    stage_hydrolysis_resources(
+        &project,
+        HydrolysisPreviewTheme::Material3,
+        &built.app_symbols()?,
     )
     .await?;
     stage_hydrolysis_shared_runtime(&project, &built, platform).await?;
