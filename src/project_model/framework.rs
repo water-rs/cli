@@ -697,16 +697,6 @@ impl ResolvedFramework {
         };
         let locked = self.cargo_lock(contents)?;
         let allowed = self.allowed_packages(&locked.packages);
-        // The names the framework contract knows: `Water.lock`'s packages and
-        // the scaffold's extracted crates. Anything else — an extracted
-        // crate's private dependencies, which can never enter `Water.lock` —
-        // is foreign to the check.
-        let ecosystem: BTreeSet<&str> = locked
-            .packages
-            .iter()
-            .map(|package| package.name.as_str())
-            .chain(self.packages.keys().map(String::as_str))
-            .collect();
         let packages: BTreeMap<_, _> = metadata
             .packages
             .iter()
@@ -750,9 +740,18 @@ impl ResolvedFramework {
                 version: package.version.to_string(),
                 source: package.source.as_ref().map(|source| source.repr.clone()),
             };
-            if !allowed.contains(&identity)
-                && ecosystem.contains(identity.name.as_str())
-                && !self.sanctioned_source(&identity)
+            // A conflict is a resolved package that took a locked package's
+            // place — the same predicate the generated build applies below —
+            // not a package the resolution merely added beside it (#203). An
+            // extracted crate carries no `Water.lock` entry the predicate
+            // could see, so it stays held to its declared pin directly.
+            if package.source.is_some()
+                && (replaces_locked_package(
+                    &allowed,
+                    &package.name,
+                    &package.version,
+                    package.source.as_ref().map(|source| source.repr.as_str()),
+                ) || self.unsanctioned_extracted(&identity))
             {
                 conflicts.push(identity);
             }
@@ -829,10 +828,19 @@ impl ResolvedFramework {
         let root = directory.to_path_buf();
         let features = features.to_vec();
         let result = async {
-            let metadata = smol::unblock(move || {
-                cargo_metadata::MetadataCommand::new().current_dir(root)
-                    .features(cargo_metadata::CargoOpt::SomeFeatures(features)).exec()
-            }).await?;
+            // A previous lock resolved without the canonical pins can carry a
+            // generation the seeded locks contradict — an `accesskit_winit`
+            // wanting an `accesskit` newer than the pin the channel certifies
+            // (#203). That is the project's state, not something to resolve
+            // past: name it and say how the seed is regenerated.
+            let metadata = managed_crate_metadata(&root, &features)
+                .await
+                .map_err(|error| {
+                    eyre!(
+                        "the managed crate's lock at {} conflicts with the channel's pins and does not resolve ({error}); remove it and `Cargo.lock.seed` and build again to regenerate them from the channel's resolution",
+                        lock_path.display()
+                    )
+                })?;
             validate_resolved_cli(&metadata)?;
             if !allow_new {
                 for package in &metadata.packages {
@@ -864,6 +872,25 @@ impl ResolvedFramework {
             })?;
         }
         result
+    }
+
+    /// The channel's certified lock — `Water.lock` at the pinned revision,
+    /// parsed with the framework's own source pin — where the channel carries
+    /// one. `stable` resolves the application's own `Cargo.lock` and a local
+    /// checkout certifies nothing, so both return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `Water.lock` cannot be read or no longer matches
+    /// the pinned revision's checksum.
+    pub(crate) async fn canonical_lock(&self, project_root: &Path) -> Result<Option<Lockfile>> {
+        if self.channel() != Some(FrameworkChannel::Dev)
+            && self.channel() != Some(FrameworkChannel::Nightly)
+        {
+            return Ok(None);
+        }
+        let contents = smol::fs::read(project_root.join("Water.lock")).await?;
+        Ok(Some(self.cargo_lock(&contents)?))
     }
 
     pub(crate) fn cargo_lock(&self, contents: &[u8]) -> Result<Lockfile> {
@@ -984,6 +1011,13 @@ impl ResolvedFramework {
             allowed.insert(identity);
         }
         allowed
+    }
+
+    /// Whether `identity` names a scaffold's extracted crate resolving at
+    /// anything but its declared source. An extracted crate carries no
+    /// `Water.lock` entry, so `replaces_locked_package` cannot see the drift.
+    fn unsanctioned_extracted(&self, identity: &LockedPackage) -> bool {
+        self.packages.contains_key(identity.name.as_str()) && !self.sanctioned_source(identity)
     }
 
     /// Whether `identity` resolves a scaffold package at the source its
@@ -1196,6 +1230,23 @@ impl ResolvedFramework {
     }
 }
 
+/// Resolve a managed crate's dependency metadata for the feature selection
+/// the build was invoked with.
+async fn managed_crate_metadata(
+    root: &std::path::Path,
+    features: &[String],
+) -> std::result::Result<cargo_metadata::Metadata, cargo_metadata::Error> {
+    let root = root.to_path_buf();
+    let features = features.to_vec();
+    smol::unblock(move || {
+        cargo_metadata::MetadataCommand::new()
+            .current_dir(root)
+            .features(cargo_metadata::CargoOpt::SomeFeatures(features))
+            .exec()
+    })
+    .await
+}
+
 /// The packages the generated crate's `Cargo.lock` seed carries.
 ///
 /// The seed is one resolution, not a union of locks: a name the pinned
@@ -1210,7 +1261,7 @@ impl ResolvedFramework {
 /// its pin or contradicted the pair a fresh version requires. Names the
 /// canonical lock does not record are exempt — the project may carry any
 /// version of a package the framework never names.
-fn seed_packages(
+pub(crate) fn seed_packages(
     canonical: Option<&Lockfile>,
     project: &Lockfile,
     previous: Option<&Lockfile>,
@@ -2682,6 +2733,116 @@ mod tests {
     };
 
     use super::*;
+
+    /// The persisted framework selection, the certified `Water.lock`, and the
+    /// generated hydrolysis backend's resolved `cargo metadata` graph, all
+    /// captured from a real `water create`/`water build` on the recorded `dev`
+    /// revision (#203). The captures under `tests/fixtures/dev_channel/` are
+    /// trimmed to the subgraph the predicates exercise by
+    /// `tests/fixtures/dev_channel/slim.py` — record a fresh `water create` +
+    /// `water build` into a scratch directory and run
+    /// `python3 slim.py --capture <dir> --out tests/fixtures/dev_channel`
+    /// when `dev` moves on.
+    #[test]
+    fn a_fresh_dev_channel_project_reports_no_lock_conflicts() {
+        #[derive(Deserialize)]
+        struct Manifest {
+            framework: ResolvedFramework,
+        }
+        let manifest: Manifest =
+            toml::from_str(include_str!("../../tests/fixtures/dev_channel/Water.toml")).unwrap();
+        let metadata: cargo_metadata::Metadata = serde_json::from_str(include_str!(
+            "../../tests/fixtures/dev_channel/hydrolysis-backend.metadata.json"
+        ))
+        .unwrap();
+        manifest
+            .framework
+            .validate_dependencies(
+                &metadata,
+                include_bytes!("../../tests/fixtures/dev_channel/Water.lock"),
+            )
+            .expect("a fresh dev-channel resolution replaces no locked package");
+    }
+
+    /// `water create` seeds the generated crate's lock the way the build
+    /// does — `seed_lockfile` writes the channel's certified pins over the
+    /// project's — so the create-time resolution the scan performs can never
+    /// write a `Cargo.lock` whose `accesskit` family splits across two
+    /// incompatible generations, the seed `water build` then could not
+    /// resolve (#203). Built from the same `seed_lockfile` call the scan
+    /// makes; the resolved lock is the fixture a real create + build
+    /// recorded, trimmed by `tests/fixtures/dev_channel/slim.py` (see the
+    /// sibling test's doc comment for how to re-cut it).
+    #[test]
+    fn the_create_time_seed_resolves_one_accesskit_generation() {
+        #[derive(Deserialize)]
+        struct Manifest {
+            framework: ResolvedFramework,
+        }
+        let manifest: Manifest =
+            toml::from_str(include_str!("../../tests/fixtures/dev_channel/Water.toml")).unwrap();
+        let canonical = manifest
+            .framework
+            .cargo_lock(include_bytes!(
+                "../../tests/fixtures/dev_channel/Water.lock"
+            ))
+            .unwrap();
+        let project: Lockfile = include_str!("../../tests/fixtures/dev_channel/Cargo.lock")
+            .parse()
+            .unwrap();
+
+        smol::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let lockfile = dir.path().join("project.lock");
+            smol::fs::write(&lockfile, project.to_string())
+                .await
+                .unwrap();
+            let crate_dir = dir.path().join("backends/hydrolysis");
+            smol::fs::create_dir_all(&crate_dir).await.unwrap();
+
+            crate::templates::seed_lockfile(&crate_dir, &lockfile, Some(&canonical))
+                .await
+                .unwrap();
+            let seed: Lockfile = smol::fs::read_to_string(crate_dir.join("Cargo.lock"))
+                .await
+                .unwrap()
+                .parse()
+                .unwrap();
+            for pin in &canonical.packages {
+                assert!(
+                    seed.packages.contains(pin),
+                    "the seed must carry the certified identity of {}",
+                    pin.name
+                );
+            }
+            // `accesskit_winit` is a name the certified lock does not record:
+            // the seed leaves it for the resolution to pick compatibly.
+            assert!(
+                !seed
+                    .packages
+                    .iter()
+                    .any(|package| package.name.as_str() == "accesskit_winit")
+            );
+
+            // The resolution that seed produced: every dependency edge lands
+            // on a package the lock records — a family split across
+            // generations could not satisfy all of them.
+            let resolved: Lockfile =
+                include_str!("../../tests/fixtures/dev_channel/hydrolysis-backend.lock")
+                    .parse()
+                    .unwrap();
+            for package in &resolved.packages {
+                for dependency in &package.dependencies {
+                    assert!(
+                        resolved.packages.iter().any(|p| dependency.matches(p)),
+                        "{} names {}, which no package in the lock provides",
+                        package.name,
+                        dependency
+                    );
+                }
+            }
+        });
+    }
 
     #[test]
     fn a_second_major_beside_the_locked_one_is_an_addition_not_a_change() {

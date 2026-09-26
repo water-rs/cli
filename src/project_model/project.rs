@@ -1305,7 +1305,11 @@ impl Project {
             .lockfile_path()
             .await
             .map_err(crate::backend::FailToInitBackend::Config)?;
-        templates::seed_lockfile(&self.ffi_crate_path(), &lockfile)
+        let canonical = framework
+            .canonical_lock(&self.root)
+            .await
+            .map_err(crate::backend::FailToInitBackend::Config)?;
+        templates::seed_lockfile(&self.ffi_crate_path(), &lockfile, canonical.as_ref())
             .await
             .map_err(crate::backend::FailToInitBackend::Io)
     }

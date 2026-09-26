@@ -2716,8 +2716,12 @@ mod tests {
         std::fs::create_dir_all(&ffi_dir).expect("ffi dir");
         let managed_lock = ffi_dir.join("Cargo.lock");
         let seed = || {
-            smol::block_on(crate::templates::seed_lockfile(&ffi_dir, &project_lock))
-                .expect("seeding the managed lockfile should succeed");
+            smol::block_on(crate::templates::seed_lockfile(
+                &ffi_dir,
+                &project_lock,
+                None,
+            ))
+            .expect("seeding the managed lockfile should succeed");
         };
         let managed = || std::fs::read_to_string(&managed_lock).expect("managed Cargo.lock");
 
@@ -5088,6 +5092,12 @@ pub const LOCKFILE_SEED: &str = "Cargo.lock.seed";
 /// every version the project already pins; Cargo then only adds the entries
 /// the managed crate needs on top and prunes the ones it does not use.
 ///
+/// When `canonical` carries the channel's certified `Water.lock`, the seed is
+/// the same merge `prepare_build` writes — certified identities for every
+/// name the canonical lock records — so a managed crate resolved outside the
+/// build (the create-time and `water fetch` font scans) cannot pin a
+/// generation the channel contradicts (#203).
+///
 /// Cargo rewrites `Cargo.lock` on every resolution, so the seed cannot be
 /// compared against it. A copy of the seed is kept as [`LOCKFILE_SEED`]
 /// instead, and the crate is re-seeded only when the project's lockfile
@@ -5098,7 +5108,11 @@ pub const LOCKFILE_SEED: &str = "Cargo.lock.seed";
 /// # Errors
 ///
 /// Returns an error when the lockfiles cannot be read or written.
-pub async fn seed_lockfile(base_dir: &Path, project_lockfile: &Path) -> io::Result<()> {
+pub async fn seed_lockfile(
+    base_dir: &Path,
+    project_lockfile: &Path,
+    canonical: Option<&cargo_lock::Lockfile>,
+) -> io::Result<()> {
     let seed = match fs::read(project_lockfile).await {
         Ok(seed) => seed,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -5122,11 +5136,39 @@ pub async fn seed_lockfile(base_dir: &Path, project_lockfile: &Path) -> io::Resu
         return Ok(());
     }
 
+    let contents = match canonical {
+        // The project's pins do not name the packages only the managed crate
+        // resolves; without the channel's certified pins Cargo takes whatever
+        // the registry holds newest — an `accesskit` generation `Water.lock`
+        // contradicts (#203).
+        Some(canonical) => {
+            let project: cargo_lock::Lockfile = std::str::from_utf8(&seed)
+                .map_err(io::Error::other)?
+                .parse()
+                .map_err(io::Error::other)?;
+            let previous: Option<cargo_lock::Lockfile> = match fs::read(&managed_lockfile).await {
+                Ok(contents) => Some(
+                    std::str::from_utf8(&contents)
+                        .map_err(io::Error::other)?
+                        .parse()
+                        .map_err(io::Error::other)?,
+                ),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let mut merged = project.clone();
+            merged.packages =
+                crate::framework::seed_packages(Some(canonical), &project, previous.as_ref());
+            merged.to_string().into_bytes()
+        }
+        None => seed.clone(),
+    };
+
     tracing::debug!(
         lockfile = %project_lockfile.display(),
         "seeding the managed crate's Cargo.lock from the project lockfile"
     );
-    fs::write(&managed_lockfile, &seed).await?;
+    fs::write(&managed_lockfile, contents).await?;
     fs::write(&seed_copy, &seed).await
 }
 
