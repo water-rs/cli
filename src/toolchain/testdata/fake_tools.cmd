@@ -89,8 +89,8 @@ if /i "%tool%"=="xcrun" goto :xcrun
 if /i "%tool%"=="sdkmanager" goto :sdkmanager
 if /i "%tool%"=="adb" goto :adb
 if /i "%tool%"=="emulator" goto :emulator
-if /i "%tool%"=="java" goto :exit_ok
-if /i "%tool%"=="javac" goto :exit_ok
+if /i "%tool%"=="java" goto :java
+if /i "%tool%"=="javac" goto :java
 if /i "%tool%"=="kotlinc" goto :kotlinc
 if /i "%tool%"=="cmake" goto :simple_version
 if /i "%tool%"=="meson" goto :simple_version
@@ -115,6 +115,14 @@ if not "%tool%"=="%tool:clang=%" goto :exit_ok
 if /i "%tool%"=="ld" goto :exit_ok
 if /i "%tool%"=="ld64" goto :exit_ok
 if /i "%tool%"=="uname" goto :uname
+goto :exit_ok
+
+:java
+rem Real java prints `openjdk version "X"` on stderr; the check reads
+rem combined output, so stdout works the same.
+if not defined WATERUI_FAKE_JAVA_VERSION set "WATERUI_FAKE_JAVA_VERSION=99.0.0"
+if "%~1"=="-version" echo openjdk version "%WATERUI_FAKE_JAVA_VERSION%" 2026-01-01
+if "%~1"=="--version" echo openjdk version "%WATERUI_FAKE_JAVA_VERSION%" 2026-01-01
 goto :exit_ok
 
 :exit_ok

@@ -560,6 +560,15 @@ impl TemplateContext {
             .unwrap_or_else(|error| panic!("{error:#}"))
     }
 
+    /// The JDK major version the generated app compiles against, rendered as
+    /// `JavaVersion.VERSION_{value}` — the value `water doctor` enforces on the
+    /// installed JDK, from the same `[package.metadata.waterui-scaffold]` key.
+    #[must_use]
+    #[allow(clippy::unused_self)] // Askama calls it as a context method.
+    pub const fn android_jdk_version(&self) -> &'static str {
+        crate::build_info::ANDROID_JDK_VERSION
+    }
+
     /// Whether the Android project consumes the runtime as the remote
     /// coordinate `android_remote_backend_dependency` names rather than a
     /// local checkout: true unless `[backends.android] backend_path` names one

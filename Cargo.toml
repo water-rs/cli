@@ -12,14 +12,16 @@ description = "Cross-platform tooling for WaterUI applications"
 keywords = ["ui", "framework", "rust", "gui", "water"]
 categories = ["gui"]
 
-# The only scaffold fact the CLI itself owns: the Kotlin toolchain the managed
-# Android toolchain installs. Every framework-owned scaffold fact — extracted
+# The only scaffold facts the CLI itself owns: the Kotlin toolchain the managed
+# Android toolchain installs, and the JDK major version the generated Android
+# app's `compileOptions` pins. Every framework-owned scaffold fact — extracted
 # crate requirements and backend coordinates — lives in the root manifest's
 # `[package.metadata.waterui]` and reaches a scaffolded project through the
 # published `framework.json`; `build.rs` fails the build if another key lands
 # in this table.
 [package.metadata.waterui-scaffold]
 android-kotlin-version = "2.3.21"
+android-jdk-version = "21"
 
 [[bin]]
 name = "water"

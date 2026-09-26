@@ -662,17 +662,48 @@ fn find_sdkmanager_on_host_path(host: &Host) -> Option<PathBuf> {
     None
 }
 
-fn parse_sdkmanager_package_id(line: &str) -> Option<&str> {
+/// The package id a `sdkmanager --list` line carries, if any.
+///
+/// Two layouts exist. Classic sdkmanager draws a `|`-separated table whose
+/// first column is already the `pkg;ver` id; the Android CLI (sdkmanager
+/// 23.x) prints whitespace-aligned columns where the id is slash-separated
+/// (`platforms/android-37.2`) and the second column is its version — or
+/// `unknown` followed by `-> latest` for an installed package. Slash ids are
+/// normalized to the `pkg;ver` form `sdkmanager --install` also accepts, so
+/// the rest of the toolchain keeps one id style.
+fn parse_sdkmanager_package_id(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let (first_column, _) = trimmed.split_once('|')?;
-    let package_id = first_column.trim();
-    if package_id.is_empty() || package_id == "Path" || package_id.starts_with('-') {
-        return None;
+    if let Some((first_column, _)) = trimmed.split_once('|') {
+        let package_id = first_column.trim();
+        if package_id.is_empty() || package_id == "Path" || package_id.starts_with('-') {
+            return None;
+        }
+        return Some(package_id.to_owned());
     }
-    Some(package_id)
+    parse_android_cli_package_id(trimmed)
+}
+
+/// One `id version [-> latest] description` row of the Android CLI's
+/// whitespace table. `id` is `/`-separated segments of `[A-Za-z0-9._+-]` and
+/// `version` starts with a digit or reads `unknown` — that pair rule keeps
+/// section headers (`Installed packages:`) and progress lines out.
+fn parse_android_cli_package_id(line: &str) -> Option<String> {
+    let mut columns = line.split_whitespace();
+    let package_id = columns.next()?;
+    let version = columns.next()?;
+    let is_id = package_id
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && package_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+'));
+    let is_version =
+        version == "unknown" || version.chars().next().is_some_and(|c| c.is_ascii_digit());
+    (is_id && is_version).then(|| package_id.replace('/', ";"))
 }
 
 /// The `(major, minor)` API-level pair of an Android platform identifier.
@@ -724,24 +755,32 @@ fn compare_version_segments(left: &[u64], right: &[u64]) -> Ordering {
     Ordering::Equal
 }
 
+/// Split a `pkg;ver` id into its numeric base and any `-rc`/`-beta` suffix.
+fn sdk_package_version_parts(id: &str) -> (&str, &str) {
+    let version = id.split_once(';').map_or("", |(_, version)| version);
+    match version.split_once('-') {
+        Some((base, suffix)) => (base, suffix),
+        None => (version, ""),
+    }
+}
+
 fn compare_sdk_package_ids(left: &str, right: &str) -> Ordering {
-    let left_version = left
-        .split_once(';')
-        .map_or("", |(_, version)| version)
+    // A `-rc`/`-beta` suffix on the version does not count toward the numeric
+    // comparison but ranks below the bare release of the same version.
+    let (left_base, left_suffix) = sdk_package_version_parts(left);
+    let (right_base, right_suffix) = sdk_package_version_parts(right);
+    let left_version = left_base
         .split('.')
         .map(parse_numeric_prefix)
         .collect::<Vec<_>>();
-    let right_version = right
-        .split_once(';')
-        .map_or("", |(_, version)| version)
+    let right_version = right_base
         .split('.')
         .map(parse_numeric_prefix)
         .collect::<Vec<_>>();
 
-    match compare_version_segments(&left_version, &right_version) {
-        Ordering::Equal => left.cmp(right),
-        ordering => ordering,
-    }
+    compare_version_segments(&left_version, &right_version)
+        .then_with(|| left_suffix.is_empty().cmp(&right_suffix.is_empty()))
+        .then_with(|| left.cmp(right))
 }
 
 fn find_d8_jar_in_sdk(sdk_root: &Path) -> Option<PathBuf> {
@@ -1025,7 +1064,6 @@ async fn list_sdk_package_ids(host: &Host) -> Result<Vec<String>, AndroidToolcha
     Ok(stdout
         .lines()
         .filter_map(parse_sdkmanager_package_id)
-        .map(ToOwned::to_owned)
         .collect::<Vec<_>>())
 }
 
@@ -1866,6 +1904,110 @@ mod tests {
     }
 
     #[test]
+    fn sdkmanager_package_id_parses_classic_pipe_table() {
+        assert_eq!(
+            parse_sdkmanager_package_id(
+                "  platforms;android-36      | 2      | Android SDK Platform 36 | platforms/android-36"
+            ),
+            Some("platforms;android-36".to_string())
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id("  ndk;29.0.14206865 | 29.0.14206865 | NDK (Side by side)"),
+            Some("ndk;29.0.14206865".to_string())
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id("  platform-tools | 36.0.0 | Android SDK Platform-Tools"),
+            Some("platform-tools".to_string())
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id("  Path     | Version | Description | Location"),
+            None
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id("  ------- | ------- | -------"),
+            None
+        );
+    }
+
+    #[test]
+    fn sdkmanager_package_id_parses_android_cli_table() {
+        // cmdline-tools 23.x (Android CLI) prints whitespace columns with
+        // slash-separated ids; installed rows show `installed -> latest`.
+        assert_eq!(
+            parse_sdkmanager_package_id(
+                "  platforms/android-37.2    1.0.0    Android SDK Platform 37.2"
+            ),
+            Some("platforms;android-37.2".to_string())
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id(
+                "  ndk/29.0.14206865    29.0.14206865    NDK (Side by side) 29.0.14206865"
+            ),
+            Some("ndk;29.0.14206865".to_string())
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id(
+                "  system-images/android-26/default/x86    1.0.0    Intel x86 Atom System Image"
+            ),
+            Some("system-images;android-26;default;x86".to_string())
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id(
+                "  cmdline-tools/latest    unknown    ->    23.0.0    Android SDK Command-line Tools (latest)"
+            ),
+            Some("cmdline-tools;latest".to_string())
+        );
+        assert_eq!(
+            parse_sdkmanager_package_id("  platform-tools    37.0.1    Android SDK Platform-Tools"),
+            Some("platform-tools".to_string())
+        );
+        assert_eq!(parse_sdkmanager_package_id("Installed packages:"), None);
+        assert_eq!(parse_sdkmanager_package_id("Available packages:"), None);
+        assert_eq!(
+            parse_sdkmanager_package_id(
+                "[=======================================] 100% Computing updates..."
+            ),
+            None
+        );
+        assert_eq!(parse_sdkmanager_package_id(""), None);
+    }
+
+    #[test]
+    fn sdk_package_id_order_prefers_stable_over_prerelease() {
+        assert_eq!(
+            compare_sdk_package_ids("build-tools;37.0.0", "build-tools;37.0.0-rc2"),
+            Ordering::Greater,
+            "the stable release outranks its release candidates"
+        );
+        assert_eq!(
+            compare_sdk_package_ids("build-tools;36.1.0", "build-tools;37.0.0-rc2"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn java_major_version_parses_openjdk_and_legacy_layouts() {
+        assert_eq!(
+            parse_java_major_version("openjdk version \"17.0.19\" 2026-04-21"),
+            Some(17)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"21.0.5\" 2024-10-15"),
+            Some(21)
+        );
+        assert_eq!(
+            parse_java_major_version("openjdk version \"25\" 2025-09-16"),
+            Some(25)
+        );
+        assert_eq!(
+            parse_java_major_version("java version \"1.8.0_361\""),
+            Some(8)
+        );
+        assert_eq!(parse_java_major_version("javac 17.0.19"), None);
+        assert_eq!(parse_java_major_version("not java output"), None);
+    }
+
+    #[test]
     fn parse_sdkmanager_proxy_config_maps_http_proxy() {
         assert_eq!(
             parse_sdkmanager_proxy_config("http://host.docker.internal:7891").unwrap(),
@@ -2269,34 +2411,104 @@ impl Toolchain for Java {
     type Installation = JavaInstallation;
 
     async fn check(&self, host: &Host) -> Result<(), ToolchainError<Self::Installation>> {
-        if Self::detect_path(host).await.is_some() {
-            Ok(())
-        } else if cfg!(target_os = "windows") {
-            Err(missing_java_on_windows(host).await)
-        } else if cfg!(target_os = "macos") {
-            if host.which("brew").await.is_ok() {
-                Err(ToolchainError::fixable(JavaInstallation::Brew))
-            } else {
-                Err(ToolchainError::unfixable(
-                    "Java runtime not found and Homebrew is unavailable",
-                    "Download a JDK from https://adoptium.net/temurin/releases/?version=21 (or install Homebrew) and set `JAVA_HOME`.",
-                ))
-            }
-        } else if cfg!(target_os = "linux") {
-            if has_supported_package_manager(host).await {
-                Err(ToolchainError::fixable(JavaInstallation::PackageManager))
-            } else {
-                Err(ToolchainError::unfixable(
-                    "Java runtime not found and no supported package manager was detected",
-                    "Install a JDK manually and set `JAVA_HOME`, then retry.",
-                ))
-            }
+        let Some(java_path) = Self::detect_path(host).await else {
+            return Err(missing_java_error(host).await);
+        };
+        check_java_version(host, &java_path).await
+    }
+}
+
+/// What a host with no usable `java` resolves to: the platform installer
+/// when one exists, otherwise manual steps.
+async fn missing_java_error(host: &Host) -> ToolchainError<JavaInstallation> {
+    if cfg!(target_os = "windows") {
+        missing_java_on_windows(host).await
+    } else if cfg!(target_os = "macos") {
+        if host.which("brew").await.is_ok() {
+            ToolchainError::fixable(JavaInstallation::Brew)
         } else {
-            Err(ToolchainError::unfixable(
-                "Java runtime not found",
-                "Install a JDK manually and set `JAVA_HOME`, then retry.",
-            ))
+            ToolchainError::unfixable(
+                "Java runtime not found and Homebrew is unavailable",
+                format!(
+                    "Download a JDK from https://adoptium.net/temurin/releases/?version={} (or install Homebrew) and set `JAVA_HOME`.",
+                    required_jdk_version()
+                ),
+            )
         }
+    } else if cfg!(target_os = "linux") {
+        if has_supported_package_manager(host).await {
+            ToolchainError::fixable(JavaInstallation::PackageManager)
+        } else {
+            ToolchainError::unfixable(
+                "Java runtime not found and no supported package manager was detected",
+                "Install a JDK manually and set `JAVA_HOME`, then retry.",
+            )
+        }
+    } else {
+        ToolchainError::unfixable(
+            "Java runtime not found",
+            "Install a JDK manually and set `JAVA_HOME`, then retry.",
+        )
+    }
+}
+
+/// The JDK major version `Java::check` enforces — the same
+/// `[package.metadata.waterui-scaffold] android-jdk-version` the
+/// `app/build.gradle.kts` template renders into `JavaVersion.VERSION_*`.
+fn required_jdk_version() -> u32 {
+    build_info::ANDROID_JDK_VERSION.parse().expect(
+        "[package.metadata.waterui-scaffold] android-jdk-version must be a JDK major version",
+    )
+}
+
+/// The feature (major) version `java -version` reports: `openjdk version
+/// "17.0.19"` gives 17; the legacy pre-JEP-223 `1.8` form gives 8.
+fn parse_java_major_version(output: &str) -> Option<u32> {
+    let version = output.split("version \"").nth(1)?.split('"').next()?;
+    let mut segments = version.split(['.', '_', '-']);
+    let major = segments.next()?;
+    if major == "1" {
+        return segments.next()?.parse().ok();
+    }
+    major.parse().ok()
+}
+
+/// The generated Android app compiles at `JavaVersion.VERSION_{required}`, so
+/// the JDK `detect_path` resolved must report at least that major version —
+/// an older one is reported with the version found and the version required
+/// rather than auto-upgraded, because installing a second JDK cannot change
+/// which `java` `JAVA_HOME`/PATH resolves.
+async fn check_java_version(
+    host: &Host,
+    java_path: &Path,
+) -> Result<(), ToolchainError<JavaInstallation>> {
+    let required = required_jdk_version();
+    let found = match host.output(java_path, ["-version"]).await {
+        Ok(output) => parse_java_major_version(&format!(
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Err(_) => None,
+    };
+    match found {
+        Some(found) if found >= required => Ok(()),
+        Some(found) => Err(ToolchainError::unfixable(
+            format!(
+                "JDK {required} is required for Android Gradle builds, but {} reports version {found}",
+                java_path.display()
+            ),
+            format!(
+                "Install JDK {required} (https://adoptium.net/temurin/releases/?version={required}) or point JAVA_HOME at a JDK {required} home, then retry."
+            ),
+        )),
+        None => Err(ToolchainError::unfixable(
+            format!(
+                "Could not determine the Java version of {} (`java -version` failed or printed nothing parseable)",
+                java_path.display()
+            ),
+            format!("Point JAVA_HOME at a JDK {required} home, then retry."),
+        )),
     }
 }
 
@@ -2670,8 +2882,10 @@ mod host_tests {
 
     use super::{
         AndroidBuildTools, AndroidNdk, AndroidPlatformTools, AndroidRustTargets, AndroidSdk,
-        AndroidSdkPlatforms, Java, Kotlin, latest_android_platform_package_id,
-        parse_android_platform_api_level, parse_android_version_pair, required_kotlin_version,
+        AndroidSdkPlatforms, Java, Kotlin, latest_android_build_tools_package_id,
+        latest_android_platform_package_id, parse_android_platform_api_level,
+        parse_android_version_pair, required_jdk_version, required_kotlin_version,
+        required_ndk_package_id,
     };
     use crate::toolchain::testing::TestMachine;
     use crate::toolchain::{Host, Toolchain, ToolchainError};
@@ -2740,6 +2954,40 @@ mod host_tests {
         assert_eq!(
             package, "platforms;android-37.1",
             "android-37.1 outranks android-37.0 and android-36.1 (#633)"
+        );
+    }
+
+    #[test]
+    fn sdkmanager_list_accepts_android_cli_columns() {
+        // Real `--list` output captured from cmdline-tools 23.0.0 (the Android
+        // CLI): whitespace-aligned columns and slash-separated ids, so the
+        // parser normalizes them into the `pkg;ver` ids the installers use.
+        let (machine, host) = sdk_machine();
+        machine.install("java");
+        machine.respond(
+            "SDKMANAGER_LIST",
+            include_str!("testdata/sdkmanager_list_android_cli.txt"),
+        );
+        assert_eq!(
+            smol::block_on(latest_android_platform_package_id(&host))
+                .as_deref()
+                .ok(),
+            Some("platforms;android-37.2"),
+            "platforms/android-37.2 is the newest stable platform in the transcript"
+        );
+        assert_eq!(
+            smol::block_on(latest_android_build_tools_package_id(&host))
+                .as_deref()
+                .ok(),
+            Some("build-tools;37.0.0"),
+            "the stable 37.0.0 outranks its 37.0.0-rc previews"
+        );
+        assert_eq!(
+            smol::block_on(required_ndk_package_id(&host))
+                .as_deref()
+                .ok(),
+            Some("ndk;29.0.14206865"),
+            "the pinned NDK resolves through slash-style ids"
         );
     }
 
@@ -3007,6 +3255,44 @@ mod host_tests {
         machine.install("java");
         let host = machine.host(Vec::<(String, String)>::new());
         smol::block_on(Java.check(&host)).expect("java on PATH must be ok");
+    }
+
+    #[test]
+    fn java_ok_when_major_version_satisfies_scaffold() {
+        let machine = TestMachine::new();
+        machine.install("java");
+        let host = machine.host([(
+            String::from("WATERUI_FAKE_JAVA_VERSION"),
+            required_jdk_version().to_string(),
+        )]);
+        smol::block_on(Java.check(&host))
+            .expect("a JDK at the scaffold's required major version must be ok");
+    }
+
+    #[test]
+    fn java_too_old_reports_found_and_required_versions() {
+        let machine = TestMachine::new();
+        machine.install("java");
+        let host = machine.host([(
+            String::from("WATERUI_FAKE_JAVA_VERSION"),
+            String::from("17.0.19"),
+        )]);
+        let result = smol::block_on(Java.check(&host));
+        let Err(ToolchainError::Unfixable(error)) = result else {
+            panic!("a JDK older than the scaffold requires must fail: {result:?}")
+        };
+        assert!(
+            error.message().contains("17"),
+            "the report names the found version: {}",
+            error.message()
+        );
+        assert!(
+            error
+                .message()
+                .contains(&required_jdk_version().to_string()),
+            "the report names the required version: {}",
+            error.message()
+        );
     }
 
     #[test]
