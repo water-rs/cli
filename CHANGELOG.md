@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/water-rs/cli/compare/v0.4.3...v0.4.4) - 2026-09-26
+
+### Fixed
+
+- *(build)* read waterui metadata from the target build's app library
+- seed every managed-crate resolution from the channel's certified lock
+- *(tests)* link fake tools instead of writing copies
+- *(doctor)* enforce the scaffold's JDK version and parse sdkmanager 23.x ids
+- *(cli)* seed the generated crate's lock from one resolution, not a union
+- *(build)* stage each shared library under the name the artifact records
+- *(build)* join the CLI's rustflags with the set Cargo resolves instead of replacing it
+- *(build)* name a marked binary with the target's executable suffix
+- *(build)* launch the binary the build just produced, with its staged resources beside it
+- *(cli)* restage build outputs over the preserved products dir
+- *(cli)* normalize rebased patch paths for generated manifests
+- *(cli)* carry the app's patch table and lockfile into the managed hydrolysis build
+- *(cli)* forward the project's cargo config to managed backend builds
+- *(framework)* state the real reason stable withholds a git-pinned package ([#173](https://github.com/water-rs/cli/pull/173))
+- *(doctor)* correct the Linux package tables and stop masking fixables ([#172](https://github.com/water-rs/cli/pull/172))
+- *(doctor)* install sccache from the pinned release artifact ([#171](https://github.com/water-rs/cli/pull/171))
+- *(doctor)* check for a C compiler and linker on Linux ([#170](https://github.com/water-rs/cli/pull/170))
+- *(doctor)* continue `doctor --fix` past a failed installation ([#168](https://github.com/water-rs/cli/pull/168))
+- *(release)* build an x86_64-unknown-linux-musl artifact for Alpine
+- start the sccache server before Cargo spawns its clients
+
+### Other
+
+- install the wasm32 target for the test job
+- *(deps)* target-gate plist to macOS, drop icns jpeg2000
+- *(packaging)* count only shared libraries as staged runtimes
+- *(packaging)* restaging over a stale hashed shared runtime
+- *(build)* cover a second water run reusing the shared build cache
+- *(build)* cover water run staging every shared library the binary records
+- *(cli)* repackage after a backend source change
+- *(cli)* compare cargo-config paths in canonical form
+- Check for git, and install it where the host can ([#169](https://github.com/water-rs/cli/pull/169))
+- Merge pull request #160 from water-rs/fix/151-musl-artifact
+- format sccache.rs with rustfmt --edition 2024
+
 ## [0.4.3](https://github.com/water-rs/cli/compare/v0.4.2...v0.4.3) - 2026-09-21
 
 ### Added
