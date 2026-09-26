@@ -10,6 +10,13 @@
 //! name. Staging the unhashed name ships a library the loader never looks
 //! for (water-rs/cli#184); packaging must stage each needed library under
 //! the name the binary itself records.
+//!
+//! The second fixture drives the same arrangement through the build path
+//! `water run` takes: `RustBuild::build_binary` with
+//! [`RustLinkage::SharedRuntime`] — `cargo rustc` on the backend crate's
+//! `--bin` unit with `-Cprefer-dynamic`, loader search paths, and the
+//! `-Cextra-filename` marker — so the artifact handed to packaging is the
+//! marked `deps/` binary a playground run produces (water-rs/cli#161).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -18,7 +25,9 @@ use std::process::{Command, Output, Stdio};
 use target_lexicon::Triple;
 use tempfile::{TempDir, tempdir};
 
-use waterui_cli::build::{BuiltTarget, RustDynamicLibraries, needed_shared_libraries};
+use waterui_cli::build::{
+    BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage, needed_shared_libraries,
+};
 use waterui_cli::project::{ManagedBackends, Project};
 
 /// Write `contents` to `path`, creating parent directories.
@@ -199,10 +208,10 @@ fn shared_runtime_name(triple: &Triple) -> String {
     }
 }
 
-/// Scaffold the fixture app under `root` and return its directory: a `dylib`
-/// crate vendored in a local git repository — so Cargo hashes the source
-/// into the dylib's `deps/` names — and a binary linking it dynamically.
-fn scaffold_fixture(root: &Path) -> PathBuf {
+/// Vendor the fixture `waterui-dylib` crate into a git repository under
+/// `root` — so Cargo hashes the source into every `deps/` file name — and
+/// return its `file://` URL.
+fn scaffold_dylib(root: &Path) -> String {
     let dylib_dir = root.join("waterui-dylib");
     write(
         &dylib_dir.join("Cargo.toml"),
@@ -237,9 +246,16 @@ fn scaffold_fixture(root: &Path) -> PathBuf {
         "git commit",
     );
 
-    let dylib_url = url::Url::from_directory_path(&dylib_dir)
+    url::Url::from_directory_path(&dylib_dir)
         .expect("dylib directory URL")
-        .to_string();
+        .to_string()
+}
+
+/// Scaffold the fixture app under `root` and return its directory: a `dylib`
+/// crate vendored in a local git repository — so Cargo hashes the source
+/// into the dylib's `deps/` names — and a binary linking it dynamically.
+fn scaffold_fixture(root: &Path) -> PathBuf {
+    let dylib_url = scaffold_dylib(root);
     let app_dir = root.join("app");
     write(
         &app_dir.join("Cargo.toml"),
@@ -262,6 +278,42 @@ fn scaffold_fixture(root: &Path) -> PathBuf {
         "[package]\ntype = \"app\"\nname = \"app\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
     );
     app_dir
+}
+
+/// Scaffold the `water run` arrangement under `root` and return the `(app,
+/// backend)` directories: an `app` library crate carrying the git-sourced
+/// `waterui-dylib` dependency and the `dev` feature `with_linkage` enables,
+/// and a standalone-workspace `backend` crate whose `--bin` calls into it —
+/// the shape `build_hydrolysis` compiles for a playground project.
+fn scaffold_run_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    let dylib_url = scaffold_dylib(root);
+
+    let app_dir = root.join("app");
+    write(
+        &app_dir.join("Cargo.toml"),
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\ndev = []\n\n[dependencies]\nwaterui-dylib = {{ git = \"{dylib_url}\" }}\n"
+        ),
+    );
+    write(
+        &app_dir.join("src/lib.rs"),
+        "/// Entry point the generated backend's `main` calls.\npub fn run() {\n    // A referenced symbol keeps the `DT_NEEDED` the link would\n    // otherwise drop under `--as-needed`.\n    assert_eq!(waterui_dylib::fixture_marker(), 42);\n}\n",
+    );
+    write(
+        &app_dir.join("Water.toml"),
+        "[package]\ntype = \"app\"\nname = \"app\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
+    );
+
+    let backend_dir = root.join("backend");
+    write(
+        &backend_dir.join("Cargo.toml"),
+        "[package]\nname = \"backend\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\napp = { path = \"../app\" }\n\n[workspace]\n",
+    );
+    write(
+        &backend_dir.join("src/main.rs"),
+        "fn main() {\n    app::run();\n}\n",
+    );
+    (app_dir, backend_dir)
 }
 
 /// Assert every non-system dynamic dependency `executable` records exists in
@@ -360,5 +412,43 @@ fn packaged_binary_finds_every_shared_library_it_records() {
 
         assert_dist_satisfies_needed(&executable, &dist);
         assert_staged_binary_runs(&executable, &dist);
+    });
+}
+
+/// Run the binary a `water run` build produces — `RustBuild::build_binary`
+/// under [`RustLinkage::SharedRuntime`], the `cargo rustc` invocation whose
+/// `-Cextra-filename` marker lands the artifact in `deps/` — through the
+/// packaging resolve + stage, and assert the dist directory satisfies every
+/// shared library the binary's own dynamic section records, then run the
+/// staged binary (water-rs/cli#161).
+#[test]
+fn run_built_binary_finds_every_shared_library_it_records() {
+    smol::block_on(async {
+        let temporary: TempDir = tempdir().expect("tempdir");
+        let root = temporary.path();
+        let (app_dir, backend_dir) = scaffold_run_fixture(root);
+
+        let triple = Triple::host();
+        let built = RustBuild::new(&backend_dir, triple.clone())
+            .with_target_dir(root.join("target"))
+            .with_linkage(RustLinkage::SharedRuntime, "app/dev", &["$ORIGIN"])
+            .build_binary("backend", false)
+            .await
+            .expect("build the fixture backend binary");
+        let project = Project::open(&app_dir, ManagedBackends::NONE)
+            .await
+            .expect("open fixture project");
+
+        let libraries = RustDynamicLibraries::resolve(&built, &triple, &project)
+            .await
+            .expect("resolve shared libraries");
+        let dist = root.join("dist");
+        libraries
+            .stage(&dist)
+            .await
+            .expect("stage shared libraries");
+
+        assert_dist_satisfies_needed(&built.artifact, &dist);
+        assert_staged_binary_runs(&built.artifact, &dist);
     });
 }
