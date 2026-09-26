@@ -736,8 +736,32 @@ pub enum FetchOutcome {
 /// [`FetchOutcome::Unsatisfiable`] instead, carrying the same report the
 /// build gives them.
 pub async fn seed_font_cache(project: &Project) -> eyre::Result<Vec<FetchOutcome>> {
+    seed_font_cache_scoped(project, None).await
+}
+
+/// [`seed_font_cache`] restricted to the crates a `backend` build scans.
+///
+/// `water fetch --backend android` is the caller: it seeds the cache for the
+/// Android build alone — the manifest set that build's font resolution reads
+/// — so a backend crate no Android build can ever compile is never
+/// scaffolded or scanned here.
+///
+/// # Errors
+///
+/// Same as [`seed_font_cache`], narrowed to the scoped crate set.
+pub async fn seed_font_cache_for_backend(
+    project: &Project,
+    backend: crate::platform::TargetBackend,
+) -> eyre::Result<Vec<FetchOutcome>> {
+    seed_font_cache_scoped(project, Some(backend)).await
+}
+
+async fn seed_font_cache_scoped(
+    project: &Project,
+    scope: Option<crate::platform::TargetBackend>,
+) -> eyre::Result<Vec<FetchOutcome>> {
     let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
-    for manifest in ensure_font_scan_manifests(project).await? {
+    for manifest in ensure_font_scan_manifests(project, scope).await? {
         declarations.extend(scan_crate_font_declarations(&manifest).await?);
     }
     fetch_fonts(declarations, &cache_dir()?, download_font).await
@@ -762,16 +786,33 @@ pub async fn seed_font_cache(project: &Project) -> eyre::Result<Vec<FetchOutcome
 /// The scanned set follows the project: an app contributes the crates of the
 /// backends it has configured, a playground the crates for the backends this
 /// host can run — Hydrolysis anywhere, GTK4 on Linux, `WinUI` on Windows —
-/// since the CLI manages them all. A crate that cannot be produced is an
-/// error naming its backend — silently dropping it is how a build's font
-/// demand and a fetch's scan disagree.
-async fn ensure_font_scan_manifests(project: &Project) -> eyre::Result<Vec<PathBuf>> {
+/// since the CLI manages them all. `scope` narrows the set to one backend's
+/// crates — the manifests that backend's builds read — so a fetch preparing
+/// a single-backend build never touches crates that build cannot compile. A
+/// crate that cannot be produced is an error naming its backend — silently
+/// dropping it is how a build's font demand and a fetch's scan disagree.
+async fn ensure_font_scan_manifests(
+    project: &Project,
+    scope: Option<crate::platform::TargetBackend>,
+) -> eyre::Result<Vec<PathBuf>> {
     let mut manifests = vec![project.root().join("Cargo.toml")];
 
-    if project.is_playground()
-        || project.apple_backend().is_some()
-        || project.android_backend().is_some()
-    {
+    // Apple and Android builds scan the FFI companion; no other backend's
+    // build does, and a scoped fetch includes it only for those two.
+    let ffi_scanned = scope.map_or_else(
+        || {
+            project.is_playground()
+                || project.apple_backend().is_some()
+                || project.android_backend().is_some()
+        },
+        |backend| {
+            matches!(
+                backend,
+                crate::platform::TargetBackend::Apple | crate::platform::TargetBackend::Android
+            )
+        },
+    );
+    if ffi_scanned {
         let manifest = project.ffi_crate_path().join("Cargo.toml");
         if !manifest.is_file() {
             project.scaffold_ffi_companion().await.map_err(|error| {
@@ -781,13 +822,16 @@ async fn ensure_font_scan_manifests(project: &Project) -> eyre::Result<Vec<PathB
         manifests.push(manifest);
     }
 
-    ensure_backend_manifest::<crate::gtk4::backend::Gtk4Backend>(project, &mut manifests).await?;
+    ensure_backend_manifest::<crate::gtk4::backend::Gtk4Backend>(project, scope, &mut manifests)
+        .await?;
     ensure_backend_manifest::<crate::hydrolysis::backend::HydrolysisBackend>(
         project,
+        scope,
         &mut manifests,
     )
     .await?;
-    ensure_backend_manifest::<crate::winui::backend::WinUiBackend>(project, &mut manifests).await?;
+    ensure_backend_manifest::<crate::winui::backend::WinUiBackend>(project, scope, &mut manifests)
+        .await?;
 
     Ok(manifests)
 }
@@ -797,11 +841,20 @@ async fn ensure_font_scan_manifests(project: &Project) -> eyre::Result<Vec<PathB
 trait FontScanCrate: crate::backend::Backend {
     /// The backend's name as `water backend` reports it.
     const NAME: &'static str;
+    /// The backend whose builds scan this crate — a scoped fetch covers the
+    /// crate only for that backend.
+    const TARGET: crate::platform::TargetBackend;
     /// Whether a build of `project` can ever compile this crate: a
     /// playground can run every backend this host supports — the CLI manages
     /// all of them — while an app builds only the backends it has
     /// configured.
     fn wanted(project: &Project) -> bool;
+    /// Whether `scope` — `water fetch --backend`'s value — selects this
+    /// crate: an unscoped fetch covers every wanted crate, a scoped one only
+    /// the selected backend's own.
+    fn in_scope(scope: Option<crate::platform::TargetBackend>) -> bool {
+        scope.is_none_or(|backend| backend == Self::TARGET)
+    }
     /// Whether the crate on disk is missing or behind the current templates
     /// — the check the build and preview paths apply before regenerating.
     fn stale(project: &Project) -> impl Future<Output = eyre::Result<bool>> + Send;
@@ -813,9 +866,10 @@ trait FontScanCrate: crate::backend::Backend {
 /// is an error naming the backend, never a skip.
 async fn ensure_backend_manifest<B: FontScanCrate>(
     project: &Project,
+    scope: Option<crate::platform::TargetBackend>,
     manifests: &mut Vec<PathBuf>,
 ) -> eyre::Result<()> {
-    if !B::wanted(project) {
+    if !B::in_scope(scope) || !B::wanted(project) {
         return Ok(());
     }
     let stale = B::stale(project)
@@ -834,6 +888,7 @@ async fn ensure_backend_manifest<B: FontScanCrate>(
 
 impl FontScanCrate for crate::gtk4::backend::Gtk4Backend {
     const NAME: &'static str = "GTK4";
+    const TARGET: crate::platform::TargetBackend = crate::platform::TargetBackend::Gtk4;
     fn wanted(project: &Project) -> bool {
         // GTK4 compiles on Linux hosts only, so a playground elsewhere never
         // builds this crate.
@@ -846,6 +901,7 @@ impl FontScanCrate for crate::gtk4::backend::Gtk4Backend {
 
 impl FontScanCrate for crate::hydrolysis::backend::HydrolysisBackend {
     const NAME: &'static str = "hydrolysis";
+    const TARGET: crate::platform::TargetBackend = crate::platform::TargetBackend::Hydrolysis;
     fn wanted(project: &Project) -> bool {
         project.is_playground() || project.hydrolysis_backend().is_some()
     }
@@ -856,6 +912,7 @@ impl FontScanCrate for crate::hydrolysis::backend::HydrolysisBackend {
 
 impl FontScanCrate for crate::winui::backend::WinUiBackend {
     const NAME: &'static str = "WinUI";
+    const TARGET: crate::platform::TargetBackend = crate::platform::TargetBackend::WinUi;
     fn wanted(project: &Project) -> bool {
         // `WinUI` compiles on Windows hosts only, so a playground elsewhere
         // never builds this crate.
@@ -2454,5 +2511,35 @@ mod permission_audit_tests {
             permission_toml_key(PermissionKey::CoarseLocation),
             "coarse_location"
         );
+    }
+
+    /// `water fetch --backend android` must never touch the GTK4 scaffold:
+    /// the scoped scan covers only the crates an Android build reads, so a
+    /// backend crate whose dependency graph does not resolve on this host
+    /// cannot fail a fetch meant for another backend.
+    #[test]
+    fn a_backend_scope_selects_only_that_backends_crate() {
+        use crate::platform::TargetBackend;
+
+        let scope = Some(TargetBackend::Android);
+        assert!(!crate::gtk4::backend::Gtk4Backend::in_scope(scope));
+        assert!(!crate::hydrolysis::backend::HydrolysisBackend::in_scope(
+            scope
+        ));
+        assert!(!crate::winui::backend::WinUiBackend::in_scope(scope));
+
+        let gtk4 = Some(TargetBackend::Gtk4);
+        assert!(crate::gtk4::backend::Gtk4Backend::in_scope(gtk4));
+        assert!(!crate::hydrolysis::backend::HydrolysisBackend::in_scope(
+            gtk4
+        ));
+        assert!(!crate::winui::backend::WinUiBackend::in_scope(gtk4));
+
+        // An unscoped fetch keeps scanning every wanted crate.
+        assert!(crate::gtk4::backend::Gtk4Backend::in_scope(None));
+        assert!(crate::hydrolysis::backend::HydrolysisBackend::in_scope(
+            None
+        ));
+        assert!(crate::winui::backend::WinUiBackend::in_scope(None));
     }
 }
