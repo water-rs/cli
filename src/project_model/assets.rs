@@ -8,6 +8,7 @@
 //! - Copy assets to platform-specific locations
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
@@ -266,8 +267,60 @@ pub async fn scan_fonts(
     build_manifest: &Path,
 ) -> eyre::Result<Vec<FontDeclaration>> {
     let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
-    declarations.extend(scan_crate_font_declarations(build_manifest).await?);
+    declarations.extend(scan_crate_font_declarations(project, build_manifest).await?);
     Ok(declarations)
+}
+
+/// Seed a managed crate's `Cargo.lock` before a `cargo metadata` call
+/// resolves it.
+///
+/// Every managed crate the CLI resolves — the font scan, capability and
+/// permission probes, `prepare_build` — must lead with the channel's
+/// certified pins, or Cargo locks whatever the registry holds newest: an
+/// `accesskit` generation `Water.lock` contradicts (#203). The project
+/// manifest's own graph already resolves from its lock, so a manifest in the
+/// project root takes no seed and returns `false`. The returned flag is
+/// whether the manifest belongs to a managed crate.
+///
+/// # Errors
+///
+/// Returns an error naming the path when `build_manifest` does not exist —
+/// every caller resolves a manifest it scaffolded; the one probe that can
+/// run before that (the Android permission audit on a first init) checks for
+/// it itself — and when the certified lock or the seed cannot be read or
+/// written.
+pub async fn seed_managed_crate_lock(
+    project: &Project,
+    build_manifest: &Path,
+) -> eyre::Result<bool> {
+    let Some(dir) = build_manifest.parent().filter(|dir| *dir != project.root()) else {
+        return Ok(false);
+    };
+    if !build_manifest.exists() {
+        return Err(eyre::eyre!(
+            "no manifest to resolve at {}",
+            build_manifest.display()
+        ));
+    }
+    let canonical = match project.manifest().framework.as_ref() {
+        Some(framework) => framework.canonical_lock(project.root()).await?,
+        None => None,
+    };
+    crate::templates::seed_lockfile(dir, &project.lockfile_path().await?, canonical.as_ref())
+        .await?;
+    Ok(true)
+}
+
+/// `cargo metadata` on a manifest, on the blocking pool.
+async fn crate_metadata(build_manifest: &Path) -> eyre::Result<cargo_metadata::Metadata> {
+    let manifest_path = build_manifest.to_path_buf();
+    smol::unblock(move || {
+        cargo_metadata::MetadataCommand::new()
+            .manifest_path(&manifest_path)
+            .exec()
+    })
+    .await
+    .map_err(Into::into)
 }
 
 /// Scans `build_manifest`'s dependency graph for
@@ -281,28 +334,34 @@ pub async fn scan_fonts(
 ///
 /// Fonts with a `required-feature` field will only be included if that feature
 /// is enabled for the declaring package (checked via cargo metadata's resolved graph).
-async fn scan_crate_font_declarations(build_manifest: &Path) -> eyre::Result<Vec<FontDeclaration>> {
+async fn scan_crate_font_declarations(
+    project: &Project,
+    build_manifest: &Path,
+) -> eyre::Result<Vec<FontDeclaration>> {
     debug!(
         "Scanning fonts from dependencies via cargo metadata on {}",
         build_manifest.display()
     );
 
-    // Run cargo metadata to get all packages
-    let manifest_path = build_manifest.to_path_buf();
-    let metadata = smol::unblock({
-        let manifest_path = manifest_path.clone();
-        move || {
-            cargo_metadata::MetadataCommand::new()
-                .manifest_path(&manifest_path)
-                .exec()
-        }
-    })
-    .await
-    .wrap_err_with(|| {
-        format!(
+    let managed = seed_managed_crate_lock(project, build_manifest).await?;
+
+    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
+        let mut message = format!(
             "Failed to run cargo metadata on {}",
             build_manifest.display()
-        )
+        );
+        if managed {
+            // A lock committed before the channel's pins existed can pin a
+            // generation they contradict; regeneration is the fix, not a
+            // retry (#203).
+            let dir = build_manifest.parent().unwrap_or_else(|| project.root());
+            let _ = write!(
+                message,
+                "; if its Cargo.lock predates the channel's pins, remove it and `Cargo.lock.seed` in {} and run again to regenerate them",
+                dir.display()
+            );
+        }
+        message
     })?;
 
     // Build map of package_id -> enabled features from resolved graph
@@ -762,7 +821,7 @@ async fn seed_font_cache_scoped(
 ) -> eyre::Result<Vec<FetchOutcome>> {
     let mut declarations = manifest_font_declarations(project.manifest(), project.root())?;
     for manifest in ensure_font_scan_manifests(project, scope).await? {
-        declarations.extend(scan_crate_font_declarations(&manifest).await?);
+        declarations.extend(scan_crate_font_declarations(project, &manifest).await?);
     }
     fetch_fonts(declarations, &cache_dir()?, download_font).await
 }
@@ -1462,17 +1521,7 @@ pub async fn package_feature_enabled(
     package: &str,
     feature: &str,
 ) -> eyre::Result<bool> {
-    let manifest_path = build_manifest.to_path_buf();
-    let metadata = smol::unblock({
-        let manifest_path = manifest_path.clone();
-        move || {
-            cargo_metadata::MetadataCommand::new()
-                .manifest_path(&manifest_path)
-                .exec()
-        }
-    })
-    .await
-    .wrap_err_with(|| {
+    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
         format!(
             "Failed to run cargo metadata on {}",
             build_manifest.display()
@@ -1597,7 +1646,10 @@ pub async fn capability_enabled(
         .find(|candidate| candidate.name == capability)
         .unwrap_or_else(|| panic!("unknown WaterUI capability: {capability}"));
     match capability.feature {
-        Some(feature) => package_feature_enabled(build_manifest, capability.package, feature).await,
+        Some(feature) => {
+            seed_managed_crate_lock(project, build_manifest).await?;
+            package_feature_enabled(build_manifest, capability.package, feature).await
+        }
         None => project.links_runtime_package(capability.package).await,
     }
 }
@@ -1659,6 +1711,7 @@ pub async fn self_drawn_realization_features(
     build_manifest: &Path,
 ) -> eyre::Result<Vec<String>> {
     let mut features = Vec::new();
+    seed_managed_crate_lock(project, build_manifest).await?;
     let opted_in = package_feature_enabled(build_manifest, "waterui", "video-gpu").await?
         || project.links_runtime_package("waterui-video-gpu").await?;
     if opted_in {
@@ -2146,17 +2199,7 @@ mod tests {
 pub async fn scan_required_permissions(
     build_manifest: &Path,
 ) -> eyre::Result<Vec<RequiredPermission>> {
-    let manifest_path = build_manifest.to_path_buf();
-    let metadata = smol::unblock({
-        let manifest_path = manifest_path.clone();
-        move || {
-            cargo_metadata::MetadataCommand::new()
-                .manifest_path(&manifest_path)
-                .exec()
-        }
-    })
-    .await
-    .wrap_err_with(|| {
+    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
         format!(
             "Failed to run cargo metadata on {}",
             build_manifest.display()

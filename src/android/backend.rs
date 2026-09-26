@@ -116,14 +116,18 @@ impl Backend for AndroidBackend {
         // surface anything a dependency needs that the app has not enabled.
         // The audit resolves the FFI companion's graph — the crate the Android
         // build compiles. On a first init the companion is not scaffolded yet,
-        // so the scan fails and the audit is skipped until the next reinit.
-        match crate::assets::scan_required_permissions(&project.ffi_crate_path().join("Cargo.toml"))
-            .await
-        {
-            Ok(required) => crate::assets::warn_missing_permissions(project, &required, |key| {
+        // so there is nothing to seed or scan until the next reinit.
+        let ffi_manifest = project.ffi_crate_path().join("Cargo.toml");
+        if ffi_manifest.exists() {
+            crate::assets::seed_managed_crate_lock(project, &ffi_manifest)
+                .await
+                .map_err(crate::backend::FailToInitBackend::Config)?;
+            let required = crate::assets::scan_required_permissions(&ffi_manifest)
+                .await
+                .map_err(crate::backend::FailToInitBackend::Config)?;
+            crate::assets::warn_missing_permissions(project, &required, |key| {
                 key.android_permission_name().is_some()
-            }),
-            Err(error) => tracing::debug!("skipped permission audit: {error}"),
+            });
         }
 
         // Extract enabled permissions from the manifest
