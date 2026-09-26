@@ -556,15 +556,19 @@ fn needed_name_file(recorded_name: &str) -> String {
         .to_owned()
 }
 
-/// The `libwaterui_dylib*` file names a directory holds, sorted.
+/// The shared libraries a directory holds for `waterui_dylib`, sorted — the
+/// platform's shared-library prefix and suffix, so Cargo's import library,
+/// export file and PDB (`waterui_dylib.dll.lib`, `.dll.exp`, `.pdb` on
+/// Windows) are never mistaken for a staged runtime.
 fn staged_waterui_names(dir: &Path) -> Vec<String> {
+    let prefix = format!("{}waterui_dylib", std::env::consts::DLL_PREFIX);
+    let suffix = std::env::consts::DLL_SUFFIX;
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("read staged dir")
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            (name.starts_with("libwaterui_dylib") || name.starts_with("waterui_dylib"))
-                .then_some(name)
+            (name.starts_with(&prefix) && name.ends_with(suffix)).then_some(name)
         })
         .collect();
     names.sort_unstable();
