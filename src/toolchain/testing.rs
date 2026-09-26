@@ -18,7 +18,10 @@ use tempfile::TempDir;
 use super::Host;
 
 #[cfg(unix)]
-const FAKE_TOOL_SCRIPT: &str = include_str!("testdata/fake_tools.sh");
+const FAKE_TOOL_SOURCE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/toolchain/testdata/fake_tools.sh"
+);
 #[cfg(windows)]
 const FAKE_TOOL_SCRIPT: &str = include_str!("testdata/fake_tools.cmd");
 
@@ -29,6 +32,12 @@ pub struct TestMachine {
 
 impl TestMachine {
     /// A scratch machine with no tools installed.
+    ///
+    /// The root lives in the system temp dir, outside this repository: a
+    /// machine under the repo would leak repo state into checks that walk
+    /// ancestors (a `rust-toolchain.toml` pin, a `.git` discovery, a
+    /// `Water.toml`), and the fixture's whole contract is that a declared
+    /// host cannot observe real-machine state.
     pub fn new() -> Self {
         let root = tempfile::tempdir().expect("create test machine root");
         let machine = Self { root };
@@ -214,10 +223,54 @@ impl TestMachine {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create fake tool dir");
         }
-        fs::write(&path, FAKE_TOOL_SCRIPT).expect("write fake tool");
-        make_executable(&path);
+        #[cfg(unix)]
+        {
+            let _ = fs::remove_file(&path);
+            fs::hard_link(dispatcher_source(), &path)
+                .expect("link fake tool to the dispatcher fixture");
+        }
+        #[cfg(windows)]
+        {
+            fs::write(&path, FAKE_TOOL_SCRIPT).expect("write fake tool");
+        }
         path
     }
+}
+
+/// The per-process copy of the dispatcher that fake tools link to.
+///
+/// A hard link is a real directory entry for the dispatcher's inode, so a
+/// `canonicalize` of the installed tool stays inside the scratch machine
+/// (a symlink would resolve out to the repository), and the exec'd inode
+/// is never opened for write by this process — the `cp` below is what
+/// creates it, deliberately: `fs::write` here would leave a window where
+/// a sibling test thread's `fork` inherits the still-open write
+/// descriptor and keeps the inode write-busy until that child's own
+/// exec, making `execve` of any fake tool fail with `ETXTBSY` ("Text
+/// file busy") — the flake this guards against. The child process's
+/// descriptor cannot be inherited back, so the window cannot exist.
+///
+/// The canonical lives beside the machine roots (the system temp dir),
+/// so links never cross filesystems.
+#[cfg(unix)]
+fn dispatcher_source() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    static SOURCE: std::sync::OnceLock<(TempDir, PathBuf)> = std::sync::OnceLock::new();
+    let (_, path) = SOURCE.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("create fake-tool source dir");
+        let canonical = dir.path().join("fake_tools.sh");
+        let status = std::process::Command::new("cp")
+            .arg(FAKE_TOOL_SOURCE)
+            .arg(&canonical)
+            .status()
+            .expect("copy the dispatcher fixture");
+        assert!(status.success(), "cp of the dispatcher fixture failed");
+        fs::set_permissions(&canonical, fs::Permissions::from_mode(0o755))
+            .expect("mark dispatcher fixture executable");
+        (dir, canonical)
+    });
+    path.clone()
 }
 
 /// Platform file name for a fake tool (`sdkmanager` vs `sdkmanager.cmd`).
@@ -268,13 +321,3 @@ const NDK_WRAPPER_API_LEVEL: u32 = 21;
 fn ndk_clang_file_name() -> String {
     format!("aarch64-linux-android{NDK_WRAPPER_API_LEVEL}-clang")
 }
-
-#[cfg(unix)]
-fn make_executable(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .expect("mark fake tool executable");
-}
-
-#[cfg(windows)]
-fn make_executable(_path: &Path) {}
