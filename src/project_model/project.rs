@@ -314,7 +314,7 @@ impl Project {
         if let Some(progress) = &progress {
             build_options = build_options.with_progress(progress.clone());
         }
-        AndroidPlatform::new(abi)
+        let built = AndroidPlatform::new(abi)
             .build(self, build_options)
             .await
             .map_err(FailToRun::Build)?;
@@ -323,7 +323,7 @@ impl Project {
         if let Some(progress) = progress {
             package_options = package_options.with_progress(progress);
         }
-        let artifact = AndroidPlatform::package_with_abis(self, package_options, &[abi])
+        let artifact = AndroidPlatform::package_with_abis(self, package_options, &[abi], &built)
             .await
             .map_err(FailToRun::Package)?;
 
@@ -435,21 +435,6 @@ impl Project {
         Ok(crate::water_dir::shared_target_dir()
             .await?
             .join(format!("toolchain-{toolchain}")))
-    }
-
-    /// Resolve the target directory the project's host-side rlib builds into.
-    ///
-    /// `build_host_rlib` compiles the user crate for the host to read its
-    /// `waterui_meta_*` symbols. That compile shares the dependency graph with
-    /// every other project's host build, so it lives beside the backend
-    /// variants in the shared target root rather than in the project's own
-    /// `target/`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the shared build-cache directory cannot be resolved.
-    pub async fn host_target_dir(&self) -> eyre::Result<PathBuf> {
-        crate::water_dir::shared_host_target_dir().await
     }
 
     /// Get the backends configured for the project.

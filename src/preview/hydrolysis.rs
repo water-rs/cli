@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use askama::Template;
 use eyre::{Context as _, Result, bail};
 
+use crate::artifact_symbols::ArtifactSymbols;
 use crate::backend::reinit_backend;
-use crate::build::{BuildOptions, BuildProfile, BuildProgress};
+use crate::build::{BuildOptions, BuildProfile, BuildProgress, BuiltTarget};
 use crate::hydrolysis::backend::HydrolysisBackend;
 use crate::hydrolysis::platform::{
     build_hydrolysis_with_envs_and_features, stage_hydrolysis_shared_runtime,
@@ -116,34 +117,9 @@ pub async fn render_preview_with_hydrolysis(
     output_path: &Path,
     scenario: Option<&HydrolysisPreviewScenario>,
 ) -> Result<()> {
-    let HydrolysisPreviewRequest {
-        project_path,
-        source,
-        theme,
-        width,
-        height,
-        sccache_path,
-        progress,
-    } = request;
-    let project = ensure_hydrolysis_backend_ready(project_path).await?;
-    write_preview_bindings(&project, source, theme, None).await?;
-    stage_hydrolysis_resources(&project, theme, sccache_path.as_deref(), progress.as_ref()).await?;
-
-    let mut build_options = BuildOptions::development(BuildProfile::Debug);
-    if let Some(sccache_path) = sccache_path {
-        build_options = build_options.with_sccache(sccache_path);
-    }
-    if let Some(progress) = progress {
-        build_options = build_options.with_progress(progress);
-    }
-    let built = build_hydrolysis_with_envs_and_features(
-        &project,
-        TargetPlatform::MacOS,
-        build_options,
-        &[],
-        &[HYDROLYSIS_PREVIEW_FEATURE],
-    )
-    .await?;
+    let (width, height, theme) = (request.width, request.height, request.theme);
+    let (project, built) = build_preview_session(&request, None).await?;
+    stage_hydrolysis_resources(&project, theme, &built.app_symbols()?).await?;
     stage_hydrolysis_shared_runtime(&project, &built, TargetPlatform::MacOS).await?;
     run_preview_binary(
         &project,
@@ -164,58 +140,91 @@ pub async fn test_preview_with_hydrolysis(
     request: HydrolysisPreviewRequest<'_>,
     automation_body: &str,
 ) -> Result<String> {
-    let HydrolysisPreviewRequest {
-        project_path,
-        source,
-        theme,
-        width,
-        height,
-        sccache_path,
-        progress,
-    } = request;
-    let project = ensure_hydrolysis_backend_ready(project_path).await?;
-    write_preview_bindings(&project, source, theme, Some(automation_body)).await?;
-    stage_hydrolysis_resources(&project, theme, sccache_path.as_deref(), progress.as_ref()).await?;
+    let (width, height, theme) = (request.width, request.height, request.theme);
+    let (project, built) = build_preview_session(&request, Some(automation_body)).await?;
+    stage_hydrolysis_resources(&project, theme, &built.app_symbols()?).await?;
+    stage_hydrolysis_shared_runtime(&project, &built, TargetPlatform::MacOS).await?;
+    run_preview_test_binary(&project, &built.artifact, width, height).await
+}
+
+/// Build the managed hydrolysis binary for a preview request: write the
+/// generated bindings, compile in preview mode — or preview-test mode when
+/// `automation_body` is `Some` — and return the build result. The app
+/// library artifact on it carries the `waterui_meta_*`/`waterui_preview_*`
+/// symbols any post-build step (resource staging, `--all` discovery) reads.
+async fn build_preview_session(
+    request: &HydrolysisPreviewRequest<'_>,
+    automation_body: Option<&str>,
+) -> Result<(Project, BuiltTarget)> {
+    let project = ensure_hydrolysis_backend_ready(request.project_path).await?;
+    write_preview_bindings(&project, request.source, request.theme, automation_body).await?;
 
     let mut build_options = BuildOptions::development(BuildProfile::Debug);
-    if let Some(sccache_path) = sccache_path {
+    if let Some(sccache_path) = request.sccache_path.clone() {
         build_options = build_options.with_sccache(sccache_path);
     }
-    if let Some(progress) = progress {
+    if let Some(progress) = request.progress.clone() {
         build_options = build_options.with_progress(progress);
     }
+    let feature = if automation_body.is_some() {
+        HYDROLYSIS_PREVIEW_TEST_FEATURE
+    } else {
+        HYDROLYSIS_PREVIEW_FEATURE
+    };
     let built = build_hydrolysis_with_envs_and_features(
         &project,
         TargetPlatform::MacOS,
         build_options,
         &[],
-        &[HYDROLYSIS_PREVIEW_TEST_FEATURE],
+        &[feature],
     )
     .await?;
-    stage_hydrolysis_shared_runtime(&project, &built, TargetPlatform::MacOS).await?;
-    run_preview_test_binary(&project, &built.artifact, width, height).await
+    Ok((project, built))
+}
+
+/// Enumerate the `waterui_preview_*` exports the project crate carries.
+///
+/// The names are read from the library artifact of a preview-mode build of
+/// the project's managed backend — `preview test --all` discovers its
+/// targets this way, and the probe compiles the same crate graph the
+/// per-target builds then reuse warm.
+///
+/// # Errors
+/// Returns an error when the preview build fails or its artifact cannot be
+/// parsed.
+pub async fn discover_hydrolysis_preview_exports(
+    project_path: &Path,
+    theme: HydrolysisPreviewTheme,
+    sccache_path: Option<PathBuf>,
+    progress: Option<BuildProgress>,
+) -> Result<Vec<String>> {
+    let request = HydrolysisPreviewRequest {
+        project_path,
+        source: HydrolysisPreviewSource::Expression("text(\"\")"),
+        theme,
+        width: 0.0,
+        height: 0.0,
+        sccache_path,
+        progress,
+    };
+    let (_project, built) = build_preview_session(&request, None).await?;
+    Ok(built.app_symbols()?.leaves_with_prefix("waterui_preview_"))
 }
 
 /// Stages the project's assets and the selected theme's fonts into the
 /// generated backend's `resources/` directory. Shared by the preview and MCP
-/// runtime modes.
+/// runtime modes. `symbols` is the app library artifact the build just
+/// produced — its `waterui_meta_bundle_*` statics declare the asset mounts.
 pub async fn stage_hydrolysis_resources(
     project: &Project,
     theme: HydrolysisPreviewTheme,
-    sccache_path: Option<&Path>,
-    progress: Option<&BuildProgress>,
+    symbols: &ArtifactSymbols,
 ) -> Result<()> {
     let resources_dir = project
         .backend_path::<HydrolysisBackend>()
         .join("resources");
-    let manifest = assets::stage_project_assets_for_gtk(
-        project,
-        &resources_dir,
-        sccache_path,
-        false,
-        progress,
-    )
-    .await?;
+    let manifest =
+        assets::stage_project_assets_for_gtk(project, &resources_dir, symbols, false).await?;
 
     let backend_path = project.backend_path::<HydrolysisBackend>();
     let mut font_declarations =

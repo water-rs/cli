@@ -20,7 +20,8 @@ pub use app_client::{PreviewAppClient, PreviewProbe};
 pub use hydrolysis::{
     HydrolysisPreviewEventKind, HydrolysisPreviewPointerButton, HydrolysisPreviewRequest,
     HydrolysisPreviewScenario, HydrolysisPreviewScenarioEvent, HydrolysisPreviewSource,
-    HydrolysisPreviewTheme, render_preview_with_hydrolysis, test_preview_with_hydrolysis,
+    HydrolysisPreviewTheme, discover_hydrolysis_preview_exports, render_preview_with_hydrolysis,
+    test_preview_with_hydrolysis,
 };
 pub use launcher::{PreviewSession, launch_preview_session};
 pub use protocol::{PreviewPlatform, Size};

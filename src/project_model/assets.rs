@@ -23,7 +23,6 @@ use walkdir::WalkDir;
 use waterui_assets_planner::BundleManifest;
 use zenwave::{Client as _, Method};
 
-use crate::build::BuildProgress;
 use crate::project::Project;
 use crate::project_model::project_types::PermissionKey;
 
@@ -1328,29 +1327,29 @@ fn sha256_hex(s: &str) -> String {
 
 /// Stage project assets for Apple packaging (Asset Catalog + raw resources).
 ///
-/// `sccache_path` feeds the host library build whose symbol table carries the
-/// `include_bundle!` mount metadata; pass `None` when no sccache binary was
-/// detected. Returns the staged manifest so callers can scan it (fonts, for
-/// example) without rebuilding the host artifact.
+/// `symbols` is the library artifact the target build already produced
+/// (`crate::build::BuiltTarget::app_symbols`) — its `waterui_meta_bundle_*`
+/// statics declare the `include_bundle!` mounts. Returns the staged manifest
+/// so callers can scan it (fonts, for example) without replanning.
 pub async fn stage_project_assets_for_apple(
     project: &Project,
     dest_dir: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    unified::stage_for_apple(project, dest_dir, sccache_path, dev_server, progress).await
+    unified::stage_for_apple(project, dest_dir, symbols, dev_server).await
 }
 
 /// Stage project assets for Android packaging (res + assets/raw).
+/// `symbols` is the target build's app library — see
+/// [`stage_project_assets_for_apple`].
 pub async fn stage_project_assets_for_android(
     project: &Project,
     backend_path: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    unified::stage_for_android(project, backend_path, sccache_path, dev_server, progress).await
+    unified::stage_for_android(project, backend_path, symbols, dev_server).await
 }
 
 /// Render the project's macOS `.icns` app icon for hand-assembled bundles.
@@ -1373,14 +1372,15 @@ pub async fn stage_hicolor_icons(project: &Project, icons_root: &Path) -> eyre::
 }
 
 /// Stage project assets for GTK4 packaging (resources + gresource bundle).
+/// `symbols` is the target build's app library — see
+/// [`stage_project_assets_for_apple`].
 pub async fn stage_project_assets_for_gtk(
     project: &Project,
     resources_dir: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<BundleManifest> {
-    unified::stage_for_gtk(project, resources_dir, sccache_path, dev_server, progress).await
+    unified::stage_for_gtk(project, resources_dir, symbols, dev_server).await
 }
 
 /// Resolves the fonts declared inside an already-staged bundle manifest.

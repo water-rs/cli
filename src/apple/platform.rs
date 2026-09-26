@@ -21,9 +21,7 @@ use crate::{
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
     assets::{self, ResolvedFont},
-    build::{
-        BuildOptions, BuildProgress, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage,
-    },
+    build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
@@ -629,9 +627,8 @@ pub async fn package_apple(
     copy_assets_and_fonts(
         project,
         &app_resources_dir,
-        None,
+        &built.app_symbols()?,
         options.uses_dev_server(),
-        options.progress(),
     )
     .await?;
 
@@ -875,22 +872,17 @@ fn apple_frameworks_dir(app_path: &Path, sdk_name: &str) -> PathBuf {
 // ============================================================================
 
 /// Copy project assets and dependency fonts to the app resources directory.
+/// `symbols` is the app library artifact the target build produced, whose
+/// `waterui_meta_bundle_*` statics declare the asset mounts.
 async fn copy_assets_and_fonts(
     project: &Project,
     dest_dir: &Path,
-    sccache_path: Option<&Path>,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
-    progress: Option<&BuildProgress>,
 ) -> eyre::Result<()> {
     // Stage project assets using platform-native conventions.
-    let manifest = assets::stage_project_assets_for_apple(
-        project,
-        dest_dir,
-        sccache_path,
-        dev_server,
-        progress,
-    )
-    .await?;
+    let manifest =
+        assets::stage_project_assets_for_apple(project, dest_dir, symbols, dev_server).await?;
 
     // Scan and resolve dependency fonts
     let font_declarations =

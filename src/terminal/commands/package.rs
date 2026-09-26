@@ -506,7 +506,11 @@ async fn package_artifact_inner(
     match context.backend {
         TargetBackend::Android => {
             let abis: Vec<AndroidAbi> = args.arch.iter().map(|arch| arch.to_abi()).collect();
-            AndroidPlatform::package_with_abis(&context.project, package_options, &abis).await
+            let built = built.ok_or_else(|| {
+                eyre::eyre!("Internal error: Android packaging has no build result")
+            })?;
+            AndroidPlatform::package_with_abis(&context.project, package_options, &abis, built)
+                .await
         }
         TargetBackend::Apple => {
             let built = built.ok_or_else(|| {

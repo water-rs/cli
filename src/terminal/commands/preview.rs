@@ -10,7 +10,6 @@ use serde::Deserialize;
 
 use crate::shell::Shell;
 use crate::{error, header, note, success};
-use waterui_cli::artifact_symbols::{ArtifactSymbols, build_host_rlib};
 use waterui_cli::build::BuildProgress;
 use waterui_cli::mcp::preview::PreviewArgs;
 use waterui_cli::preview::request::{
@@ -18,8 +17,9 @@ use waterui_cli::preview::request::{
 };
 use waterui_cli::preview::{
     HydrolysisPreviewEventKind, HydrolysisPreviewPointerButton, HydrolysisPreviewRequest,
-    HydrolysisPreviewScenario, HydrolysisPreviewScenarioEvent, PreviewPlatform,
-    launch_preview_session, render_preview_with_hydrolysis, test_preview_with_hydrolysis,
+    HydrolysisPreviewScenario, HydrolysisPreviewScenarioEvent, HydrolysisPreviewTheme,
+    PreviewPlatform, discover_hydrolysis_preview_exports, launch_preview_session,
+    render_preview_with_hydrolysis, test_preview_with_hydrolysis,
 };
 use waterui_cli::project::read_project_crate_name;
 
@@ -34,9 +34,7 @@ async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
     let targets = resolve_test_targets(
         &project_path,
         &crate_name,
-        args.target.as_deref(),
-        args.expr,
-        args.all,
+        &args,
         sccache_path.as_deref(),
         Some(&shell.build_progress()),
     )
@@ -452,24 +450,29 @@ fn parse_scenario_event(event: &ScenarioEventFile) -> Result<HydrolysisPreviewSc
 async fn resolve_test_targets(
     project_path: &Path,
     crate_name: &str,
-    target: Option<&str>,
-    force_expression: bool,
-    all: bool,
+    args: &PreviewTestArgs,
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
-    match (all, target) {
+    match (args.all, args.target.as_deref()) {
         (true, Some(_)) => {
             bail!("`--all` cannot be combined with an explicit preview target.");
         }
-        (true, None) if force_expression => {
+        (true, None) if args.expr => {
             bail!("`--all` cannot be combined with `--expr`.");
         }
         (true, None) => {
-            discover_preview_targets(project_path, crate_name, sccache_path, progress).await
+            discover_preview_targets(
+                project_path,
+                crate_name,
+                args.theme.into(),
+                sccache_path,
+                progress,
+            )
+            .await
         }
         (false, Some(target)) => {
-            if force_expression {
+            if args.expr {
                 Ok(vec![PreviewTarget::Expression {
                     expression: target.to_string(),
                 }])
@@ -485,29 +488,36 @@ async fn resolve_test_targets(
     }
 }
 
+/// Probe-build the project through its hydrolysis backend and read the
+/// `waterui_preview_*` exports off the app library the build produced. The
+/// probe shares its Cargo profile with the per-target builds `run_preview_test`
+/// then performs, so discovery costs one warm build.
 async fn discover_preview_targets(
     project_path: &Path,
     crate_name: &str,
+    theme: HydrolysisPreviewTheme,
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
-    let rlib = build_host_rlib(
+    let exports = discover_hydrolysis_preview_exports(
         project_path,
-        &waterui_cli::water_dir::shared_host_target_dir().await?,
-        sccache_path,
-        progress,
+        theme,
+        sccache_path.map(Path::to_path_buf),
+        progress.cloned(),
     )
     .await?;
-    let symbols = ArtifactSymbols::read(&rlib)?;
     // `#[preview]` exports `waterui_preview_<crate>_<fn>`; crate names are
     // normalized like `function_path_to_symbol` does (dashes become
     // underscores).
     let prefix = format!("waterui_preview_{}_", crate_name.replace('-', "_"));
-    let symbols_found = symbols.leaves_with_prefix(&prefix);
-    if symbols_found.is_empty() {
-        bail!("no `waterui_preview_*` exports found in {}", rlib.display());
+    let found: Vec<String> = exports
+        .into_iter()
+        .filter(|symbol| symbol.starts_with(&prefix))
+        .collect();
+    if found.is_empty() {
+        bail!("no `waterui_preview_*` exports found in {project_path:?}");
     }
-    Ok(symbols_found
+    Ok(found
         .into_iter()
         .map(|symbol| PreviewTarget::Function {
             function_path: symbol[prefix.len()..].to_string(),

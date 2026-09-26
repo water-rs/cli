@@ -1,6 +1,7 @@
 //! Build system
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     io::{self, Write as _},
     path::{Path, PathBuf},
@@ -131,6 +132,12 @@ pub struct BuiltTarget {
     /// The `waterui-dylib` dynamic library Cargo reported, when this build
     /// produced one.
     pub shared_runtime: Option<PathBuf>,
+    /// The library artifact this build's dependency graph produced for the
+    /// project crate — the `deps/` rlib, staticlib, or dylib whose symbol
+    /// table carries the `waterui_meta_*` statics and `waterui_preview_*`
+    /// exports `crate::artifact_symbols::ArtifactSymbols` reads. `None` when
+    /// no project is attached or Cargo reported no library unit for it.
+    pub app_library: Option<PathBuf>,
 }
 
 impl BuiltTarget {
@@ -145,6 +152,22 @@ impl BuiltTarget {
                 self.profile_dir.display()
             )
         })
+    }
+
+    /// Symbols of this build's project-crate library artifact.
+    ///
+    /// The artifact is the one the build just emitted, so the symbols are
+    /// ground truth for what compiled: macro-emitted `waterui_meta_*` statics
+    /// and `waterui_preview_*` exports enumerate here. A build with no project
+    /// attached — a fixture or a support crate — reads empty.
+    ///
+    /// # Errors
+    /// Returns an error when the reported artifact cannot be read or parsed.
+    pub fn app_symbols(&self) -> eyre::Result<crate::artifact_symbols::ArtifactSymbols> {
+        self.app_library.as_ref().map_or_else(
+            || Ok(crate::artifact_symbols::ArtifactSymbols::empty()),
+            |library| crate::artifact_symbols::ArtifactSymbols::read(library),
+        )
     }
 }
 
@@ -1643,10 +1666,17 @@ Automatic meson installation failed: {install_err}\n\n{}",
         }
 
         let shared_runtime = reported_shared_runtime(&output.stdout)?;
+        let app_library = match self.project.as_ref() {
+            Some(project) => {
+                app_library_artifact(&output.stdout, &project.root().join("Cargo.toml"))?
+            }
+            None => None,
+        };
         Ok(BuiltTarget {
             profile_dir,
             artifact,
             shared_runtime,
+            app_library,
         })
     }
 
@@ -1971,6 +2001,10 @@ Automatic meson installation failed: {install_err}\n\n{}",
                 .flat_map(|path| [OsString::from("--config"), path.clone().into_os_string()]),
         );
 
+        if let Some(config) = self.debug_assertions_config_arg(release) {
+            cmd = cmd.arg("--config").arg(config);
+        }
+
         if let Some(target_dir) = &self.target_dir {
             cmd = cmd.arg("--target-dir").arg(target_dir);
         }
@@ -2047,6 +2081,29 @@ Automatic meson installation failed: {install_err}\n\n{}",
         command_output_with_progress(cmd, self.progress.clone())
             .await
             .map_err(RustBuildError::FailToExecuteCargoBuild)
+    }
+
+    /// The `--config` argument re-enabling `debug_assertions` for the
+    /// project's own package on a development-profile build whose profile
+    /// disables them (Optimized).
+    ///
+    /// The framework gates its `waterui_meta_*` statics and
+    /// `waterui_preview_*` exports on `debug_assertions` so release binaries
+    /// stay free of them, but those symbols are how the CLI discovers mounts
+    /// and previews — so the Optimized development profile would compile the
+    /// project's own library artifact without them. Scoping the flag back on
+    /// for the project package only leaves dependencies on the profile's
+    /// setting; a release build keeps the gate.
+    fn debug_assertions_config_arg(&self, release: bool) -> Option<String> {
+        if release {
+            return None;
+        }
+        self.project.as_ref().map(|project| {
+            format!(
+                "profile.dev.package.{}.debug-assertions=true",
+                project.crate_name()
+            )
+        })
     }
 
     /// The arguments after `cargo rustc --`: the `--crate-type` override,
@@ -2405,6 +2462,84 @@ fn reported_shared_runtime(stdout: &[u8]) -> Result<Option<PathBuf>, RustBuildEr
                     .join(", ")
             ),
         ))),
+    }
+}
+
+/// The library artifact `stdout` reports for the crate at `manifest_path` —
+/// the `deps/` rlib, staticlib, or dylib whose symbol table
+/// `crate::artifact_symbols::ArtifactSymbols` reads.
+///
+/// The selected build's own `compiler-artifact` stream is the source, so the
+/// path is what this invocation's rustc wrote — never a `<profile>`-glob that
+/// could name bytes an older configuration left behind. Several library
+/// filenames can accompany one artifact (a crate-type list emits an rlib
+/// beside a staticlib); the most parseable rank wins — `.rlib`, then a
+/// static archive, then a dynamic library — and two equally ranked reports
+/// are a hard error rather than a guess.
+///
+/// # Errors
+/// Returns an error when cargo's message stream cannot be parsed or reports
+/// two indistinguishable library artifacts for the crate.
+pub(crate) fn app_library_artifact(
+    stdout: &[u8],
+    manifest_path: &Path,
+) -> Result<Option<PathBuf>, RustBuildError> {
+    let mut candidates: BTreeMap<u8, BTreeSet<PathBuf>> = BTreeMap::new();
+    for artifact in compiler_artifacts(stdout)? {
+        if !artifact.target.kind.iter().any(|kind| {
+            matches!(
+                kind,
+                cargo_metadata::TargetKind::Lib
+                    | cargo_metadata::TargetKind::RLib
+                    | cargo_metadata::TargetKind::DyLib
+                    | cargo_metadata::TargetKind::CDyLib
+                    | cargo_metadata::TargetKind::StaticLib
+            )
+        }) || !same_manifest_path(artifact.manifest_path.as_std_path(), manifest_path)
+        {
+            continue;
+        }
+        for filename in &artifact.filenames {
+            let path = filename.as_std_path();
+            if let Some(rank) = app_library_extension_rank(path) {
+                candidates
+                    .entry(rank)
+                    .or_default()
+                    .insert(path.to_path_buf());
+            }
+        }
+    }
+    let Some((_, mut best)) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    if best.len() == 1 {
+        return Ok(best.pop_first());
+    }
+    Err(RustBuildError::FailToBuildRustLibrary(io::Error::other(
+        format!(
+            "Cargo reported multiple library artifacts for {}: {}",
+            manifest_path.display(),
+            best.iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )))
+}
+
+/// The readability rank of a library filename, or `None` for a file that is
+/// not a library artifact (`.rmeta`, executables, `.d` dep-info). `.rlib` and
+/// `.a` archives read as full object collections; `.so`/`.dylib`/`.dll` are
+/// single objects; a bare `.lib`/`foo.dll.lib` can also be a linker import
+/// stub beside a `.dll`, so it ranks last.
+fn app_library_extension_rank(path: &Path) -> Option<u8> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "rlib" | "wasm" => Some(0),
+        "a" => Some(1),
+        "so" | "dylib" | "dll" => Some(2),
+        "lib" => Some(3),
+        _ => None,
     }
 }
 
@@ -3143,6 +3278,7 @@ mod tests {
             profile_dir: profile_dir.clone(),
             artifact: temporary.path().join("app"),
             shared_runtime: None,
+            app_library: None,
         }
         .shared_runtime()
         .expect_err("missing runtime should fail");
@@ -4386,6 +4522,78 @@ mod tests {
                 .expect("the cli config layer resolves");
 
             assert_eq!(flags, ["--cfg=water_cli_probe"]);
+        });
+    }
+
+    /// `water build --release` on an app with an `include_bundle!` mount must
+    /// stage the mount's files: the mount plan is read from the
+    /// `waterui_meta_bundle_*` statics in the release build's own rlib, and
+    /// the framework emits them in every profile. Before the metadata was
+    /// emitted under `debug_assertions` a release build carried none and the
+    /// staged mount came out empty (water-rs/waterui#1272).
+    ///
+    /// The project resolves the framework from a local checkout — the pinned
+    /// revision by default, or `WATERUI_PATH` to exercise a working tree — so
+    /// the test builds the same `waterui` commit the crate's git deps pin.
+    #[test]
+    #[ignore = "clones the pinned framework revision and builds a release app"]
+    fn release_build_stages_include_bundle_mounts() {
+        smol::block_on(async {
+            let checkout = crate::toolchain::host::Host::current()
+                .env("WATERUI_PATH")
+                .map_or_else(
+                    || crate::pinned_framework::checkout().to_path_buf(),
+                    PathBuf::from,
+                );
+            let temporary = tempdir().expect("tempdir");
+            let root = temporary.path().join("release-app");
+            let mut project = crate::project::Project::create(
+                &root,
+                crate::project::CreateOptions {
+                    name: "Release App".to_string(),
+                    bundle_identifier:
+                        crate::project_model::project_types::BundleIdentifier::try_from(
+                            "dev.waterui.releaseapp",
+                        )
+                        .expect("bundle identifier"),
+                    package_type: crate::project::PackageType::App,
+                    waterui_path: Some(checkout),
+                    channel: None,
+                    framework_manifest: None,
+                    framework: None,
+                    author: String::new(),
+                    backends: Vec::new(),
+                    web: None,
+                },
+            )
+            .await
+            .expect("project creation must succeed");
+
+            std::fs::create_dir_all(root.join("bundle")).expect("bundle dir");
+            std::fs::write(root.join("bundle/hello.txt"), "fixture asset\n").expect("asset");
+            let lib_rs = root.join("src/lib.rs");
+            let mut source = std::fs::read_to_string(&lib_rs).expect("lib.rs");
+            source.push_str("\nwaterui::include_bundle!(\"bundle\", as = media);\n");
+            std::fs::write(&lib_rs, source).expect("write lib.rs");
+
+            project
+                .init_hydrolysis_backend()
+                .await
+                .expect("hydrolysis backend scaffolds");
+            crate::hydrolysis::platform::build_hydrolysis(
+                &project,
+                crate::platform::TargetPlatform::Linux,
+                BuildOptions::development(BuildProfile::Release),
+            )
+            .await
+            .expect("release build must succeed");
+
+            let staged = root.join("backends/hydrolysis/resources/waterui_assets/media/hello.txt");
+            assert!(
+                staged.metadata().is_ok_and(|meta| meta.len() > 0),
+                "release build stages a non-empty mount at {}",
+                staged.display()
+            );
         });
     }
 }
