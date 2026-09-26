@@ -17,6 +17,10 @@
 //! `--bin` unit with `-Cprefer-dynamic`, loader search paths, and the
 //! `-Cextra-filename` marker — so the artifact handed to packaging is the
 //! marked `deps/` binary a playground run produces (water-rs/cli#161).
+//! Built twice, the second invocation reports the shared dylib unit
+//! `fresh`, so the stale check must find the dep-info rustc wrote as
+//! `deps/<crate>-<metadata>.d` — the hashed name a git-sourced dylib
+//! carries (water-rs/cli#162).
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -450,5 +454,32 @@ fn run_built_binary_finds_every_shared_library_it_records() {
 
         assert_dist_satisfies_needed(&built.artifact, &dist);
         assert_staged_binary_runs(&built.artifact, &dist);
+    });
+}
+
+/// Build the binary a `water run` produces — `RustBuild::build_binary` under
+/// [`RustLinkage::SharedRuntime`] — twice on one target directory. The
+/// second `cargo rustc` invocation reports the shared dylib unit `fresh`,
+/// so the stale check must locate the dep-info rustc wrote as
+/// `deps/<crate>-<metadata>.d`: the recorded name the dylib's own dynamic
+/// section carries when the dependency comes from git (water-rs/cli#162).
+#[test]
+fn a_second_shared_runtime_build_finds_the_dylib_dep_info() {
+    smol::block_on(async {
+        let temporary: TempDir = tempdir().expect("tempdir");
+        let root = temporary.path();
+        let (_app_dir, backend_dir) = scaffold_run_fixture(root);
+
+        let build = RustBuild::new(&backend_dir, Triple::host())
+            .with_target_dir(root.join("target"))
+            .with_linkage(RustLinkage::SharedRuntime, "app/dev", &["$ORIGIN"]);
+        build
+            .build_binary("backend", false)
+            .await
+            .expect("build the fixture backend binary");
+        build
+            .build_binary("backend", false)
+            .await
+            .expect("rebuild the fixture backend binary on the warm cache");
     });
 }
