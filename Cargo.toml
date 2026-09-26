@@ -55,7 +55,6 @@ target-lexicon = "0.13.5"
 thiserror = "2.0.20"
 jiff = { version = "0.2", features = ["serde"] }
 toml = "1.1.5"
-plist = "1.10"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 semver = "1.0"
@@ -164,7 +163,13 @@ nix = { version = "0.31", features = ["process", "signal", "user"] }
 # `.icns` encoding for hand-assembled app bundles. Only the macOS packaging path
 # builds one, and that path is itself `#[cfg(target_os = "macos")]`, so the
 # dependency does not belong in a Linux or Windows build of the CLI.
-icns = "0.4"
+# `pngio` covers the PNG-encoded family members this CLI writes; the `jp2io`
+# default would pull a whole JPEG 2000 decoder (hayro-jpeg2000) for entries we
+# never read or emit.
+icns = { version = "0.4", default-features = false, features = ["pngio"] }
+# `plist::Value` is only used to read `Info.plist` during macOS device/bundle
+# probing, all under `#[cfg(target_os = "macos")]`.
+plist = "1.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
