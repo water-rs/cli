@@ -375,6 +375,33 @@ fn assert_staged_binary_runs(executable: &Path, dist: &Path) {
     );
 }
 
+/// Run `executable` where it already lives, with `runtime_dir` — the profile
+/// directory it sits in — on the loader search path, the way `water mcp`
+/// spawns the binary it just staged.
+fn assert_binary_runs_in_place(executable: &Path, runtime_dir: &Path) {
+    let mut run = Command::new(executable);
+    if cfg!(windows) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![runtime_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        run.env("PATH", std::env::join_paths(paths).expect("join PATH"));
+    } else if cfg!(target_os = "macos") {
+        run.env("DYLD_FALLBACK_LIBRARY_PATH", runtime_dir);
+    } else {
+        run.env("LD_LIBRARY_PATH", runtime_dir);
+    }
+    let output = run
+        .stdin(Stdio::null())
+        .output()
+        .expect("launch rebuilt binary");
+    assert!(
+        output.status.success(),
+        "rebuilt binary failed against the restaged runtime: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Build a binary that links a git-sourced `dylib` crate dynamically, run
 /// `RustDynamicLibraries::resolve` + `stage` the way platform packaging
 /// does, and assert the dist directory contains every non-system library the
@@ -481,5 +508,151 @@ fn a_second_shared_runtime_build_finds_the_dylib_dep_info() {
             .build_binary("backend", false)
             .await
             .expect("rebuild the fixture backend binary on the warm cache");
+    });
+}
+
+/// Re-resolve the vendored `waterui-dylib` at a bumped version: a new
+/// package id hashes into a new `-C metadata` suffix on every `deps/` name,
+/// the way a framework update does between two `water mcp` runs sharing one
+/// target directory.
+fn bump_vendored_dylib(root: &Path, backend_dir: &Path) {
+    let dylib_dir = root.join("waterui-dylib");
+    write(
+        &dylib_dir.join("Cargo.toml"),
+        "[package]\nname = \"waterui-dylib\"\nversion = \"0.2.0\"\nedition = \"2021\"\n\n[lib]\nname = \"waterui_dylib\"\ncrate-type = [\"dylib\", \"rlib\"]\n",
+    );
+    run(
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dylib_dir),
+        "git add",
+    );
+    run(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "user.name=fixture",
+            ])
+            .args(["commit", "-qm", "bump"])
+            .current_dir(&dylib_dir),
+        "git commit",
+    );
+    run(
+        Command::new("cargo")
+            .args(["update", "-p", "waterui-dylib"])
+            .current_dir(backend_dir),
+        "cargo update waterui-dylib",
+    );
+}
+
+/// The file name part of a recorded dynamic dependency.
+fn needed_name_file(recorded_name: &str) -> String {
+    recorded_name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(recorded_name)
+        .to_owned()
+}
+
+/// The `libwaterui_dylib*` file names a directory holds, sorted.
+fn staged_waterui_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read staged dir")
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with("libwaterui_dylib") || name.starts_with("waterui_dylib"))
+                .then_some(name)
+        })
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// Stage into the binary's own profile directory twice across a dylib `-C
+/// metadata` change — the arrangement `water mcp` uses, where the staged
+/// runtime lives beside the binary it serves — and assert the second stage
+/// lands the newly needed `libwaterui_dylib-<hash>.so` and removes the stale
+/// hash the first stage left (water-rs/cli#176).
+#[test]
+fn restaging_replaces_a_stale_hashed_shared_runtime() {
+    smol::block_on(async {
+        let temporary: TempDir = tempdir().expect("tempdir");
+        let root = temporary.path();
+        let (app_dir, backend_dir) = scaffold_run_fixture(root);
+        let triple = Triple::host();
+        let target_dir = root.join("target");
+        let project = Project::open(&app_dir, ManagedBackends::NONE)
+            .await
+            .expect("open fixture project");
+
+        let built = RustBuild::new(&backend_dir, triple.clone())
+            .with_target_dir(target_dir.clone())
+            .with_linkage(RustLinkage::SharedRuntime, "app/dev", &["$ORIGIN"])
+            .build_binary("backend", false)
+            .await
+            .expect("first fixture build");
+        let runtime_dir = built
+            .artifact
+            .parent()
+            .expect("binary profile dir")
+            .to_path_buf();
+        RustDynamicLibraries::resolve(&built, &triple, &project)
+            .await
+            .expect("resolve first shared libraries")
+            .stage(&runtime_dir)
+            .await
+            .expect("stage first runtime");
+        let first_waterui: Vec<String> = needed_shared_libraries(&built.artifact)
+            .expect("first needed")
+            .into_iter()
+            .filter(|name| name.contains("waterui_dylib"))
+            .collect();
+        assert_eq!(
+            staged_waterui_names(&runtime_dir).as_slice(),
+            first_waterui
+                .iter()
+                .map(|name| needed_name_file(name))
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "first stage must leave exactly the recorded runtime name"
+        );
+
+        bump_vendored_dylib(root, &backend_dir);
+
+        let rebuilt = RustBuild::new(&backend_dir, triple.clone())
+            .with_target_dir(target_dir)
+            .with_linkage(RustLinkage::SharedRuntime, "app/dev", &["$ORIGIN"])
+            .build_binary("backend", false)
+            .await
+            .expect("rebuild after dylib bump");
+        let rebuilt_needed: Vec<String> = needed_shared_libraries(&rebuilt.artifact)
+            .expect("rebuilt needed")
+            .into_iter()
+            .filter(|name| name.contains("waterui_dylib"))
+            .collect();
+        assert_ne!(
+            first_waterui, rebuilt_needed,
+            "the fixture must change the recorded dylib name"
+        );
+        RustDynamicLibraries::resolve(&rebuilt, &triple, &project)
+            .await
+            .expect("resolve rebuilt shared libraries")
+            .stage(&runtime_dir)
+            .await
+            .expect("restage runtime");
+
+        assert_eq!(
+            staged_waterui_names(&runtime_dir).as_slice(),
+            rebuilt_needed
+                .iter()
+                .map(|name| needed_name_file(name))
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "restaging must replace the stale hashed runtime with the recorded one"
+        );
+        assert_binary_runs_in_place(&rebuilt.artifact, &runtime_dir);
     });
 }
