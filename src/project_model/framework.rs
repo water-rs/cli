@@ -739,6 +739,7 @@ impl ResolvedFramework {
             .map(|package| package.id.clone())
             .collect();
         let mut visited = BTreeSet::new();
+        let mut conflicts = Vec::new();
         while let Some(id) = pending.pop() {
             if !visited.insert(id.clone()) {
                 continue;
@@ -753,13 +754,23 @@ impl ResolvedFramework {
                 && ecosystem.contains(identity.name.as_str())
                 && !self.sanctioned_source(&identity)
             {
-                bail!(
-                    "framework dependency {} {} differs from Water.lock; select a compatible channel explicitly",
-                    identity.name,
-                    identity.version
-                );
+                conflicts.push(identity);
             }
             pending.extend(nodes[&id].dependencies.iter().cloned());
+        }
+        // Report the whole divergent set at once: a resolution that moved
+        // several pinned packages is one conflict, not a sequence of
+        // one-package-at-a-time errors (#177).
+        if !conflicts.is_empty() {
+            conflicts.sort();
+            bail!(
+                "framework dependencies conflict with Water.lock: {}; select a compatible channel explicitly",
+                conflicts
+                    .iter()
+                    .map(|package| format!("{} {}", package.name, package.version))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         Ok(())
     }
@@ -797,32 +808,23 @@ impl ResolvedFramework {
         } else {
             Some(smol::fs::read(project.root().join("Water.lock")).await?)
         };
-        let mut packages = BTreeMap::new();
-        if let Some(previous) = &previous {
-            packages.extend(
-                previous
-                    .packages
-                    .iter()
-                    .map(|package| (LockedDependency::from(package), package.clone())),
-            );
-        }
-        if let Some(canonical) = &canonical {
-            packages.extend(
-                self.cargo_lock(canonical)?
-                    .packages
-                    .into_iter()
-                    .map(|package| (LockedDependency::from(&package), package)),
-            );
-        }
-        packages.extend(
-            project_lock
-                .packages
+        let canonical_lock = canonical
+            .as_deref()
+            .map(|contents| self.cargo_lock(contents))
+            .transpose()?;
+        // Every identity an input lock records is an acceptable resolution
+        // outcome — a second version beside a locked one is an addition, not
+        // a change — so `allowed` still sees all three locks.
+        let allowed = self.allowed_packages(
+            previous
                 .iter()
-                .map(|package| (LockedDependency::from(package), package.clone())),
+                .flat_map(|lock| lock.packages.iter())
+                .chain(canonical_lock.iter().flat_map(|lock| lock.packages.iter()))
+                .chain(project_lock.packages.iter()),
         );
-        let allowed = self.allowed_packages(packages.values());
+        let packages = seed_packages(canonical_lock.as_ref(), &project_lock, previous.as_ref());
         let mut seed = project_lock;
-        seed.packages = packages.into_values().collect();
+        seed.packages = packages;
         smol::fs::write(&lock_path, seed.to_string()).await?;
         let root = directory.to_path_buf();
         let features = features.to_vec();
@@ -1192,6 +1194,47 @@ impl ResolvedFramework {
             lockfile,
         ))
     }
+}
+
+/// The packages the generated crate's `Cargo.lock` seed carries.
+///
+/// The seed is one resolution, not a union of locks: a name the pinned
+/// framework lock records resolves only to the identities the channel
+/// certifies, the project lock supplies every name the framework does
+/// not know, and the previous generated lock fills what neither names so
+/// packages only the managed crate adds stay put. Unioning the three
+/// keyed on the locked identity let a canonical name enter twice at
+/// divergent resolutions — the `wasm-bindgen`/`js-sys` lockstep split of
+/// #177 — and no resolution of the generated crate could then satisfy
+/// `Water.lock`: the divergent candidate either moved a shared edge off
+/// its pin or contradicted the pair a fresh version requires. Names the
+/// canonical lock does not record are exempt — the project may carry any
+/// version of a package the framework never names.
+fn seed_packages(
+    canonical: Option<&Lockfile>,
+    project: &Lockfile,
+    previous: Option<&Lockfile>,
+) -> Vec<cargo_lock::Package> {
+    let canonical_names: BTreeSet<&str> = canonical
+        .into_iter()
+        .flat_map(|lock| lock.packages.iter().map(|package| package.name.as_str()))
+        .collect();
+    let mut packages: Vec<cargo_lock::Package> = canonical
+        .into_iter()
+        .flat_map(|lock| lock.packages.iter().cloned())
+        .collect();
+    let mut rest: BTreeMap<LockedDependency, cargo_lock::Package> = BTreeMap::new();
+    for package in project
+        .packages
+        .iter()
+        .chain(previous.into_iter().flat_map(|lock| lock.packages.iter()))
+    {
+        if !canonical_names.contains(package.name.as_str()) {
+            rest.insert(LockedDependency::from(package), package.clone());
+        }
+    }
+    packages.extend(rest.into_values());
+    packages
 }
 
 /// The Apple backend follows the framework's channel. `dev` resolves the
@@ -2679,6 +2722,68 @@ mod tests {
             resolved("annotate-snippets", "0.12.20"),
             "the locked 0.12.16 moved"
         );
+    }
+
+    /// The generated crate's lock seed is one resolution: a name the
+    /// pinned framework lock records resolves only to the identities the
+    /// channel certifies — the union seed handed Cargo the project's
+    /// divergent `wasm-bindgen`/`js-sys` pair beside the pin and no
+    /// resolution then satisfied `Water.lock` (#177) — while a name the
+    /// canonical lock does not record keeps every input lock's entries.
+    #[test]
+    fn the_seed_resolves_a_canonical_name_to_the_pinned_identity() {
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
+        let lock = |packages| Lockfile {
+            packages,
+            version: cargo_lock::ResolveVersion::V4,
+            root: None,
+            metadata: BTreeMap::default(),
+            patch: cargo_lock::Patch::default(),
+        };
+        let canonical = lock(vec![
+            package("wasm-bindgen", "0.2.128", registry),
+            package("js-sys", "0.3.128", registry),
+            package("cc", "1.4.5", registry),
+        ]);
+        let project = lock(vec![
+            package("app", "0.1.0", None),
+            package("wasm-bindgen", "0.2.105", registry),
+            package("js-sys", "0.3.105", registry),
+            package("cc", "1.4.7", registry),
+            package("annotate-snippets", "0.12.16", registry),
+            package("toml", "0.9.5", registry),
+        ]);
+        let previous = lock(vec![
+            package("wasm-bindgen", "0.2.105", registry),
+            package("annotate-snippets", "0.11.5", registry),
+            package("bindgen", "0.72.0", registry),
+        ]);
+
+        let seed = seed_packages(Some(&canonical), &project, Some(&previous));
+        let versions = |name: &str| {
+            let mut versions: Vec<_> = seed
+                .iter()
+                .filter(|package| package.name.as_str() == name)
+                .map(|package| package.version.to_string())
+                .collect();
+            versions.sort();
+            versions
+        };
+        assert_eq!(versions("wasm-bindgen"), ["0.2.128"]);
+        assert_eq!(versions("js-sys"), ["0.3.128"]);
+        assert_eq!(versions("cc"), ["1.4.5"]);
+        assert_eq!(versions("app"), ["0.1.0"]);
+        assert_eq!(versions("toml"), ["0.9.5"]);
+        assert_eq!(versions("annotate-snippets"), ["0.11.5", "0.12.16"]);
+        assert_eq!(versions("bindgen"), ["0.72.0"]);
+
+        // Without a canonical lock — the stable channel — every input
+        // entry still seeds, one resolution per recorded identity.
+        let seed = seed_packages(None, &project, Some(&previous));
+        assert!(seed.iter().any(|package| {
+            package.name.as_str() == "wasm-bindgen" && package.version.to_string() == "0.2.105"
+        }));
+        assert_eq!(seed.iter().filter(|p| p.name.as_str() == "app").count(), 1);
     }
 
     fn snapshot(lock: &Lockfile) -> (ResolvedFramework, Vec<u8>) {
