@@ -1341,6 +1341,16 @@ async fn scaffold_preview_module(project: &Project, platform: PreviewPlatform) -
         )
         .await
         .wrap_err("Failed to open the preview support project")?;
+    } else {
+        // The support app's scaffold runs only after this module's metadata
+        // resolves, so the workspace the module joins has no root manifest
+        // yet — and without it Cargo honours none of the project's `[patch]`
+        // tables, resolving every `waterui-*` crate from the registry beside
+        // the checkout's pinned copies. Write the root stub the resolution
+        // needs; the companion scaffold replaces it once the app exists.
+        crate::templates::ensure_preview_module_workspace_root(&workspace_root, project.root())
+            .await
+            .wrap_err("Failed to write the preview workspace root manifest")?;
     }
     Ok(crate_path)
 }
