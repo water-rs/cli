@@ -237,14 +237,13 @@ impl Esp32Backend {
                     project.root().join(path)
                 };
                 Some(
-                    crate::project_model::templates::collect_workspace_patches(&root).map_err(
-                        |error| {
+                    crate::project_model::templates::collect_framework_checkout_patches(&root)
+                        .map_err(|error| {
                             eyre::eyre!(
                                 "failed to read the WaterUI checkout's patch tables at {}: {error}",
                                 root.display()
                             )
-                        },
-                    )?,
+                        })?,
                 )
             }
             (None, Some(framework)) => Some(framework.patches()),

@@ -33,6 +33,21 @@ pub const fn lib_extension_for_triple(triple: &Triple) -> &'static str {
     }
 }
 
+/// Whether `triple` targets an Apple platform — the set whose `-l` link flag
+/// and `@rpath` install-name conventions [`RustDynamicLibraries::resolve`]
+/// stages for.
+const fn is_apple_triple(triple: &Triple) -> bool {
+    matches!(
+        triple.operating_system,
+        OperatingSystem::Darwin(_)
+            | OperatingSystem::MacOSX { .. }
+            | OperatingSystem::IOS(_)
+            | OperatingSystem::TvOS(_)
+            | OperatingSystem::WatchOS(_)
+            | OperatingSystem::VisionOS(_)
+    )
+}
+
 /// The rustup toolchain a project's builds run under: the one its own
 /// directory selects, whatever directory the generated crate compiles in.
 ///
@@ -371,6 +386,42 @@ impl RustDynamicLibraries {
     #[must_use]
     pub fn waterui(&self) -> &Path {
         &self.waterui.source
+    }
+
+    /// The path the canonical `libwaterui_dylib.dylib` occupies once
+    /// [`stage_apple_canonical`](Self::stage_apple_canonical) copies it into
+    /// `destination` — the file the `-lwaterui_dylib` link flag and the
+    /// `@rpath/libwaterui_dylib.dylib` install name resolve to. Apple-only:
+    /// cargo writes only the hashed `deps/` name (water-rs/cli#197). On other
+    /// triples the staged copy already carries the recorded name, so this is
+    /// its own path.
+    #[must_use]
+    pub fn apple_canonical_waterui(&self, destination: &Path) -> PathBuf {
+        if is_apple_triple(&self.triple) {
+            destination.join("libwaterui_dylib.dylib")
+        } else {
+            destination.join(&self.waterui.staged_name)
+        }
+    }
+
+    /// Copy the resolved `waterui_dylib` into `destination` under the
+    /// canonical Apple name [`apple_canonical_waterui`] returns, alongside
+    /// the recorded name [`stage`](Self::stage) writes.
+    ///
+    /// # Errors
+    /// Returns an error if the copy fails.
+    pub async fn stage_apple_canonical(&self, destination: &Path) -> eyre::Result<PathBuf> {
+        let staged = self.apple_canonical_waterui(destination);
+        crate::utils::copy_file(&self.waterui.source, &staged)
+            .await
+            .wrap_err_with(|| {
+                format!(
+                    "Failed to stage {} to {}",
+                    self.waterui.source.display(),
+                    staged.display()
+                )
+            })?;
+        Ok(staged)
     }
 
     /// Target Rust standard-library dynamic library path.
@@ -2857,6 +2908,31 @@ fn dep_info_path(
     {
         return Some(dep_info);
     }
+    // The hashed dep-info cargo writes beside the hashed `deps/` copy —
+    // `deps/lib<name>-<meta>.dylib` pairs with `deps/<name>-<meta>.d` — a
+    // spelling neither the unhashed uplift's stem nor a retargeted `@rpath`
+    // install record derives (water-rs/cli#197). Cargo's report never names
+    // the hashed dylib, so read the directory rather than `sibling_files`.
+    let base = name.split('-').next().unwrap_or(name);
+    if let Ok(entries) = std::fs::read_dir(&deps) {
+        let mut hashed = entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_str()?;
+                let stem = file_name.strip_suffix(".d")?;
+                if stem.starts_with(&format!("{base}-")) {
+                    Some(entry.path())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        hashed.sort();
+        if let Some(dep_info) = hashed.into_iter().find(|candidate| candidate.is_file()) {
+            return Some(dep_info);
+        }
+    }
     let mut candidates = vec![
         dir.join(format!("{file_stem}.d")),
         deps.join(format!("{name}.d")),
@@ -3196,7 +3272,7 @@ mod tests {
     use tempfile::tempdir;
 
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{
         BuildOptions, BuildProfile, BuiltTarget, CargoTarget, CompileEvent, RustBuild,
@@ -4136,6 +4212,129 @@ mod tests {
                 "the needed name spells the hashed dep-info a copied uplift leaves: {stale:?}"
             );
         });
+    }
+
+    /// On Apple the artifact report names the unhashed uplift
+    /// `libwaterui_dylib.dylib` while cargo writes `deps/waterui_dylib-<meta>.d`
+    /// and the consuming image's `LC_LOAD_DYLIB` records the retargeted
+    /// `@rpath/libwaterui_dylib.dylib` — an unhashed `deps/waterui_dylib.d`
+    /// never exists, so the lookup reads the hashed sibling `deps/` carries
+    /// (#197). Missing it flags `MissingDepInfo` on every build and the
+    /// clean-and-rebuild remedy loops forever.
+    #[test]
+    fn stale_check_finds_the_hashed_dep_info_a_retargeted_apple_record_leaves() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let profile = temporary.path().join("debug");
+            let deps = profile.join("deps");
+            std::fs::create_dir_all(&deps).expect("deps dir");
+            let dylib = profile.join("libwaterui_dylib.dylib");
+            std::fs::write(&dylib, []).expect("dylib");
+
+            let ours = temporary.path().join("ours");
+            std::fs::create_dir_all(ours.join("src")).expect("our manifest dir");
+            let manifest = ours.join("Cargo.toml");
+            std::fs::write(&manifest, "").expect("manifest");
+            let own_source = ours.join("src/lib.rs");
+            std::fs::write(&own_source, "").expect("own source");
+            std::fs::write(
+                deps.join("waterui_dylib-0123456789abcdef.d"),
+                format!(
+                    "{}: {}\n",
+                    deps.join("libwaterui_dylib-0123456789abcdef.dylib")
+                        .display(),
+                    own_source.display()
+                ),
+            )
+            .expect("dep-info");
+
+            let stdout = serde_json::json!({
+                "reason": "compiler-artifact",
+                "package_id": "registry+https://x#waterui-dylib@0.1.0",
+                "manifest_path": manifest,
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["dylib"],
+                    "name": "waterui_dylib",
+                    "src_path": own_source,
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true,
+                },
+                "profile": {
+                    "opt_level": "0",
+                    "debuginfo": 0,
+                    "debug_assertions": true,
+                    "overflow_checks": true,
+                    "test": false,
+                },
+                "features": [],
+                "filenames": [dylib],
+                "executable": null,
+                "fresh": true,
+            })
+            .to_string();
+
+            // The retargeted consumer records the unhashed install name; the
+            // hashed dep-info a `deps/` sibling pairs with is the only `.d`.
+            let needed = vec!["@rpath/libwaterui_dylib.dylib".to_string()];
+            let stale = super::stale_shared_dylib_packages(stdout.as_bytes(), &needed)
+                .await
+                .expect("scan");
+            assert!(
+                stale.is_empty(),
+                "the hashed `deps/<crate>-<meta>.d` the sibling dylib pairs with resolves: {stale:?}"
+            );
+        });
+    }
+
+    /// `resolve` stages the runtime under the name the artifact's dynamic
+    /// section records — the hashed `deps/` name every platform's loader
+    /// resolves — and additionally names the canonical
+    /// `libwaterui_dylib.dylib` Apple alone needs: the `-lwaterui_dylib` link
+    /// flag and `@rpath` install name cargo's hashed `deps/` output can never
+    /// carry (water-rs/cli#197, the Apple arm of #184).
+    #[test]
+    fn shared_runtime_stages_the_recorded_name_and_the_apple_canonical_one() {
+        fn libraries(recorded: &str, triple: Triple) -> super::RustDynamicLibraries {
+            let waterui =
+                super::StagedDynamicLibrary::needed(recorded, PathBuf::from("/deps/libwaterui"));
+            let standard_library = super::StagedDynamicLibrary::needed(
+                "libstd-0123456789abcdef.so",
+                PathBuf::from("/deps/libstd"),
+            );
+            super::RustDynamicLibraries {
+                waterui,
+                standard_library,
+                triple,
+            }
+        }
+
+        let destination = Path::new("/dist");
+        let apple = libraries(
+            "deps/libwaterui_dylib-0123456789abcdef.dylib",
+            triple("aarch64-apple-darwin"),
+        );
+        // The recorded (hashed) name still stages — a non-retargeted Mach-O
+        // resolves it — and the canonical name is the `-l`/`@rpath` target.
+        assert_eq!(
+            Path::new("/dist").join("libwaterui_dylib-0123456789abcdef.dylib"),
+            destination.join(&apple.waterui.staged_name)
+        );
+        assert_eq!(
+            Path::new("/dist/libwaterui_dylib.dylib"),
+            apple.apple_canonical_waterui(destination)
+        );
+
+        let linux = libraries(
+            "deps/libwaterui_dylib-0123456789abcdef.so",
+            triple("x86_64-unknown-linux-gnu"),
+        );
+        assert_eq!(
+            Path::new("/dist/libwaterui_dylib-0123456789abcdef.so"),
+            linux.apple_canonical_waterui(destination)
+        );
     }
 
     /// Cargo's build-dir layout (nightly 1.100) writes a unit's dep-info in

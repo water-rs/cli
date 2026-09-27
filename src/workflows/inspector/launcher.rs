@@ -248,6 +248,7 @@ async fn scaffold_inspector_app(path: &Path, requirements: &InspectorRequirement
         channel: None,
         framework_manifest: None,
         framework: None,
+        framework_lock: None,
         author: String::new(),
         backends: Vec::new(),
         web: None,

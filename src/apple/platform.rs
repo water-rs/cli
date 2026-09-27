@@ -114,10 +114,12 @@ async fn remove_superseded_host_library(
     }
 }
 
-/// Cargo features an Apple FFI build resolves its dependency graph with.
-/// The `waterui-ffi` features an Apple runtime is compiled with.
+/// The features an Apple runtime's generated FFI crate is compiled with.
 ///
-/// Anything loaded into that runtime has to be compiled with the same set. Cargo
+/// Each name is a feature the generated manifest forwards to `waterui-ffi`
+/// (`FORWARDED_FFI_FEATURES`), so the resolve stays inside the seeded
+/// lockfile. Anything loaded into that runtime has to be compiled with the
+/// same set. Cargo
 /// unifies features per build and folds the result into the `-C metadata` hash it
 /// mangles into every symbol, so a module that enables one feature more or fewer
 /// than its host links against a runtime whose symbols no longer match. Both
@@ -132,15 +134,15 @@ pub(crate) async fn apple_ffi_dependency_features(
     browser_runtime: BrowserRuntimePlan,
 ) -> eyre::Result<Vec<String>> {
     let build_manifest = project.ffi_crate_path().join("Cargo.toml");
-    let mut features = vec!["waterui-ffi/c-api".to_string()];
+    let mut features = vec!["c-api".to_string()];
     features.extend(
         crate::project_model::assets::capability_ffi_features(project, &build_manifest).await?,
     );
     if browser_runtime.chromium {
-        features.push("waterui-ffi/chromium".to_string());
+        features.push("chromium".to_string());
     }
     if matches!(browser_runtime.webview, Some(ResolvedWebViewBackend::Cef)) {
-        features.push("waterui-ffi/webview-cef".to_string());
+        features.push("webview-cef".to_string());
     }
     Ok(features)
 }
@@ -231,8 +233,14 @@ pub async fn build_rust_lib(
         remove_superseded_host_library(output_dir, host_library).await?;
         if options.linkage() == RustLinkage::SharedRuntime {
             let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
-            dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
             libraries.stage(output_dir).await?;
+            let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
+            if host_library == AppleHostLibrary::Dynamic {
+                // The app library records the runtime's cargo-written install
+                // name; retarget while the canonical copy still carries it.
+                dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
+            }
+            dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
         }
     }
 
@@ -684,8 +692,14 @@ pub async fn package_apple(
 
     let shared_runtime = if options.uses_shared_rust_runtime() {
         let libraries = RustDynamicLibraries::resolve(built, &triple, project).await?;
-        dynamic_runtime::prepare_host_runtime(libraries.waterui()).await?;
         libraries.stage(&products_dir).await?;
+        let staged_runtime = libraries.stage_apple_canonical(&products_dir).await?;
+        if host_library == AppleHostLibrary::Dynamic {
+            // The app library records the runtime's cargo-written install
+            // name; retarget it while the canonical copy still carries that name.
+            dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
+        }
+        dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
         Some(libraries)
     } else {
         RustDynamicLibraries::remove_staged(&products_dir, &triple).await?;
@@ -802,6 +816,10 @@ pub async fn package_apple(
     if let Some(libraries) = shared_runtime {
         fs::create_dir_all(&frameworks_dir).await?;
         libraries.stage(&frameworks_dir).await?;
+        // The canonical `libwaterui_dylib.dylib` the retargeted modules and
+        // the `-lwaterui_dylib` link resolve, beside the recorded name.
+        let staged_runtime = libraries.stage_apple_canonical(&frameworks_dir).await?;
+        dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
         // The executable resolves `@rpath/libwaterui_app.dylib` through the bundle's
         // Frameworks directory, the same way it resolves the shared runtime.
         copy_file(
