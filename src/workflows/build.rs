@@ -1362,7 +1362,21 @@ impl RustBuild {
     /// project tree, where rustup would fall back to its default toolchain and
     /// link the runtime against a `libstd` the project's toolchain does not
     /// have.
+    ///
+    /// The project's bundle identifier also enters the cargo environment as
+    /// `WATERUI_APP_ID`: the framework compiles it into
+    /// `waterui::app::application_identifier` through `option_env!`, which
+    /// Cargo tracks through dep-info, so a changed identifier rebuilds the
+    /// framework rather than shipping a stale identity. It leads `envs` so a
+    /// caller-provided value still overrides it.
     pub(crate) fn with_project(mut self, project: &Project) -> Self {
+        self.envs.insert(
+            0,
+            (
+                "WATERUI_APP_ID".to_string(),
+                project.bundle_identifier().as_str().into(),
+            ),
+        );
         self.project = Some(project.clone());
         self
     }
@@ -3608,6 +3622,61 @@ mod tests {
                 "packaging {profile:?} must ship the declared profile"
             );
         }
+    }
+
+    /// Every build a project drives compiles its bundle identifier into the
+    /// framework's `application_identifier()` through `WATERUI_APP_ID`, so a
+    /// window's `WM_CLASS`/Wayland `app_id` matches the desktop entry the
+    /// packager writes — a caller-provided value still wins.
+    #[test]
+    fn project_builds_carry_waterui_app_id() {
+        smol::block_on(async {
+            let temporary = tempdir().expect("tempdir");
+            let project = crate::project::Project::create(
+                &temporary.path().join("appid-app"),
+                crate::project::CreateOptions {
+                    name: "Appid App".to_string(),
+                    bundle_identifier:
+                        crate::project_model::project_types::BundleIdentifier::try_from(
+                            "dev.waterui.appidapp",
+                        )
+                        .expect("bundle identifier"),
+                    package_type: crate::project::PackageType::Playground,
+                    waterui_path: None,
+                    channel: None,
+                    framework_manifest: None,
+                    framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    framework_lock: None,
+                    author: String::new(),
+                    backends: Vec::new(),
+                    web: None,
+                },
+            )
+            .await
+            .expect("project creation must succeed");
+
+            let build = RustBuild::new(temporary.path(), Triple::host()).with_project(&project);
+            assert!(
+                build.envs.contains(&(
+                    "WATERUI_APP_ID".to_string(),
+                    OsString::from("dev.waterui.appidapp")
+                )),
+                "the cargo environment must carry WATERUI_APP_ID: {:?}",
+                build.envs
+            );
+
+            let overridden = build.with_env("WATERUI_APP_ID", "dev.example.override");
+            let effective = overridden
+                .envs
+                .iter()
+                .rfind(|(key, _)| key == "WATERUI_APP_ID")
+                .map(|(_, value)| value.clone());
+            assert_eq!(
+                effective,
+                Some(OsString::from("dev.example.override")),
+                "the last WATERUI_APP_ID entry wins on the spawned command"
+            );
+        });
     }
 
     #[test]

@@ -5,4 +5,4 @@ Exec={{ executable_name }}
 Icon={{ bundle_identifier }}
 Terminal=false
 Categories=Utility;
-StartupWMClass={{ executable_name }}
+StartupWMClass={{ bundle_identifier }}
