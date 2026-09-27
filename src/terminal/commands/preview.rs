@@ -26,6 +26,9 @@ use waterui_cli::project::read_project_crate_name;
 async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
     let platform = request::resolve_preview_platform(args.platform)?;
     request::ensure_hydrolysis_preview_platform(platform)?;
+    let target_platform = platform
+        .hydrolysis_target_platform()
+        .expect("checked by ensure_hydrolysis_preview_platform");
     let (width, height) = request::parse_frame(&args.frame)?;
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let crate_name = read_project_crate_name(&project_path).await?;
@@ -35,6 +38,7 @@ async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
         &project_path,
         &crate_name,
         &args,
+        target_platform,
         sccache_path.as_deref(),
         Some(&shell.build_progress()),
     )
@@ -54,6 +58,7 @@ async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
                 project_path: &project_path,
                 source: target.hydrolysis_source(),
                 theme: args.theme.into(),
+                platform: target_platform,
                 width,
                 height,
                 sccache_path: sccache_path.clone(),
@@ -163,7 +168,7 @@ struct PreviewTestArgs {
     platform: Option<CliPreviewPlatform>,
 
     /// Theme package for Hydrolysis preview testing.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "material3")]
     theme: CliHydrolysisPreviewTheme,
 
     /// Frame size `WIDTHxHEIGHT` (default: `375x667`).
@@ -229,6 +234,10 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
                 theme: request
                     .hydrolysis_theme
                     .expect("hydrolysis preview theme must be resolved"),
+                platform: request
+                    .platform
+                    .hydrolysis_target_platform()
+                    .expect("hydrolysis backend implies a desktop preview platform"),
                 width: request.width,
                 height: request.height,
                 sccache_path,
@@ -267,7 +276,10 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
 
     // Launch preview session (connects to existing app or launches new one)
     let spinner = shell.spinner("Connecting to preview app...");
-    let preview_platform: PreviewPlatform = request.platform.into();
+    let preview_platform: PreviewPlatform = request
+        .platform
+        .support_app_platform()
+        .expect("a non-Hydrolysis preview backend implies a support-app platform");
     let mut session = Box::pin(launch_preview_session(
         &project_path,
         preview_platform,
@@ -451,6 +463,7 @@ async fn resolve_test_targets(
     project_path: &Path,
     crate_name: &str,
     args: &PreviewTestArgs,
+    target_platform: waterui_cli::platform::TargetPlatform,
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
@@ -466,6 +479,7 @@ async fn resolve_test_targets(
                 project_path,
                 crate_name,
                 args.theme.into(),
+                target_platform,
                 sccache_path,
                 progress,
             )
@@ -496,12 +510,14 @@ async fn discover_preview_targets(
     project_path: &Path,
     crate_name: &str,
     theme: HydrolysisPreviewTheme,
+    target_platform: waterui_cli::platform::TargetPlatform,
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
     let exports = discover_hydrolysis_preview_exports(
         project_path,
         theme,
+        target_platform,
         sccache_path.map(Path::to_path_buf),
         progress.cloned(),
     )
@@ -668,9 +684,9 @@ mod tests {
     }
 
     #[test]
-    fn hydrolysis_preview_requires_explicit_theme() {
+    fn hydrolysis_preview_theme_defaults_to_material3() {
         let result = request::resolve_hydrolysis_preview_theme(CliPreviewBackend::Hydrolysis, None);
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), Some(HydrolysisPreviewTheme::Material3));
     }
 
     #[test]

@@ -48,17 +48,18 @@ pub struct PreviewArgs {
     pub frame: Option<String>,
 
     /// Rendering backend: `apple`, `android`, or `hydrolysis`. Defaults to the
-    /// platform's native backend (`apple` on macOS/iOS, `android` on Android).
+    /// platform's native backend (`apple` on macOS/iOS, `android` on Android,
+    /// `hydrolysis` on Linux and Windows).
     #[serde(default)]
     pub backend: Option<CliPreviewBackend>,
 
-    /// Theme package for the `hydrolysis` backend (`material3`). Required when
-    /// `backend` is `hydrolysis`; rejected otherwise.
+    /// Theme package for the `hydrolysis` backend (`material3`, the default);
+    /// rejected for other backends.
     #[serde(default)]
     pub theme: Option<CliHydrolysisPreviewTheme>,
 
-    /// Target platform: `ios`, `macos`, or `android`. Defaults to this host's
-    /// native preview platform.
+    /// Target platform: `ios`, `macos`, `android`, `linux`, or `windows`.
+    /// Defaults to this host's native preview platform.
     #[serde(default)]
     pub platform: Option<CliPreviewPlatform>,
 }
@@ -164,6 +165,10 @@ impl PreviewTool {
                         theme: request
                             .hydrolysis_theme
                             .expect("resolve guarantees a theme for hydrolysis"),
+                        platform: request
+                            .platform
+                            .hydrolysis_target_platform()
+                            .expect("hydrolysis backend implies a desktop preview platform"),
                         width: request.width,
                         height: request.height,
                         sccache_path: self.sccache_path.clone(),
@@ -208,7 +213,10 @@ impl PreviewTool {
     ) -> Result<()> {
         let mut session = Box::pin(launch_preview_session(
             &self.project_path,
-            request.platform.into(),
+            request
+                .platform
+                .support_app_platform()
+                .expect("a non-Hydrolysis preview backend implies a support-app platform"),
             self.sccache_path.clone(),
             None,
         ))

@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::apple::toolchain::AppleSdk;
+use crate::platform::TargetPlatform;
 use crate::preview::protocol::{AppError, DylibId, function_path_to_symbol};
 use crate::preview::{
     HydrolysisPreviewSource, HydrolysisPreviewTheme, PreviewPlatform, PreviewSession,
@@ -32,14 +33,38 @@ pub enum CliPreviewPlatform {
     Macos,
     /// Android Emulator.
     Android,
+    /// Linux (Hydrolysis).
+    Linux,
+    /// Windows (Hydrolysis).
+    Windows,
 }
 
-impl From<CliPreviewPlatform> for PreviewPlatform {
-    fn from(p: CliPreviewPlatform) -> Self {
-        match p {
-            CliPreviewPlatform::Ios => Self::IosSimulator,
-            CliPreviewPlatform::Macos => Self::Macos,
-            CliPreviewPlatform::Android => Self::Android,
+impl CliPreviewPlatform {
+    /// The support-app [`PreviewPlatform`] this platform renders through.
+    ///
+    /// Hydrolysis platforms render in-process through the managed backend
+    /// binary — they have no support app, so they return `None`.
+    #[must_use]
+    pub const fn support_app_platform(self) -> Option<PreviewPlatform> {
+        match self {
+            Self::Ios => Some(PreviewPlatform::IosSimulator),
+            Self::Macos => Some(PreviewPlatform::Macos),
+            Self::Android => Some(PreviewPlatform::Android),
+            Self::Linux | Self::Windows => None,
+        }
+    }
+
+    /// The build target a Hydrolysis preview on this platform compiles for.
+    ///
+    /// `resolve_preview_backend` admits Hydrolysis only on the desktop
+    /// platforms, so a resolved Hydrolysis request never hits the `None` arm.
+    #[must_use]
+    pub const fn hydrolysis_target_platform(self) -> Option<TargetPlatform> {
+        match self {
+            Self::Macos => Some(TargetPlatform::MacOS),
+            Self::Linux => Some(TargetPlatform::Linux),
+            Self::Windows => Some(TargetPlatform::Windows),
+            Self::Ios | Self::Android => None,
         }
     }
 }
@@ -207,6 +232,7 @@ pub fn resolve_preview_backend(
     let default_backend = match platform {
         CliPreviewPlatform::Ios | CliPreviewPlatform::Macos => CliPreviewBackend::Apple,
         CliPreviewPlatform::Android => CliPreviewBackend::Android,
+        CliPreviewPlatform::Linux | CliPreviewPlatform::Windows => CliPreviewBackend::Hydrolysis,
     };
 
     let backend = backend_override.unwrap_or(default_backend);
@@ -215,12 +241,14 @@ pub fn resolve_preview_backend(
         (
             CliPreviewPlatform::Ios | CliPreviewPlatform::Macos,
             CliPreviewBackend::Apple
-        ) | (CliPreviewPlatform::Macos, CliPreviewBackend::Hydrolysis)
-            | (CliPreviewPlatform::Android, CliPreviewBackend::Android)
+        ) | (
+            CliPreviewPlatform::Macos | CliPreviewPlatform::Linux | CliPreviewPlatform::Windows,
+            CliPreviewBackend::Hydrolysis
+        ) | (CliPreviewPlatform::Android, CliPreviewBackend::Android)
     );
     if !supported {
         bail!(
-            "Preview backend {:?} does not support platform {:?}. Valid combinations: ios/apple, macos/apple, macos/hydrolysis, android/android",
+            "Preview backend {:?} does not support platform {:?}. Valid combinations: ios/apple, macos/apple, macos/hydrolysis, linux/hydrolysis, windows/hydrolysis, android/android",
             backend,
             platform
         );
@@ -243,61 +271,55 @@ pub fn resolve_preview_platform(
     native_preview_platform()
 }
 
-// Both lints are host-dependent, so neither `expect` can be fulfilled everywhere:
-// on macOS the body is an infallible `const`-compatible `Ok`, while every other host
-// bails at runtime with an unsupported-host error.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "non-macOS hosts return an explicit unsupported-host error"
-)]
-#[allow(
-    clippy::missing_const_for_fn,
-    reason = "non-macOS hosts call the non-const `bail!`"
-)]
 fn native_preview_platform() -> Result<CliPreviewPlatform> {
-    #[cfg(target_os = "macos")]
-    {
-        Ok(CliPreviewPlatform::Macos)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        // `bail!` expands to a `return`, so the trailing semicolon keeps this a
-        // statement rather than a macro invocation in expression position.
-        bail!(
+    native_preview_platform_for_os(std::env::consts::OS).ok_or_else(|| {
+        eyre::eyre!(
             "No native preview platform is configured for this host. Pass `--platform` explicitly."
-        );
+        )
+    })
+}
+
+/// The preview platform a host OS renders natively: `macos` through the Apple
+/// support app, `linux` and `windows` through the Hydrolysis backend — the
+/// same renderer `water run` uses on those hosts.
+fn native_preview_platform_for_os(os: &str) -> Option<CliPreviewPlatform> {
+    match os {
+        "macos" => Some(CliPreviewPlatform::Macos),
+        "linux" => Some(CliPreviewPlatform::Linux),
+        "windows" => Some(CliPreviewPlatform::Windows),
+        _ => None,
     }
 }
 
-/// `water preview test` supports Hydrolysis on macOS only.
+/// `water preview test` runs through Hydrolysis, which renders on the
+/// desktop platforms only.
 ///
 /// # Errors
 /// Returns an error for any other platform.
 pub fn ensure_hydrolysis_preview_platform(platform: CliPreviewPlatform) -> Result<()> {
-    if platform != CliPreviewPlatform::Macos {
-        bail!("`water preview test` supports Hydrolysis on macos only.");
+    if platform.hydrolysis_target_platform().is_none() {
+        bail!("`water preview test` supports Hydrolysis on macos, linux and windows only.");
     }
     Ok(())
 }
 
-/// Resolve the Hydrolysis theme: required for the Hydrolysis backend,
+/// Resolve the Hydrolysis theme: defaulted for the Hydrolysis backend,
 /// rejected for the others.
 ///
+/// Hydrolysis is the native preview platform on Linux and Windows, so its
+/// theme cannot be a required flag there — `material3` is the only theme
+/// package today and is the default until a second one exists.
+///
 /// # Errors
-/// Returns an error if the theme is missing for Hydrolysis or set for another
-/// backend.
+/// Returns an error if the theme is set for a non-Hydrolysis backend.
 pub fn resolve_hydrolysis_preview_theme(
     backend: CliPreviewBackend,
     theme: Option<CliHydrolysisPreviewTheme>,
 ) -> Result<Option<HydrolysisPreviewTheme>> {
     match (backend, theme) {
-        (CliPreviewBackend::Hydrolysis, Some(theme)) => Ok(Some(theme.into())),
-        (CliPreviewBackend::Hydrolysis, None) => {
-            bail!(
-                "Hydrolysis preview requires an explicit theme package. Pass `--theme material3`."
-            );
-        }
+        (CliPreviewBackend::Hydrolysis, theme) => Ok(Some(
+            theme.unwrap_or(CliHydrolysisPreviewTheme::Material3).into(),
+        )),
         (_, Some(_)) => {
             bail!("`--theme` is only supported with `--backend hydrolysis`.");
         }
@@ -319,8 +341,10 @@ pub async fn check_toolchain_for_backend(
             let sdk = match platform {
                 CliPreviewPlatform::Ios => AppleSdk::IosSimulator,
                 CliPreviewPlatform::Macos => AppleSdk::Macos,
-                CliPreviewPlatform::Android => {
-                    bail!("Internal error: Apple preview backend is not supported on android");
+                CliPreviewPlatform::Android
+                | CliPreviewPlatform::Linux
+                | CliPreviewPlatform::Windows => {
+                    bail!("Internal error: Apple preview backend is not supported on {platform:?}");
                 }
             };
             toolchain_checks::check_apple(&host, sdk).await?;
@@ -332,11 +356,12 @@ pub async fn check_toolchain_for_backend(
             toolchain_checks::check_android_run(&host).await?;
         }
         CliPreviewBackend::Hydrolysis => {
-            if platform != CliPreviewPlatform::Macos {
+            if platform.hydrolysis_target_platform().is_none() {
                 bail!(
                     "Internal error: Hydrolysis preview backend is not supported on {platform:?}"
                 );
             }
+            toolchain_checks::check_hydrolysis(&host).await?;
         }
     }
     Ok(())
@@ -392,6 +417,69 @@ Example:\n  #[preview]\n  fn {}() -> impl View {{ ... }}",
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_preview_platform_selects_the_host_platform() {
+        assert_eq!(
+            native_preview_platform_for_os("macos"),
+            Some(CliPreviewPlatform::Macos)
+        );
+        assert_eq!(
+            native_preview_platform_for_os("linux"),
+            Some(CliPreviewPlatform::Linux)
+        );
+        assert_eq!(
+            native_preview_platform_for_os("windows"),
+            Some(CliPreviewPlatform::Windows)
+        );
+        assert_eq!(native_preview_platform_for_os("freebsd"), None);
+    }
+
+    #[test]
+    fn native_preview_platform_matches_this_host() {
+        let expected = match std::env::consts::OS {
+            "macos" => Some(CliPreviewPlatform::Macos),
+            "linux" => Some(CliPreviewPlatform::Linux),
+            "windows" => Some(CliPreviewPlatform::Windows),
+            _ => None,
+        };
+        match expected {
+            Some(platform) => {
+                assert_eq!(resolve_preview_platform(None).unwrap(), platform);
+            }
+            None => assert!(resolve_preview_platform(None).is_err()),
+        }
+    }
+
+    #[test]
+    fn linux_and_windows_default_to_the_hydrolysis_backend() {
+        for (platform, target) in [
+            (CliPreviewPlatform::Linux, TargetPlatform::Linux),
+            (CliPreviewPlatform::Windows, TargetPlatform::Windows),
+        ] {
+            assert_eq!(
+                resolve_preview_backend(platform, None).unwrap(),
+                CliPreviewBackend::Hydrolysis
+            );
+            assert_eq!(platform.hydrolysis_target_platform(), Some(target));
+            assert_eq!(platform.support_app_platform(), None);
+        }
+    }
+
+    #[test]
+    fn hydrolysis_preview_theme_defaults_to_material3() {
+        assert_eq!(
+            resolve_hydrolysis_preview_theme(CliPreviewBackend::Hydrolysis, None).unwrap(),
+            Some(HydrolysisPreviewTheme::Material3)
+        );
+        assert!(
+            resolve_hydrolysis_preview_theme(
+                CliPreviewBackend::Apple,
+                Some(CliHydrolysisPreviewTheme::Material3)
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn formats_missing_preview_symbol_message() {
