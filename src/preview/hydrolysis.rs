@@ -98,6 +98,9 @@ pub struct HydrolysisPreviewRequest<'a> {
     pub source: HydrolysisPreviewSource<'a>,
     /// Theme package the preview runtimes are constructed with.
     pub theme: HydrolysisPreviewTheme,
+    /// Desktop platform the preview binary builds and stages for — the same
+    /// target `water run` compiles the managed backend for on this host.
+    pub platform: TargetPlatform,
     /// Viewport width in logical units.
     pub width: f32,
     /// Viewport height in logical units.
@@ -120,7 +123,7 @@ pub async fn render_preview_with_hydrolysis(
     let (width, height, theme) = (request.width, request.height, request.theme);
     let (project, built) = build_preview_session(&request, None).await?;
     stage_hydrolysis_resources(&project, theme, &built.app_symbols()?).await?;
-    stage_hydrolysis_shared_runtime(&project, &built, TargetPlatform::MacOS).await?;
+    stage_hydrolysis_shared_runtime(&project, &built, request.platform).await?;
     run_preview_binary(
         &project,
         &built.artifact,
@@ -143,7 +146,7 @@ pub async fn test_preview_with_hydrolysis(
     let (width, height, theme) = (request.width, request.height, request.theme);
     let (project, built) = build_preview_session(&request, Some(automation_body)).await?;
     stage_hydrolysis_resources(&project, theme, &built.app_symbols()?).await?;
-    stage_hydrolysis_shared_runtime(&project, &built, TargetPlatform::MacOS).await?;
+    stage_hydrolysis_shared_runtime(&project, &built, request.platform).await?;
     run_preview_test_binary(&project, &built.artifact, width, height).await
 }
 
@@ -173,7 +176,7 @@ async fn build_preview_session(
     };
     let built = build_hydrolysis_with_envs_and_features(
         &project,
-        TargetPlatform::MacOS,
+        request.platform,
         build_options,
         &[],
         &[feature],
@@ -195,6 +198,7 @@ async fn build_preview_session(
 pub async fn discover_hydrolysis_preview_exports(
     project_path: &Path,
     theme: HydrolysisPreviewTheme,
+    platform: TargetPlatform,
     sccache_path: Option<PathBuf>,
     progress: Option<BuildProgress>,
 ) -> Result<Vec<String>> {
@@ -202,6 +206,7 @@ pub async fn discover_hydrolysis_preview_exports(
         project_path,
         source: HydrolysisPreviewSource::Expression("text(\"\")"),
         theme,
+        platform,
         width: 0.0,
         height: 0.0,
         sccache_path,

@@ -3,6 +3,7 @@
 use std::str::FromStr;
 
 use crate::build::{BuildProfile, BuildProgress};
+use eyre::bail;
 use target_lexicon::{
     Aarch64Architecture, Architecture, DefaultToHost, Environment, OperatingSystem,
     Riscv32Architecture, Triple, Vendor,
@@ -300,6 +301,32 @@ impl TargetPlatform {
             Self::Esp32C3 => Architecture::Riscv32(Riscv32Architecture::Riscv32imc),
             Self::Esp32P4 => Architecture::Riscv32(Riscv32Architecture::Riscv32imafc),
         }
+    }
+}
+
+/// Reject a desktop platform label that does not name the host OS.
+///
+/// `macos`, `linux` and `windows` platforms build host-native binaries —
+/// their [`TargetPlatform::triple`] is `Triple::host()` — so resolving
+/// `--platform linux` on a macOS host produces a darwin binary that cannot
+/// run on Linux. `water run` and `water preview` funnel through this check
+/// so the gate is identical for both.
+///
+/// `desktop_os` is `Some` only for host-native platform labels; mobile, web
+/// and embedded platforms carry their own triples and pass `None`.
+///
+/// # Errors
+/// Returns an error when `desktop_os` names a different OS than `host_os`
+/// (typically `std::env::consts::OS`).
+pub fn ensure_desktop_platform_is_host(
+    desktop_os: Option<&str>,
+    host_os: &str,
+) -> eyre::Result<()> {
+    match desktop_os {
+        Some(os) if os != host_os => {
+            bail!("`--platform {os}` targets the host; this host is {host_os}.");
+        }
+        _ => Ok(()),
     }
 }
 

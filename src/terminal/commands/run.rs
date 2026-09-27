@@ -175,6 +175,20 @@ impl TargetPlatform {
             _ => None,
         }
     }
+
+    /// The desktop OS this platform runs natively on the host, if it is one.
+    ///
+    /// Device, web and embedded platforms carry their own target triples;
+    /// the desktop platforms resolve `Triple::host()` and only make sense on
+    /// the OS they name.
+    const fn desktop_os(self) -> Option<&'static str> {
+        match self {
+            Self::Macos => Some("macos"),
+            Self::Linux => Some("linux"),
+            Self::Windows => Some("windows"),
+            _ => None,
+        }
+    }
 }
 
 /// Arguments for the run command.
@@ -559,6 +573,10 @@ async fn run_tui_app(shell: &Shell, args: Args) -> Result<()> {
 async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let platform = resolve_platform(args.platform);
+    waterui_cli::platform::ensure_desktop_platform_is_host(
+        platform.desktop_os(),
+        std::env::consts::OS,
+    )?;
     let managed_backends = managed_backends(platform);
     let mut project = Project::open(&project_path, managed_backends).await?;
     let backend = resolve_run_backend(&project, platform, args.backend)?;
@@ -2256,6 +2274,43 @@ mod tests {
     #[test]
     fn resolve_platform_defaults_to_host_on_windows() {
         assert_eq!(resolve_platform(None), TargetPlatform::Windows);
+    }
+
+    #[test]
+    fn desktop_platform_must_match_the_host() {
+        // `--platform linux` resolves host-native (`Triple::host()`), so on a
+        // macOS host it would build a darwin binary — reject it instead.
+        let err = waterui_cli::platform::ensure_desktop_platform_is_host(
+            TargetPlatform::Linux.desktop_os(),
+            "macos",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`--platform linux` targets the host; this host is macos."
+        );
+        assert!(
+            waterui_cli::platform::ensure_desktop_platform_is_host(
+                TargetPlatform::Linux.desktop_os(),
+                "linux"
+            )
+            .is_ok()
+        );
+        // Device, web and embedded platforms carry their own triples.
+        for platform in [
+            TargetPlatform::Ios,
+            TargetPlatform::Android,
+            TargetPlatform::Web,
+            TargetPlatform::Esp32s3,
+        ] {
+            assert!(
+                waterui_cli::platform::ensure_desktop_platform_is_host(
+                    platform.desktop_os(),
+                    "linux"
+                )
+                .is_ok()
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

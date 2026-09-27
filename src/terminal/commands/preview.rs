@@ -14,18 +14,21 @@ use waterui_cli::build::BuildProgress;
 use waterui_cli::mcp::preview::PreviewArgs;
 use waterui_cli::preview::request::{
     self, CliHydrolysisPreviewTheme, CliPreviewBackend, CliPreviewPlatform, PreviewTarget,
+    ResolvedPreviewBackend,
 };
 use waterui_cli::preview::{
     HydrolysisPreviewEventKind, HydrolysisPreviewPointerButton, HydrolysisPreviewRequest,
     HydrolysisPreviewScenario, HydrolysisPreviewScenarioEvent, HydrolysisPreviewTheme,
-    PreviewPlatform, discover_hydrolysis_preview_exports, launch_preview_session,
-    render_preview_with_hydrolysis, test_preview_with_hydrolysis,
+    discover_hydrolysis_preview_exports, launch_preview_session, render_preview_with_hydrolysis,
+    test_preview_with_hydrolysis,
 };
 use waterui_cli::project::read_project_crate_name;
 
 async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
     let platform = request::resolve_preview_platform(args.platform)?;
-    request::ensure_hydrolysis_preview_platform(platform)?;
+    let target_platform = request::resolve_hydrolysis_test_platform(platform)?;
+    request::check_toolchain_for_backend(ResolvedPreviewBackend::Hydrolysis(target_platform))
+        .await?;
     let (width, height) = request::parse_frame(&args.frame)?;
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let crate_name = read_project_crate_name(&project_path).await?;
@@ -35,6 +38,7 @@ async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
         &project_path,
         &crate_name,
         &args,
+        target_platform,
         sccache_path.as_deref(),
         Some(&shell.build_progress()),
     )
@@ -54,6 +58,7 @@ async fn run_preview_test(shell: &Shell, args: PreviewTestArgs) -> Result<()> {
                 project_path: &project_path,
                 source: target.hydrolysis_source(),
                 theme: args.theme.into(),
+                platform: target_platform,
                 width,
                 height,
                 sccache_path: sccache_path.clone(),
@@ -163,7 +168,7 @@ struct PreviewTestArgs {
     platform: Option<CliPreviewPlatform>,
 
     /// Theme package for Hydrolysis preview testing.
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, default_value = "material3")]
     theme: CliHydrolysisPreviewTheme,
 
     /// Frame size `WIDTHxHEIGHT` (default: `375x667`).
@@ -213,13 +218,13 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     let request = args.preview_args(target).resolve(&crate_name)?;
     header!(shell, "Preview: {}", request.target.display_name());
 
-    request::check_toolchain_for_backend(request.platform, request.backend).await?;
+    request::check_toolchain_for_backend(request.backend).await?;
 
     // Detect sccache for compilation caching
     let sccache_path =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await;
 
-    if request.backend == CliPreviewBackend::Hydrolysis {
+    if let ResolvedPreviewBackend::Hydrolysis(platform) = request.backend {
         let scenario = load_hydrolysis_scenario(args.scenario.as_deref(), args.output_dir).await?;
         let spinner = shell.spinner("Building and rendering with hydrolysis...");
         render_preview_with_hydrolysis(
@@ -229,6 +234,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
                 theme: request
                     .hydrolysis_theme
                     .expect("hydrolysis preview theme must be resolved"),
+                platform,
                 width: request.width,
                 height: request.height,
                 sccache_path,
@@ -265,9 +271,12 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         bail!("Expression preview is currently supported only with `--backend hydrolysis`.");
     };
 
+    let ResolvedPreviewBackend::SupportApp(preview_platform) = request.backend else {
+        unreachable!("the Hydrolysis arm returned early");
+    };
+
     // Launch preview session (connects to existing app or launches new one)
     let spinner = shell.spinner("Connecting to preview app...");
-    let preview_platform: PreviewPlatform = request.platform.into();
     let mut session = Box::pin(launch_preview_session(
         &project_path,
         preview_platform,
@@ -451,6 +460,7 @@ async fn resolve_test_targets(
     project_path: &Path,
     crate_name: &str,
     args: &PreviewTestArgs,
+    target_platform: waterui_cli::platform::TargetPlatform,
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
@@ -466,6 +476,7 @@ async fn resolve_test_targets(
                 project_path,
                 crate_name,
                 args.theme.into(),
+                target_platform,
                 sccache_path,
                 progress,
             )
@@ -496,12 +507,14 @@ async fn discover_preview_targets(
     project_path: &Path,
     crate_name: &str,
     theme: HydrolysisPreviewTheme,
+    target_platform: waterui_cli::platform::TargetPlatform,
     sccache_path: Option<&Path>,
     progress: Option<&BuildProgress>,
 ) -> Result<Vec<PreviewTarget>> {
     let exports = discover_hydrolysis_preview_exports(
         project_path,
         theme,
+        target_platform,
         sccache_path.map(Path::to_path_buf),
         progress.cloned(),
     )
@@ -566,11 +579,22 @@ mod tests {
             .args
     }
 
+    /// This host's desktop preview platform label — a resolved `--platform`
+    /// must name the host OS, so tests substitute it rather than hardcoding
+    /// one.
+    fn host_platform_name() -> &'static str {
+        match std::env::consts::OS {
+            "macos" | "linux" | "windows" => std::env::consts::OS,
+            other => panic!("test host {other} has no native preview platform"),
+        }
+    }
+
     #[test]
     fn cli_and_mcp_args_resolve_to_the_same_request() {
         // `water preview --expr --frame 800x600 --backend hydrolysis --theme
-        // material3 --platform macos 'text("hi")'` and the equivalent MCP
+        // material3 --platform <host> 'text("hi")'` and the equivalent MCP
         // `preview` call must produce the identical render request.
+        let platform = host_platform_name();
         let cli_args = parse(&[
             "preview",
             "text(\"hi\")",
@@ -582,23 +606,21 @@ mod tests {
             "--theme",
             "material3",
             "--platform",
-            "macos",
+            platform,
         ]);
         let cli_request = cli_args
             .preview_args(cli_args.target.as_deref().expect("target"))
             .resolve("demo_app")
             .expect("cli resolve");
 
-        let mcp_args: PreviewArgs = serde_json::from_str(
-            r#"{
-                "target": "text(\"hi\")",
-                "expr": true,
-                "frame": "800x600",
-                "backend": "hydrolysis",
-                "theme": "material3",
-                "platform": "macos"
-            }"#,
-        )
+        let mcp_args: PreviewArgs = serde_json::from_value(serde_json::json!({
+            "target": "text(\"hi\")",
+            "expr": true,
+            "frame": "800x600",
+            "backend": "hydrolysis",
+            "theme": "material3",
+            "platform": platform,
+        }))
         .expect("mcp args parse");
         let mcp_request = mcp_args.resolve("demo_app").expect("mcp resolve");
 
@@ -607,15 +629,18 @@ mod tests {
 
     #[test]
     fn cli_and_mcp_defaults_resolve_to_the_same_request() {
-        let cli_args = parse(&["preview", "views::home", "--platform", "macos"]);
+        let platform = host_platform_name();
+        let cli_args = parse(&["preview", "views::home", "--platform", platform]);
         let cli_request = cli_args
             .preview_args(cli_args.target.as_deref().expect("target"))
             .resolve("demo_app")
             .expect("cli resolve");
 
-        let mcp_args: PreviewArgs =
-            serde_json::from_str(r#"{"target": "views::home", "platform": "macos"}"#)
-                .expect("mcp args parse");
+        let mcp_args: PreviewArgs = serde_json::from_value(serde_json::json!({
+            "target": "views::home",
+            "platform": platform,
+        }))
+        .expect("mcp args parse");
         let mcp_request = mcp_args.resolve("demo_app").expect("mcp resolve");
 
         assert_eq!(cli_request, mcp_request);
@@ -668,15 +693,18 @@ mod tests {
     }
 
     #[test]
-    fn hydrolysis_preview_requires_explicit_theme() {
-        let result = request::resolve_hydrolysis_preview_theme(CliPreviewBackend::Hydrolysis, None);
-        assert!(result.is_err());
+    fn hydrolysis_preview_theme_defaults_to_material3() {
+        let result = request::resolve_hydrolysis_preview_theme(
+            ResolvedPreviewBackend::Hydrolysis(waterui_cli::platform::TargetPlatform::Linux),
+            None,
+        );
+        assert_eq!(result.unwrap(), Some(HydrolysisPreviewTheme::Material3));
     }
 
     #[test]
     fn rejects_theme_for_non_hydrolysis_preview() {
         let result = request::resolve_hydrolysis_preview_theme(
-            CliPreviewBackend::Apple,
+            ResolvedPreviewBackend::SupportApp(waterui_cli::preview::PreviewPlatform::Macos),
             Some(CliHydrolysisPreviewTheme::Material3),
         );
         assert!(result.is_err());

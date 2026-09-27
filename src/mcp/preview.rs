@@ -17,10 +17,11 @@ use tracing::info;
 
 use crate::preview::request::{
     self, CliHydrolysisPreviewTheme, CliPreviewBackend, CliPreviewPlatform, DEFAULT_FRAME,
-    PreviewRequest, PreviewTarget,
+    PreviewRequest, PreviewTarget, ResolvedPreviewBackend,
 };
 use crate::preview::{
-    HydrolysisPreviewRequest, launch_preview_session, render_preview_with_hydrolysis,
+    HydrolysisPreviewRequest, PreviewPlatform, launch_preview_session,
+    render_preview_with_hydrolysis,
 };
 use crate::project::read_project_crate_name;
 
@@ -48,17 +49,18 @@ pub struct PreviewArgs {
     pub frame: Option<String>,
 
     /// Rendering backend: `apple`, `android`, or `hydrolysis`. Defaults to the
-    /// platform's native backend (`apple` on macOS/iOS, `android` on Android).
+    /// platform's native backend (`apple` on macOS/iOS, `android` on Android,
+    /// `hydrolysis` on Linux and Windows).
     #[serde(default)]
     pub backend: Option<CliPreviewBackend>,
 
-    /// Theme package for the `hydrolysis` backend (`material3`). Required when
-    /// `backend` is `hydrolysis`; rejected otherwise.
+    /// Theme package for the `hydrolysis` backend (`material3`, the default);
+    /// rejected for other backends.
     #[serde(default)]
     pub theme: Option<CliHydrolysisPreviewTheme>,
 
-    /// Target platform: `ios`, `macos`, or `android`. Defaults to this host's
-    /// native preview platform.
+    /// Target platform: `ios`, `macos`, `android`, `linux`, or `windows`.
+    /// Defaults to this host's native preview platform.
     #[serde(default)]
     pub platform: Option<CliPreviewPlatform>,
 }
@@ -152,11 +154,11 @@ impl PreviewTool {
     async fn run(&self, args: &PreviewArgs) -> Result<(PathBuf, Vec<u8>)> {
         let crate_name = read_project_crate_name(&self.project_path).await?;
         let request = args.resolve(&crate_name)?;
-        request::check_toolchain_for_backend(request.platform, request.backend).await?;
+        request::check_toolchain_for_backend(request.backend).await?;
         let output_path = self.output_path(&request).await?;
 
         match request.backend {
-            CliPreviewBackend::Hydrolysis => {
+            ResolvedPreviewBackend::Hydrolysis(platform) => {
                 render_preview_with_hydrolysis(
                     HydrolysisPreviewRequest {
                         project_path: &self.project_path,
@@ -164,6 +166,7 @@ impl PreviewTool {
                         theme: request
                             .hydrolysis_theme
                             .expect("resolve guarantees a theme for hydrolysis"),
+                        platform,
                         width: request.width,
                         height: request.height,
                         sccache_path: self.sccache_path.clone(),
@@ -176,7 +179,7 @@ impl PreviewTool {
                 )
                 .await?;
             }
-            CliPreviewBackend::Apple | CliPreviewBackend::Android => {
+            ResolvedPreviewBackend::SupportApp(preview_platform) => {
                 let PreviewTarget::Function {
                     function_path,
                     symbol,
@@ -186,8 +189,14 @@ impl PreviewTool {
                         "Expression preview is currently supported only with the `hydrolysis` backend."
                     );
                 };
-                Box::pin(self.render_support_app(&request, function_path, symbol, &output_path))
-                    .await?;
+                Box::pin(self.render_support_app(
+                    &request,
+                    preview_platform,
+                    function_path,
+                    symbol,
+                    &output_path,
+                ))
+                .await?;
             }
         }
 
@@ -202,13 +211,14 @@ impl PreviewTool {
     async fn render_support_app(
         &self,
         request: &PreviewRequest,
+        preview_platform: PreviewPlatform,
         function_path: &str,
         symbol: &str,
         output_path: &Path,
     ) -> Result<()> {
         let mut session = Box::pin(launch_preview_session(
             &self.project_path,
-            request.platform.into(),
+            preview_platform,
             self.sccache_path.clone(),
             None,
         ))
@@ -309,24 +319,41 @@ mod tests {
     #[test]
     fn resolves_to_the_same_request_as_water_preview() {
         // `water preview --expr --frame 800x600 --backend hydrolysis --theme
-        // material3 --platform macos 'text("hi")'`
-        let args: PreviewArgs = serde_json::from_str(
-            r#"{
-                "target": "text(\"hi\")",
-                "expr": true,
-                "frame": "800x600",
-                "backend": "hydrolysis",
-                "theme": "material3",
-                "platform": "macos"
-            }"#,
-        )
+        // material3 --platform <host> 'text("hi")'` — the platform must name
+        // the host OS, so derive it.
+        let (platform_name, platform, target) = match std::env::consts::OS {
+            "macos" => (
+                "macos",
+                CliPreviewPlatform::Macos,
+                crate::platform::TargetPlatform::MacOS,
+            ),
+            "linux" => (
+                "linux",
+                CliPreviewPlatform::Linux,
+                crate::platform::TargetPlatform::Linux,
+            ),
+            "windows" => (
+                "windows",
+                CliPreviewPlatform::Windows,
+                crate::platform::TargetPlatform::Windows,
+            ),
+            other => panic!("test host {other} has no native preview platform"),
+        };
+        let args: PreviewArgs = serde_json::from_value(serde_json::json!({
+            "target": "text(\"hi\")",
+            "expr": true,
+            "frame": "800x600",
+            "backend": "hydrolysis",
+            "theme": "material3",
+            "platform": platform_name,
+        }))
         .expect("args parse");
         let request = args.resolve("demo_app").expect("resolve");
         assert_eq!(
             request,
             PreviewRequest {
-                platform: CliPreviewPlatform::Macos,
-                backend: CliPreviewBackend::Hydrolysis,
+                platform,
+                backend: ResolvedPreviewBackend::Hydrolysis(target),
                 hydrolysis_theme: Some(crate::preview::HydrolysisPreviewTheme::Material3),
                 target: PreviewTarget::Expression {
                     expression: "text(\"hi\")".to_string(),
