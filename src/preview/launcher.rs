@@ -28,6 +28,7 @@ use crate::build::BuildProgress;
 use crate::apple::dynamic_runtime;
 use crate::build::{BuildOptions, BuildProfile, BuiltTarget, RustBuild, RustLinkage};
 use crate::device::{Device, DeviceEvent, Local, LogLevel, RunOptions, Running};
+use crate::framework::ResolvedFramework;
 use crate::platform::TargetPlatform;
 use crate::project::{ManagedBackends, Project};
 use crate::runtime_compat::{PREVIEW_RUNTIME_ENV_VARS, runtime_profile_tag};
@@ -46,7 +47,21 @@ const PREVIEW_DYLIB_METADATA_SUFFIX: &str = ".waterui-preview-dylib-signature";
 #[derive(Debug, Clone)]
 struct PreviewRequirements {
     waterui_path: Option<PathBuf>,
+    /// The framework selection the previewed project resolved — its patch
+    /// table is what the support app's manifest inherits; the support app's
+    /// own scaffold records no framework, so taking it from there would drop
+    /// every `[patch]` entry the runtime's graph needs (#197).
+    framework: ResolvedFramework,
+    /// The previewed project's `Water.lock` bytes, when it records a
+    /// channel-managed framework — the support project's lock gate reads the
+    /// same lock the app's graph was resolved against.
+    framework_lock: Option<Vec<u8>>,
     runtime_fingerprint: String,
+    /// The commit the support app's `waterui-preview-protocol` build reports
+    /// in its handshake — read from the framework revision the project
+    /// resolved, never from the revision this CLI binary was pinned at, so a
+    /// stale pair rejects at connect instead of dropping mid-session (#197).
+    expected_protocol_commit: String,
     runtime_features: Vec<String>,
     app_crate_name: crate::project_types::CrateName,
     app_path: PathBuf,
@@ -55,6 +70,7 @@ struct PreviewRequirements {
 #[derive(Debug)]
 struct ResolvedPreviewMetadata {
     metadata: cargo_metadata::Metadata,
+    framework: ResolvedFramework,
     app_crate_name: crate::project_types::CrateName,
     app_path: PathBuf,
 }
@@ -622,6 +638,7 @@ pub async fn launch_preview_session(
         "Preview resolved runtime requirements"
     );
     let expected_fingerprint = requirements.runtime_fingerprint.clone();
+    let expected_protocol_commit = requirements.expected_protocol_commit.clone();
     let tcp_config = PreviewTcpConfig::from_env()
         .map_err(|e| eyre::eyre!(e))
         .wrap_err("Invalid preview TCP config")?;
@@ -630,6 +647,7 @@ pub async fn launch_preview_session(
     if let Some(session) = try_connect_existing_preview_app(
         tcp_config,
         &expected_fingerprint,
+        &expected_protocol_commit,
         platform,
         sccache_path.clone(),
     )
@@ -650,6 +668,7 @@ pub async fn launch_preview_session(
         platform,
         tcp_config,
         expected_fingerprint,
+        expected_protocol_commit,
         sccache_path,
     )
     .await
@@ -658,19 +677,25 @@ pub async fn launch_preview_session(
 async fn try_connect_existing_preview_app(
     tcp_config: PreviewTcpConfig,
     expected_fingerprint: &str,
+    expected_protocol_commit: &str,
     platform: PreviewPlatform,
     sccache_path: Option<PathBuf>,
 ) -> Result<Option<PreviewSession>> {
     let probe = match platform {
         PreviewPlatform::Macos => {
-            PreviewAppClient::probe_registered(expected_fingerprint, PreviewRuntimePlatform::Macos)
-                .await?
+            PreviewAppClient::probe_registered(
+                expected_fingerprint,
+                PreviewRuntimePlatform::Macos,
+                expected_protocol_commit,
+            )
+            .await?
         }
         PreviewPlatform::IosSimulator | PreviewPlatform::Ios | PreviewPlatform::Android => {
             PreviewAppClient::probe_ports(
                 tcp_config,
                 expected_fingerprint,
                 preview_runtime_platform(platform),
+                expected_protocol_commit,
             )
             .await
         }
@@ -706,6 +731,61 @@ const fn preview_runtime_platform(platform: PreviewPlatform) -> PreviewRuntimePl
         PreviewPlatform::Ios => PreviewRuntimePlatform::Ios,
         PreviewPlatform::Android => PreviewRuntimePlatform::Android,
     }
+}
+
+/// The commit a `waterui-preview-protocol` build at `manifest_dir` stamps
+/// into `PreviewProtocolInfo::build_commit`: the last commit touching that
+/// crate's directory, read exactly as the crate's own `build.rs` reads it
+/// (`git log -1 --format=%h --abbrev=12 -- .`). A directory that is not a git
+/// worktree answers `unknown`, which is also what the build script stamps.
+async fn preview_protocol_commit(manifest_dir: &Path) -> String {
+    use std::ffi::OsStr;
+    let commit = crate::toolchain::Host::current()
+        .run(
+            "git",
+            [
+                OsStr::new("-C"),
+                manifest_dir.as_os_str(),
+                OsStr::new("log"),
+                OsStr::new("-1"),
+                OsStr::new("--format=%h"),
+                OsStr::new("--abbrev=12"),
+                OsStr::new("--"),
+                OsStr::new("."),
+            ],
+        )
+        .await;
+    commit.map_or_else(
+        |_| "unknown".to_string(),
+        |commit| {
+            let commit = commit.trim();
+            if commit.is_empty() {
+                "unknown".to_string()
+            } else {
+                commit.to_string()
+            }
+        },
+    )
+}
+
+/// The directory the `waterui-preview-protocol` manifest lives in for a
+/// `waterui` package root — either the checkout itself or the package the
+/// app's own metadata resolved.
+async fn protocol_commit_from_metadata(metadata: &cargo_metadata::Metadata) -> Result<String> {
+    let protocol = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "waterui-preview-protocol")
+        .ok_or_else(|| {
+            eyre::eyre!("resolved metadata names no waterui-preview-protocol package")
+        })?;
+    let dir = protocol
+        .manifest_path
+        .as_std_path()
+        .parent()
+        .ok_or_else(|| eyre::eyre!("waterui-preview-protocol manifest has no parent directory"))?
+        .to_path_buf();
+    Ok(preview_protocol_commit(&dir).await)
 }
 
 /// The build target a preview on `platform` links its module for.
@@ -772,13 +852,18 @@ async fn launch_preview_on_macos(
     let host = crate::toolchain::Host::current();
     let device = Local;
     device.launch(&host).await?;
+    let mut run_options = preview_run_options(PreviewPlatform::Macos);
+    // The support app detaches and outlives this command; its stdout/stderr go
+    // to a log file the next `water preview` reopens and appends, never a pipe
+    // whose reader is gone (water-rs/cli#197).
+    run_options.set_app_log_file(preview_support_log_path()?);
     info!("Building and running preview app on macOS...");
     project
         .run_with_options(
             backend,
             TargetPlatform::MacOS,
             device,
-            preview_run_options(PreviewPlatform::Macos),
+            run_options,
             progress.cloned(),
         )
         .await
@@ -869,12 +954,19 @@ async fn build_preview_session_from_launch(
     platform: PreviewPlatform,
     tcp_config: PreviewTcpConfig,
     expected_fingerprint: String,
+    expected_protocol_commit: String,
     sccache_path: Option<PathBuf>,
 ) -> Result<PreviewSession> {
     info!("Preview app launched, waiting for TCP connection...");
     let mut running = Box::pin(running);
-    match wait_for_connection_or_crash(&mut running, platform, tcp_config, &expected_fingerprint)
-        .await
+    match wait_for_connection_or_crash(
+        &mut running,
+        platform,
+        tcp_config,
+        &expected_fingerprint,
+        &expected_protocol_commit,
+    )
+    .await
     {
         ConnectionWaitResult::Ready(client) => Ok(PreviewSession {
             client,
@@ -895,6 +987,12 @@ async fn build_preview_session_from_launch(
             bail!(
                 "Preview app exited unexpectedly.
 Check the app logs for more information."
+            );
+        }
+        ConnectionWaitResult::Rejected(rejection) => {
+            bail!(
+                "The preview app this run just launched rejected the protocol handshake:
+{rejection}"
             );
         }
         // An app that answered and was turned away is not a connection problem,
@@ -938,6 +1036,10 @@ enum ConnectionWaitResult {
     /// one did: that is a different failure from silence and has to be reported
     /// as itself.
     Timeout(Option<String>),
+    /// The app this launch started answered its own announced address and was
+    /// rejected by the handshake — it can never become compatible, so waiting
+    /// out the deadline would only hang.
+    Rejected(String),
 }
 
 /// How long a launched preview app may stay alive without ever becoming reachable.
@@ -959,6 +1061,7 @@ async fn wait_for_connection_or_crash(
     platform: PreviewPlatform,
     tcp_config: PreviewTcpConfig,
     expected_fingerprint: &str,
+    expected_protocol_commit: &str,
 ) -> ConnectionWaitResult {
     const NON_MACOS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -969,6 +1072,7 @@ async fn wait_for_connection_or_crash(
             wait_for_registered_preview_ready(
                 running,
                 expected_fingerprint,
+                expected_protocol_commit,
                 start,
                 STARTUP_DEADLINE,
             )
@@ -978,8 +1082,11 @@ async fn wait_for_connection_or_crash(
             wait_for_polled_preview_ready(
                 running,
                 tcp_config,
-                expected_fingerprint,
-                preview_runtime_platform(platform),
+                PolledPreviewExpectation {
+                    fingerprint: expected_fingerprint,
+                    protocol_commit: expected_protocol_commit,
+                    platform: preview_runtime_platform(platform),
+                },
                 start,
                 STARTUP_DEADLINE,
                 NON_MACOS_POLL_INTERVAL,
@@ -999,6 +1106,7 @@ async fn wait_for_connection_or_crash(
 async fn wait_for_registered_preview_ready(
     running: &mut Pin<Box<Running>>,
     expected_fingerprint: &str,
+    expected_protocol_commit: &str,
     start: Instant,
     timeout: Duration,
 ) -> ConnectionWaitResult {
@@ -1008,7 +1116,13 @@ async fn wait_for_registered_preview_ready(
     // on timeout it is the only thing here that explains anything.
     let mut rejection = None;
 
-    match probe_registered_preview(expected_fingerprint, PreviewRuntimePlatform::Macos, start).await
+    match probe_registered_preview(
+        expected_fingerprint,
+        expected_protocol_commit,
+        PreviewRuntimePlatform::Macos,
+        start,
+    )
+    .await
     {
         PreviewProbe::Connected(client) => return ConnectionWaitResult::Ready(client),
         PreviewProbe::Rejected(reason) => rejection = Some(reason),
@@ -1041,8 +1155,13 @@ async fn wait_for_registered_preview_ready(
     };
 
     loop {
-        match probe_registered_preview(expected_fingerprint, PreviewRuntimePlatform::Macos, start)
-            .await
+        match probe_registered_preview(
+            expected_fingerprint,
+            expected_protocol_commit,
+            PreviewRuntimePlatform::Macos,
+            start,
+        )
+        .await
         {
             PreviewProbe::Connected(client) => return ConnectionWaitResult::Ready(client),
             PreviewProbe::Rejected(reason) => rejection = Some(reason),
@@ -1069,9 +1188,9 @@ async fn wait_for_registered_preview_ready(
                 if let Some(result) = preview_connection_result_from_device_event(
                     event,
                     expected_fingerprint,
+                    expected_protocol_commit,
                     PreviewRuntimePlatform::Macos,
                     start,
-                    &mut rejection,
                 )
                 .await
                 {
@@ -1095,11 +1214,20 @@ async fn wait_for_registered_preview_ready(
     }
 }
 
+/// The identity a polled preview app must advertise to count as this
+/// session's app: the runtime fingerprint, protocol commit and platform the
+/// handshake checks it for.
+#[derive(Clone, Copy)]
+struct PolledPreviewExpectation<'a> {
+    fingerprint: &'a str,
+    protocol_commit: &'a str,
+    platform: PreviewRuntimePlatform,
+}
+
 async fn wait_for_polled_preview_ready(
     running: &mut Pin<Box<Running>>,
     tcp_config: PreviewTcpConfig,
-    expected_fingerprint: &str,
-    expected_platform: PreviewRuntimePlatform,
+    expectation: PolledPreviewExpectation<'_>,
     start: Instant,
     timeout: Duration,
     poll_interval: Duration,
@@ -1107,8 +1235,7 @@ async fn wait_for_polled_preview_ready(
     let mut rejection = None;
 
     loop {
-        match probe_polled_preview(tcp_config, expected_fingerprint, expected_platform, start).await
-        {
+        match probe_polled_preview(tcp_config, expectation, start).await {
             PreviewProbe::Connected(client) => return ConnectionWaitResult::Ready(client),
             PreviewProbe::Rejected(reason) => rejection = Some(reason),
             PreviewProbe::Silent => {}
@@ -1128,10 +1255,10 @@ async fn wait_for_polled_preview_ready(
             event = running_event => {
                 if let Some(result) = preview_connection_result_from_device_event(
                     event,
-                    expected_fingerprint,
-                    expected_platform,
+                    expectation.fingerprint,
+                    expectation.protocol_commit,
+                    expectation.platform,
                     start,
-                    &mut rejection,
                 )
                 .await
                 {
@@ -1150,10 +1277,17 @@ async fn wait_for_polled_preview_ready(
 /// for the app to go away in between.
 async fn probe_registered_preview(
     expected_fingerprint: &str,
+    expected_protocol_commit: &str,
     expected_platform: PreviewRuntimePlatform,
     start: Instant,
 ) -> PreviewProbe {
-    match PreviewAppClient::probe_registered(expected_fingerprint, expected_platform).await {
+    match PreviewAppClient::probe_registered(
+        expected_fingerprint,
+        expected_platform,
+        expected_protocol_commit,
+    )
+    .await
+    {
         Ok(PreviewProbe::Connected(client)) => {
             info!(
                 "Connected to preview app after {}ms",
@@ -1172,12 +1306,16 @@ async fn probe_registered_preview(
 /// Probe the configured port range for a ready preview app, keeping the connection.
 async fn probe_polled_preview(
     tcp_config: PreviewTcpConfig,
-    expected_fingerprint: &str,
-    expected_platform: PreviewRuntimePlatform,
+    expectation: PolledPreviewExpectation<'_>,
     start: Instant,
 ) -> PreviewProbe {
-    let probe =
-        PreviewAppClient::probe_ports(tcp_config, expected_fingerprint, expected_platform).await;
+    let probe = PreviewAppClient::probe_ports(
+        tcp_config,
+        expectation.fingerprint,
+        expectation.platform,
+        expectation.protocol_commit,
+    )
+    .await;
     if matches!(probe, PreviewProbe::Connected(_)) {
         info!(
             "Connected to preview app after {}ms",
@@ -1190,9 +1328,9 @@ async fn probe_polled_preview(
 async fn preview_connection_result_from_device_event(
     event: Option<DeviceEvent>,
     expected_fingerprint: &str,
+    expected_protocol_commit: &str,
     expected_platform: PreviewRuntimePlatform,
     start: Instant,
-    rejection: &mut Option<String>,
 ) -> Option<ConnectionWaitResult> {
     match event? {
         DeviceEvent::Crashed(message) => {
@@ -1209,8 +1347,13 @@ async fn preview_connection_result_from_device_event(
                 error!("{message}");
             }
             if let Some(addr) = parse_preview_listening_addr(&message) {
-                match PreviewAppClient::probe_addr(addr, expected_fingerprint, expected_platform)
-                    .await
+                match PreviewAppClient::probe_addr(
+                    addr,
+                    expected_fingerprint,
+                    expected_platform,
+                    expected_protocol_commit,
+                )
+                .await
                 {
                     PreviewProbe::Connected(client) => {
                         info!(
@@ -1219,10 +1362,13 @@ async fn preview_connection_result_from_device_event(
                         );
                         return Some(ConnectionWaitResult::Ready(client));
                     }
-                    // The app this launch just started announced its own port and
-                    // is the wrong build: that is the finding, and the wait keeps
-                    // it so the deadline can report it instead of guessing.
-                    PreviewProbe::Rejected(reason) => *rejection = Some(reason),
+                    // The app this launch just started announced its own port
+                    // and is the wrong build: its protocol is fixed at build
+                    // time, so it can never become compatible — report it now
+                    // rather than letting the deadline stand in (#197).
+                    PreviewProbe::Rejected(reason) => {
+                        return Some(ConnectionWaitResult::Rejected(reason));
+                    }
                     PreviewProbe::Silent => {}
                 }
             }
@@ -1260,6 +1406,15 @@ async fn drain_terminal_preview_event(
 /// Get the path to the preview support app.
 fn preview_support_path() -> Result<PathBuf> {
     support_app::support_app_path("preview_support")
+}
+
+/// The file the macOS preview support app's stdout/stderr append to, under the
+/// CLI's `~/.water` state dir beside `preview_support/` — stable across the
+/// pooled instances a later `water preview` reuses.
+fn preview_support_log_path() -> Result<PathBuf> {
+    Ok(crate::water_dir::water_home_dir()?
+        .join("logs")
+        .join("preview-support.log"))
 }
 
 /// Root of the workspace a preview module joins.
@@ -1342,15 +1497,27 @@ async fn scaffold_preview_module(project: &Project, platform: PreviewPlatform) -
         .await
         .wrap_err("Failed to open the preview support project")?;
     } else {
-        // The support app's scaffold runs only after this module's metadata
-        // resolves, so the workspace the module joins has no root manifest
-        // yet — and without it Cargo honours none of the project's `[patch]`
-        // tables, resolving every `waterui-*` crate from the registry beside
-        // the checkout's pinned copies. Write the root stub the resolution
-        // needs; the companion scaffold replaces it once the app exists.
-        crate::templates::ensure_preview_module_workspace_root(&workspace_root, project.root())
-            .await
-            .wrap_err("Failed to write the preview workspace root manifest")?;
+        // First run: no support project exists yet, so nothing generates the
+        // workspace root the module manifest resolves under. Write a virtual
+        // root now — the managed manifest replaces it once the support
+        // project scaffolds — or `cargo metadata` on the module resolves
+        // without any `[patch]` and picks registry `waterui-*` copies (#197).
+        let patches = match runtime_path.as_deref() {
+            Some(root) => {
+                let root = root.to_path_buf();
+                smol::unblock(move || {
+                    crate::project_model::templates::collect_framework_checkout_patches(&root)
+                })
+                .await?
+            }
+            None => project.resolved_framework().await?.patches(),
+        };
+        crate::project_model::templates::ffi::write_workspace_root_manifest(
+            &workspace_root,
+            patches,
+            Some(project.root()),
+        )
+        .await?;
     }
     Ok(crate_path)
 }
@@ -1385,7 +1552,12 @@ async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -
         waterui_path: waterui_path.clone(),
         channel: None,
         framework_manifest: None,
-        framework: None,
+        // The support app inherits the previewed project's framework
+        // selection exactly: its scaffold's lockfile and `[patch]` table are
+        // generated against the same revision the app resolves, so a `dev`
+        // project never meets a `stable` support graph (cli#197).
+        framework: Some(requirements.framework.clone()),
+        framework_lock: requirements.framework_lock.clone(),
         author: String::new(),
         backends: Vec::new(),
         web: None,
@@ -1416,7 +1588,7 @@ async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -
         crate::project_types::BundleIdentifier::try_from("dev.waterui.preview")
             .expect("preview support bundle identifier must be valid"),
         waterui_path,
-        &project.resolved_framework().await?,
+        &requirements.framework,
         true,
         Some(requirements.runtime_fingerprint.clone()),
     )
@@ -1429,6 +1601,36 @@ async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -
     crate::templates::preview::scaffold(project.root(), &ctx)
         .await
         .wrap_err("Failed to scaffold embedded preview app template")?;
+
+    // The manifest the preview template writes supersedes the one the create
+    // pass resolved, so the lock must resolve once more before the locked
+    // project open that follows reads it. Seeding from the previewed app's
+    // lock keeps every version the project's graph already pins.
+    let canonical = requirements
+        .framework
+        .canonical_lock(project.root())
+        .await
+        .wrap_err("Failed to read the channel's canonical lock")?;
+    crate::templates::seed_lockfile(
+        project.root(),
+        &requirements.app_path.join("Cargo.lock"),
+        canonical.as_ref(),
+    )
+    .await
+    .wrap_err("Failed to seed the preview support app's Cargo.lock")?;
+    // `cargo metadata` refreshes the lock in place, keeping the seeded
+    // versions and adding only the entries the support manifest's own
+    // packages need — `generate-lockfile` would re-resolve every crate at
+    // its newest and drift the support app off the project's lock.
+    let support_manifest = project.root().join("Cargo.toml");
+    smol::unblock(move || {
+        cargo_metadata::MetadataCommand::new()
+            .manifest_path(&support_manifest)
+            .exec()
+            .map(|_| ())
+    })
+    .await
+    .wrap_err("Failed to refresh the preview support app's Cargo.lock")?;
 
     info!("Preview app scaffolded at {}", path.display());
     Ok(())
@@ -1462,6 +1664,7 @@ async fn resolve_preview_requirements(
         &graph_fingerprint,
         &resolved.app_crate_name,
         &resolved.app_path,
+        &resolved.framework,
     )
     .await?
     {
@@ -1484,8 +1687,13 @@ async fn resolve_preview_requirements(
             elapsed_ms = runtime_fingerprint_start.elapsed().as_millis(),
             "Preview computed dev-mode runtime fingerprint"
         );
+        let protocol_dir = waterui_root.join("components/devtools/preview/protocol");
+        let expected_protocol_commit = preview_protocol_commit(&protocol_dir).await;
         return Ok(PreviewRequirements {
             waterui_path: Some(waterui_root),
+            framework: resolved.framework,
+            framework_lock: None,
+            expected_protocol_commit,
             runtime_fingerprint: runtime_fingerprint(
                 &fingerprint,
                 &runtime_features,
@@ -1512,6 +1720,13 @@ async fn resolve_preview_requirements(
 
     Ok(PreviewRequirements {
         waterui_path: None,
+        framework_lock: Some(
+            smol::fs::read(resolved.app_path.join("Water.lock"))
+                .await
+                .wrap_err("the project's Water.lock could not be read")?,
+        ),
+        framework: resolved.framework,
+        expected_protocol_commit: protocol_commit_from_metadata(metadata).await?,
         runtime_fingerprint: runtime_fingerprint(
             &runtime_fingerprint_base,
             &runtime_features,
@@ -1529,6 +1744,7 @@ async fn resolve_preview_requirements_from_manifest(
     graph_fingerprint: &str,
     app_crate_name: &crate::project_types::CrateName,
     app_path: &Path,
+    framework: &ResolvedFramework,
 ) -> Result<Option<PreviewRequirements>> {
     let manifest_open_start = Instant::now();
     let manifest = crate::project::Manifest::open(project_path.join("Water.toml"))
@@ -1578,8 +1794,13 @@ async fn resolve_preview_requirements_from_manifest(
         "Preview resolved runtime requirements from Water.toml"
     );
 
+    let protocol_dir = waterui_root.join("components/devtools/preview/protocol");
+    let expected_protocol_commit = preview_protocol_commit(&protocol_dir).await;
     Ok(Some(PreviewRequirements {
         waterui_path: Some(waterui_root),
+        framework: framework.clone(),
+        framework_lock: None,
+        expected_protocol_commit,
         runtime_fingerprint,
         runtime_features: runtime_features.to_vec(),
         app_crate_name: app_crate_name.clone(),
@@ -1593,6 +1814,7 @@ async fn resolve_preview_metadata(
 ) -> Result<ResolvedPreviewMetadata> {
     let project = Project::open_for_preview_build(project_path).await?;
     ensure_project_dev_feature_for_preview(&project).await?;
+    let framework = project.resolved_framework().await?;
     let manifest_path = scaffold_preview_module(&project, platform)
         .await?
         .join("Cargo.toml");
@@ -1619,6 +1841,7 @@ async fn resolve_preview_metadata(
     );
     Ok(ResolvedPreviewMetadata {
         metadata,
+        framework,
         app_crate_name,
         app_path,
     })

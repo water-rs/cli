@@ -1159,6 +1159,10 @@ pub struct CreateOptions {
     /// the host project's framework exactly. Mutually exclusive with every
     /// resolving source above.
     pub framework: Option<ResolvedFramework>,
+    /// The `Water.lock` bytes `framework` was resolved against: a caller
+    /// passing `framework` carries the host project's lock verbatim, so the
+    /// scaffolded project's `Water.lock`/`Cargo.lock` match it.
+    pub framework_lock: Option<Vec<u8>>,
     /// Author name for Cargo.toml.
     pub author: String,
     /// The backends the caller will scaffold after creation: each one's
@@ -1237,7 +1241,7 @@ impl CreateOptions {
             return ResolvedFramework::resolve_manifest(path).await;
         }
         if let Some(framework) = &self.framework {
-            return Ok((framework.clone(), None));
+            return Ok((framework.clone(), self.framework_lock.take()));
         }
         ResolvedFramework::resolve(self.channel.unwrap_or_default()).await
     }
@@ -2796,6 +2800,7 @@ mod channel_tests {
                 channel: None,
                 framework_manifest: None,
                 framework: None,
+                framework_lock: None,
                 author: String::new(),
                 backends: Vec::new(),
                 web: None,
@@ -3125,6 +3130,7 @@ mod scaffold_tests {
                 // A channel resolution would fetch the newest release from
                 // GitHub; a unit test resolves a fixture in place instead.
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
+                framework_lock: None,
                 author: "Lexo Liu".to_string(),
                 backends: Vec::new(),
                 web: None,
@@ -3173,6 +3179,7 @@ mod scaffold_tests {
                     channel: None,
                     framework_manifest: None,
                     framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    framework_lock: None,
                     author: "Lexo Liu".to_string(),
                     backends: vec![backend],
                     web: None,
@@ -3211,6 +3218,7 @@ mod scaffold_tests {
                 channel: None,
                 framework_manifest: None,
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
+                framework_lock: None,
                 author: "Lexo Liu".to_string(),
                 backends: Vec::new(),
                 web: None,
@@ -3257,6 +3265,7 @@ mod scaffold_tests {
                 channel: None,
                 framework_manifest: None,
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
+                framework_lock: None,
                 author: "Lexo Liu".to_string(),
                 backends: Vec::new(),
                 web: None,
@@ -3335,6 +3344,7 @@ mod scaffold_tests {
                     channel: None,
                     framework_manifest: None,
                     framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    framework_lock: None,
                     author: "Lexo Liu".to_string(),
                     backends: Vec::new(),
                     web: None,

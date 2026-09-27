@@ -784,7 +784,23 @@ impl ResolvedFramework {
         let project_lock: Lockfile = smol::fs::read_to_string(project.lockfile_path().await?)
             .await?
             .parse()?;
-        let lock_path = directory.join("Cargo.lock");
+        // Cargo resolves a member's lockfile at the workspace root, so the
+        // seed has to land there — a `Cargo.lock` written into a member
+        // directory (a preview module under `managed_backends/ffi/modules`)
+        // is never read (#197).
+        let workspace_root = {
+            let manifest_dir = directory.to_path_buf();
+            smol::unblock(move || {
+                cargo_metadata::MetadataCommand::new()
+                    .current_dir(manifest_dir)
+                    .no_deps()
+                    .exec()
+            })
+            .await?
+            .workspace_root
+            .into_std_path_buf()
+        };
+        let lock_path = workspace_root.join("Cargo.lock");
         let previous: Option<Lockfile> = match smol::fs::read_to_string(&lock_path).await {
             Ok(contents) => Some(contents.parse()?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -915,28 +931,7 @@ impl ResolvedFramework {
             bail!("Water.lock does not match the selected framework revision");
         }
         let mut lock: Lockfile = std::str::from_utf8(contents)?.parse()?;
-        let source = format!("git+{repository}?rev={revision}#{revision}")
-            .parse::<cargo_lock::SourceId>()?;
-        let mut local = BTreeMap::new();
-        for package in &mut lock.packages {
-            if package.source.is_none() {
-                package.source = Some(source.clone());
-                local.insert(
-                    (package.name.clone(), package.version.clone()),
-                    LockedDependency::from(&*package),
-                );
-            }
-        }
-        for package in &mut lock.packages {
-            for dependency in &mut package.dependencies {
-                if dependency.source.is_none()
-                    && let Some(replacement) =
-                        local.get(&(dependency.name.clone(), dependency.version.clone()))
-                {
-                    *dependency = replacement.clone();
-                }
-            }
-        }
+        annotate_workspace_lock(&mut lock, repository, revision)?;
         Ok(lock)
     }
 
@@ -1166,7 +1161,7 @@ impl ResolvedFramework {
             }
         };
 
-        let (source, submodules) = if let Some(certification) = &certification {
+        let (mut source, submodules) = if let Some(certification) = &certification {
             (
                 certified_source(
                     certification,
@@ -1208,9 +1203,13 @@ impl ResolvedFramework {
                 // repository at the pinned commit, not the superproject's —
                 // whose tree holds a gitlink there, not the crate.
                 let pins = submodule_pins(submodule_repositories, &submodules);
-                let patches = rebase_patches_onto_source(patches, repository, revision, &pins);
+                let mut patches = rebase_patches_onto_source(patches, repository, revision, &pins);
+                patch_framework_members(&mut patches, &lock, repository, revision);
                 let packages = resolve_packages(&scaffold, &lock, repository, revision)?;
-                (packages, patches, Some(lock_bytes))
+
+                let foreign = foreign_locked_packages(&lock, &packages, repository).await?;
+                let lockfile = merge_foreign_lock(&lock, lock_bytes, foreign, &mut source);
+                (packages, patches, Some(lockfile))
             }
         };
         Ok((
@@ -1245,6 +1244,38 @@ async fn managed_crate_metadata(
             .exec()
     })
     .await
+}
+
+/// The framework lock only covers its own workspace; an extracted backend
+/// pins its own repository revision whose graph (`winit`, `accesskit_winit`,
+/// `redox_syscall`, …) no framework entry names. Fold each pinned
+/// repository's own lock packages into the channel's — after the
+/// certification checked the framework's bytes — so `Water.lock` seeds and
+/// gates the backend graphs a generated project actually resolves
+/// (water-rs/cli#197). The `Source`'s recorded lock hash follows the merged
+/// bytes.
+fn merge_foreign_lock(
+    lock: &Lockfile,
+    lock_bytes: Vec<u8>,
+    foreign: Vec<cargo_lock::Package>,
+    source: &mut Source,
+) -> Vec<u8> {
+    if foreign.is_empty() {
+        return lock_bytes;
+    }
+    let mut merged = lock.clone();
+    merged.packages.extend(foreign);
+    merged.packages.sort_by(|left, right| {
+        left.name
+            .as_str()
+            .cmp(right.name.as_str())
+            .then(left.version.cmp(&right.version))
+    });
+    let merged_bytes = merged.to_string().into_bytes();
+    if let Source::Dev { lock_sha256, .. } | Source::Nightly { lock_sha256, .. } = source {
+        *lock_sha256 = hex::encode(Sha256::digest(&merged_bytes));
+    }
+    merged_bytes
 }
 
 /// The packages the generated crate's `Cargo.lock` seed carries.
@@ -2707,6 +2738,158 @@ fn rebase_patches_onto_source(
         }
     }
     patches
+}
+
+/// Patch the channel's `[patch.crates-io]` table with every framework member
+/// crate the workspace's own table does not name.
+///
+/// The checkout's patch table only lists the members its own crates depend on
+/// through `path`; a member resolved through `[workspace.dependencies]` —
+/// `waterui-ffi`, `waterui-internal`, `waterui-media`, `waterui-mcp`,
+/// `waterui-preview`, `waterui-preview-protocol`, `waterui-testing`, … — can
+/// still be requested by bare version from a generated or transitive manifest,
+/// and without an entry that request resolves a published release built from a
+/// different revision (water-rs/cli#197). The lock's source-less packages are
+/// the workspace member set — the same record `resolve_packages` resolves
+/// scaffold requirements against — so they are the names the table must pin at
+/// the revision the channel selected.
+fn patch_framework_members(
+    patches: &mut PatchSet,
+    lock: &Lockfile,
+    repository: &str,
+    revision: &str,
+) {
+    let crates_io = patches.entry("crates-io".to_owned()).or_default();
+    for package in &lock.packages {
+        let name = package.name.as_str();
+        if package.source.is_some() || !name.starts_with("waterui") {
+            continue;
+        }
+        crates_io.entry(name.to_owned()).or_insert_with(|| {
+            Dependency::Detailed(Box::new(DependencyDetail {
+                git: Some(repository.to_owned()),
+                rev: Some(revision.to_owned()),
+                ..DependencyDetail::default()
+            }))
+        });
+    }
+}
+
+/// Rewrite a workspace lockfile's member identities to the git source the
+/// workspace resolves from: every source-less package is a member built from
+/// `repository` at `revision`, and a dependency edge naming one points at that
+/// same source.
+fn annotate_workspace_lock(lock: &mut Lockfile, repository: &str, revision: &str) -> Result<()> {
+    let source =
+        format!("git+{repository}?rev={revision}#{revision}").parse::<cargo_lock::SourceId>()?;
+    let mut local = BTreeMap::new();
+    for package in &mut lock.packages {
+        if package.source.is_none() {
+            package.source = Some(source.clone());
+            local.insert(
+                (package.name.clone(), package.version.clone()),
+                LockedDependency::from(&*package),
+            );
+        }
+    }
+    for package in &mut lock.packages {
+        for dependency in &mut package.dependencies {
+            if dependency.source.is_none()
+                && let Some(replacement) =
+                    local.get(&(dependency.name.clone(), dependency.version.clone()))
+            {
+                *dependency = replacement.clone();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The lock entries an extracted framework package's own `Cargo.lock` carries
+/// at the revision the scaffold pins — the only written record of its resolved
+/// graph, since an extracted crate never enters the framework lock.
+///
+/// `hydrolysis` builds `winit`, `accesskit_winit` and `redox_syscall` versions
+/// the `WaterUI` workspace lock does not name, so the backend's graph failed
+/// the `Water.lock` gate on every edge (water-rs/cli#197). Each pinned
+/// repository's lock is annotated with its own pin exactly as the framework
+/// lock is annotated with the channel's — member packages become
+/// `git+<repo>?rev=<rev>` entries and member edges follow them. Entries naming
+/// a framework member, or resolving the framework repository at the extracted
+/// crate's own (older) patch pin, are dropped: the channel's lock owns every
+/// `waterui-*` identity at this revision.
+async fn foreign_locked_packages(
+    framework_lock: &Lockfile,
+    packages: &BTreeMap<String, DependencyDetail>,
+    repository: &str,
+) -> Result<Vec<cargo_lock::Package>> {
+    let member_names: BTreeSet<&str> = framework_lock
+        .packages
+        .iter()
+        .filter(|package| package.source.is_none())
+        .map(|package| package.name.as_str())
+        .collect();
+    let mut known: BTreeSet<(String, String, String)> = framework_lock
+        .packages
+        .iter()
+        .map(|package| {
+            (
+                package.name.to_string(),
+                package.version.to_string(),
+                package
+                    .source
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string),
+            )
+        })
+        .collect();
+    let mut pins = BTreeSet::new();
+    for detail in packages.values() {
+        let (Some(git), Some(revision)) = (&detail.git, &detail.rev) else {
+            continue;
+        };
+        if canonical_git_url(git) != canonical_git_url(repository) {
+            pins.insert((git.clone(), revision.clone()));
+        }
+    }
+    let mut foreign = Vec::new();
+    for (git, revision) in pins {
+        let slug = repository_slug(&git)?;
+        let Some(bytes) = fetch_optional(&format!(
+            "https://raw.githubusercontent.com/{slug}/{revision}/Cargo.lock"
+        ))
+        .await?
+        else {
+            // An extracted crate that keeps no lock of its own contributes
+            // nothing the channel can pin.
+            continue;
+        };
+        let mut lock: Lockfile = std::str::from_utf8(&bytes)?.parse()?;
+        annotate_workspace_lock(&mut lock, &git, &revision)?;
+        for package in lock.packages {
+            if member_names.contains(package.name.as_str()) {
+                continue;
+            }
+            if package.source.as_ref().is_some_and(|source| {
+                source.is_git()
+                    && canonical_git_url(source.url().as_str()) == canonical_git_url(repository)
+            }) {
+                continue;
+            }
+            let key = (
+                package.name.to_string(),
+                package.version.to_string(),
+                package
+                    .source
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string),
+            );
+            if known.insert(key) {
+                foreign.push(package);
+            }
+        }
+    }
+    Ok(foreign)
 }
 
 /// A git URL in the spelling Cargo canonicalizes sources to: the query,

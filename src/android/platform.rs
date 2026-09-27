@@ -693,7 +693,8 @@ async fn resolve_android_sdk_paths(host: &Host) -> eyre::Result<(PathBuf, PathBu
     .await
 }
 
-/// The `waterui-ffi` features an Android runtime is compiled with.
+/// The features an Android runtime's generated FFI crate is compiled with,
+/// each forwarded to `waterui-ffi` by the generated manifest.
 ///
 /// See [`crate::apple::platform::apple_ffi_dependency_features`] for why anything
 /// loaded into that runtime must be compiled with the same set.
@@ -705,7 +706,7 @@ pub(crate) async fn android_ffi_dependency_features(
     project: &Project,
 ) -> eyre::Result<Vec<String>> {
     let build_manifest = project.ffi_crate_path().join("Cargo.toml");
-    let mut features = vec!["waterui-ffi/android-jni".to_string()];
+    let mut features = vec!["android-jni".to_string()];
     features.extend(
         crate::project_model::assets::capability_ffi_features(project, &build_manifest).await?,
     );

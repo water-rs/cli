@@ -3547,7 +3547,7 @@ async fn write_support_cargo_toml(
     let patch = match runtime_root {
         Some(root) => {
             let root = root.to_path_buf();
-            smol::unblock(move || collect_workspace_patches(&root)).await?
+            smol::unblock(move || collect_framework_checkout_patches(&root)).await?
         }
         None => framework.patches(),
     };
@@ -4945,7 +4945,7 @@ pub mod tui {
     fn tui_patch_set(ctx: &TemplateContext) -> io::Result<cargo_toml::PatchSet> {
         let waterui_root = ctx.waterui_workspace_root();
         let mut patch = match &waterui_root {
-            Some(root) => super::collect_workspace_patches(root)?,
+            Some(root) => super::collect_framework_checkout_patches(root)?,
             None => ctx.framework.patches(),
         };
         let crates_io = patch.entry("crates-io".to_string()).or_default();
@@ -5067,6 +5067,103 @@ fn patch_framework_git_source(patches: &mut cargo_toml::PatchSet) {
     }
 }
 
+/// Every directory the workspace at `root` declares a member crate in —
+/// `[workspace] members` patterns expanded one path segment at a time and
+/// `exclude` subtracted the same way — paired with the package name the
+/// member's manifest declares. `components/*`-style member globs carry crates
+/// the patch table never names, so generated manifests that copy only the
+/// checkout's `[patch]` leave them unpinned.
+fn workspace_member_packages(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    // A missing manifest is an empty member set, matching
+    // `collect_workspace_patches`' missing-workspace default: a
+    // `waterui_path` that names nothing augments nothing.
+    if !root.join("Cargo.toml").is_file() {
+        return Ok(Vec::new());
+    }
+    let manifest = cargo_toml::Manifest::from_path(root.join("Cargo.toml"))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let workspace = manifest.workspace.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} declares no [workspace]",
+                root.join("Cargo.toml").display()
+            ),
+        )
+    })?;
+    let expand = |pattern: &str| -> io::Result<Vec<PathBuf>> {
+        let mut dirs = vec![root.to_path_buf()];
+        for component in pattern.split('/') {
+            let mut next = Vec::new();
+            for dir in &dirs {
+                if component == "*" {
+                    for entry in std::fs::read_dir(dir)? {
+                        let path = entry?.path();
+                        if path.is_dir() {
+                            next.push(path);
+                        }
+                    }
+                } else {
+                    let path = dir.join(component);
+                    if path.is_dir() {
+                        next.push(path);
+                    }
+                }
+            }
+            dirs = next;
+        }
+        Ok(dirs)
+    };
+    let mut excluded = std::collections::BTreeSet::new();
+    for pattern in &workspace.exclude {
+        excluded.extend(expand(pattern)?);
+    }
+    let mut packages = Vec::new();
+    for pattern in &workspace.members {
+        for dir in expand(pattern)? {
+            if excluded.contains(&dir) {
+                continue;
+            }
+            let member_manifest = dir.join("Cargo.toml");
+            if let Ok(member) = cargo_toml::Manifest::from_path(&member_manifest)
+                && let Some(package) = member.package
+            {
+                packages.push((package.name, dir));
+            }
+        }
+    }
+    Ok(packages)
+}
+
+/// [`collect_workspace_patches`] plus a `{ path }` entry for every `waterui*`
+/// member package the checkout's own patch table leaves out — the workspace's
+/// glob members (`waterui-ffi`, `waterui-preview`, …) carry no entry of their
+/// own, and without one a generated crate resolves their registry copies
+/// beside the patched siblings (#197). The member set is read off the
+/// checkout's workspace globs, the same source of truth channel resolution
+/// reads from the framework lockfile. Additions ride every table the set
+/// already carries, `crates-io` and the repository-source mirror alike.
+pub fn collect_framework_checkout_patches(
+    workspace_root: &Path,
+) -> io::Result<cargo_toml::PatchSet> {
+    let mut patches = collect_workspace_patches(workspace_root)?;
+    for (name, dir) in workspace_member_packages(workspace_root)? {
+        if !name.starts_with("waterui") {
+            continue;
+        }
+        let path = normalize_path_for_config(&dir);
+        for table in patches.values_mut() {
+            table.entry(name.clone()).or_insert_with(|| {
+                cargo_toml::Dependency::Detailed(Box::new(cargo_toml::DependencyDetail {
+                    path: Some(path.clone()),
+                    ..cargo_toml::DependencyDetail::default()
+                }))
+            });
+        }
+    }
+    Ok(patches)
+}
+
 /// The `[patch]` tables a generated crate resolves the framework with: the
 /// checkout's own when `waterui_path` names a checkout — carrying the
 /// repository-source mirror [`collect_workspace_patches`] synthesizes — and
@@ -5075,7 +5172,7 @@ fn patch_framework_git_source(patches: &mut cargo_toml::PatchSet) {
 fn generated_crate_patches(ctx: &TemplateContext) -> io::Result<cargo_toml::PatchSet> {
     ctx.waterui_workspace_root().map_or_else(
         || Ok(ctx.framework.patches()),
-        |root| collect_workspace_patches(&root),
+        |root| collect_framework_checkout_patches(&root),
     )
 }
 
@@ -5200,6 +5297,24 @@ pub fn local_framework_patches(
         }
     }
     patch_framework_git_source(&mut patches);
+    // The checkout's glob members carry no patch entry of their own; pin each
+    // `waterui*` member's directory the same relative way (#197).
+    let checkout_root = project_root.join(waterui_path);
+    for (name, dir) in workspace_member_packages(&checkout_root)? {
+        if !name.starts_with("waterui") || !dir.starts_with(&checkout_root) {
+            continue;
+        }
+        let path = waterui_path.join(dir.strip_prefix(&checkout_root).unwrap_or(&dir));
+        let path = normalize_path_for_config(&path);
+        for table in patches.values_mut() {
+            table.entry(name.clone()).or_insert_with(|| {
+                cargo_toml::Dependency::Detailed(Box::new(cargo_toml::DependencyDetail {
+                    path: Some(path.clone()),
+                    ..cargo_toml::DependencyDetail::default()
+                }))
+            });
+        }
+    }
     Ok(patches)
 }
 
@@ -5378,6 +5493,29 @@ fn find_workspace_manifest(
     Ok(fallback)
 }
 
+/// The `waterui-ffi` features the generated FFI manifests re-export under their
+/// own names, so builds select them as features of the generated crate.
+///
+/// Cargo only honours the seeded lockfile for dependency subtrees it reaches
+/// through manifest-declared features: `dep/feature` passed to `--features`
+/// resolves outside the lockfile's coverage — the reported resolve is free to
+/// drift off `Water.lock`, and the lockfile Cargo writes back omits that
+/// subtree entirely (#197: `hyper-util` drifted under `waterui-ffi/media` →
+/// `waterkit-audio` → `zenwave` and the generated-build gate then rejected
+/// its own resolution). Declaring each selectable feature in the manifest
+/// keeps every one of them inside the locked graph.
+const FORWARDED_FFI_FEATURES: &[&str] = &[
+    "android-jni",
+    "c-api",
+    "chromium",
+    "gpu",
+    "map",
+    "media",
+    "video",
+    "webview",
+    "webview-cef",
+];
+
 /// Native FFI companion crate templates.
 pub mod ffi {
     use cargo_toml::{Dependency, DependencyDetail, Manifest, Package, Product, Workspace};
@@ -5444,6 +5582,15 @@ pub mod ffi {
             .features
             .insert("dev".to_string(), vec![format!("{}/dev", ctx.crate_name)]);
 
+        // `waterui-ffi` is a hard dependency here, so the forwards are the
+        // plain `dep/feat` form; see `FORWARDED_FFI_FEATURES` for why they are
+        // manifest-declared.
+        for name in super::FORWARDED_FFI_FEATURES {
+            manifest
+                .features
+                .insert((*name).to_string(), vec![format!("waterui-ffi/{name}")]);
+        }
+
         for (name, source) in [
             ("waterui", NativeBackendDependencySource::WateruiRoot),
             (
@@ -5462,7 +5609,9 @@ pub mod ffi {
                 .insert(name.to_owned(), Dependency::Detailed(Box::new(dependency)));
         }
         manifest.patch = match ctx.waterui_workspace_root() {
-            Some(root) => smol::unblock(move || super::collect_workspace_patches(&root)).await?,
+            Some(root) => {
+                smol::unblock(move || super::collect_framework_checkout_patches(&root)).await?
+            }
             None => ctx.framework.patches(),
         };
 
@@ -5487,6 +5636,47 @@ pub mod ffi {
             super::propagate_workspace_patches(&mut manifest, project_root).await?;
         }
 
+        let toml_string = toml::to_string_pretty(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::create_dir_all(base_dir).await?;
+        write_file_if_changed(&base_dir.join("Cargo.toml"), toml_string.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Lay down the workspace root the preview modules resolve under before
+    /// the support project exists to generate the real one.
+    ///
+    /// `scaffold_preview_module` writes a module's manifest before the
+    /// preview support app has been scaffolded, so the first run reaches
+    /// `cargo metadata` on the module with no `[workspace]` root above it:
+    /// Cargo honours `[patch]` only at a workspace root, so the module's own
+    /// table is ignored and the resolution collapses to the registry copies
+    /// (#197). This manifest carries just the workspace — members, the
+    /// channel's or checkout's patch tables, the generated profile — and the
+    /// managed `generate_cargo_toml` run overwrites it once the support
+    /// project exists, member list included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the modules directory or the manifest cannot be
+    /// written.
+    pub async fn write_workspace_root_manifest(
+        base_dir: &Path,
+        patches: cargo_toml::PatchSet,
+        project_root: Option<&Path>,
+    ) -> io::Result<()> {
+        let mut manifest = Manifest::<()> {
+            profile: generated_profiles(),
+            patch: patches,
+            workspace: Some(Workspace {
+                members: super::preview_module_members(base_dir).await?,
+                ..Workspace::default()
+            }),
+            ..Default::default()
+        };
+        if let Some(project_root) = project_root {
+            super::propagate_workspace_patches(&mut manifest, project_root).await?;
+        }
         let toml_string = toml::to_string_pretty(&manifest)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::create_dir_all(base_dir).await?;
@@ -5527,55 +5717,6 @@ async fn preview_module_members(ffi_crate_dir: &Path) -> io::Result<Vec<String>>
 /// The FFI crate roots the workspace these modules join; see the workspace
 /// declaration in `ffi::generate_cargo_toml` for why they must share one.
 pub const PREVIEW_MODULES_DIR: &str = "modules";
-
-/// Write the workspace-root manifest a preview module's `cargo metadata`
-/// resolves under when the support runtime's own scaffold has not run yet.
-///
-/// A preview module is a member of the workspace rooted at the generated FFI
-/// companion's `Cargo.toml`, and Cargo honours `[patch]` from the workspace
-/// root alone — a member manifest cannot carry them. The support application
-/// writes that root, but only after the module's metadata has resolved, so a
-/// support app that does not exist yet — a first preview, or one discarded
-/// for a different `WaterUI` checkout — leaves the module resolving outside
-/// the project's patch tables: a checkout that pins a fork (a `nami` the
-/// published `waterui-*` crates cannot satisfy) fails resolution before the
-/// root is ever written. This stub carries only what resolution needs — the
-/// member list and the `[patch]` tables governing the project's build; the
-/// companion's own scaffold replaces it once the support app exists.
-///
-/// An existing root is left alone: a real companion manifest is refreshed by
-/// the support project's own open, and this stub must not truncate it.
-///
-/// # Errors
-///
-/// Returns an error when the module list cannot be read or the manifest
-/// cannot be written.
-pub async fn ensure_preview_module_workspace_root(
-    workspace_root: &Path,
-    project_root: &Path,
-) -> io::Result<()> {
-    let manifest_path = workspace_root.join("Cargo.toml");
-    if manifest_path.is_file() {
-        return Ok(());
-    }
-    let members = preview_module_members(workspace_root).await?;
-    let patch = {
-        let project_root = project_root.to_path_buf();
-        smol::unblock(move || collect_workspace_patches(&project_root)).await?
-    };
-    let manifest = cargo_toml::Manifest::<()> {
-        workspace: Some(cargo_toml::Workspace {
-            members,
-            ..cargo_toml::Workspace::default()
-        }),
-        patch,
-        ..cargo_toml::Manifest::default()
-    };
-    let toml_string = toml::to_string_pretty(&manifest)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    fs::create_dir_all(workspace_root).await?;
-    write_file_if_changed(&manifest_path, toml_string.as_bytes()).await
-}
 
 /// Root-level templates (Cargo.toml, lib.rs, .gitignore).
 pub mod root {
@@ -6106,6 +6247,15 @@ pub mod preview_ffi {
                     "dep:waterui-preview".to_string(),
                 ],
             );
+        }
+
+        // Same forwards as the workspace root's, weakened: this crate's
+        // `waterui-ffi` dependency is optional and only an ABI feature enables
+        // it, so a capability feature alone must not pull the dep in.
+        for name in super::FORWARDED_FFI_FEATURES {
+            manifest
+                .features
+                .insert((*name).to_string(), vec![format!("waterui-ffi?/{name}")]);
         }
 
         let toml_string = toml::to_string_pretty(&manifest)

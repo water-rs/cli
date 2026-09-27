@@ -369,6 +369,7 @@ async fn create_project(shell: &Shell, plan: &CreatePlan) -> Result<Project> {
             channel: plan.channel,
             framework_manifest: plan.framework_manifest.clone(),
             framework: None,
+            framework_lock: None,
             author: whoami::username()
                 .map_err(|error| eyre!("Failed to determine project author: {error}"))?,
             // The create-time gate holds each requested backend's scaffold
@@ -655,6 +656,7 @@ mod tests {
                 channel: None,
                 framework_manifest: None,
                 framework: None,
+                framework_lock: None,
                 author: "water test".to_string(),
                 backends: Vec::new(),
                 web: Some(waterui_cli::project::WebScaffold {

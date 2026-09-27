@@ -294,6 +294,7 @@ async fn scaffold_shell(
             channel: args.channel,
             framework_manifest: args.framework_manifest.clone(),
             framework: None,
+            framework_lock: None,
             author: whoami::username()
                 .map_err(|error| eyre!("Failed to determine project author: {error}"))?,
             // `water init` scaffolds no backend through `Project::init`.

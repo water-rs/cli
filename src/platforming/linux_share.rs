@@ -77,6 +77,7 @@ mod tests {
                     // A channel resolution would fetch the newest release from
                     // GitHub; a unit test resolves a fixture in place instead.
                     framework: Some(crate::framework::test_fixtures::stable_framework()),
+                    framework_lock: None,
                     author: "Lexo Liu".to_string(),
                     backends: Vec::new(),
                     web: None,

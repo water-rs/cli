@@ -1654,7 +1654,12 @@ pub async fn capability_enabled(
     }
 }
 
-/// Returns the `waterui-ffi` features to enable for this app's capabilities.
+/// Returns the generated FFI crate's features to enable for this app's
+/// capabilities.
+///
+/// Each entry is a feature the generated manifest forwards to `waterui-ffi`
+/// of the same name (`FORWARDED_FFI_FEATURES`), keeping the resolve inside
+/// the seeded lockfile.
 ///
 /// An app opts into a capability through its dependency graph — a component
 /// crate it depends on (`waterui-map`), or a crate that carries the capability
@@ -1676,15 +1681,15 @@ pub async fn capability_ffi_features(
     let mut features = Vec::new();
     for capability in OPTIONAL_CAPABILITIES {
         if capability_enabled(project, build_manifest, capability.name).await? {
-            features.push(format!("waterui-ffi/{}", capability.name));
+            features.push(capability.name.to_string());
         }
     }
     Ok(features)
 }
 
-/// Returns the `waterui-ffi` features that select `WaterUI`'s own realizations
-/// of the semantic components the facade carries, for a platform with no
-/// native primitive to bridge.
+/// Returns the generated FFI crate features — forwarded to `waterui-ffi` —
+/// that select `WaterUI`'s own realizations of the semantic components the
+/// facade carries, for a platform with no native primitive to bridge.
 ///
 /// Apple bridges `AVPlayer`, so an Apple build asks for none of these and links
 /// no player. Every other platform draws the video itself, and the
@@ -1715,7 +1720,7 @@ pub async fn self_drawn_realization_features(
     let opted_in = package_feature_enabled(build_manifest, "waterui", "video-gpu").await?
         || project.links_runtime_package("waterui-video-gpu").await?;
     if opted_in {
-        features.push("waterui-ffi/video".to_string());
+        features.push("video".to_string());
     }
     Ok(features)
 }
