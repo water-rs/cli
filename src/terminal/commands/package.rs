@@ -112,9 +112,8 @@ pub struct Args {
     #[arg(short, long, value_enum)]
     backend: TargetBackend,
 
-    /// Build in release mode (optimized).
-    #[arg(long)]
-    release: bool,
+    #[command(flatten)]
+    profile: ProfileArgs,
 
     /// Package for store distribution (App Store, Play Store).
     #[arg(long)]
@@ -136,6 +135,39 @@ pub struct Args {
     yes: bool,
 }
 
+/// The build profile flags: at most one of them, and `release` when neither is
+/// given — `water package` builds what users ship unless asked otherwise.
+#[derive(ClapArgs, Debug)]
+#[group(multiple = false)]
+struct ProfileArgs {
+    /// Build the shipped `release` profile. This is the default; the flag
+    /// states it explicitly.
+    #[arg(long)]
+    release: bool,
+
+    /// Build the unoptimized `dev` profile instead of the shipped `release`
+    /// profile.
+    #[arg(long, conflicts_with = "distribution")]
+    debug: bool,
+}
+
+impl ProfileArgs {
+    const fn build_profile(&self) -> BuildProfile {
+        if self.release || !self.debug {
+            BuildProfile::Release
+        } else {
+            BuildProfile::Debug
+        }
+    }
+}
+
+impl Args {
+    /// The profile the package builds.
+    const fn profile(&self) -> BuildProfile {
+        self.profile.build_profile()
+    }
+}
+
 struct PackagingContext {
     project: Project,
     backend: TargetBackend,
@@ -155,7 +187,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         &context.project,
         args.platform,
         context.backend,
-        args.release,
+        args.profile(),
         args.distribution,
     );
     check_packaging_toolchain(shell, args.platform, context.backend, &args.arch).await?;
@@ -180,12 +212,8 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     }
     let project = ensure_packaging_backend_generated(shell, project, backend).await?;
 
-    let mut build_options = BuildOptions::packaging(if args.release {
-        BuildProfile::Release
-    } else {
-        BuildProfile::Debug
-    })
-    .with_progress(shell.build_progress());
+    let mut build_options =
+        BuildOptions::packaging(args.profile()).with_progress(shell.build_progress());
     if let Some(sccache_path) =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await
     {
@@ -295,10 +323,14 @@ fn print_packaging_header(
     project: &Project,
     platform: TargetPlatform,
     backend: TargetBackend,
-    release: bool,
+    profile: BuildProfile,
     distribution: bool,
 ) {
-    let mode = if release { "release" } else { "debug" };
+    let mode = if profile.is_release() {
+        "release"
+    } else {
+        "debug"
+    };
     let dist = if distribution { " (distribution)" } else { "" };
     header!(
         shell,
@@ -501,8 +533,9 @@ async fn package_artifact_inner(
     context: &PackagingContext,
     built: Option<&BuiltTarget>,
 ) -> Result<Artifact> {
-    let package_options = PackageOptions::packaging(args.distribution, !args.release)
-        .with_progress(shell.build_progress());
+    let package_options =
+        PackageOptions::packaging(args.distribution, args.profile().is_development())
+            .with_progress(shell.build_progress());
     match context.backend {
         TargetBackend::Android => {
             let abis: Vec<AndroidAbi> = args.arch.iter().map(|arch| arch.to_abi()).collect();
