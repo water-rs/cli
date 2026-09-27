@@ -206,12 +206,12 @@ impl PreviewTool {
         symbol: &str,
         output_path: &Path,
     ) -> Result<()> {
-        let mut session = launch_preview_session(
+        let mut session = Box::pin(launch_preview_session(
             &self.project_path,
             request.platform.into(),
             self.sccache_path.clone(),
             None,
-        )
+        ))
         .await?;
 
         let result = async {
