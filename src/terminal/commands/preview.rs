@@ -268,12 +268,12 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     // Launch preview session (connects to existing app or launches new one)
     let spinner = shell.spinner("Connecting to preview app...");
     let preview_platform: PreviewPlatform = request.platform.into();
-    let mut session = launch_preview_session(
+    let mut session = Box::pin(launch_preview_session(
         &project_path,
         preview_platform,
         sccache_path.clone(),
         Some(shell.build_progress()),
-    )
+    ))
     .await?;
     if let Some(s) = spinner {
         s.finish_and_clear();
