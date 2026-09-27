@@ -24,7 +24,7 @@ use waterui_cli::{
         platform::{build_hydrolysis, package_hydrolysis},
     },
     package_output::place_in_project,
-    platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
+    platform::{DeviceSigning, PackageOptions, TargetPlatform as LibTargetPlatform},
     project::{ManagedBackends, Project},
     winui::{
         backend::WinUiBackend,
@@ -119,6 +119,12 @@ pub struct Args {
     #[arg(long)]
     distribution: bool,
 
+    /// Leave an iOS device build unsigned, for a host with no signing
+    /// identity (CI, a build VM). Linkage and profile are those of the signed
+    /// build; sign the `.app` (`codesign`) before installing it.
+    #[arg(long, conflicts_with = "distribution")]
+    unsigned: bool,
+
     /// Project directory path (defaults to current directory).
     #[arg(long, default_value = ".")]
     path: PathBuf,
@@ -202,6 +208,7 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     let backend = resolve_backend(args.platform, args.backend)?;
 
     validate_arch_args(backend, &args.arch)?;
+    validate_unsigned_args(args.platform, backend, args.unsigned)?;
     validate_desktop_backend_platform_on_host(args.platform, backend)?;
     ensure_packaging_backend_ready(&project, backend)?;
 
@@ -535,6 +542,11 @@ async fn package_artifact_inner(
 ) -> Result<Artifact> {
     let package_options =
         PackageOptions::packaging(args.distribution, args.profile().is_development())
+            .with_device_signing(if args.unsigned {
+                DeviceSigning::Unsigned
+            } else {
+                DeviceSigning::Automatic
+            })
             .with_progress(shell.build_progress());
     match context.backend {
         TargetBackend::Android => {
@@ -626,6 +638,20 @@ fn resolve_backend(platform: TargetPlatform, backend: TargetBackend) -> Result<T
     }
 
     Ok(backend)
+}
+
+fn validate_unsigned_args(
+    platform: TargetPlatform,
+    backend: TargetBackend,
+    unsigned: bool,
+) -> Result<()> {
+    if unsigned && !(platform == TargetPlatform::Ios && backend == TargetBackend::Apple) {
+        bail!(
+            "--unsigned only applies to an iOS device build with the Apple backend; \
+             simulator and desktop packages are not signed per device"
+        );
+    }
+    Ok(())
 }
 
 fn validate_arch_args(backend: TargetBackend, arch: &[AndroidArch]) -> Result<()> {

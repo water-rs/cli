@@ -23,7 +23,7 @@ use crate::{
     assets::{self, ResolvedFont},
     build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
-    platform::{PackageOptions, TargetBackend, TargetPlatform},
+    platform::{DeviceSigning, PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
     templates::FontRegistrationTemplateEntry,
     toolchain::Host,
@@ -761,9 +761,11 @@ pub async fn package_apple(
     ];
 
     // Physical Apple OSes refuse unsigned code in every profile, so signing
-    // is disabled only for simulators and for local macOS debug builds. For a
-    // device target the build sets automatic signing with the developer team
-    // resolved from the keychain — the generated Xcode project cannot know it.
+    // is disabled only for simulators, for local macOS debug builds, and for
+    // a device build explicitly packaged unsigned (a host without a signing
+    // identity; the artifact is signed before install). Otherwise a device
+    // target builds with automatic signing and the developer team resolved
+    // from the keychain — the generated Xcode project cannot know it.
     let device_platform = matches!(
         platform,
         TargetPlatform::IOS
@@ -771,7 +773,7 @@ pub async fn package_apple(
             | TargetPlatform::WatchOS
             | TargetPlatform::VisionOS
     );
-    if device_platform {
+    if device_platform && options.device_signing() == DeviceSigning::Automatic {
         let team = crate::apple::toolchain::development_team_id(&Host::current()).await?;
         // `-allowProvisioningUpdates` lets automatic signing mint the
         // development provisioning profile a fresh bundle id does not have
@@ -781,7 +783,7 @@ pub async fn package_apple(
             OsString::from("CODE_SIGN_STYLE=Automatic"),
             OsString::from(format!("DEVELOPMENT_TEAM={team}")),
         ]);
-    } else if platform.is_simulator() || options.is_debug() {
+    } else if device_platform || platform.is_simulator() || options.is_debug() {
         args.extend([
             OsString::from("CODE_SIGNING_ALLOWED=NO"),
             OsString::from("CODE_SIGNING_REQUIRED=NO"),
