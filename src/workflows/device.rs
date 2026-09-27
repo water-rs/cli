@@ -120,6 +120,17 @@ pub struct RunOptions {
     /// detached — a detached preview app keeps serving future sessions through
     /// the same ports.
     forward_tcp_ports: Vec<u16>,
+
+    /// File the launched app's stdout and stderr append to instead of pipes.
+    ///
+    /// A pipe is only as alive as the reader at its other end: a support app
+    /// designed to outlive the CLI (the preview support app detaches and keeps
+    /// serving the next `water preview`) would keep writing to a pipe whose
+    /// reader is gone — on unix that write raises SIGPIPE and kills the app
+    /// (water-rs/cli#197). A file is the right channel for a process that
+    /// outlives the command; the launch still follows it into [`DeviceEvent::Log`]
+    /// events while the command runs.
+    app_log_file: Option<PathBuf>,
 }
 
 impl RunOptions {
@@ -132,6 +143,7 @@ impl RunOptions {
             native_logs: false,
             replace_existing_macos_app_instances: true,
             forward_tcp_ports: Vec::new(),
+            app_log_file: None,
         }
     }
 
@@ -200,6 +212,19 @@ impl RunOptions {
     #[must_use]
     pub const fn replace_existing_macos_app_instances(&self) -> bool {
         self.replace_existing_macos_app_instances
+    }
+
+    /// Send the launched app's stdout and stderr to `path` (appended, created
+    /// with parents) instead of pipes. Use for a process designed to outlive
+    /// this command — a pipe whose reader has exited raises SIGPIPE on unix.
+    pub fn set_app_log_file(&mut self, path: PathBuf) {
+        self.app_log_file = Some(path);
+    }
+
+    /// The file the launched app's stdout and stderr are redirected to, if any.
+    #[must_use]
+    pub fn app_log_file(&self) -> Option<&Path> {
+        self.app_log_file.as_deref()
     }
 
     /// Forward the given TCP ports from the host loopback to the device's
@@ -1171,10 +1196,9 @@ async fn run_macos_app(
     // as the working directory.
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .current_dir("/")
         .kill_on_drop(true);
+    let app_log_file = configure_app_stdio(&mut command, options.app_log_file())?;
     let child = command.spawn().map_err(|error| {
         FailToRun::Launch(eyre::eyre!(
             "Failed to launch '{}': {error}",
@@ -1190,6 +1214,9 @@ async fn run_macos_app(
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
         let _ = cancel_tx.try_send(());
     });
+    if let Some(log_file) = app_log_file {
+        spawn_app_log_file_follower(log_file, sender.clone());
+    }
     let (log_stream, log_child) =
         start_log_stream(host, sender.clone(), options.log_level(), app_pid)?;
     running.retain(log_child);
@@ -1197,6 +1224,112 @@ async fn run_macos_app(
     spawn_macos_app_exit_monitor(host, monitor, log_stream, sender, started_at, app_pid);
 
     Ok(running)
+}
+
+/// Route a spawned macOS app's stdout and stderr.
+///
+/// With a log file, both streams append to it (created, with parents): a file
+/// is the right channel for an app designed to outlive this command, where a
+/// pipe whose reader has exited raises SIGPIPE on unix (water-rs/cli#197).
+/// Without one, the streams keep the pipes the [`ChildMonitor`] forwards while
+/// the app is supervised.
+///
+/// Returns the log file's path when the streams were redirected to it.
+#[cfg(target_os = "macos")]
+fn configure_app_stdio(
+    command: &mut Command,
+    app_log_file: Option<&Path>,
+) -> Result<Option<PathBuf>, FailToRun> {
+    let Some(path) = app_log_file else {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        return Ok(None);
+    };
+    let open_log = || {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    };
+    let stdout = open_log().map_err(|error| {
+        FailToRun::Launch(eyre::eyre!(
+            "Failed to open the app log file {}: {error}",
+            path.display()
+        ))
+    })?;
+    let stderr = open_log().map_err(|error| {
+        FailToRun::Launch(eyre::eyre!(
+            "Failed to open the app log file {}: {error}",
+            path.display()
+        ))
+    })?;
+    command
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    Ok(Some(path.to_path_buf()))
+}
+
+/// Follow the file a spawned app logs to and forward new lines as
+/// [`DeviceEvent::Log`].
+///
+/// The file is the app's log channel for the rest of its life — a detached
+/// support app keeps writing long after this command exits — but this run
+/// still streams what lands while it runs. A task, not a `tail` child: a child
+/// retained on the [`Running`] would be forgotten by [`Running::detach`] and
+/// orphaned past the command's exit.
+#[cfg(target_os = "macos")]
+fn spawn_app_log_file_follower(path: PathBuf, sender: Sender<DeviceEvent>) {
+    use smol::io::{AsyncReadExt, AsyncSeekExt};
+    spawn(async move {
+        let mut file = match smol::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), "Cannot follow the app log file: {error}");
+                return;
+            }
+        };
+        // Only lines written during this run matter.
+        if let Err(error) = file.seek(std::io::SeekFrom::End(0)).await {
+            tracing::warn!(path = %path.display(), "Cannot seek the app log file: {error}");
+            return;
+        }
+        let mut pending = String::new();
+        loop {
+            let mut chunk = [0u8; 8192];
+            match file.read(&mut chunk).await {
+                Ok(0) => {
+                    if sender.is_closed() {
+                        return;
+                    }
+                    Timer::after(Duration::from_millis(200)).await;
+                }
+                Ok(read) => {
+                    pending.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                    while let Some(newline) = pending.find('\n') {
+                        let line = pending[..newline].trim_end().to_string();
+                        pending.drain(..=newline);
+                        if !line.is_empty()
+                            && sender
+                                .try_send(DeviceEvent::Log {
+                                    level: parse_log_level(&line),
+                                    message: line,
+                                })
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), "App log file read failed: {error}");
+                    return;
+                }
+            }
+        }
+    })
+    .detach();
 }
 
 /// Run a macOS .app bundle on non-macOS platforms (not supported).
@@ -1797,5 +1930,50 @@ mod tests {
         running.as_mut().detach();
         drop(running);
         assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    /// The preview support app outlives `water preview`; a pipe whose reader
+    /// has exited turns the app's next write into SIGPIPE (water-rs/cli#197).
+    /// With an app log file set, the spawned child must carry no pipes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_app_stdio_lands_in_the_log_file_not_pipes() {
+        smol::block_on(async {
+            let machine = crate::toolchain::testing::TestMachine::new();
+            let host = machine.host(Vec::<(String, String)>::new());
+            let script = machine.root().join("emit");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\nprintf 'out-line\\n'\nprintf 'err-line\\n' >&2\n",
+            )
+            .expect("write emitter script");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                    .expect("mark emitter executable");
+            }
+            let log = machine.root().join("logs/support-app.log");
+
+            let mut command = host.command(&script);
+            let redirected = super::configure_app_stdio(&mut command, Some(&log))
+                .expect("configure app log-file stdio");
+            assert_eq!(redirected.as_deref(), Some(log.as_path()));
+            let mut child = command.spawn().expect("spawn the emitter");
+            assert!(
+                child.stdout.is_none() && child.stderr.is_none(),
+                "a log-file app's stdio must be files, not pipes"
+            );
+            assert!(child.status().await.expect("await the emitter").success());
+            let contents = std::fs::read_to_string(&log).expect("read the app log");
+            assert!(contents.contains("out-line") && contents.contains("err-line"));
+
+            // Supervised apps (no log file) keep the pipes the monitor
+            // forwards.
+            let mut piped = host.command(&script);
+            super::configure_app_stdio(&mut piped, None).expect("configure piped stdio");
+            let mut piped_child = piped.spawn().expect("spawn the piped emitter");
+            assert!(piped_child.stdout.is_some() && piped_child.stderr.is_some());
+            let _ = piped_child.kill();
+        });
     }
 }

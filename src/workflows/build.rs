@@ -4760,6 +4760,7 @@ mod tests {
                     channel: None,
                     framework_manifest: None,
                     framework: None,
+                    framework_lock: None,
                     author: String::new(),
                     backends: Vec::new(),
                     web: None,

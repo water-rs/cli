@@ -852,13 +852,18 @@ async fn launch_preview_on_macos(
     let host = crate::toolchain::Host::current();
     let device = Local;
     device.launch(&host).await?;
+    let mut run_options = preview_run_options(PreviewPlatform::Macos);
+    // The support app detaches and outlives this command; its stdout/stderr go
+    // to a log file the next `water preview` reopens and appends, never a pipe
+    // whose reader is gone (water-rs/cli#197).
+    run_options.set_app_log_file(preview_support_log_path()?);
     info!("Building and running preview app on macOS...");
     project
         .run_with_options(
             backend,
             TargetPlatform::MacOS,
             device,
-            preview_run_options(PreviewPlatform::Macos),
+            run_options,
             progress.cloned(),
         )
         .await
@@ -1401,6 +1406,15 @@ async fn drain_terminal_preview_event(
 /// Get the path to the preview support app.
 fn preview_support_path() -> Result<PathBuf> {
     support_app::support_app_path("preview_support")
+}
+
+/// The file the macOS preview support app's stdout/stderr append to, under the
+/// CLI's `~/.water` state dir beside `preview_support/` — stable across the
+/// pooled instances a later `water preview` reuses.
+fn preview_support_log_path() -> Result<PathBuf> {
+    Ok(crate::water_dir::water_home_dir()?
+        .join("logs")
+        .join("preview-support.log"))
 }
 
 /// Root of the workspace a preview module joins.
