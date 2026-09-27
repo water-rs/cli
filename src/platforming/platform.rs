@@ -339,6 +339,9 @@ pub struct PackageOptions {
     /// while `debug` decide the build configuration.
     debug: bool,
 
+    /// How a build for a physical device is code-signed.
+    device_signing: DeviceSigning,
+
     /// Whether the package embeds the shared `WaterUI` Rust runtime.
     shared_rust_runtime: bool,
 
@@ -348,6 +351,18 @@ pub struct PackageOptions {
     /// Sink compile progress is reported to while packaging runs cargo —
     /// asset-manifest planning compiles the project rlib for its symbol table.
     progress: Option<BuildProgress>,
+}
+
+/// How a build for a physical device is code-signed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeviceSigning {
+    /// Automatic signing with the developer team resolved on the host.
+    #[default]
+    Automatic,
+    /// No code signing, for a host without a signing identity (CI, a build
+    /// VM). The artifact keeps the shipped linkage and profile and is signed
+    /// before it is installed.
+    Unsigned,
 }
 
 /// Whether an `include_web!` mount is staged from a frontend build or served
@@ -373,6 +388,7 @@ impl PackageOptions {
         Self {
             distribution: false,
             debug: true,
+            device_signing: DeviceSigning::Automatic,
             shared_rust_runtime: true,
             web_frontend: WebFrontendMode::Stage,
             progress: None,
@@ -385,10 +401,24 @@ impl PackageOptions {
         Self {
             distribution,
             debug,
+            device_signing: DeviceSigning::Automatic,
             shared_rust_runtime: false,
             web_frontend: WebFrontendMode::Stage,
             progress: None,
         }
+    }
+
+    /// Choose how a build for a physical device is code-signed.
+    #[must_use]
+    pub const fn with_device_signing(mut self, device_signing: DeviceSigning) -> Self {
+        self.device_signing = device_signing;
+        self
+    }
+
+    /// How a build for a physical device is code-signed.
+    #[must_use]
+    pub const fn device_signing(&self) -> DeviceSigning {
+        self.device_signing
     }
 
     /// Override the debug flag without changing the runtime linkage.
