@@ -98,6 +98,11 @@ mod tests {
             assert!(entry.contains("Name=Share Example"));
             assert!(entry.contains("Exec=share-example"));
             assert!(entry.contains("Icon=dev.waterui.shareexample"));
+            assert!(
+                entry.contains("StartupWMClass=dev.waterui.shareexample"),
+                "the entry must name the window's WM_CLASS/Wayland app_id, \
+                 which the build compiles in as WATERUI_APP_ID: {entry}"
+            );
 
             let icon_128 = share.join("icons/hicolor/128x128/apps/dev.waterui.shareexample.png");
             let decoded = image::open(&icon_128).expect("hicolor icon must decode");
