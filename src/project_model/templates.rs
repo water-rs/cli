@@ -5528,6 +5528,55 @@ async fn preview_module_members(ffi_crate_dir: &Path) -> io::Result<Vec<String>>
 /// declaration in `ffi::generate_cargo_toml` for why they must share one.
 pub const PREVIEW_MODULES_DIR: &str = "modules";
 
+/// Write the workspace-root manifest a preview module's `cargo metadata`
+/// resolves under when the support runtime's own scaffold has not run yet.
+///
+/// A preview module is a member of the workspace rooted at the generated FFI
+/// companion's `Cargo.toml`, and Cargo honours `[patch]` from the workspace
+/// root alone — a member manifest cannot carry them. The support application
+/// writes that root, but only after the module's metadata has resolved, so a
+/// support app that does not exist yet — a first preview, or one discarded
+/// for a different `WaterUI` checkout — leaves the module resolving outside
+/// the project's patch tables: a checkout that pins a fork (a `nami` the
+/// published `waterui-*` crates cannot satisfy) fails resolution before the
+/// root is ever written. This stub carries only what resolution needs — the
+/// member list and the `[patch]` tables governing the project's build; the
+/// companion's own scaffold replaces it once the support app exists.
+///
+/// An existing root is left alone: a real companion manifest is refreshed by
+/// the support project's own open, and this stub must not truncate it.
+///
+/// # Errors
+///
+/// Returns an error when the module list cannot be read or the manifest
+/// cannot be written.
+pub async fn ensure_preview_module_workspace_root(
+    workspace_root: &Path,
+    project_root: &Path,
+) -> io::Result<()> {
+    let manifest_path = workspace_root.join("Cargo.toml");
+    if manifest_path.is_file() {
+        return Ok(());
+    }
+    let members = preview_module_members(workspace_root).await?;
+    let patch = {
+        let project_root = project_root.to_path_buf();
+        smol::unblock(move || collect_workspace_patches(&project_root)).await?
+    };
+    let manifest = cargo_toml::Manifest::<()> {
+        workspace: Some(cargo_toml::Workspace {
+            members,
+            ..cargo_toml::Workspace::default()
+        }),
+        patch,
+        ..cargo_toml::Manifest::default()
+    };
+    let toml_string = toml::to_string_pretty(&manifest)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    fs::create_dir_all(workspace_root).await?;
+    write_file_if_changed(&manifest_path, toml_string.as_bytes()).await
+}
+
 /// Root-level templates (Cargo.toml, lib.rs, .gitignore).
 pub mod root {
     use super::{
