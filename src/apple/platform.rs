@@ -7,11 +7,10 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use askama::Template;
 use eyre::{Context, bail};
 use smol::fs;
 use target_lexicon::Architecture;
-use tracing::{debug, info};
+use tracing::info;
 
 #[cfg(target_os = "macos")]
 use crate::browser_runtime;
@@ -20,12 +19,11 @@ use crate::macos_bundle::{package_cef_helper_app, remove_cef_helper_apps, sign_m
 use crate::{
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
-    assets::{self, ResolvedFont},
+    assets,
     build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
     platform::{DeviceSigning, PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
-    templates::FontRegistrationTemplateEntry,
     toolchain::Host,
     utils::{copy_file, run_command_os},
 };
@@ -934,56 +932,13 @@ async fn copy_assets_and_fonts(
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
 
     if !resolved_fonts.is_empty() {
-        // Copy fonts to app resources
+        // Copy fonts to app resources; `waterui-apple` registers every font
+        // file in the bundle at startup.
         let fonts_dest = dest_dir.join("fonts");
         assets::copy_fonts(&resolved_fonts, &fonts_dest).await?;
 
-        // Generate WaterUIFonts.swift for font registration
-        generate_font_registration_swift(&resolved_fonts, dest_dir).await?;
-
         info!("Copied {} fonts to Apple app", resolved_fonts.len());
     }
-
-    Ok(())
-}
-
-#[derive(Template)]
-#[template(
-    path = "src/templates/apple/AppName/WaterUIFonts.swift.tpl",
-    escape = "none"
-)]
-struct WaterUiFontsSwiftTemplate<'a> {
-    font_entries: &'a [FontRegistrationTemplateEntry],
-}
-
-/// Generate WaterUIFonts.swift file for registering custom fonts.
-async fn generate_font_registration_swift(
-    fonts: &[ResolvedFont],
-    dest_dir: &Path,
-) -> eyre::Result<()> {
-    let font_entries = fonts
-        .iter()
-        .map(|font| FontRegistrationTemplateEntry {
-            family_name: font.name.clone(),
-            file_name: font
-                .path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_string(),
-        })
-        .collect::<Vec<_>>();
-
-    let content = WaterUiFontsSwiftTemplate {
-        font_entries: &font_entries,
-    }
-    .render()
-    .map_err(|error| eyre::eyre!("Failed to render WaterUIFonts.swift template: {error}"))?;
-
-    let swift_path = dest_dir.join("WaterUIFonts.swift");
-    fs::write(&swift_path, content).await?;
-
-    debug!("Generated {}", swift_path.display());
 
     Ok(())
 }
