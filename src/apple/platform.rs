@@ -203,7 +203,15 @@ pub async fn build_rust_lib(
         apple_deployment_target(project, platform).await?;
     build = build.with_env(deployment_environment, deployment_target);
     if options.linkage() == RustLinkage::SharedRuntime {
-        build = build.with_preferred_dynamic_linking();
+        build = build
+            .with_preferred_dynamic_linking()
+            // The seam between `waterui-apple` and the app target is
+            // circular by design: the dylib calls `waterui_swift_*` entry
+            // points the Swift package implements inside the application
+            // binary, resolved at load time — the same callback shape the
+            // ObjC runtime uses everywhere else. Without dynamic lookup the
+            // dylib's own link step demands the symbols up front and fails.
+            .with_final_rustc_arg("-Clink-arg=-Wl,-undefined,dynamic_lookup");
     }
     build = build.with_target_dir(project.water_target_dir(options.linkage()).await?);
     let built_target = build.build_lib(options.is_release()).await?;
