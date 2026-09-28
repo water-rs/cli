@@ -303,6 +303,17 @@ async fn build_options(shell: &Shell, args: &Args, backend: TargetBackend) -> Bu
         )
         .with_progress(shell.build_progress());
 
+    // `--release` is the shipped artifact, not a development unit: the shared
+    // `waterui-dylib` runtime exists so `water run`/preview/mcp can reuse one
+    // framework copy across sessions, and it makes the bin link the GPU stack
+    // a second time (once inside the dylib through `waterui-internal/gpu`,
+    // once statically through the backend). A production binary links the
+    // whole stack once — statically — and stages as a single self-contained
+    // file.
+    if args.release {
+        build_options = build_options.with_static_runtime();
+    }
+
     if let Some(sccache_path) =
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await
     {
