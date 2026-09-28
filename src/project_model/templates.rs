@@ -862,7 +862,8 @@ impl TemplateContext {
     /// when one exists, and the backend repository's git source at the
     /// resolved pin otherwise — the same `[backends.apple]`-then-channel
     /// order [`Self::apple_backend_requirement`] applies to the `SwiftPM`
-    /// reference.
+    /// reference, except `branch` is rejected outright: a Cargo git
+    /// dependency must pin an exact commit, never a moving ref.
     fn waterui_apple_dependency(&self) -> GeneratedDependencyDetail {
         if let Some(backend_path) = self.compute_apple_backend_path() {
             return GeneratedDependencyDetail {
@@ -873,6 +874,11 @@ impl TemplateContext {
         if let (Some(_), Some(_)) = (&self.apple_backend_branch, &self.apple_backend_revision) {
             panic!("`[backends.apple]` sets both `branch` and `revision`; pick one");
         }
+        if let Some(branch) = self.apple_backend_branch.as_deref() {
+            panic!(
+                "`[backends.apple]` branch `{branch}` is a moving ref; the `waterui-apple` Cargo dependency must pin an exact commit — set `revision` instead"
+            );
+        }
         let mut detail = GeneratedDependencyDetail {
             git: Some(
                 self.framework
@@ -881,10 +887,6 @@ impl TemplateContext {
             ),
             ..GeneratedDependencyDetail::default()
         };
-        if let Some(branch) = self.apple_backend_branch.as_deref() {
-            detail.branch = Some(branch.to_string());
-            return detail;
-        }
         if let Some(revision) = self.apple_backend_revision.as_deref() {
             detail.rev = Some(revision.to_string());
             return detail;
@@ -1148,8 +1150,7 @@ impl Esp32CargoTomlTemplate {
 define_scaffold_templates! {
     AssetsReadmeTemplate => (Root, "src/templates/assets_readme.md.tpl"),
     AppleProjectTemplate => (Apple, "src/templates/apple/AppName.xcodeproj/project.pbxproj.tpl"),
-    // `apple/AppName/main.swift.tpl` renders verbatim (no substitutions), so
-    // it is not registered here — the catch-all arm copies it through.
+    AppleMainTemplate => (Apple, "src/templates/apple/AppName/main.swift.tpl"),
     AppleInfoPlistTemplate => (Apple, "src/templates/apple/AppName/Info.plist.tpl"),
     AppleBuildScriptTemplate => (Apple, "src/templates/apple/build-rust.sh.tpl"),
     AndroidGradleAppTemplate => (Android, "src/templates/android/app/build.gradle.kts.tpl"),
@@ -1784,6 +1785,75 @@ mod tests {
         );
 
         assert!(ctx.compute_apple_backend_path().is_none());
+    }
+
+    #[test]
+    fn waterui_apple_dependency_prefers_a_local_checkout() {
+        let mut ctx = ctx(
+            None,
+            Some(PathBuf::from("managed_backends/apple")),
+            None,
+            crate::project::PackageType::App,
+        );
+        ctx.apple_backend_path = Some(PathBuf::from("../apple-backend"));
+
+        let detail = ctx.waterui_apple_dependency();
+        assert_eq!(detail.path.as_deref(), Some("../../../apple-backend"));
+        assert!(detail.git.is_none() && detail.rev.is_none() && detail.tag.is_none());
+    }
+
+    #[test]
+    fn waterui_apple_dependency_pins_revision_never_branch() {
+        let mut ctx = app_ctx();
+        ctx.apple_backend_revision = Some("1305031f".to_string());
+
+        let detail = ctx.waterui_apple_dependency();
+        assert_eq!(detail.rev.as_deref(), Some("1305031f"));
+        assert!(detail.branch.is_none());
+        assert!(detail.git.is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "moving ref")]
+    fn waterui_apple_dependency_rejects_a_branch_pin() {
+        let mut ctx = app_ctx();
+        ctx.apple_backend_branch = Some("dev".to_string());
+        let _ = ctx.waterui_apple_dependency();
+    }
+
+    #[test]
+    fn apple_main_swift_renders_cef_preinit_and_the_accessory_flag() {
+        let template = embedded::APPLE
+            .get_file("AppName/main.swift.tpl")
+            .expect("main.swift template must exist")
+            .contents_utf8()
+            .expect("main.swift template must be utf-8");
+
+        let mut ctx = app_ctx()
+            .with_chromium_enabled(true)
+            .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
+        ctx.accessory = true;
+        let rendered = render_scaffold_template(
+            TemplateNamespace::Apple,
+            std::path::Path::new("AppName/main.swift.tpl"),
+            template,
+            &ctx,
+        )
+        .expect("main.swift render");
+        assert!(rendered.contains("prepareWaterUICEFApplication()"));
+        assert!(rendered.contains("installWaterUIChromium()"));
+        assert!(rendered.contains("waterui_apple_main(true)"));
+
+        let rendered = render_scaffold_template(
+            TemplateNamespace::Apple,
+            std::path::Path::new("AppName/main.swift.tpl"),
+            template,
+            &app_ctx(),
+        )
+        .expect("main.swift render");
+        assert!(!rendered.contains("prepareWaterUICEFApplication"));
+        assert!(!rendered.contains("installWaterUIChromium"));
+        assert!(rendered.contains("waterui_apple_main(false)"));
     }
 
     #[test]
