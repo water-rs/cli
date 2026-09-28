@@ -3130,6 +3130,60 @@ mod tests {
         assert_eq!(seed.iter().filter(|p| p.name.as_str() == "app").count(), 1);
     }
 
+    /// The divergence hydroterm hit: the previous generated lock, the
+    /// channel's `Water.lock` and the application's `Cargo.lock` all record
+    /// `accesskit`, at `0.25.0`, `0.25.0` and `0.25.1` respectively — three
+    /// locks, one caret family, two identities. The union seed kept the
+    /// application entry beside the pinned one, and Cargo could not satisfy
+    /// both the pinned identity and the edges that named the other version.
+    /// The seed must carry only the canonical identity for a name the
+    /// channel records.
+    #[test]
+    fn the_seed_drops_a_projects_divergent_patch_of_a_canonical_name() {
+        let registry = Some("registry+https://github.com/rust-lang/crates.io-index");
+        let lock = |packages| Lockfile {
+            packages,
+            version: cargo_lock::ResolveVersion::V4,
+            root: None,
+            metadata: BTreeMap::default(),
+            patch: cargo_lock::Patch::default(),
+        };
+        let canonical = lock(vec![
+            package("accesskit", "0.25.0", registry),
+            package("dirs", "6.0.0", registry),
+        ]);
+        let project = lock(vec![
+            package("app", "0.1.0", None),
+            package("accesskit", "0.25.1", registry),
+            package("dirs", "7.0.0", registry),
+        ]);
+        let previous = lock(vec![
+            package("accesskit", "0.25.0", registry),
+            package("aither", "0.12.0", registry),
+        ]);
+
+        let seed = seed_packages(Some(&canonical), &project, Some(&previous));
+        let versions = |name: &str| {
+            let mut versions: Vec<_> = seed
+                .iter()
+                .filter(|package| package.name.as_str() == name)
+                .map(|package| package.version.to_string())
+                .collect();
+            versions.sort();
+            versions
+        };
+        // A name the channel records resolves to its certified identity
+        // alone — the project's divergent 0.25.1 and the previous lock's
+        // duplicate 0.25.0 cannot both enter the seed.
+        assert_eq!(versions("accesskit"), ["0.25.0"]);
+        // The project's second-major addition beside a canonical name is
+        // dropped too: canonical owns the name.
+        assert_eq!(versions("dirs"), ["6.0.0"]);
+        // Names only the previous generated lock knew stay seeded.
+        assert_eq!(versions("aither"), ["0.12.0"]);
+        assert_eq!(versions("app"), ["0.1.0"]);
+    }
+
     fn snapshot(lock: &Lockfile) -> (ResolvedFramework, Vec<u8>) {
         let bytes = lock.to_string().into_bytes();
         let scaffold = lock
