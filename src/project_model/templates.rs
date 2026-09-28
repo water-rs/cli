@@ -856,6 +856,61 @@ impl TemplateContext {
             },
         )
     }
+
+    /// The `waterui-apple` dependency the generated FFI crate declares: a
+    /// `path` into the same Apple backend checkout the Xcode project uses
+    /// when one exists, and the backend repository's git source at the
+    /// resolved pin otherwise — the same `[backends.apple]`-then-channel
+    /// order [`Self::apple_backend_requirement`] applies to the `SwiftPM`
+    /// reference.
+    fn waterui_apple_dependency(&self) -> GeneratedDependencyDetail {
+        if let Some(backend_path) = self.compute_apple_backend_path() {
+            return GeneratedDependencyDetail {
+                path: Some(backend_path),
+                ..GeneratedDependencyDetail::default()
+            };
+        }
+        if let (Some(_), Some(_)) = (&self.apple_backend_branch, &self.apple_backend_revision) {
+            panic!("`[backends.apple]` sets both `branch` and `revision`; pick one");
+        }
+        let mut detail = GeneratedDependencyDetail {
+            git: Some(
+                self.framework
+                    .scaffold_value("apple-backend-url")
+                    .to_string(),
+            ),
+            ..GeneratedDependencyDetail::default()
+        };
+        if let Some(branch) = self.apple_backend_branch.as_deref() {
+            detail.branch = Some(branch.to_string());
+            return detail;
+        }
+        if let Some(revision) = self.apple_backend_revision.as_deref() {
+            detail.rev = Some(revision.to_string());
+            return detail;
+        }
+        match self.framework.channel() {
+            Some(FrameworkChannel::Dev | FrameworkChannel::Nightly) => {
+                if let Some(revision) = self.framework.apple_backend_revision() {
+                    detail.rev = Some(revision.to_string());
+                } else if let Some(version) = self.framework.apple_backend_version() {
+                    detail.tag = Some(version.to_string());
+                } else {
+                    panic!("resolved framework carries no Apple backend pin");
+                }
+            }
+            Some(FrameworkChannel::Stable) | None => {
+                if let Some(version) = self.framework.apple_backend_version() {
+                    detail.tag = Some(version.to_string());
+                } else if let Some(revision) = self.framework.apple_backend_revision() {
+                    detail.rev = Some(revision.to_string());
+                } else {
+                    panic!("resolved framework carries no Apple backend pin");
+                }
+            }
+        }
+        detail
+    }
 }
 
 pub fn apple_app_name(crate_name: &CrateName) -> String {
@@ -967,19 +1022,6 @@ macro_rules! define_scaffold_templates {
             let display_path = relative_path.to_string_lossy();
             let dispatch_path = scaffold_template_dispatch_path(namespace, relative_path);
             match dispatch_path.as_str() {
-                "src/templates/apple/AppName/WaterUIFonts.swift.tpl" => {
-                    let empty_font_entries: &[FontRegistrationTemplateEntry] = &[];
-                    ScaffoldAppleFontTemplate {
-                        font_entries: empty_font_entries,
-                    }
-                    .render()
-                    .map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Failed to render template {display_path}: {error}"),
-                        )
-                    })
-                }
                 "src/templates/esp32/Cargo.toml.tpl" => Esp32CargoTomlTemplate::from_ctx(ctx)
                     .and_then(|template| {
                         template.render().map_err(|error| {
@@ -1022,15 +1064,6 @@ macro_rules! define_scaffold_templates {
             }
         }
     };
-}
-
-#[derive(Template)]
-#[template(
-    path = "src/templates/apple/AppName/WaterUIFonts.swift.tpl",
-    escape = "none"
-)]
-struct ScaffoldAppleFontTemplate<'a> {
-    font_entries: &'a [FontRegistrationTemplateEntry],
 }
 
 /// Generated `Cargo.toml` for the ESP32 firmware harness crate.
@@ -1115,7 +1148,8 @@ impl Esp32CargoTomlTemplate {
 define_scaffold_templates! {
     AssetsReadmeTemplate => (Root, "src/templates/assets_readme.md.tpl"),
     AppleProjectTemplate => (Apple, "src/templates/apple/AppName.xcodeproj/project.pbxproj.tpl"),
-    AppleAppTemplate => (Apple, "src/templates/apple/AppName/AppNameApp.swift.tpl"),
+    // `apple/AppName/main.swift.tpl` renders verbatim (no substitutions), so
+    // it is not registered here — the catch-all arm copies it through.
     AppleInfoPlistTemplate => (Apple, "src/templates/apple/AppName/Info.plist.tpl"),
     AppleBuildScriptTemplate => (Apple, "src/templates/apple/build-rust.sh.tpl"),
     AndroidGradleAppTemplate => (Android, "src/templates/android/app/build.gradle.kts.tpl"),
@@ -1994,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn apple_chromium_template_links_and_initializes_cef_before_appkit() {
+    fn apple_chromium_template_links_cef_products() {
         let ctx = app_ctx()
             .with_chromium_enabled(true)
             .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
@@ -2013,26 +2047,6 @@ mod tests {
         assert!(project.contains("WaterUICEF in Frameworks"));
         assert!(project.contains("WaterUIChromium in Frameworks"));
         assert!(!project.contains("WaterUICefWebView in Frameworks"));
-
-        let app_template = embedded::APPLE
-            .get_file("AppName/AppNameApp.swift.tpl")
-            .expect("apple app template must exist")
-            .contents_utf8()
-            .expect("apple app template must be utf-8");
-        let app = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName/AppNameApp.swift.tpl"),
-            app_template,
-            &ctx,
-        )
-        .expect("apple Chromium app render");
-        assert!(app.contains("import WaterUICEF"));
-        assert!(app.contains("import WaterUIChromium"));
-        assert!(app.contains("installWaterUIChromium()"));
-        assert!(
-            app.find("prepareWaterUICEFApplication()") < app.find("let app = NSApplication.shared")
-        );
-        assert!(!app.contains("runWaterUICEFSubprocessIfNeeded()"));
     }
 
     #[test]
@@ -2055,22 +2069,6 @@ mod tests {
         assert!(project.contains("WaterUICEF in Frameworks"));
         assert!(project.contains("WaterUICefWebView in Frameworks"));
         assert!(!project.contains("WaterUIChromium in Frameworks"));
-
-        let app_template = embedded::APPLE
-            .get_file("AppName/AppNameApp.swift.tpl")
-            .expect("apple app template must exist")
-            .contents_utf8()
-            .expect("apple app template must be utf-8");
-        let app = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName/AppNameApp.swift.tpl"),
-            app_template,
-            &ctx,
-        )
-        .expect("apple CEF WebView app render");
-        assert!(app.contains("import WaterUICefWebView"));
-        assert!(app.contains("installWaterUICefWebView()"));
-        assert!(!app.contains("installWaterUIChromium()"));
     }
 
     #[test]
@@ -5624,6 +5622,17 @@ pub mod ffi {
                 .dependencies
                 .insert(name.to_owned(), Dependency::Detailed(Box::new(dependency)));
         }
+
+        // The Rust backend owns the app's whole startup through
+        // `waterui_apple::export_app!`. It does not live in the `WaterUI`
+        // workspace, so it resolves against the Apple backend checkout the
+        // project already uses — never the framework registry source the
+        // loop above applies.
+        let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
+        manifest.dependencies.insert(
+            "waterui-apple".to_string(),
+            Dependency::Detailed(Box::new(waterui_apple)),
+        );
         manifest.patch = match ctx.waterui_workspace_root() {
             Some(root) => {
                 smol::unblock(move || super::collect_framework_checkout_patches(&root)).await?

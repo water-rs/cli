@@ -8,3 +8,4 @@ fn app(env: Environment) -> App {
 }
 
 waterui_ffi::export!();
+waterui_apple::export_app!(app);
