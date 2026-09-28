@@ -386,15 +386,13 @@ mod tests {
         )
         .expect("Package.swift");
         let manifest_path = root.join("Water.toml");
-        let manifest = fs::read_to_string(&manifest_path).expect("Water.toml");
-        let manifest = manifest.replace(
-            "[backends.apple]",
-            &format!(
-                "[backends.apple]\nbackend_path = \"{}\"",
-                checkout.display()
-            ),
-        );
-        fs::write(&manifest_path, manifest).expect("edited Water.toml");
+        let mut manifest: toml_edit::DocumentMut = fs::read_to_string(&manifest_path)
+            .expect("Water.toml")
+            .parse()
+            .expect("Water.toml parses");
+        manifest["backends"]["apple"]["backend_path"] =
+            toml_edit::value(checkout.to_str().expect("temp dir path is UTF-8"));
+        fs::write(&manifest_path, manifest.to_string()).expect("edited Water.toml");
 
         let project = smol::block_on(Project::open(&root, ManagedBackends::NONE))
             .expect("project must reopen");
