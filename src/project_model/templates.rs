@@ -4474,11 +4474,20 @@ pub mod hydrolysis {
             bins,
             profile: super::generated_profiles(),
             features: BTreeMap::from([
-                ("waterui-preview-mode".to_string(), Vec::new()),
-                ("waterui-preview-test-mode".to_string(), Vec::new()),
+                (
+                    "waterui-preview-mode".to_string(),
+                    vec!["dep:waterui-preview".to_string()],
+                ),
+                (
+                    "waterui-preview-test-mode".to_string(),
+                    vec!["dep:waterui-testing".to_string()],
+                ),
                 (
                     "waterui-mcp-mode".to_string(),
-                    vec!["dep:waterui-mcp".to_string()],
+                    vec![
+                        "dep:waterui-mcp".to_string(),
+                        "dep:waterui-testing".to_string(),
+                    ],
                 ),
             ]),
             dependencies: cargo_dependencies(ctx)?,
@@ -4651,7 +4660,8 @@ pub mod hydrolysis {
                             ),
                         ),
                     )?
-                    .with_default_features(false),
+                    .with_default_features(false)
+                    .with_optional(),
                 ),
             ),
             (
@@ -4703,7 +4713,8 @@ pub mod hydrolysis {
                             NativeBackendDependencySource::WorkspaceSubdir("testing"),
                         ),
                     )?
-                    .with_default_features(false),
+                    .with_default_features(false)
+                    .with_optional(),
                 ),
             ),
             (
