@@ -14,8 +14,7 @@ use crate::{error, header, success};
 use waterui_cli::toolchain_checks;
 use waterui_cli::{
     android::platform::{AndroidAbi, AndroidPlatform},
-    apple::platform::build_rust_lib,
-    apple::toolchain::AppleSdk,
+    apple::{backend::AppleBackend, platform::build_rust_lib, toolchain::AppleSdk},
     backend::reinit_backend,
     build::{BuildOptions, BuildProfile, BuiltTarget},
     esp32::{backend::Esp32Backend, platform::build_esp32},
@@ -250,6 +249,18 @@ async fn ensure_generated_backend_ready(
                 project,
                 "Re-initializing ESP32 backend...",
                 "ESP32 backend re-initialized",
+            )
+            .await
+        }
+        TargetBackend::Apple
+            if project.apple_backend().is_some()
+                && AppleBackend::requires_regeneration(&project).await? =>
+        {
+            reinitialize_generated_backend::<AppleBackend>(
+                shell,
+                project,
+                "Re-initializing Apple backend...",
+                "Apple backend re-initialized",
             )
             .await
         }
