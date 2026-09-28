@@ -10,8 +10,11 @@ use crate::{header, success};
 use waterui_cli::toolchain_checks;
 use waterui_cli::{
     android::platform::{AndroidAbi, AndroidPlatform},
-    apple::platform::{build_rust_lib, package_apple},
-    apple::toolchain::AppleSdk,
+    apple::{
+        backend::AppleBackend,
+        platform::{build_rust_lib, package_apple},
+        toolchain::AppleSdk,
+    },
     backend::reinit_backend,
     build::{BuildOptions, BuildProfile, BuiltTarget},
     device::Artifact,
@@ -295,6 +298,17 @@ async fn ensure_packaging_backend_generated(
                 needs_reinit,
                 "Initializing WinUI backend...",
                 "WinUI backend initialized",
+            )
+            .await
+        }
+        TargetBackend::Apple if project.apple_backend().is_some() => {
+            let needs_reinit = AppleBackend::requires_regeneration(&project).await?;
+            ensure_packaging_generated_backend::<AppleBackend>(
+                shell,
+                project,
+                needs_reinit,
+                "Re-initializing Apple backend...",
+                "Apple backend re-initialized",
             )
             .await
         }

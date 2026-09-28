@@ -57,8 +57,8 @@ import WaterUICefWebView
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow?
-    private var headlessContext: WuiRootContext?
-    private var headlessTask: Task<Void, Never>?
+    private var context: WuiRootContext?
+    private var launchTask: Task<Void, Never>?
     private let isAccessory: Bool = {{ ctx.accessory }}
 
     static func main() {
@@ -91,38 +91,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             setenv("WATERUI_ASSETS_ROOT", assetsRoot, 1)
         }
 
-        if isAccessory {
-            headlessTask = Task { @MainActor [weak self] in
-                let context = await WuiRootContext()
-                guard !Task.isCancelled else { return }
+        // The runtime starts before any window: the application decides
+        // whether it has one to show, and what happens once none is left.
+        launchTask = Task { @MainActor [weak self] in
+            let context = await WuiRootContext()
+            guard let self, !Task.isCancelled else { return }
+            self.context = context
+            if self.isAccessory {
                 // Force view construction so Preview::body runs and TCP server starts.
                 _ = context.rootView
-                self?.headlessContext = context
+                return
             }
-            return
+            guard context.window != nil else {
+                // An application with no window either stays resident or has
+                // nothing to run.
+                if context.terminatesAfterLastWindowClosed {
+                    NSApp.terminate(nil)
+                }
+                return
+            }
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "{{ ctx.app_display_name }}"
+            window.contentView = WaterUIView(
+                context: context,
+                frame: window.contentRect(forFrameRect: window.frame)
+            )
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            self.window = window
         }
-
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "{{ ctx.app_display_name }}"
-        window.contentView = WaterUIView(frame: window.contentRect(forFrameRect: window.frame))
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        self.window = window
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        !isAccessory
+        // No window opens before the runtime has started, so a window closing
+        // before then is none of the application's.
+        guard !isAccessory, let context else { return false }
+        return context.terminatesAfterLastWindowClosed
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        headlessTask?.cancel()
-        headlessTask = nil
-        headlessContext = nil
+        launchTask?.cancel()
+        launchTask = nil
+        context = nil
     }
 }
 #endif

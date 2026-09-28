@@ -4010,7 +4010,10 @@ async fn write_generated_cargo_toml(base_dir: &Path, toml_string: String) -> io:
 
 /// Apple backend templates.
 pub mod apple {
-    use super::{Path, TemplateContext, TemplateNamespace, embedded, fs, io, scaffold_dir};
+    use super::{
+        Path, PathBuf, TemplateContext, TemplateNamespace, embedded, fs, io, render_dir_outputs,
+        scaffold_dir,
+    };
 
     /// Write all Apple templates to the given directory.
     ///
@@ -4038,6 +4041,17 @@ pub mod apple {
         }
 
         Ok(())
+    }
+
+    /// The `(path, contents)` pairs [`scaffold`] would write for `ctx`, without
+    /// touching the filesystem — the comparison set a generated Apple backend
+    /// is regenerated against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a template fails to render.
+    pub fn rendered_outputs(ctx: &TemplateContext) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+        render_dir_outputs(TemplateNamespace::Apple, &embedded::APPLE, ctx)
     }
 }
 
