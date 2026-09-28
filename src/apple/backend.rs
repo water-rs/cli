@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use eyre::WrapErr as _;
 use serde::{Deserialize, Serialize};
 use waterui_assets_planner::ColorScheme;
 
@@ -214,7 +215,8 @@ impl AppleBackend {
             if file_name == Some("WaterUIFonts.swift") {
                 continue;
             }
-            match std::fs::read(backend_dir.join(&relative)) {
+            let path = backend_dir.join(&relative);
+            match std::fs::read(&path) {
                 Ok(existing) if file_name == Some("project.pbxproj") => {
                     if crate::apple::platform::strip_other_ldflags(&String::from_utf8_lossy(
                         &existing,
@@ -225,7 +227,14 @@ impl AppleBackend {
                     }
                 }
                 Ok(existing) if existing == expected => {}
-                Err(_) | Ok(_) => return Ok(true),
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(true);
+                }
+                Err(error) => {
+                    return Err(error)
+                        .wrap_err_with(|| format!("Failed to read {}", path.display()));
+                }
             }
         }
         Ok(false)
