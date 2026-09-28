@@ -19,6 +19,7 @@ use waterui_cli::{
         platform::AndroidPlatform,
     },
     apple::{
+        backend::AppleBackend,
         device::AppleSimulator,
         physical::ApplePhysicalDevice,
         platform::{build_rust_lib, package_apple},
@@ -714,6 +715,17 @@ async fn ensure_generated_run_backend(
                 needs_reinit,
                 "Initializing ESP32 backend...",
                 "ESP32 backend initialized",
+            )
+            .await
+        }
+        TargetBackend::Apple if project.apple_backend().is_some() => {
+            let needs_reinit = AppleBackend::requires_regeneration(&project).await?;
+            ensure_generated_run_backend_impl::<AppleBackend>(
+                shell,
+                project,
+                needs_reinit,
+                "Re-initializing Apple backend...",
+                "Apple backend re-initialized",
             )
             .await
         }

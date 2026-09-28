@@ -412,6 +412,29 @@ fn sanitize_other_ldflags(flags: &str) -> (String, bool) {
     (normalized, changed)
 }
 
+/// Every `OTHER_LDFLAGS` value in `content` emptied, the rest of the file
+/// untouched. The build owns those values — it merges the last build's
+/// resolved link inputs into the scaffolded `project.pbxproj` — so the
+/// regeneration check compares the file with them stripped.
+pub(crate) fn strip_other_ldflags(content: &str) -> String {
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if line.contains("OTHER_LDFLAGS = \"")
+            && let Some((prefix, rest)) = line.split_once("OTHER_LDFLAGS = \"")
+            && let Some((_, suffix)) = rest.split_once("\";")
+        {
+            lines.push(format!("{prefix}OTHER_LDFLAGS = \"\";{suffix}"));
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    let mut stripped = lines.join("\n");
+    if content.ends_with('\n') {
+        stripped.push('\n');
+    }
+    stripped
+}
+
 async fn collect_apple_native_link_inputs(lib_dir: &Path) -> eyre::Result<AppleNativeLinkInputs> {
     let lib_dir = lib_dir.to_path_buf();
     smol::unblock(move || collect_apple_native_link_inputs_sync(&lib_dir)).await
