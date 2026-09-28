@@ -2976,8 +2976,9 @@ mod tests {
         assert_eq!(release["panic"].as_str(), Some("abort"));
     }
 
-    /// The scaffolded app links text, layout, controls and assets; video is
-    /// declared as the crate's own `media` feature and left off, because
+    /// The scaffolded app links text, layout and controls — none of which is
+    /// feature-gated — so the waterui dependency declares no features; video
+    /// is declared as the crate's own `media` feature and left off, because
     /// `waterui/media` carries the system media stack (VA-API, `PipeWire`) a
     /// hello-world never uses.
     #[test]
@@ -3006,13 +3007,17 @@ mod tests {
 
         let native_features = manifest["target"]
             ["cfg(not(any(target_arch = \"wasm32\", target_os = \"espidf\")))"]["dependencies"]
-            ["waterui"]["features"]
-            .as_array()
-            .expect("native waterui dependency lists features")
-            .iter()
-            .map(|feature| feature.as_str().expect("feature name"))
-            .collect::<Vec<_>>();
-        assert_eq!(native_features, ["assets", "flow-markdown"]);
+            ["waterui"]
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .map(|features| {
+                features
+                    .iter()
+                    .map(|feature| feature.as_str().expect("feature name"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert_eq!(native_features, Vec::<&str>::new());
         assert_eq!(
             manifest["dependencies"]["waterui"]["default-features"].as_bool(),
             Some(false)
@@ -4469,11 +4474,20 @@ pub mod hydrolysis {
             bins,
             profile: super::generated_profiles(),
             features: BTreeMap::from([
-                ("waterui-preview-mode".to_string(), Vec::new()),
-                ("waterui-preview-test-mode".to_string(), Vec::new()),
+                (
+                    "waterui-preview-mode".to_string(),
+                    vec!["dep:waterui-preview".to_string()],
+                ),
+                (
+                    "waterui-preview-test-mode".to_string(),
+                    vec!["dep:waterui-testing".to_string()],
+                ),
                 (
                     "waterui-mcp-mode".to_string(),
-                    vec!["dep:waterui-mcp".to_string()],
+                    vec![
+                        "dep:waterui-mcp".to_string(),
+                        "dep:waterui-testing".to_string(),
+                    ],
                 ),
             ]),
             dependencies: cargo_dependencies(ctx)?,
@@ -4646,7 +4660,8 @@ pub mod hydrolysis {
                             ),
                         ),
                     )?
-                    .with_default_features(false),
+                    .with_default_features(false)
+                    .with_optional(),
                 ),
             ),
             (
@@ -4698,7 +4713,8 @@ pub mod hydrolysis {
                             NativeBackendDependencySource::WorkspaceSubdir("testing"),
                         ),
                     )?
-                    .with_default_features(false),
+                    .with_default_features(false)
+                    .with_optional(),
                 ),
             ),
             (
@@ -5906,15 +5922,16 @@ pub mod root {
         waterui_dependency: GeneratedDependencyDetail,
         web_frontend: bool,
     ) -> BTreeMap<String, GeneratedTargetSection<GeneratedDependencyDetail>> {
-        // Desktop conveniences only: `assets` pulls the GPU stack, which does
-        // not exist on espidf targets, so firmware builds must fall through
-        // to the bare default-features-off dependency for the scaffolded app
-        // to cross-compile for ESP32 chips at all. Video stays behind the
-        // crate's own [`MEDIA_FEATURE`].
-        // `include_web!` expands against both the assets bundle API and the
-        // webview surface, so a web-frontend project enables both.
-        let mut waterui_features = vec!["assets", "flow-markdown"];
+        // The scaffold carries only the features the generated sources use:
+        // nothing the plain template reaches for is feature-gated, so the
+        // dependency declares none. A web frontend needs `assets` for the
+        // `include_web!` bundle API plus `webview` for the surface. The
+        // `assets`/`media` codec stack and `flow-markdown` are heavy —
+        // they enter the manifest only when the author enables them, which
+        // is what keeps the built dylib at the app's own feature set.
+        let mut waterui_features = Vec::new();
         if web_frontend {
+            waterui_features.push("assets");
             waterui_features.push("webview");
         }
         BTreeMap::from([(
