@@ -892,14 +892,27 @@ impl ResolvedFramework {
 
     /// The channel's certified lock — `Water.lock` at the pinned revision,
     /// parsed with the framework's own source pin — where the channel carries
-    /// one. `stable` resolves the application's own `Cargo.lock` and a local
-    /// checkout certifies nothing, so both return `None`.
+    /// one. `stable` resolves the application's own `Cargo.lock`, so it returns
+    /// `None`. A local checkout certifies nothing either, but its own
+    /// `Cargo.lock` is still the pin the checkout resolved its transitive
+    /// dependencies to: without it a generated workspace resolves the
+    /// packages only it reaches — the video stack's `hyper-util`,
+    /// `rustls-platform-verifier`, `xcb` — at whatever the registry holds
+    /// newest, and the lock guard then rejects the drift. Only the sourced
+    /// entries apply: a source-less workspace member resolves by path inside
+    /// the generated workspace, where a seed entry would name nothing.
     ///
     /// # Errors
     ///
-    /// Returns an error when `Water.lock` cannot be read or no longer matches
-    /// the pinned revision's checksum.
+    /// Returns an error when `Water.lock` (or a local checkout's `Cargo.lock`)
+    /// cannot be read or no longer matches the pinned revision's checksum.
     pub(crate) async fn canonical_lock(&self, project_root: &Path) -> Result<Option<Lockfile>> {
+        if let Source::Local { root } = &self.source {
+            let contents = smol::fs::read(root.join("Cargo.lock")).await?;
+            let mut lock: Lockfile = std::str::from_utf8(&contents)?.parse()?;
+            lock.packages.retain(|package| package.source.is_some());
+            return Ok(Some(lock));
+        }
         if self.channel() != Some(FrameworkChannel::Dev)
             && self.channel() != Some(FrameworkChannel::Nightly)
         {

@@ -123,10 +123,19 @@ pub async fn build_hydrolysis_with_envs_and_features(
     // the binary built here must resolve the same graph the application's
     // own `cargo build` does (#178). `prepare_build` merges the same
     // lockfile into the managed lock again for channel-resolved projects;
-    // this seed is the carrier when `waterui_path` pins a checkout instead.
-    let canonical = match project.manifest().framework.as_ref() {
-        Some(framework) => framework.canonical_lock(project.root()).await?,
-        None => None,
+    // this seed is the carrier when `waterui_path` pins a checkout instead —
+    // the path is the record there, so the framework resolves from the
+    // checkout, whose own `Cargo.lock` is the canonical pin.
+    let has_framework =
+        project.manifest().framework.is_some() || project.manifest().waterui_path.is_some();
+    let canonical = if has_framework {
+        project
+            .resolved_framework()
+            .await?
+            .canonical_lock(project.root())
+            .await?
+    } else {
+        None
     };
     crate::templates::seed_lockfile(
         &backend_path,
