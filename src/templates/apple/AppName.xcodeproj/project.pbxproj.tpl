@@ -352,7 +352,7 @@
 				INFOPLIST_FILE = "{{ ctx.app_name }}/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "{{ ctx.app_display_name }}";
 				"INFOPLIST_KEY_LSUIElement[sdk=macosx*]" = {{ ctx.macos_lsuielement() }};
-				"INFOPLIST_KEY_NSPrincipalClass[sdk=macosx*]" = NSApplication;
+				"INFOPLIST_KEY_NSPrincipalClass[sdk=macosx*]" = {{ ctx.macos_principal_class() }};
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*][0]" = audio;
@@ -413,7 +413,7 @@
 				INFOPLIST_FILE = "{{ ctx.app_name }}/Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "{{ ctx.app_display_name }}";
 				"INFOPLIST_KEY_LSUIElement[sdk=macosx*]" = {{ ctx.macos_lsuielement() }};
-				"INFOPLIST_KEY_NSPrincipalClass[sdk=macosx*]" = NSApplication;
+				"INFOPLIST_KEY_NSPrincipalClass[sdk=macosx*]" = {{ ctx.macos_principal_class() }};
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*][0]" = audio;

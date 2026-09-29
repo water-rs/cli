@@ -502,6 +502,17 @@ impl TemplateContext {
         self.cef_runtime_enabled() || self.chromium_enabled() || self.cef_webview_enabled()
     }
 
+    /// `NSPrincipalClass` for the macOS target: CEF apps must instantiate
+    /// `WaterUICefApplication` (the `CefAppProtocol` subclass) as `NSApp`,
+    /// which the pre-init hook asserts before CEF can initialize.
+    const fn macos_principal_class(&self) -> &'static str {
+        if self.cef_runtime_enabled() {
+            "WaterUICefApplication"
+        } else {
+            "NSApplication"
+        }
+    }
+
     /// Set the exact `WaterUI` feature set used by a preview support runtime.
     #[must_use]
     pub fn with_preview_runtime_features(mut self, features: Vec<String>) -> Self {
