@@ -2623,7 +2623,18 @@ mod tests {
             Some(false)
         );
         assert_eq!(manifest["package"]["autobins"].as_bool(), Some(false));
-        assert!(manifest.get("bin").is_none());
+        let bins = manifest["bin"]
+            .as_array()
+            .expect("the FFI crate declares its entry-owning Apple binary");
+        assert_eq!(bins.len(), 1);
+        assert_eq!(
+            bins[0]["name"].as_str(),
+            Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME)
+        );
+        assert_eq!(
+            bins[0]["path"].as_str(),
+            Some("src/bin/waterui-apple-main.rs")
+        );
     }
 
     #[test]
@@ -2649,11 +2660,15 @@ mod tests {
             .expect("ffi Cargo.toml should parse");
         let bins = manifest["bin"]
             .as_array()
-            .expect("CEF FFI companion should declare a helper binary");
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0]["name"].as_str(), Some("chromium-ffi-cef-helper"));
+            .expect("CEF FFI companion should declare binaries");
+        assert_eq!(bins.len(), 2);
         assert_eq!(
-            bins[0]["path"].as_str(),
+            bins[0]["name"].as_str(),
+            Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME)
+        );
+        assert_eq!(bins[1]["name"].as_str(), Some("chromium-ffi-cef-helper"));
+        assert_eq!(
+            bins[1]["path"].as_str(),
             Some("src/bin/waterui-cef-helper.rs")
         );
 
