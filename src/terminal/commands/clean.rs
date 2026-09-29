@@ -378,7 +378,7 @@ async fn collect_existing_cache_dirs(project_roots: Vec<PathBuf>) -> Result<Vec<
 
 async fn discover_project_cache_dir(project_root: PathBuf) -> Result<PathBuf> {
     // Opening the manifest validates the project before its cache is swept:
-    // an app-mode leftover fails here with the keys and directories to delete.
+    // an app-mode leftover fails here with the keys to delete.
     Manifest::open(project_root.join("Water.toml"))
         .await
         .map_err(eyre::Report::from)?;

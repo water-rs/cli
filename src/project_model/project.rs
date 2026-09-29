@@ -158,7 +158,7 @@ impl Project {
         let cargo_path = path.join("Cargo.toml");
         let mut water: toml_edit::DocumentMut =
             smol::fs::read_to_string(&water_path).await?.parse()?;
-        let previous = Manifest::parse(&path, &water.to_string())?;
+        let previous = Manifest::parse(&water.to_string())?;
         let mut cargo: toml_edit::DocumentMut =
             smol::fs::read_to_string(&cargo_path).await?.parse()?;
         let (framework, lockfile) = ResolvedFramework::resolve(channel).await?;
@@ -1942,8 +1942,7 @@ pub enum FailToOpenManifest {
     #[error("Manifest file not found at the specified path")]
     NotFound,
 
-    /// The project carries configuration or scaffolded native projects from
-    /// the removed app mode.
+    /// The project carries configuration from the removed app mode.
     #[error("{0}")]
     AppMode(crate::project_model::app_mode::AppModeLeftovers),
 }
@@ -1965,36 +1964,24 @@ impl Manifest {
     /// - `FailToOpenManifest::ReadError`: If there was an error reading the file.
     /// - `FailToOpenManifest::InvalidManifest`: If the file contents are not valid TOML.
     /// - `FailToOpenManifest::NotFound`: If the file does not exist at the specified path.
-    /// - `FailToOpenManifest::AppMode`: If the project carries app-mode keys
-    ///   or scaffolded native project directories.
-    ///
-    /// # Panics
-    /// If `path` has no parent directory, which no manifest file path lacks.
+    /// - `FailToOpenManifest::AppMode`: If the project carries app-mode keys.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, FailToOpenManifest> {
-        let path = path.as_ref();
-        match read_to_string(path).await {
-            Ok(text) => Self::parse(
-                path.parent()
-                    .expect("a manifest path names a file in the project directory"),
-                &text,
-            ),
+        match read_to_string(path.as_ref()).await {
+            Ok(text) => Self::parse(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(FailToOpenManifest::NotFound),
             Err(e) => Err(FailToOpenManifest::ReadError(e)),
         }
     }
 
-    /// Parse the `Water.toml` text of the project at `root`, refusing a
-    /// project that still carries app-mode leftovers.
+    /// Parse `Water.toml` text, refusing a project that still carries
+    /// app-mode leftovers.
     ///
     /// # Errors
     /// - `FailToOpenManifest::InvalidManifest`: If the text is not a valid manifest.
-    /// - `FailToOpenManifest::AppMode`: If the project carries app-mode keys
-    ///   or scaffolded native project directories.
-    pub fn parse(root: &Path, text: &str) -> Result<Self, FailToOpenManifest> {
+    /// - `FailToOpenManifest::AppMode`: If the project carries app-mode keys.
+    pub fn parse(text: &str) -> Result<Self, FailToOpenManifest> {
         let table: toml::Table = text.parse().map_err(FailToOpenManifest::InvalidManifest)?;
-        if let Some(leftovers) =
-            crate::project_model::app_mode::AppModeLeftovers::find(root, &table)
-        {
+        if let Some(leftovers) = crate::project_model::app_mode::AppModeLeftovers::find(&table) {
             return Err(FailToOpenManifest::AppMode(leftovers));
         }
         toml::from_str(text).map_err(FailToOpenManifest::InvalidManifest)

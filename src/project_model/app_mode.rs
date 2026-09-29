@@ -1,13 +1,11 @@
 //! Detection of projects created in the removed app mode.
 //!
-//! App mode scaffolded user-owned native projects (Xcode, Gradle, and the
-//! Rust backend crates) into the project directory and recorded them in
-//! `Water.toml`. The CLI now generates and manages every backend project in
-//! the build cache, so such a project is refused with the exact keys and
-//! directories to delete — it is never silently reinterpreted.
+//! App mode recorded its projects in `Water.toml`, so the manifest keys are
+//! the reliable signal. The CLI now generates and manages every backend
+//! project in the build cache, so such a project is refused with the exact
+//! keys to delete — it is never silently reinterpreted.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
 
 /// `Water.toml` keys only app mode read, as `(table path, key)`; an empty key
 /// names the whole table.
@@ -26,32 +24,18 @@ const APP_MODE_KEYS: &[(&[&str], &str)] = &[
     (&["backends", "winui"], ""),
 ];
 
-/// Directories app mode scaffolded user-owned backend projects into, below the
-/// project root or its `backends/` directory.
-const APP_MODE_DIRECTORIES: &[&str] = &[
-    "apple",
-    "android",
-    "gtk4",
-    "hydrolysis",
-    "winui",
-    "esp32",
-    "ffi",
-];
-
 /// What an app-mode project carries that the CLI no longer reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppModeLeftovers {
     /// Dotted `Water.toml` keys, such as `backends.apple.scheme`.
     pub keys: Vec<String>,
-    /// Scaffolded native project directories, relative to the project root.
-    pub directories: Vec<PathBuf>,
 }
 
 impl AppModeLeftovers {
-    /// Collect the app-mode leftovers of the project at `root` whose
-    /// `Water.toml` parsed to `manifest`. `None` when there are none.
+    /// Collect the app-mode leftovers of a project whose `Water.toml` parsed
+    /// to `manifest`. `None` when there are none.
     #[must_use]
-    pub fn find(root: &Path, manifest: &toml::Table) -> Option<Self> {
+    pub fn find(manifest: &toml::Table) -> Option<Self> {
         let keys: Vec<String> = APP_MODE_KEYS
             .iter()
             .filter(|(table, key)| {
@@ -72,12 +56,7 @@ impl AppModeLeftovers {
                 dotted
             })
             .collect();
-        let directories: Vec<PathBuf> = [Path::new(""), Path::new("backends")]
-            .into_iter()
-            .flat_map(|base| APP_MODE_DIRECTORIES.iter().map(move |name| base.join(name)))
-            .filter(|relative| root.join(relative).is_dir())
-            .collect();
-        (!keys.is_empty() || !directories.is_empty()).then_some(Self { keys, directories })
+        (!keys.is_empty()).then_some(Self { keys })
     }
 }
 
@@ -90,17 +69,9 @@ impl fmt::Display for AppModeLeftovers {
              itself, and `[package] type` no longer selects a mode. \
              Delete the following, then run the command again."
         )?;
-        if !self.keys.is_empty() {
-            writeln!(f, "Water.toml keys that are no longer read:")?;
-            for key in &self.keys {
-                writeln!(f, "  - {key}")?;
-            }
-        }
-        if !self.directories.is_empty() {
-            writeln!(f, "Scaffolded native project directories:")?;
-            for directory in &self.directories {
-                writeln!(f, "  - {}", directory.display())?;
-            }
+        writeln!(f, "Water.toml keys that are no longer read:")?;
+        for key in &self.keys {
+            writeln!(f, "  - {key}")?;
         }
         Ok(())
     }
@@ -109,7 +80,6 @@ impl fmt::Display for AppModeLeftovers {
 #[cfg(test)]
 mod tests {
     use super::AppModeLeftovers;
-    use std::path::PathBuf;
 
     fn parse(text: &str) -> toml::Table {
         text.parse().expect("fixture manifest parses")
@@ -117,7 +87,6 @@ mod tests {
 
     #[test]
     fn a_current_manifest_has_no_leftovers() {
-        let root = tempfile::tempdir().unwrap();
         let manifest = parse(
             r#"
                 [package]
@@ -134,14 +103,11 @@ mod tests {
                 chip = "esp32s3"
             "#,
         );
-        assert_eq!(AppModeLeftovers::find(root.path(), &manifest), None);
+        assert_eq!(AppModeLeftovers::find(&manifest), None);
     }
 
     #[test]
-    fn app_mode_keys_and_directories_are_named() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("backends/apple")).unwrap();
-        std::fs::create_dir_all(root.path().join("android")).unwrap();
+    fn app_mode_keys_are_named() {
         let manifest = parse(
             r#"
                 [package]
@@ -160,7 +126,7 @@ mod tests {
                 project_path = "gtk4"
             "#,
         );
-        let leftovers = AppModeLeftovers::find(root.path(), &manifest).expect("app-mode project");
+        let leftovers = AppModeLeftovers::find(&manifest).expect("app-mode project");
         assert_eq!(
             leftovers.keys,
             [
@@ -170,20 +136,14 @@ mod tests {
                 "backends.gtk4"
             ]
         );
-        assert_eq!(
-            leftovers.directories,
-            [PathBuf::from("android"), PathBuf::from("backends/apple")]
-        );
         let message = leftovers.to_string();
         assert!(message.contains("backends.apple.scheme"));
-        assert!(message.contains("backends/apple"));
     }
 
     /// `type = "playground"` is the removed mode selector too: the key is no
     /// longer read, so it is named rather than silently accepted.
     #[test]
     fn the_playground_type_key_is_named() {
-        let root = tempfile::tempdir().unwrap();
         let manifest = parse(
             r#"
                 [package]
@@ -192,8 +152,7 @@ mod tests {
                 bundle_identifier = "dev.waterui.demo"
             "#,
         );
-        let leftovers = AppModeLeftovers::find(root.path(), &manifest).expect("mode key");
+        let leftovers = AppModeLeftovers::find(&manifest).expect("mode key");
         assert_eq!(leftovers.keys, ["package.type"]);
-        assert!(leftovers.directories.is_empty());
     }
 }
