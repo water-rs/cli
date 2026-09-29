@@ -50,7 +50,7 @@ impl HydrolysisBackend {
 
     /// Check whether generated hydrolysis backend files should be regenerated.
     ///
-    /// This is used by playground mode where backend glue code is fully managed by the CLI.
+    /// The backend crate is generated and managed by the CLI.
     ///
     /// # Errors
     ///

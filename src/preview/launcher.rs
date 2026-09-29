@@ -1537,9 +1537,9 @@ async fn ensure_preview_support_app(path: &Path, requirements: &PreviewRequireme
     .await
 }
 
-/// Scaffold the preview support app as a normal playground project.
+/// Scaffold the preview support app as a normal project.
 async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -> Result<()> {
-    use crate::project::{CreateOptions, Manifest as WaterManifest, PackageType};
+    use crate::project::{CreateOptions, Manifest as WaterManifest};
     use crate::templates::TemplateContext;
 
     let waterui_path = requirements.waterui_path.clone();
@@ -1548,7 +1548,6 @@ async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -
         name: "WaterUI Preview".to_string(),
         bundle_identifier: crate::project_types::BundleIdentifier::try_from("dev.waterui.preview")
             .expect("preview support bundle identifier must be valid"),
-        package_type: PackageType::Playground,
         waterui_path: waterui_path.clone(),
         channel: None,
         framework_manifest: None,
@@ -1559,11 +1558,9 @@ async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -
         framework: Some(requirements.framework.clone()),
         framework_lock: requirements.framework_lock.clone(),
         author: String::new(),
-        backends: Vec::new(),
         web: None,
     };
 
-    // Create as normal playground project
     let project = Project::create(path, options)
         .await
         .map_err(|e| eyre::eyre!("Failed to create preview app: {e}"))?;
@@ -1582,7 +1579,7 @@ async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -
     );
     manifest.save(project.root()).await?;
 
-    let ctx = TemplateContext::for_support_playground(
+    let ctx = TemplateContext::for_support_app(
         "WaterUI Preview",
         project.crate_name().clone(),
         crate::project_types::BundleIdentifier::try_from("dev.waterui.preview")

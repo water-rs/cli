@@ -1,12 +1,6 @@
 [package]
-type = "app"
 name = "repro-app"
 bundle_identifier = "dev.waterui.repro_app"
-
-[backends]
-path = "backends"
-
-[backends.hydrolysis]
 
 [framework]
 channel = "dev"

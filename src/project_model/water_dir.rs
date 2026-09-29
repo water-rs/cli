@@ -1,6 +1,6 @@
 //! Management of the global Water home and per-project managed backend build cache.
 //!
-//! Playground projects store generated backends under
+//! Projects store generated backends under
 //! `~/.water/build_cache/<absolute-project-path>/managed_backends/` instead of
 //! scattering `.water` directories into user projects. Compiled Cargo artifacts
 //! live in the sibling `~/.water/build_cache/target/` — one directory shared by
@@ -255,7 +255,7 @@ async fn remove_shared_target_dir_in(cache_root: &Path) -> eyre::Result<Option<u
 /// `remove_shared_target_dir` is the only operation that drops those.
 ///
 /// This is the filesystem effect of `cargo clean --package` for each name, done
-/// without Cargo because a playground's generated manifests are removed by
+/// without Cargo because a project's generated manifests are removed by
 /// the same clean and Cargo needs them — and their resolved dependency graph —
 /// to compute the units.
 ///
@@ -738,7 +738,7 @@ async fn remove_legacy_local_water_dir(project_root: &Path) -> eyre::Result<()> 
     let legacy_dir = project_root.join(LEGACY_LOCAL_WATER_DIR_NAME);
     if legacy_dir.exists() {
         info!(
-            "Removing legacy local playground cache at {}",
+            "Removing legacy local build cache at {}",
             legacy_dir.display()
         );
         fs::remove_dir_all(&legacy_dir).await?;

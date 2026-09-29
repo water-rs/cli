@@ -27,8 +27,8 @@ use crate::{
 
 /// ESP32 toolchain checker for a set of chips.
 ///
-/// The chip set is what `[backends.esp32]` selects — or every supported chip
-/// for a playground, which can target any of them. Pieces shared across
+/// The chip set is what `[backends.esp32]` selects — or every supported chip,
+/// since a project can target any of them. Pieces shared across
 /// chips (the `esp` toolchain, its clang libraries, `rust-src`, the helper
 /// binaries) are probed once; the architecture-specific GCC and QEMU binary
 /// once per architecture.

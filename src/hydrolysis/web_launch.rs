@@ -174,7 +174,6 @@ mod tests {
     #[test]
     fn index_inlines_the_launch_screen_and_the_dark_override() {
         let manifest = crate::project::Manifest::new(crate::project::Package {
-            package_type: crate::project::PackageType::Playground,
             name: "Demo <App>".to_string(),
             bundle_identifier: BundleIdentifier::try_from("dev.waterui.demo").unwrap(),
             assets_path: "assets".to_string(),
@@ -211,7 +210,6 @@ mod tests {
     #[test]
     fn index_omits_the_dark_block_when_nothing_differs() {
         let manifest = crate::project::Manifest::new(crate::project::Package {
-            package_type: crate::project::PackageType::Playground,
             name: "Demo".to_string(),
             bundle_identifier: BundleIdentifier::try_from("dev.waterui.demo").unwrap(),
             assets_path: "assets".to_string(),
