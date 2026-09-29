@@ -496,6 +496,12 @@ impl TemplateContext {
         crate::project_model::project_types::declares_cef_helper(self.browser.engine)
     }
 
+    /// Whether any CEF hook runs in `main.swift` — when at least one is
+    /// emitted, they share one `MainActor.assumeIsolated` block.
+    const fn cef_any_enabled(&self) -> bool {
+        self.cef_runtime_enabled() || self.chromium_enabled() || self.cef_webview_enabled()
+    }
+
     /// Set the exact `WaterUI` feature set used by a preview support runtime.
     #[must_use]
     pub fn with_preview_runtime_features(mut self, features: Vec<String>) -> Self {
