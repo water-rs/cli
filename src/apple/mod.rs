@@ -1,5 +1,7 @@
 //! Apple platform support.
 
+/// `.app` bundle assembly without an Xcode project.
+pub mod app_bundle;
 /// Apple backend implementation.
 pub mod backend;
 /// Apple device detection and management.
