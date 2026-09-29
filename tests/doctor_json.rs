@@ -109,6 +109,7 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
                     | ids::IOS_SIMULATOR_SDK
                     | ids::IOS_SIMULATORS
                     | ids::MACOS_SDK
+                    | ids::APPLE_RUST_TARGETS
             );
             let linux_item = matches!(
                 *id,
