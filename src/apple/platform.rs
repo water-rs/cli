@@ -350,6 +350,7 @@ fn validate_local_apple_backend(project: &Project) -> eyre::Result<()> {
 
 async fn ensure_apple_linker_flags(
     xcodeproj: &Path,
+    sdk_name: &str,
     required_flags: &[String],
 ) -> eyre::Result<()> {
     let pbxproj_path = xcodeproj.join("project.pbxproj");
@@ -360,7 +361,7 @@ async fn ensure_apple_linker_flags(
     let content = fs::read_to_string(&pbxproj_path)
         .await
         .wrap_err_with(|| format!("Failed to read {}", pbxproj_path.display()))?;
-    let (updated, changed) = inject_other_ldflags(&content, required_flags);
+    let (updated, changed) = inject_other_ldflags(&content, sdk_name, required_flags);
     if changed {
         fs::write(&pbxproj_path, updated)
             .await
@@ -374,31 +375,89 @@ async fn ensure_apple_linker_flags(
     Ok(())
 }
 
-fn inject_other_ldflags(content: &str, required_flags: &[String]) -> (String, bool) {
+/// Writes the flags this build requires into the `OTHER_LDFLAGS[sdk=<sdk>*]`
+/// build setting for the SDK being packaged, never into the unqualified
+/// `OTHER_LDFLAGS` line. The Xcode project is shared across Apple platforms, so
+/// flags collected for one SDK (frameworks and archives found in that build's
+/// cargo output) must not leak into the settings another SDK's package reads.
+/// The per-SDK line is rewritten wholesale on each package, which keeps the
+/// injection idempotent and self-healing when the flag set changes (for
+/// example when the linkage switches between static and the shared runtime).
+fn inject_other_ldflags(
+    content: &str,
+    sdk_name: &str,
+    required_flags: &[String],
+) -> (String, bool) {
+    let sdk_key = format!("OTHER_LDFLAGS[sdk={sdk_name}*]");
+    let flags_value = required_flags.join(" ");
     let mut changed = false;
+    // Per-SDK settings form a group directly after their block's base
+    // `OTHER_LDFLAGS` line — each SDK owns one line in it. Outside a group a
+    // per-SDK line is a stray, and inside it a second line for this SDK is a
+    // duplicate: both are dropped, along with the stale one when this build
+    // needs no injected flags at all.
+    let mut in_sdk_group = false;
+    let mut sdk_seen = false;
     let mut lines = Vec::new();
-    for line in content.lines() {
-        if line.contains("OTHER_LDFLAGS = \"")
+    let mut iter = content.lines().peekable();
+
+    while let Some(line) = iter.next() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("OTHER_LDFLAGS[sdk=") || trimmed.starts_with("\"OTHER_LDFLAGS[sdk=")
+        {
+            if let Some((prefix, rest)) = line.split_once(&sdk_key)
+                && let Some((_, tail)) = rest.split_once("= \"")
+                && let Some((existing, suffix)) = tail.split_once("\";")
+            {
+                if !in_sdk_group || sdk_seen || flags_value.is_empty() {
+                    changed = true;
+                    continue;
+                }
+                if existing != flags_value {
+                    changed = true;
+                }
+                // A quoted key leaves its opening quote in the split prefix;
+                // emit the canonical quoted form either way.
+                let prefix = prefix.strip_suffix('"').unwrap_or(prefix);
+                lines.push(format!(
+                    "{prefix}\"{sdk_key}\" = \"{flags_value}\";{suffix}"
+                ));
+                sdk_seen = true;
+                continue;
+            }
+            // A per-SDK setting for another platform stays untouched: that
+            // SDK's own packaging pass owns it.
+            lines.push(line.to_string());
+            continue;
+        }
+        if trimmed.starts_with("OTHER_LDFLAGS = \"")
             && let Some((prefix, rest)) = line.split_once("OTHER_LDFLAGS = \"")
             && let Some((flags, suffix)) = rest.split_once("\";")
         {
-            let (mut merged, _) = sanitize_other_ldflags(flags);
-            for required in required_flags {
-                if !merged.contains(required) {
-                    if !merged.is_empty() {
-                        merged.push(' ');
-                    }
-                    merged.push_str(required);
-                }
-            }
-            let line_changed = merged != flags;
-            if line_changed {
+            // Scrub flags earlier CLI versions baked into the shared setting;
+            // everything else in the template/user value is preserved.
+            let (sanitized, scrubbed) = sanitize_other_ldflags(flags);
+            if scrubbed {
                 changed = true;
             }
-            lines.push(format!("{prefix}OTHER_LDFLAGS = \"{merged}\";{suffix}"));
+            lines.push(format!("{prefix}OTHER_LDFLAGS = \"{sanitized}\";{suffix}"));
+            in_sdk_group = true;
+            sdk_seen = false;
+            // Each configuration block needs its own per-SDK line: inject one
+            // unless the next line already carries this SDK's setting.
+            let sdk_line_follows = iter
+                .peek()
+                .is_some_and(|next| next.contains(sdk_key.as_str()));
+            if !sdk_line_follows && !flags_value.is_empty() {
+                lines.push(format!("{prefix}\"{sdk_key}\" = \"{flags_value}\";"));
+                sdk_seen = true;
+                changed = true;
+            }
             continue;
         }
         lines.push(line.to_string());
+        in_sdk_group = false;
+        sdk_seen = false;
     }
 
     let mut updated = lines.join("\n");
@@ -737,7 +796,7 @@ pub async fn package_apple(
     for flag in native_link_inputs.linker_flags {
         push_unique_flag(&mut required_link_flags, flag);
     }
-    ensure_apple_linker_flags(&xcodeproj, &required_link_flags).await?;
+    ensure_apple_linker_flags(&xcodeproj, sdk_name, &required_link_flags).await?;
 
     // Build with xcodebuild
     // Determine the Xcode arch name from the platform architecture
@@ -1022,52 +1081,90 @@ mod tests {
     }
 
     #[test]
-    fn injects_required_apple_frameworks_into_other_ldflags() {
-        let input =
-            "OTHER_LDFLAGS = \"-lwaterui_app -lc++\";\nOTHER_LDFLAGS = \"-lwaterui_app -lc++\";\n";
-        let required_flags = vec!["-framework VideoToolbox".to_string()];
-        let (output, changed) = inject_other_ldflags(input, &required_flags);
+    fn injects_required_flags_into_a_per_sdk_setting() {
+        let input = "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n";
+        let required_flags = vec!["-lwaterui_app".to_string(), "-L/some/build".to_string()];
+        let (output, changed) = inject_other_ldflags(input, "macosx", &required_flags);
         assert!(changed);
-        assert_eq!(output.matches("-framework VideoToolbox").count(), 2);
-        assert!(!output.contains("-lwaterui_app"));
+        assert_eq!(
+            output,
+            "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n\
+             \"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app -L/some/build\";\n"
+        );
     }
 
     #[test]
     fn linker_flag_injection_is_idempotent() {
-        let input = "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n";
-        let required_flags = vec!["-framework VideoToolbox".to_string()];
-        let (output, changed) = inject_other_ldflags(input, &required_flags);
+        let required_flags = vec![
+            "-framework VideoToolbox".to_string(),
+            "-lwaterui_app".to_string(),
+        ];
+        let (first, changed) = inject_other_ldflags(
+            "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n",
+            "macosx",
+            &required_flags,
+        );
+        assert!(changed);
+        let (second, changed) = inject_other_ldflags(&first, "macosx", &required_flags);
         assert!(!changed);
-        assert_eq!(output, input);
+        assert_eq!(second, first);
     }
 
     #[test]
-    fn removes_redundant_waterui_app_link_flag() {
-        let input = "OTHER_LDFLAGS = \"-lwaterui_app -lc++ -framework VideoToolbox\";\n";
-        let required_flags = vec!["-framework VideoToolbox".to_string()];
-        let (output, changed) = inject_other_ldflags(input, &required_flags);
-        assert!(changed);
+    fn per_sdk_settings_do_not_contaminate_other_platforms() {
+        // An iphoneos packaging pass must leave the macosx setting alone and
+        // vice versa, so consecutive platform packages share one project file.
+        let flags = vec!["-lwaterui_app".to_string()];
+        let (macos, _) = inject_other_ldflags("OTHER_LDFLAGS = \"-lc++\";\n", "macosx", &flags);
+        let (ios, _) = inject_other_ldflags(&macos, "iphoneos", &flags);
+        assert!(ios.contains("\"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app\""));
+        assert!(ios.contains("\"OTHER_LDFLAGS[sdk=iphoneos*]\" = \"-lwaterui_app\""));
         assert_eq!(
-            output,
-            "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n"
+            ios.matches("OTHER_LDFLAGS = \"-lc++\";").count(),
+            1,
+            "shared setting untouched: {ios}"
         );
+    }
+
+    #[test]
+    fn every_configuration_block_keeps_its_per_sdk_setting() {
+        // Debug and Release each own an OTHER_LDFLAGS group; a rerun must not
+        // collapse the second block's per-SDK line into the first's.
+        let input = "OTHER_LDFLAGS = \"-lc++\";\n\
+                     PRODUCT_NAME = \"app\";\n\
+                     OTHER_LDFLAGS = \"-lc++\";\n";
+        let flags = vec!["-lwaterui_app".to_string()];
+        let (first, _) = inject_other_ldflags(input, "macosx", &flags);
+        assert_eq!(first.matches("OTHER_LDFLAGS[sdk=macosx*]").count(), 2);
+        let (second, changed) = inject_other_ldflags(&first, "macosx", &flags);
+        assert!(!changed, "second pass rewrote the file: {second}");
+        assert_eq!(second.matches("OTHER_LDFLAGS[sdk=macosx*]").count(), 2);
+    }
+
+    #[test]
+    fn removes_redundant_waterui_app_link_flag_from_shared_setting() {
+        // Older versions baked -lwaterui_* into the shared setting; scrub it.
+        let input = "OTHER_LDFLAGS = \"-lwaterui_app -lc++ -framework VideoToolbox\";\n";
+        let required_flags = vec!["-lwaterui_app".to_string()];
+        let (output, changed) = inject_other_ldflags(input, "macosx", &required_flags);
+        assert!(changed);
+        assert!(output.contains("OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";"));
+        assert!(output.contains("\"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app\";"));
     }
 
     #[test]
     fn switches_between_shared_runtime_and_static_link_flags() {
         let input = "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n";
-        let dynamic_flags = vec![
-            "-framework VideoToolbox".to_string(),
-            "-lwaterui_dylib".to_string(),
-        ];
-        let (dynamic, changed) = inject_other_ldflags(input, &dynamic_flags);
+        let dynamic_flags = vec!["-lwaterui_app".to_string(), "-lwaterui_dylib".to_string()];
+        let (dynamic, changed) = inject_other_ldflags(input, "macosx", &dynamic_flags);
         assert!(changed);
         assert!(dynamic.contains("-lwaterui_dylib"));
 
-        let static_flags = vec!["-framework VideoToolbox".to_string()];
-        let (static_linked, changed) = inject_other_ldflags(&dynamic, &static_flags);
+        let static_flags = vec!["-lwaterui_app".to_string()];
+        let (static_linked, changed) = inject_other_ldflags(&dynamic, "macosx", &static_flags);
         assert!(changed);
-        assert_eq!(static_linked, input);
+        assert!(!static_linked.contains("-lwaterui_dylib"));
+        assert!(static_linked.contains("\"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app\";"));
     }
 
     #[test]
