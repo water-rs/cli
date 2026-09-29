@@ -21,7 +21,7 @@ use waterui_cli::{
     gtk4::platform::clean_gtk4,
     hydrolysis::platform::clean_hydrolysis,
     platform::TargetBackend as LibTargetBackend,
-    project::{ManagedBackends, Manifest, PackageType, Project},
+    project::{ManagedBackends, Manifest, Project},
     water_dir,
     winui::platform::clean_winui,
 };
@@ -55,8 +55,8 @@ pub struct Args {
     #[arg(long, default_value = ".")]
     path: PathBuf,
 
-    /// Recursively find all valid `WaterUI` projects under `--path` and clean each playground
-    /// project's managed build cache plus each app project's `Cargo` target directory.
+    /// Recursively find all valid `WaterUI` projects under `--path` and clean each
+    /// project's managed build cache.
     #[arg(short = 'r', long)]
     recursive: bool,
 
@@ -241,7 +241,7 @@ async fn clean_recursive(shell: &Shell, root: &Path, yes: bool) -> Result<()> {
     );
 
     let spinner = shell.spinner("Scanning for WaterUI projects...");
-    let cache_plan = CachePlan::discover(shell, root).await?;
+    let cache_plan = CachePlan::discover(root).await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }
@@ -343,10 +343,10 @@ struct CachePlan {
 }
 
 impl CachePlan {
-    async fn discover(shell: &Shell, root: &Path) -> Result<Self> {
+    async fn discover(root: &Path) -> Result<Self> {
         let project_roots = discover_projects(root).await?;
         let project_count = project_roots.len();
-        let cache_dirs = collect_existing_cache_dirs(shell, project_roots).await?;
+        let cache_dirs = collect_existing_cache_dirs(project_roots).await?;
         Ok(Self {
             project_count,
             cache_dirs,
@@ -354,18 +354,16 @@ impl CachePlan {
     }
 }
 
-async fn collect_existing_cache_dirs(
-    shell: &Shell,
-    project_roots: Vec<PathBuf>,
-) -> Result<Vec<PathBuf>> {
+async fn collect_existing_cache_dirs(project_roots: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     let mut cache_dirs = BTreeSet::new();
-    let mut discovered =
-        stream::iter(project_roots.into_iter().map(|project_root| async move {
-            discover_project_cache_dirs(shell, project_root).await
-        }))
-        .buffer_unordered(discovery_parallelism());
-    while let Some(project_cache_dirs) = discovered.next().await.transpose()? {
-        cache_dirs.extend(project_cache_dirs);
+    let mut discovered = stream::iter(
+        project_roots
+            .into_iter()
+            .map(|project_root| async move { discover_project_cache_dir(project_root).await }),
+    )
+    .buffer_unordered(discovery_parallelism());
+    while let Some(cache_dir) = discovered.next().await.transpose()? {
+        cache_dirs.insert(cache_dir);
     }
 
     let mut existing_cache_dirs = Vec::new();
@@ -378,46 +376,13 @@ async fn collect_existing_cache_dirs(
     Ok(collapse_nested_cache_dirs(existing_cache_dirs))
 }
 
-async fn discover_project_cache_dirs(
-    shell: &Shell,
-    project_root: PathBuf,
-) -> Result<BTreeSet<PathBuf>> {
-    let manifest = Manifest::open(project_root.join("Water.toml"))
+async fn discover_project_cache_dir(project_root: PathBuf) -> Result<PathBuf> {
+    // Opening the manifest validates the project before its cache is swept:
+    // an app-mode leftover fails here with the keys and directories to delete.
+    Manifest::open(project_root.join("Water.toml"))
         .await
         .map_err(eyre::Report::from)?;
-
-    let mut cache_dirs = BTreeSet::new();
-    match manifest.package.package_type {
-        PackageType::Playground => {
-            cache_dirs.insert(water_dir::project_build_cache_dir(&project_root).await?);
-        }
-        PackageType::App => match resolve_target_dir(project_root.clone()).await {
-            Ok(target_dir) => {
-                cache_dirs.insert(target_dir);
-            }
-            Err(error) => warn!(
-                shell,
-                "Skipping target cache discovery for {}: {}",
-                project_root.display(),
-                error
-            ),
-        },
-    }
-
-    Ok(cache_dirs)
-}
-
-async fn resolve_target_dir(
-    project_root: PathBuf,
-) -> std::result::Result<PathBuf, cargo_metadata::Error> {
-    smol::unblock(move || {
-        let mut metadata_cmd = cargo_metadata::MetadataCommand::new();
-        metadata_cmd.current_dir(&project_root);
-        metadata_cmd.no_deps();
-        let metadata = metadata_cmd.exec()?;
-        Ok(metadata.target_directory.as_std_path().to_path_buf())
-    })
-    .await
+    water_dir::project_build_cache_dir(&project_root).await
 }
 
 fn discover_projects_blocking(root: &Path) -> Vec<PathBuf> {
@@ -564,7 +529,7 @@ mod tests {
         ensure_recursive_root_is_directory, remove_global_build_cache_root, should_skip_dir,
     };
     use waterui_cli::{
-        project::{Manifest, Package, PackageType},
+        project::{Manifest, Package},
         project_types::BundleIdentifier,
     };
 
@@ -650,7 +615,6 @@ mod tests {
     fn write_manifest(project_root: &Path, name: &str) {
         fs::create_dir_all(project_root).expect("create project root");
         let manifest = Manifest::new(Package {
-            package_type: PackageType::Playground,
             name: name.to_owned(),
             // The identifier doubles as the Android package name, so a
             // hyphenated project name cannot be used verbatim.

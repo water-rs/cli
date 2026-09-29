@@ -841,10 +841,9 @@ async fn seed_font_cache_scoped(
 /// compiles. The ESP32 harness never takes part: no build scans it for
 /// fonts — `dew`'s fonts come from `[backends.esp32]` as plain files.
 ///
-/// The scanned set follows the project: an app contributes the crates of the
-/// backends it has configured, a playground the crates for the backends this
-/// host can run — Hydrolysis anywhere, GTK4 on Linux, `WinUI` on Windows —
-/// since the CLI manages them all. `scope` narrows the set to one backend's
+/// The scanned set is the crates for the backends this host can run —
+/// Hydrolysis anywhere, GTK4 on Linux, `WinUI` on Windows — since the CLI
+/// manages them all. `scope` narrows the set to one backend's
 /// crates — the manifests that backend's builds read — so a fetch preparing
 /// a single-backend build never touches crates that build cannot compile. A
 /// crate that cannot be produced is an error naming its backend — silently
@@ -857,19 +856,12 @@ async fn ensure_font_scan_manifests(
 
     // Apple and Android builds scan the FFI companion; no other backend's
     // build does, and a scoped fetch includes it only for those two.
-    let ffi_scanned = scope.map_or_else(
-        || {
-            project.is_playground()
-                || project.apple_backend().is_some()
-                || project.android_backend().is_some()
-        },
-        |backend| {
-            matches!(
-                backend,
-                crate::platform::TargetBackend::Apple | crate::platform::TargetBackend::Android
-            )
-        },
-    );
+    let ffi_scanned = scope.is_none_or(|backend| {
+        matches!(
+            backend,
+            crate::platform::TargetBackend::Apple | crate::platform::TargetBackend::Android
+        )
+    });
     if ffi_scanned {
         let manifest = project.ffi_crate_path().join("Cargo.toml");
         if !manifest.is_file() {
@@ -897,16 +889,14 @@ async fn ensure_font_scan_manifests(
 /// A generated backend crate — GTK4, Hydrolysis or `WinUI` — whose manifest
 /// a build scans for font declarations.
 trait FontScanCrate: crate::backend::Backend {
-    /// The backend's name as `water backend` reports it.
+    /// The backend's display name.
     const NAME: &'static str;
     /// The backend whose builds scan this crate — a scoped fetch covers the
     /// crate only for that backend.
     const TARGET: crate::platform::TargetBackend;
-    /// Whether a build of `project` can ever compile this crate: a
-    /// playground can run every backend this host supports — the CLI manages
-    /// all of them — while an app builds only the backends it has
-    /// configured.
-    fn wanted(project: &Project) -> bool;
+    /// Whether a build on this host can ever compile this crate: the CLI
+    /// manages every backend the host supports.
+    fn wanted() -> bool;
     /// Whether `scope` — `water fetch --backend`'s value — selects this
     /// crate: an unscoped fetch covers every wanted crate, a scoped one only
     /// the selected backend's own.
@@ -927,7 +917,7 @@ async fn ensure_backend_manifest<B: FontScanCrate>(
     scope: Option<crate::platform::TargetBackend>,
     manifests: &mut Vec<PathBuf>,
 ) -> eyre::Result<()> {
-    if !B::in_scope(scope) || !B::wanted(project) {
+    if !B::in_scope(scope) || !B::wanted() {
         return Ok(());
     }
     let stale = B::stale(project)
@@ -947,10 +937,9 @@ async fn ensure_backend_manifest<B: FontScanCrate>(
 impl FontScanCrate for crate::gtk4::backend::Gtk4Backend {
     const NAME: &'static str = "GTK4";
     const TARGET: crate::platform::TargetBackend = crate::platform::TargetBackend::Gtk4;
-    fn wanted(project: &Project) -> bool {
-        // GTK4 compiles on Linux hosts only, so a playground elsewhere never
-        // builds this crate.
-        project.gtk4_backend().is_some() || (project.is_playground() && cfg!(target_os = "linux"))
+    fn wanted() -> bool {
+        // GTK4 compiles on Linux hosts only.
+        cfg!(target_os = "linux")
     }
     async fn stale(project: &Project) -> eyre::Result<bool> {
         Self::requires_regeneration(project).await
@@ -960,8 +949,8 @@ impl FontScanCrate for crate::gtk4::backend::Gtk4Backend {
 impl FontScanCrate for crate::hydrolysis::backend::HydrolysisBackend {
     const NAME: &'static str = "hydrolysis";
     const TARGET: crate::platform::TargetBackend = crate::platform::TargetBackend::Hydrolysis;
-    fn wanted(project: &Project) -> bool {
-        project.is_playground() || project.hydrolysis_backend().is_some()
+    fn wanted() -> bool {
+        true
     }
     async fn stale(project: &Project) -> eyre::Result<bool> {
         Self::requires_regeneration(project).await
@@ -971,11 +960,9 @@ impl FontScanCrate for crate::hydrolysis::backend::HydrolysisBackend {
 impl FontScanCrate for crate::winui::backend::WinUiBackend {
     const NAME: &'static str = "WinUI";
     const TARGET: crate::platform::TargetBackend = crate::platform::TargetBackend::WinUi;
-    fn wanted(project: &Project) -> bool {
-        // `WinUI` compiles on Windows hosts only, so a playground elsewhere
-        // never builds this crate.
-        project.winui_backend().is_some()
-            || (project.is_playground() && cfg!(target_os = "windows"))
+    fn wanted() -> bool {
+        // `WinUI` compiles on Windows hosts only.
+        cfg!(target_os = "windows")
     }
     async fn stale(project: &Project) -> eyre::Result<bool> {
         Self::requires_regeneration(project).await
@@ -1762,7 +1749,7 @@ mod tests {
 
     fn manifest_with_fonts(toml_fonts: &str) -> crate::project::Manifest {
         toml::from_str(&format!(
-            "[package]\ntype = \"app\"\nname = \"Demo\"\n\
+            "[package]\nname = \"Demo\"\n\
              bundle_identifier = \"dev.example.demo\"\n\n{toml_fonts}"
         ))
         .expect("manifest parses")

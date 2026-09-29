@@ -14,16 +14,13 @@ use crate::{
 
 /// Configuration for the Android backend in a `WaterUI` project.
 ///
-/// `[backends.android]` in `Water.toml`
+/// `[backends.android]` in `Water.toml` persists only `backend_path`; the
+/// project path locates the Gradle project the CLI generates in the managed
+/// build cache.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AndroidBackend {
-    #[serde(
-        default = "default_android_project_path",
-        skip_serializing_if = "is_default_android_project_path"
-    )]
+    #[serde(skip, default = "default_android_project_path")]
     project_path: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<String>,
     /// Path to a local `android-backend` checkout used as the runtime source.
     #[serde(skip_serializing_if = "Option::is_none")]
     backend_path: Option<String>,
@@ -35,16 +32,8 @@ impl AndroidBackend {
     pub fn new() -> Self {
         Self {
             project_path: default_android_project_path(),
-            version: None,
             backend_path: None,
         }
-    }
-
-    /// Set a custom project path (defaults to "android").
-    #[must_use]
-    pub fn with_project_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.project_path = path.into();
-        self
     }
 
     /// Set the local `android-backend` checkout used as the runtime source.
@@ -64,13 +53,6 @@ impl AndroidBackend {
     #[must_use]
     pub fn backend_path(&self) -> Option<&str> {
         self.backend_path.as_deref()
-    }
-
-    /// Whether this entry configures backend-project scaffolding — anything
-    /// beyond `backend_path`, which only selects the runtime's source.
-    #[must_use]
-    pub fn configures_project(&self) -> bool {
-        self.project_path != default_android_project_path() || self.version.is_some()
     }
 
     /// Get the path to the Gradle wrapper script within the Android project.
@@ -158,13 +140,12 @@ impl Backend for AndroidBackend {
             .await
             .map_err(crate::backend::FailToInitBackend::Io)?;
 
-        let existing = manifest.backends.android();
         Ok(Self {
-            project_path: existing.map_or_else(default_android_project_path, |backend| {
-                backend.project_path.clone()
-            }),
-            version: existing.and_then(|backend| backend.version.clone()),
-            backend_path: existing.and_then(|backend| backend.backend_path.clone()),
+            project_path: default_android_project_path(),
+            backend_path: manifest
+                .backends
+                .android()
+                .and_then(|backend| backend.backend_path.clone()),
         })
     }
 
@@ -203,8 +184,4 @@ impl Backend for AndroidBackend {
 
 fn default_android_project_path() -> PathBuf {
     PathBuf::from("android")
-}
-
-fn is_default_android_project_path(s: &Path) -> bool {
-    s == Path::new("android")
 }

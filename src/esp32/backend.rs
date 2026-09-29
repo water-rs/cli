@@ -33,10 +33,8 @@ fn subset_font(_path: &Path, _ranges: &str, _output_dir: &Path) -> eyre::Result<
 /// `[backends.esp32]` in `Water.toml`
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Esp32Backend {
-    #[serde(
-        default = "default_esp32_project_path",
-        skip_serializing_if = "is_default_esp32_project_path"
-    )]
+    /// The generated harness's directory below the managed backends root.
+    #[serde(skip, default = "default_esp32_project_path")]
     project_path: PathBuf,
     #[serde(
         default = "default_esp32_chip",
@@ -85,13 +83,6 @@ impl Esp32Backend {
             fonts: Vec::new(),
             font_ranges: Vec::new(),
         }
-    }
-
-    /// Set a custom project path (defaults to "esp32").
-    #[must_use]
-    pub fn with_project_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.project_path = path.into();
-        self
     }
 
     /// Set the target chip, returning the updated configuration.
@@ -176,7 +167,7 @@ impl Esp32Backend {
 
     /// Check whether generated ESP32 harness files should be regenerated.
     ///
-    /// This is used by playground mode where backend glue code is fully managed by the CLI.
+    /// The harness is generated and managed by the CLI.
     ///
     /// # Errors
     ///
@@ -366,10 +357,6 @@ impl Backend for Esp32Backend {
 
 fn default_esp32_project_path() -> PathBuf {
     PathBuf::from("esp32")
-}
-
-fn is_default_esp32_project_path(path: &Path) -> bool {
-    path == Path::new("esp32")
 }
 
 fn default_esp32_chip() -> String {

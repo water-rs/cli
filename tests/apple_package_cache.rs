@@ -170,8 +170,6 @@ fn repackaging_after_a_backend_change_rebuilds_the_backend() {
         &[
             "create",
             "probe",
-            "--mode",
-            "playground",
             "--waterui-path",
             root.join("waterui").to_str().expect("utf8 path"),
         ],

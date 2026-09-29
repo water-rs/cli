@@ -26,7 +26,7 @@ name: Nightly
 # Platform split: macOS ties GUI app launch to the console login session, so a
 # headless sudo'd account cannot `water run` — the macOS leg runs doctor and
 # the scaffold/build/package cycle as the fresh user, then smoke-runs the
-# playground as the runner (console) user. Linux runs the GTK4 app under
+# app as the runner (console) user. Linux runs the GTK4 app under
 # `xvfb-run` inside the fresh account; `xvfb` is test harness, not a
 # doctor-managed dependency. Windows launches the whole flow as the fresh user
 # via `Start-Process -Credential` in the runner's session.
@@ -314,16 +314,10 @@ jobs:
           # or git refuses to read the submodule pins `water create`
           # resolves through.
           git config --global --add safe.directory '*'
-          # `--yes` answers the experimental-backend confirmation (GTK4 on the
-          # Ubuntu leg); non-interactive runs cannot be prompted.
           phase "water create e2eapp"
-          water create e2eapp --mode app --backends "$E2E_BACKEND" --waterui-path "$WATERUI_SRC" --yes \
-            2>&1 | tee e2e-logs/create-app.log || fail "water create app failed"
+          water create e2eapp --waterui-path "$WATERUI_SRC" \
+            2>&1 | tee e2e-logs/create-app.log || fail "water create failed"
           [ -f e2eapp/Water.toml ] || fail "e2eapp scaffold has no Water.toml"
-          phase "water create e2eplay"
-          water create e2eplay --mode playground --waterui-path "$WATERUI_SRC" \
-            2>&1 | tee e2e-logs/create-play.log || fail "water create playground failed"
-          [ -f e2eplay/Water.toml ] || fail "e2eplay scaffold has no Water.toml"
 
           phase "water build e2eapp"
           (cd e2eapp && water build --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" --yes \
@@ -342,11 +336,11 @@ jobs:
           # the Hydrolysis renderer is the template that has a runtime to drift
           # from, so it runs there regardless of the leg's own backend.
           if [ "$E2E_PLATFORM" = "macos" ]; then
-            phase "water preview e2eplay (hydrolysis)"
+            phase "water preview e2eapp (hydrolysis)"
             # The Hydrolysis renderer draws every widget itself, so it has no
             # implicit theme to fall back on and refuses to guess one: the
             # backend requires `--theme` and errors out without it.
-            (cd e2eplay && water preview main --platform macos --backend hydrolysis \
+            (cd e2eapp && water preview main --platform macos --backend hydrolysis \
               --theme material3 \
               --output ../e2e-logs/preview.png 2>&1 | tee ../e2e-logs/preview.log) \
               || fail "water preview failed"
@@ -409,13 +403,9 @@ jobs:
           # through.
           git config --global --add safe.directory '*'
           Phase "water create e2eapp"
-          water create e2eapp --mode app --backends $env:E2E_BACKEND --waterui-path $wateruiSrc 2>&1 |
+          water create e2eapp --waterui-path $wateruiSrc 2>&1 |
             Tee-Object "$logs\create-app.log"
-          if ($LASTEXITCODE -or -not (Test-Path "e2eapp\Water.toml")) { Fail "water create app failed" }
-          Phase "water create e2eplay"
-          water create e2eplay --mode playground --waterui-path $wateruiSrc 2>&1 |
-            Tee-Object "$logs\create-play.log"
-          if ($LASTEXITCODE -or -not (Test-Path "e2eplay\Water.toml")) { Fail "water create playground failed" }
+          if ($LASTEXITCODE -or -not (Test-Path "e2eapp\Water.toml")) { Fail "water create failed" }
 
           Push-Location e2eapp
           Phase "water build e2eapp"
@@ -432,7 +422,7 @@ jobs:
             Fail "water package produced no artifact line"
           }
 
-          Phase "water run e2eplay"
+          Phase "water run e2eapp"
           # windows-latest has no GPU: the only surface-compatible adapter is
           # the D3D12 WARP software device, which Hydrolysis refuses in
           # production selection unless the diagnostic switch is set. WARP
@@ -440,7 +430,7 @@ jobs:
           # one; the switch only widens adapter selection.
           $env:WATER_HYDROLYSIS_FORCE_FALLBACK_ADAPTER = "1"
           $p = Start-Process -FilePath water -ArgumentList "run --platform $env:E2E_PLATFORM --backend $env:E2E_BACKEND" -PassThru `
-            -WorkingDirectory "$env:USERPROFILE\e2eplay" `
+            -WorkingDirectory "$env:USERPROFILE\e2eapp" `
             -RedirectStandardOutput "$logs\run-play.out" -RedirectStandardError "$logs\run-play.err"
           $runStart = Get-Date
           $started = $false
@@ -482,7 +472,7 @@ jobs:
             Start-Sleep -Seconds 10
           }
           taskkill /T /F /PID $p.Id 2>$null | Out-Null
-          Get-Process e2eplay -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process e2eapp -ErrorAction SilentlyContinue | Stop-Process -Force
           if (-not $started) {
             Write-Output "---- run-play.out (tail) ----"
             Get-Content "$logs\run-play.out" -Tail 60 -ErrorAction SilentlyContinue
@@ -528,7 +518,7 @@ jobs:
       # A process that reports Started but exits immediately is not a passing
       # launch, so after the marker appears the script waits out a grace window
       # and requires the app to still be running before teardown.
-      - name: Run the playground (macOS, console user)
+      - name: Run the app (macOS, console user)
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -542,9 +532,9 @@ jobs:
           # access — a recursive a+rwX would open the whole tree instead.
           sudo chmod -R +a \
             "$(id -un) allow read,write,execute,delete,append,delete_child,file_inherit,directory_inherit" \
-            "/Users/$E2E_USER/e2eplay" "/Users/$E2E_USER/e2e-logs"
-          cd "/Users/$E2E_USER/e2eplay" || exit 1
-          echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] water run e2eplay"
+            "/Users/$E2E_USER/e2eapp" "/Users/$E2E_USER/e2e-logs"
+          cd "/Users/$E2E_USER/e2eapp" || exit 1
+          echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] water run e2eapp"
           water run --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
             > "$RUNNER_TEMP/run-play.log" 2>&1 &
           run_pid=$!
@@ -582,7 +572,7 @@ jobs:
           # runs with `-e`: unguarded, that aborted the leg before the log was
           # collected and the failure annotated.
           kill "$run_pid" 2>/dev/null || true; sleep 2; kill -9 "$run_pid" 2>/dev/null || true
-          pkill -f 'e2eplay' 2>/dev/null || true
+          pkill -f 'e2eapp' 2>/dev/null || true
           cp "$RUNNER_TEMP/run-play.log" "/Users/$E2E_USER/e2e-logs/run-play.log" || true
           cp "$RUNNER_TEMP/run-play-time.log" "/Users/$E2E_USER/e2e-logs/run-play-time.log" \
             2>/dev/null || true
@@ -594,7 +584,7 @@ jobs:
           fi
           [ "$started" -eq 0 ] || exit 1
 
-      - name: Run the playground (Ubuntu, fresh user under Xvfb)
+      - name: Run the app (Ubuntu, fresh user under Xvfb)
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -603,10 +593,10 @@ jobs:
             bash -s <<'SCRIPT'
           set -uo pipefail
           export PATH="$HOME/.cargo/bin:$PATH"
-          cd "$HOME/e2eplay"
+          cd "$HOME/e2eapp"
           # `--yes` answers the GTK4 experimental-backend confirmation, and the
           # backend must be named: the project default on Linux is hydrolysis.
-          echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] water run e2eplay"
+          echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] water run e2eapp"
           LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a \
             water run --yes --platform "$E2E_PLATFORM" --backend "$E2E_BACKEND" \
             > "$HOME/e2e-logs/run-play.log" 2>&1 &
@@ -642,7 +632,7 @@ jobs:
               && { echo "::error::water run launched but the app died within the grace window"; started=2; }
           fi
           kill "$run_pid" 2>/dev/null; sleep 2; kill -9 "$run_pid" 2>/dev/null
-          pkill -f 'water run' 2>/dev/null; pkill -f 'e2eplay' 2>/dev/null; pkill Xvfb 2>/dev/null
+          pkill -f 'water run' 2>/dev/null; pkill -f 'e2eapp' 2>/dev/null; pkill Xvfb 2>/dev/null
           if [ "$started" -ne 0 ]; then
             tail -30 "$HOME/e2e-logs/run-play.log" 2>/dev/null || true
           fi

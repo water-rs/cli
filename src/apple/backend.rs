@@ -16,30 +16,18 @@ use crate::{
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-// Warn: You cannot use both revision and local_path at the same time.
 /// Configuration for the Apple backend in a `WaterUI` project.
 ///
-/// `[backends.apple]` in `Water.toml`
+/// `[backends.apple]` in `Water.toml` persists only `backend_path`; the
+/// project path and scheme describe the Xcode project the CLI generates in
+/// the managed build cache.
 pub struct AppleBackend {
-    #[serde(
-        default = "default_apple_project_path",
-        skip_serializing_if = "is_default_apple_project_path"
-    )]
-    /// Path to the Apple project within the `WaterUI` project.
+    /// Path to the generated Apple project below the managed backends root.
+    #[serde(skip, default = "default_apple_project_path")]
     pub project_path: PathBuf,
     /// The scheme to use for building the Apple project.
+    #[serde(skip)]
     pub scheme: String,
-    /// The branch of the Apple backend to use.
-    ///
-    /// You cannot use both branch and revision at the same time.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-
-    /// The revision (commit hash or tag) of the Apple backend to use.
-    ///
-    /// You cannot use both revision and branch at the same time.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revision: Option<String>,
     /// Local path to the Apple backend for local dev.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_path: Option<String>,
@@ -48,7 +36,7 @@ pub struct AppleBackend {
 /// What this project's built application bundle is called.
 ///
 /// Deliberately not the scheme. The scheme is a fixed handle the CLI drives the
-/// Xcode project with — every playground shares one, which is what lets one set
+/// Xcode project with — every project shares one, which is what lets one set
 /// of commands build any of them — while the product name is the one a person
 /// reads. macOS takes `CFBundleName`, and with it the menu bar, the Dock and
 /// Force Quit, from `PRODUCT_NAME`, so a project that leaves the two equal
@@ -81,17 +69,8 @@ impl AppleBackend {
         Self {
             project_path: default_apple_project_path(),
             scheme: scheme.into(),
-            branch: None,
-            revision: None,
             backend_path: None,
         }
-    }
-
-    /// Set a custom project path (defaults to "apple").
-    #[must_use]
-    pub fn with_project_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.project_path = path.into();
-        self
     }
 
     /// Set the local backend path for development.
@@ -106,44 +85,22 @@ impl AppleBackend {
     pub fn project_path(&self) -> &Path {
         &self.project_path
     }
-
-    /// Whether this entry configures backend-project scaffolding — anything
-    /// beyond `backend_path`, which only selects the runtime's source.
-    #[must_use]
-    pub fn configures_project(&self) -> bool {
-        self.project_path != default_apple_project_path()
-            || !self.scheme.is_empty()
-            || self.branch.is_some()
-            || self.revision.is_some()
-    }
 }
 
 fn default_apple_project_path() -> PathBuf {
     PathBuf::from("apple")
 }
 
-fn is_default_apple_project_path(s: &Path) -> bool {
-    s == Path::new("apple")
-}
-
 impl AppleBackend {
-    /// The `(scheme, app name, crate name)` the scaffold renders with: fixed
-    /// `WaterUIApp` for playgrounds, derived from the crate name for apps —
-    /// the scheme must match the Xcode target name.
-    fn scaffold_names(project: &Project) -> (String, String, CrateName) {
-        if project.manifest().package.package_type == crate::project::PackageType::Playground {
-            (
-                "WaterUIApp".to_string(),
-                "WaterUIApp".to_string(),
-                CrateName::try_from("WaterUIApp").expect("playground crate name must be valid"),
-            )
-        } else {
-            let crate_name = project.crate_name().clone();
-            // App name for Swift code must be a valid Swift identifier (no hyphens)
-            // Convert "video-player-example" to "VideoPlayerExample"
-            let app_name = templates::apple_app_name(&crate_name);
-            (crate_name.to_string(), app_name, crate_name)
-        }
+    /// The `(scheme, app name, crate name)` the scaffold renders with: every
+    /// generated Apple project is the shared `WaterUIApp` host, and the scheme
+    /// must match its Xcode target name.
+    fn scaffold_names() -> (String, String, CrateName) {
+        (
+            "WaterUIApp".to_string(),
+            "WaterUIApp".to_string(),
+            CrateName::try_from("WaterUIApp").expect("the Apple host crate name must be valid"),
+        )
     }
 
     /// The template context [`init`] scaffolds with, rebuilt from the current
@@ -156,7 +113,7 @@ impl AppleBackend {
     /// framework cannot be resolved.
     async fn template_context(project: &Project) -> eyre::Result<TemplateContext> {
         let manifest = project.manifest();
-        let (_, app_name, crate_name_for_template) = Self::scaffold_names(project);
+        let (_, app_name, crate_name_for_template) = Self::scaffold_names();
         let ios_permissions = manifest
             .permissions
             .iter()
@@ -255,7 +212,7 @@ impl Backend for AppleBackend {
         // A `[backends.apple]` source override the manifest already carries is
         // a user choice; init re-scaffolds the project without rewriting it.
         let existing = project.manifest().backends.apple();
-        let (scheme, _, _) = Self::scaffold_names(project);
+        let (scheme, _, _) = Self::scaffold_names();
         let project_path = default_apple_project_path();
 
         let ctx = Self::template_context(project)
@@ -269,8 +226,6 @@ impl Backend for AppleBackend {
         Ok(Self {
             project_path,
             scheme,
-            branch: existing.and_then(|backend| backend.branch.clone()),
-            revision: existing.and_then(|backend| backend.revision.clone()),
             backend_path: existing.and_then(|backend| backend.backend_path.clone()),
         })
     }
@@ -314,7 +269,7 @@ mod tests {
     use crate::{
         backend::reinit_backend,
         platform::TargetBackend,
-        project::{CreateOptions, ManagedBackends, PackageType, Project},
+        project::{CreateOptions, ManagedBackends, Project},
         project_types::BundleIdentifier,
     };
 
@@ -327,25 +282,27 @@ mod tests {
     fn backend_path_added_after_create_re_renders_the_local_package_reference() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("water-example");
-        let mut project = smol::block_on(Project::create(
+        smol::block_on(Project::create(
             &root,
             CreateOptions {
                 name: "Water Example".to_string(),
                 bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
                     .expect("bundle identifier"),
-                package_type: PackageType::App,
                 waterui_path: None,
                 channel: None,
                 framework_manifest: None,
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
                 framework_lock: None,
                 author: "Lexo Liu".to_string(),
-                backends: vec![TargetBackend::Apple],
                 web: None,
             },
         ))
         .expect("project creation must succeed");
-        smol::block_on(project.init_apple_backend()).expect("apple backend scaffold");
+        let project = smol::block_on(Project::open(
+            &root,
+            ManagedBackends::for_backend(TargetBackend::Apple),
+        ))
+        .expect("opening the project scaffolds the Apple backend");
 
         let backend_dir = project.backend_path::<AppleBackend>();
         let xcodeproj = fs::read_dir(&backend_dir)

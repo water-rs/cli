@@ -12,10 +12,11 @@ Run it in a directory holding the full captures of one `water create` +
                                         [framework] table is used verbatim)
     Water.lock                          the channel's certified lock
     Cargo.lock                          the project's lock
-    hydrolysis-backend.lock             backends/hydrolysis/Cargo.lock after
-                                        the build resolved it
+    hydrolysis-backend.lock             the generated hydrolysis backend's
+                                        Cargo.lock (in the project's managed
+                                        build cache) after the build resolved it
     hydrolysis-backend.metadata.json    `cargo metadata --format-version 1`
-                                        on backends/hydrolysis/Cargo.toml
+                                        on that backend's Cargo.toml
 
 It writes the slimmed fixtures — Water.toml (with `lock_sha256` recomputed
 for the slim Water.lock), Water.lock, Cargo.lock, hydrolysis-backend.lock,

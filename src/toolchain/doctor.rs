@@ -34,7 +34,7 @@ use crate::{
     framework::manifest_rust_version,
     gtk4::toolchain::Gtk4Toolchain,
     platform::TargetPlatform,
-    project::{Manifest, PackageType},
+    project::Manifest,
     toolchain::{
         Host, Installation, Toolchain, ToolchainError, UnfixableToolchain,
         cargo_helpers::CargoHelpers,
@@ -554,7 +554,7 @@ fn unfixable_message(error: &UnfixableToolchain) -> String {
 /// Why a backend is (or is not) checked in the current run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendScope {
-    /// The project's `Water.toml` selects the backend (or is a playground).
+    /// The run is inside a project, which can build with every backend.
     Selected,
     /// No project surrounds the run and the host can build for the backend.
     HostDefault,
@@ -582,9 +582,8 @@ struct ProjectContext {
 impl ProjectContext {
     /// Whether `backend` is checked in this run and why.
     ///
-    /// Inside a project the manifest decides: a selected backend (every
-    /// backend, for a playground) is [`BackendScope::Selected`], anything
-    /// else optional. Outside a project the host decides: the backends the
+    /// Inside a project every backend is [`BackendScope::Selected`]: the CLI
+    /// generates whichever backend a command selects. Outside a project the host decides: the backends the
     /// machine can build for — Apple on macOS, `WinUI` on Windows, GTK4 on
     /// Linux, Hydrolysis on every desktop host — are
     /// [`BackendScope::HostDefault`]; Android and Dew need a project to
@@ -605,21 +604,7 @@ impl ProjectContext {
                     BackendScope::Optional
                 }
             },
-            |manifest| {
-                let selected = match backend {
-                    TargetBackend::Apple => manifest.backends.apple().is_some(),
-                    TargetBackend::Android => manifest.backends.android().is_some(),
-                    TargetBackend::Gtk4 => manifest.backends.gtk4().is_some(),
-                    TargetBackend::Hydrolysis => manifest.backends.hydrolysis().is_some(),
-                    TargetBackend::WinUi => manifest.backends.winui().is_some(),
-                    TargetBackend::Dew => manifest.backends.esp32().is_some(),
-                };
-                if manifest.package.package_type == PackageType::Playground || selected {
-                    BackendScope::Selected
-                } else {
-                    BackendScope::Optional
-                }
-            },
+            |_| BackendScope::Selected,
         )
     }
 
@@ -628,32 +613,27 @@ impl ProjectContext {
     }
 
     /// The `skipped` message for a project-gated item whose backend is out
-    /// of scope: names the manifest table that would bring it in.
-    fn out_of_scope_message(&self, backend: &str, table: &str) -> String {
-        if self.manifest.is_some() {
-            format!("No {backend} backend is selected in this project's Water.toml.")
-        } else {
-            format!(
-                "Optional: checked inside a project whose Water.toml has a `[backends.{table}]` section."
-            )
-        }
+    /// of scope — only ever outside a project, since a project selects every
+    /// backend.
+    fn out_of_scope_message(backend: &str) -> String {
+        format!(
+            "Optional: checked inside a WaterUI project, which can build with the {backend} backend."
+        )
     }
 
     /// The chips the project's ESP32 (Dew) backend can target: the chip
-    /// `[backends.esp32]` declares, or every supported chip for a playground.
-    /// `None` when no project is present or no ESP32 backend is selected.
+    /// `[backends.esp32]` declares, or every supported chip. `None` when no
+    /// project is present.
     fn esp32_chips(&self) -> Option<eyre::Result<Vec<Esp32Chip>>> {
         let manifest = self.manifest.as_ref()?;
         if let Some(backend) = manifest.backends.esp32() {
             return Some(backend.resolved_chip().map(|chip| vec![chip]));
         }
-        (manifest.package.package_type == PackageType::Playground).then(|| {
-            Ok(vec![
-                Esp32Chip::Esp32S3,
-                Esp32Chip::Esp32C3,
-                Esp32Chip::Esp32P4,
-            ])
-        })
+        Some(Ok(vec![
+            Esp32Chip::Esp32S3,
+            Esp32Chip::Esp32C3,
+            Esp32Chip::Esp32P4,
+        ]))
     }
 }
 
@@ -820,7 +800,7 @@ async fn apple_rust_targets_check(host: &Host, project: &ProjectContext) -> Doct
         return DoctorItem::skipped_with_message(
             ids::APPLE_RUST_TARGETS,
             NAME,
-            project.out_of_scope_message("Apple", "apple"),
+            ProjectContext::out_of_scope_message("Apple"),
         );
     }
     toolchain_check(
@@ -903,7 +883,7 @@ async fn android_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorItem
             DoctorItem::skipped_with_message(
                 ids::ANDROID_RUST_TARGETS,
                 "Android Rust Targets",
-                project.out_of_scope_message("Android", "android"),
+                ProjectContext::out_of_scope_message("Android"),
             )
         }
     };
@@ -1041,12 +1021,12 @@ async fn hydrolysis_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorI
                 DoctorItem::skipped_with_message(
                     ids::WASM32_TARGET,
                     "Rust wasm32 target",
-                    project.out_of_scope_message("hydrolysis (web)", "hydrolysis"),
+                    ProjectContext::out_of_scope_message("hydrolysis (web)"),
                 ),
                 DoctorItem::skipped_with_message(
                     ids::WASM_PACK,
                     "wasm-pack",
-                    project.out_of_scope_message("hydrolysis (web)", "hydrolysis"),
+                    ProjectContext::out_of_scope_message("hydrolysis (web)"),
                 ),
             )
         }
@@ -1107,7 +1087,7 @@ async fn esp32_check(host: &Host, project: &ProjectContext) -> DoctorItem {
         return DoctorItem::skipped_with_message(
             ids::ESP32_TOOLCHAIN,
             NAME,
-            project.out_of_scope_message("ESP32", "esp32"),
+            ProjectContext::out_of_scope_message("ESP32"),
         );
     };
     let chips = match chips {
@@ -1413,7 +1393,7 @@ mod tests {
     /// (`[backends.*]`, `[web]`, ...).
     fn manifest(extra: &str) -> String {
         format!(
-            "[package]\ntype = \"app\"\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n\n{extra}"
+            "[package]\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n\n{extra}"
         )
     }
 
@@ -1678,42 +1658,25 @@ mod tests {
         host_only(TargetBackend::WinUi, cfg!(target_os = "windows"));
     }
 
-    /// Inside a project the manifest decides exactly as before: selected
-    /// backends are in scope, the rest optional, and a playground selects all.
+    /// Inside a project every backend is in scope: the CLI generates
+    /// whichever one a command selects.
     #[test]
-    fn scope_inside_a_project_follows_the_manifest() {
-        let project = project_with("[backends.android]\n\n[backends.hydrolysis]\n");
-        assert_eq!(
-            project.scope(TargetBackend::Android),
-            BackendScope::Selected
-        );
-        assert_eq!(
-            project.scope(TargetBackend::Hydrolysis),
-            BackendScope::Selected
-        );
+    fn scope_inside_a_project_selects_every_backend() {
+        let project = project_with("");
         for backend in [
             TargetBackend::Apple,
+            TargetBackend::Android,
             TargetBackend::Gtk4,
+            TargetBackend::Hydrolysis,
             TargetBackend::WinUi,
             TargetBackend::Dew,
         ] {
             assert_eq!(
                 project.scope(backend),
-                BackendScope::Optional,
-                "{backend:?} is not selected"
+                BackendScope::Selected,
+                "{backend:?}"
             );
         }
-
-        let playground = ProjectContext {
-            manifest: Some(
-                toml::from_str(
-                    "[package]\ntype = \"playground\"\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
-                )
-                    .expect("playground manifest must parse"),
-            ),
-            rust_floor: Version::new(1, 85, 0),
-        };
-        assert_eq!(playground.scope(TargetBackend::Dew), BackendScope::Selected);
     }
 
     /// Outside a project the host's backends are probed and Android / ESP32
@@ -1788,15 +1751,13 @@ mod tests {
         );
     }
 
-    /// Every platform the manifest selects is probed, even on a bare host.
+    /// Inside a project every backend is probed, even on a bare host.
     #[test]
-    fn doctor_probes_the_backends_a_manifest_selects() {
+    fn doctor_probes_every_backend_inside_a_project() {
         let machine = TestMachine::new();
         machine.file(
             "Water.toml",
-            &manifest(
-                "[backends.android]\n\n[backends.hydrolysis]\n\n[backends.esp32]\nchip = \"esp32c3\"\n\n[backends.apple]\nscheme = \"Fixture\"\n",
-            ),
+            &manifest("[backends.esp32]\nchip = \"esp32c3\"\n"),
         );
         let host = machine.host(Vec::<(String, String)>::new());
         let items = smol::block_on(doctor(&host));
@@ -1810,7 +1771,7 @@ mod tests {
             assert_eq!(
                 item(&items, id).status,
                 CheckStatus::Missing,
-                "selected {id} must be probed on a bare host"
+                "{id} must be probed on a bare host"
             );
         }
         if cfg!(target_os = "macos") {

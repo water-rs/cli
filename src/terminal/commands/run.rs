@@ -19,34 +19,23 @@ use waterui_cli::{
         platform::AndroidPlatform,
     },
     apple::{
-        backend::AppleBackend,
         device::AppleSimulator,
         physical::ApplePhysicalDevice,
         platform::{build_rust_lib, package_apple},
         toolchain::AppleSdk,
     },
-    backend::reinit_backend,
     build::{BuildOptions, BuildProfile, BuildProgress},
     device::{Artifact, Device, DeviceEvent, Local, LogLevel, RunOptions, Running},
-    esp32::{backend::Esp32Backend, platform::run_esp32},
-    gtk4::{
-        backend::Gtk4Backend,
-        platform::{build_gtk4, package_gtk4},
-    },
-    hydrolysis::{
-        backend::HydrolysisBackend,
-        platform::{
-            HydrolysisWebDevServer, build_hydrolysis, package_hydrolysis,
-            prepare_hydrolysis_web_dev_site,
-        },
+    esp32::platform::run_esp32,
+    gtk4::platform::{build_gtk4, package_gtk4},
+    hydrolysis::platform::{
+        HydrolysisWebDevServer, build_hydrolysis, package_hydrolysis,
+        prepare_hydrolysis_web_dev_site,
     },
     platform::{PackageOptions, TargetPlatform as LibTargetPlatform},
     project::{ManagedBackends, Project},
     web,
-    winui::{
-        backend::WinUiBackend,
-        platform::{build_winui, package_winui},
-    },
+    winui::platform::{build_winui, package_winui},
 };
 
 #[cfg(target_os = "macos")]
@@ -106,24 +95,6 @@ async fn find_latest_ips_report(
         ctx.started_at,
     )
     .await
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BackendAvailability {
-    available: [bool; 6],
-}
-
-impl BackendAvailability {
-    const fn has(self, backend: TargetBackend) -> bool {
-        self.available[match backend {
-            TargetBackend::Apple => 0,
-            TargetBackend::Android => 1,
-            TargetBackend::Gtk4 => 2,
-            TargetBackend::Hydrolysis => 3,
-            TargetBackend::WinUi => 4,
-            TargetBackend::Dew => 5,
-        }]
-    }
 }
 
 struct RunContext {
@@ -380,37 +351,18 @@ fn resolve_backend(
     Ok(backend)
 }
 
-const fn default_backend_priority(platform: TargetPlatform) -> &'static [TargetBackend] {
+/// The backend a run on `platform` uses when `--backend` is not given.
+const fn default_backend(platform: TargetPlatform) -> TargetBackend {
     match platform {
-        TargetPlatform::Ios => &[TargetBackend::Apple],
-        TargetPlatform::Android => &[TargetBackend::Android],
-        TargetPlatform::Macos => &[TargetBackend::Apple, TargetBackend::Hydrolysis],
-        TargetPlatform::Linux => &[TargetBackend::Hydrolysis, TargetBackend::Gtk4],
-        TargetPlatform::Windows => &[TargetBackend::Hydrolysis, TargetBackend::WinUi],
-        TargetPlatform::Web => &[TargetBackend::Hydrolysis],
+        TargetPlatform::Ios | TargetPlatform::Macos => TargetBackend::Apple,
+        TargetPlatform::Android => TargetBackend::Android,
+        TargetPlatform::Linux | TargetPlatform::Windows | TargetPlatform::Web => {
+            TargetBackend::Hydrolysis
+        }
         TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4 => {
-            &[TargetBackend::Dew]
+            TargetBackend::Dew
         }
     }
-}
-
-fn resolve_default_backend_for_project(
-    platform: TargetPlatform,
-    project_is_playground: bool,
-    availability: BackendAvailability,
-) -> TargetBackend {
-    let backends = default_backend_priority(platform);
-    if project_is_playground {
-        return backends[0];
-    }
-
-    for backend in backends {
-        if availability.has(*backend) {
-            return *backend;
-        }
-    }
-
-    backends[0]
 }
 
 /// The managed native backends a run on `platform` needs opened.
@@ -580,12 +532,14 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunCon
     )?;
     let managed_backends = managed_backends(platform);
     let mut project = Project::open(&project_path, managed_backends).await?;
-    let backend = resolve_run_backend(&project, platform, args.backend)?;
+    let backend = resolve_backend(
+        platform,
+        Some(args.backend.unwrap_or_else(|| default_backend(platform))),
+    )?;
 
     validate_desktop_backend_platform_on_host(platform, backend)?;
     validate_device_arg(platform, backend, args.device.as_deref())?;
     validate_log_pipeline_args(platform, args.logs, args.native_logs)?;
-    ensure_run_backend_ready(&project, backend)?;
 
     if backend.is_experimental()
         && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
@@ -600,160 +554,13 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunCon
         project.set_esp32_chip(chip).await?;
     }
 
-    let project = ensure_generated_run_backend(shell, project, backend).await?;
+    let project = super::ensure_generated_backend(shell, project, backend).await?;
 
     Ok(Some(RunContext {
         project,
         platform,
         backend,
     }))
-}
-
-fn resolve_run_backend(
-    project: &Project,
-    platform: TargetPlatform,
-    backend_override: Option<TargetBackend>,
-) -> Result<TargetBackend> {
-    resolve_backend(
-        platform,
-        backend_override.or_else(|| {
-            Some(resolve_default_backend_for_project(
-                platform,
-                project.is_playground(),
-                backend_availability(project),
-            ))
-        }),
-    )
-}
-
-const fn backend_availability(project: &Project) -> BackendAvailability {
-    BackendAvailability {
-        available: [
-            project.apple_backend().is_some(),
-            project.android_backend().is_some(),
-            project.gtk4_backend().is_some(),
-            project.hydrolysis_backend().is_some(),
-            project.winui_backend().is_some(),
-            project.esp32_backend().is_some(),
-        ],
-    }
-}
-
-fn ensure_run_backend_ready(project: &Project, backend: TargetBackend) -> Result<()> {
-    if project.is_playground() {
-        return Ok(());
-    }
-
-    match backend {
-        TargetBackend::Apple if project.apple_backend().is_none() => {
-            bail!("Apple backend is not configured. Run `water backend add apple`.");
-        }
-        TargetBackend::Android if project.android_backend().is_none() => {
-            bail!("Android backend is not configured. Run `water backend add android`.");
-        }
-        TargetBackend::Gtk4 if project.gtk4_backend().is_none() => {
-            bail!("GTK4 backend is not configured. Run `water backend add gtk4`.");
-        }
-        TargetBackend::Hydrolysis if project.hydrolysis_backend().is_none() => {
-            bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
-        }
-        TargetBackend::WinUi if project.winui_backend().is_none() => {
-            bail!("WinUI backend is not configured. Run `water backend add winui`.");
-        }
-        TargetBackend::Dew if project.esp32_backend().is_none() => {
-            bail!("ESP32 backend is not configured. Run `water backend add esp32`.");
-        }
-        _ => Ok(()),
-    }
-}
-
-async fn ensure_generated_run_backend(
-    shell: &Shell,
-    project: Project,
-    backend: TargetBackend,
-) -> Result<Project> {
-    match backend {
-        TargetBackend::Gtk4 if project.is_playground() => {
-            let needs_reinit = Gtk4Backend::requires_regeneration(&project).await?;
-            ensure_generated_run_backend_impl::<Gtk4Backend>(
-                shell,
-                project,
-                needs_reinit,
-                "Initializing GTK4 backend...",
-                "GTK4 backend initialized",
-            )
-            .await
-        }
-        TargetBackend::Hydrolysis if project.is_playground() => {
-            let needs_reinit = HydrolysisBackend::requires_regeneration(&project).await?;
-            ensure_generated_run_backend_impl::<HydrolysisBackend>(
-                shell,
-                project,
-                needs_reinit,
-                "Initializing hydrolysis backend...",
-                "Hydrolysis backend initialized",
-            )
-            .await
-        }
-        TargetBackend::WinUi if project.is_playground() => {
-            let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
-            ensure_generated_run_backend_impl::<WinUiBackend>(
-                shell,
-                project,
-                needs_reinit,
-                "Initializing WinUI backend...",
-                "WinUI backend initialized",
-            )
-            .await
-        }
-        TargetBackend::Dew if project.is_playground() => {
-            let needs_reinit =
-                project.esp32_backend().is_none() || Esp32Backend::requires_regeneration(&project)?;
-            ensure_generated_run_backend_impl::<Esp32Backend>(
-                shell,
-                project,
-                needs_reinit,
-                "Initializing ESP32 backend...",
-                "ESP32 backend initialized",
-            )
-            .await
-        }
-        TargetBackend::Apple if project.apple_backend().is_some() => {
-            let needs_reinit = AppleBackend::requires_regeneration(&project).await?;
-            ensure_generated_run_backend_impl::<AppleBackend>(
-                shell,
-                project,
-                needs_reinit,
-                "Re-initializing Apple backend...",
-                "Apple backend re-initialized",
-            )
-            .await
-        }
-        _ => Ok(project),
-    }
-}
-
-async fn ensure_generated_run_backend_impl<T>(
-    shell: &Shell,
-    project: Project,
-    needs_reinit: bool,
-    spinner_message: &str,
-    success_message: &str,
-) -> Result<Project>
-where
-    T: waterui_cli::backend::Backend,
-{
-    if !needs_reinit {
-        return Ok(project);
-    }
-
-    let spinner = shell.spinner(spinner_message);
-    reinit_backend::<T>(&project).await?;
-    if let Some(pb) = spinner {
-        pb.finish_and_clear();
-    }
-    success!(shell, "{success_message}");
-    Ok(project)
 }
 
 fn print_run_header(shell: &Shell, context: &RunContext) {
@@ -1973,10 +1780,10 @@ fn handle_device_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, BackendAvailability, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend,
-        TargetPlatform, device_choice, handle_device_event, parse_env_assignment,
-        prompt_for_device, resolve_backend, resolve_default_backend_for_project, resolve_platform,
-        run_profile, validate_desktop_backend_platform_on_host, validate_device_arg,
+        Args, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend, TargetPlatform,
+        default_backend, device_choice, handle_device_event, parse_env_assignment,
+        prompt_for_device, resolve_backend, resolve_platform, run_profile,
+        validate_desktop_backend_platform_on_host, validate_device_arg,
     };
     use clap::Parser as _;
     use waterui_cli::build::BuildProfile;
@@ -2200,72 +2007,19 @@ mod tests {
     }
 
     #[test]
-    fn default_backend_prefers_native_then_hydrolysis_for_app_projects() {
+    fn default_backend_is_the_platforms_native_backend() {
+        assert_eq!(default_backend(TargetPlatform::Macos), TargetBackend::Apple);
+        assert_eq!(default_backend(TargetPlatform::Ios), TargetBackend::Apple);
         assert_eq!(
-            resolve_default_backend_for_project(
-                TargetPlatform::Linux,
-                false,
-                BackendAvailability {
-                    available: [false, false, false, true, false, false],
-                }
-            ),
+            default_backend(TargetPlatform::Android),
+            TargetBackend::Android
+        );
+        assert_eq!(
+            default_backend(TargetPlatform::Linux),
             TargetBackend::Hydrolysis
         );
         assert_eq!(
-            resolve_default_backend_for_project(
-                TargetPlatform::Macos,
-                false,
-                BackendAvailability {
-                    available: [false, false, false, true, false, false],
-                }
-            ),
-            TargetBackend::Hydrolysis
-        );
-        // Hydrolysis is the Linux default even with no backend configured;
-        // GTK4 stays selectable but experimental.
-        assert_eq!(
-            resolve_default_backend_for_project(
-                TargetPlatform::Linux,
-                false,
-                BackendAvailability {
-                    available: [false, false, false, false, false, false],
-                }
-            ),
-            TargetBackend::Hydrolysis
-        );
-        // GTK4 remains selectable when it is the only configured backend.
-        assert_eq!(
-            resolve_default_backend_for_project(
-                TargetPlatform::Linux,
-                false,
-                BackendAvailability {
-                    available: [false, false, true, false, false, false],
-                }
-            ),
-            TargetBackend::Gtk4
-        );
-    }
-
-    #[test]
-    fn playground_defaults_use_platform_native_backend() {
-        assert_eq!(
-            resolve_default_backend_for_project(
-                TargetPlatform::Macos,
-                true,
-                BackendAvailability {
-                    available: [false, false, false, true, false, false],
-                }
-            ),
-            TargetBackend::Apple
-        );
-        assert_eq!(
-            resolve_default_backend_for_project(
-                TargetPlatform::Linux,
-                true,
-                BackendAvailability {
-                    available: [false, false, false, true, false, false],
-                }
-            ),
+            default_backend(TargetPlatform::Windows),
             TargetBackend::Hydrolysis
         );
     }

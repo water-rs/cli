@@ -48,7 +48,7 @@ Create a new `WaterUI` project and run it on iOS Simulator:
 
 ```bash
 # Create a new project
-water create my-app --backends apple,android
+water create my-app
 
 # Run on iOS Simulator
 cd my-app
@@ -58,13 +58,9 @@ water run --platform ios
 water run --platform android
 ```
 
-Create a playground for quick experimentation (auto-managed backends):
-
-```bash
-water create my-experiment --mode playground
-cd my-experiment
-water run --platform ios
-```
+The project directory holds only your Rust crate and its `Water.toml`. The
+CLI generates and manages every backend project (Xcode, Gradle, and the Rust
+backend crates) in its build cache; there is no native project to edit.
 
 ### Preview Views
 
@@ -219,7 +215,7 @@ water run --platform ios --device "iPhone 15 Pro"
 ### Create Project with Local `WaterUI` Development
 
 ```bash
-water create my-app --waterui-path /path/to/waterui --backends apple,android
+water create my-app --waterui-path /path/to/waterui
 ```
 
 This creates a project that uses the local `WaterUI` repository.
@@ -256,7 +252,7 @@ This validates toolchain dependencies (Xcode, Android SDK, Rust targets).
 - **`build`**: Rust build orchestration with cargo
 - **`debug`**: Crash handling and diagnostics
 - **`toolchain`**: Toolchain checking and installation
-- **`backend`**: Backend configuration and scaffolding
+- **`backend`**: Backend configuration and generation
 - **`templates`**: Project scaffolding templates
 - **`apple`**: Apple platform, devices, and backend
 - **`android`**: Android platform, devices, and backend
@@ -285,7 +281,7 @@ The CLI supports:
 - **Instant previews**: Render individual views to PNG without running the full app
 - **Device management**: Automatic device discovery and simulator launching
 - **Interactive creation**: Guided project setup with prompts
-- **Playground mode**: Auto-managed backends for quick prototyping
+- **Managed backends**: The CLI generates every backend project; the project holds only Rust code
 - **Parallel builds**: Device launch overlaps with compilation
 - **Log streaming**: Real-time device logs with level filtering
 - **JSON output**: Machine-readable output with `--json` flag

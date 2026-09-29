@@ -9,8 +9,8 @@ use std::process::Command;
 use waterui_cli::toolchain::doctor::{DoctorGroup, DoctorItemRecord, ids};
 
 /// Status vocabulary, diagnostic presence, group label, and scope of one
-/// record. The fixture manifest selects no backend, so every backend group is
-/// optional and only the Rust toolchain and helpers are in scope.
+/// record. The run is inside a project, which can build with every backend,
+/// so no group is optional.
 fn assert_item_schema(item: &DoctorItemRecord) {
     assert!(
         ["ok", "missing", "skipped"].contains(&item.status.as_ref()),
@@ -34,12 +34,7 @@ fn assert_item_schema(item: &DoctorItemRecord) {
         "group label drifted on {}",
         item.id
     );
-    assert_eq!(
-        item.optional,
-        group.backend().is_some(),
-        "scope drifted on {}",
-        item.id
-    );
+    assert!(!item.optional, "scope drifted on {}", item.id);
 }
 
 #[test]
@@ -50,7 +45,7 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
     let project = tempfile::tempdir().expect("scratch project for the child process");
     std::fs::write(
         project.path().join("Water.toml"),
-        "[package]\ntype = \"app\"\nname = \"Doctor Fixture\"\nbundle_identifier = \"dev.waterui.doctor_fixture\"\n\n[web]\npackage_manager = \"bun\"\n",
+        "[package]\nname = \"Doctor Fixture\"\nbundle_identifier = \"dev.waterui.doctor_fixture\"\n\n[web]\npackage_manager = \"bun\"\n",
     )
     .expect("write fixture manifest");
     let output = Command::new(env!("CARGO_BIN_EXE_water"))
@@ -120,22 +115,11 @@ fn doctor_json_emits_typed_item_records_for_every_check() {
                 ids::C_TOOLCHAIN | ids::LINUX_SYSTEM_PACKAGES | ids::GTK4
             );
             let windows_item = matches!(*id, ids::WINUI | ids::MSVC_BUILD_TOOLS | ids::DXC);
-            // The fixture manifest selects no backends, so every
-            // project-gated item reports skipped on every host.
-            let unselected_project_item = matches!(
-                *id,
-                ids::APPLE_RUST_TARGETS
-                    | ids::ANDROID_RUST_TARGETS
-                    | ids::WASM32_TARGET
-                    | ids::WASM_PACK
-                    | ids::ESP32_TOOLCHAIN
-            );
             (apple_item && !cfg!(target_os = "macos"))
                 || (linux_item && !cfg!(target_os = "linux"))
                 || (windows_item && !cfg!(target_os = "windows"))
                 || (*id == ids::WINDOWS_ARM64_LLVM
                     && !cfg!(all(target_os = "windows", target_arch = "aarch64")))
-                || unselected_project_item
         })
         .collect();
     assert_eq!(skipped_ids, expected_skipped);

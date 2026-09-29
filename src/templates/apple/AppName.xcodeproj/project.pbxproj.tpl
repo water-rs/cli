@@ -99,7 +99,6 @@
 			isa = PBXNativeTarget;
             buildConfigurationList = D018676A2E6C7BBD00802E96 /* Build configuration list for PBXNativeTarget "{{ ctx.crate_name }}" */;
 			buildPhases = (
-				D0000001000000000000001 /* Build Rust Library */,
 				D018675A2E6C7BBB00802E96 /* Sources */,
 				D018675B2E6C7BBB00802E96 /* Frameworks */,
 				D018675C2E6C7BBB00802E96 /* Resources */,
@@ -174,32 +173,6 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
-
-/* Begin PBXShellScriptBuildPhase section */
-		D0000001000000000000001 /* Build Rust Library */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-				"$(SRCROOT)/../Cargo.toml",
-				"$(SRCROOT)/../src/lib.rs",
-				"$(PROJECT_DIR)/build-rust.sh",
-			);
-			name = "Build Rust Library";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(PROJECT_DIR)/rust_build_info.xcconfig",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/bash;
-			shellScript = "bash \"${PROJECT_DIR}/build-rust.sh\"";
-		};
-/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		D018675A2E6C7BBB00802E96 /* Sources */ = {

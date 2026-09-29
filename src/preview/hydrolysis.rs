@@ -254,10 +254,6 @@ pub async fn ensure_hydrolysis_backend_ready(project_path: &Path) -> Result<Proj
         ManagedBackends::for_backend(TargetBackend::Hydrolysis),
     )
     .await?;
-    if project.hydrolysis_backend().is_none() && !project.is_playground() {
-        bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
-    }
-
     if HydrolysisBackend::requires_regeneration(&project).await? {
         reinit_backend::<HydrolysisBackend>(&project).await?;
     }

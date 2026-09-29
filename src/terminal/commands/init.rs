@@ -12,7 +12,7 @@ use heck::ToSnakeCase;
 use crate::shell::Shell;
 use crate::{header, line, success};
 use waterui_cli::framework::FrameworkChannel;
-use waterui_cli::project::{CreateOptions, PackageType, Project, WebScaffold};
+use waterui_cli::project::{CreateOptions, Project, WebScaffold};
 use waterui_cli::project_types::BundleIdentifier;
 use waterui_cli::web::{
     self, ExistingFrontendMode, InitAction, InitAnswers, PackageManager, WebSource, plan_init,
@@ -289,7 +289,6 @@ async fn scaffold_shell(
             name,
             bundle_identifier: BundleIdentifier::try_from(bundle_id.as_str())
                 .map_err(|error| eyre!(error))?,
-            package_type: PackageType::App,
             waterui_path: args.waterui_path.clone(),
             channel: args.channel,
             framework_manifest: args.framework_manifest.clone(),
@@ -297,8 +296,6 @@ async fn scaffold_shell(
             framework_lock: None,
             author: whoami::username()
                 .map_err(|error| eyre!("Failed to determine project author: {error}"))?,
-            // `water init` scaffolds no backend through `Project::init`.
-            backends: Vec::new(),
             web: Some(WebScaffold {
                 package_manager,
                 include_arg: include_arg.to_string(),
