@@ -111,7 +111,7 @@ impl AppleBackend {
     ///
     /// Returns an error when the application dependency graph or the
     /// framework cannot be resolved.
-    async fn template_context(project: &Project) -> eyre::Result<TemplateContext> {
+    pub(crate) async fn template_context(project: &Project) -> eyre::Result<TemplateContext> {
         let manifest = project.manifest();
         let (_, app_name, crate_name_for_template) = Self::scaffold_names();
         let ios_permissions = manifest
@@ -153,13 +153,8 @@ impl AppleBackend {
 
     /// Whether the generated Apple project differs from what the current
     /// templates and manifest would render — a `[backends.apple]`
-    /// `backend_path`, `branch` or `revision` change rewrites the Swift
-    /// package reference the Xcode project pins.
-    ///
-    /// `project.pbxproj` is compared with its `OTHER_LDFLAGS` values stripped
-    /// — the build merges resolved link inputs into them — and
-    /// `WaterUIFonts.swift` is skipped: the build re-renders it from the
-    /// resolved fonts, replacing the scaffold output before it can go stale.
+    /// `backend_path`, `branch` or `revision` change rewrites the backend
+    /// dependency the ffi crate's manifest pins.
     ///
     /// # Errors
     ///
@@ -168,21 +163,8 @@ impl AppleBackend {
         let backend_dir = project.backend_path::<Self>();
         let ctx = Self::template_context(project).await?;
         for (relative, expected) in templates::apple::rendered_outputs(&ctx)? {
-            let file_name = relative.file_name().and_then(|name| name.to_str());
-            if file_name == Some("WaterUIFonts.swift") {
-                continue;
-            }
             let path = backend_dir.join(&relative);
             match std::fs::read(&path) {
-                Ok(existing) if file_name == Some("project.pbxproj") => {
-                    if crate::apple::platform::strip_other_ldflags(&String::from_utf8_lossy(
-                        &existing,
-                    )) != crate::apple::platform::strip_other_ldflags(&String::from_utf8_lossy(
-                        &expected,
-                    )) {
-                        return Ok(true);
-                    }
-                }
                 Ok(existing) if existing == expected => {}
                 Ok(_) => return Ok(true),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -273,13 +255,11 @@ mod tests {
         project_types::BundleIdentifier,
     };
 
-    /// A `[backends.apple]` `backend_path` declared after `water create` must
-    /// switch the Xcode project from the remote Swift package to the local
-    /// checkout on the next build: the staleness check sees the manifest
-    /// change, and the shared re-render rewrites the package reference to an
-    /// `XCLocalSwiftPackageReference`.
+    /// The scaffold emits only the entitlements file — no Xcode project
+    /// exists to regenerate — yet the staleness check still detects an edit
+    /// and re-renders without losing the packaging cache.
     #[test]
-    fn backend_path_added_after_create_re_renders_the_local_package_reference() {
+    fn scaffold_without_xcode_project_still_detects_staleness() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("water-example");
         smol::block_on(Project::create(
@@ -305,74 +285,39 @@ mod tests {
         .expect("opening the project scaffolds the Apple backend");
 
         let backend_dir = project.backend_path::<AppleBackend>();
-        let xcodeproj = fs::read_dir(&backend_dir)
-            .expect("scaffolded backend directory")
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.is_dir()
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == "xcodeproj")
-            })
-            .expect("the scaffold produces an .xcodeproj directory");
-        let pbxproj = xcodeproj.join("project.pbxproj");
-        let rendered = fs::read_to_string(&pbxproj).expect("scaffolded project.pbxproj");
         assert!(
-            rendered.contains("XCRemoteSwiftPackageReference"),
-            "without backend_path the scaffold pins the remote package"
+            !backend_dir
+                .join("WaterUIApp.xcodeproj/project.pbxproj")
+                .exists(),
+            "the entry-owning scaffold produces no Xcode project"
         );
+        let entitlements = backend_dir
+            .join("WaterUIApp")
+            .join("WaterUIApp.entitlements");
+        assert!(entitlements.exists(), "the entitlements scaffolded");
         assert!(
             !smol::block_on(AppleBackend::requires_regeneration(&project))
                 .expect("staleness check"),
             "a freshly scaffolded backend is not stale"
         );
 
-        // The Xcode build cache must survive the re-render like it does for
+        // The packaging cache must survive the re-render like it does for
         // the other generated backends.
         let derived_data = backend_dir.join("DerivedData/stale.txt");
         fs::create_dir_all(derived_data.parent().expect("parent")).expect("DerivedData");
         fs::write(&derived_data, "cache").expect("cache file");
 
-        // The local checkout the manifest points at, declared after create.
-        let checkout = dir.path().join("apple-backend");
-        fs::create_dir_all(&checkout).expect("checkout");
-        fs::write(
-            checkout.join("Package.swift"),
-            "// swift-tools-version: 6.0\n",
-        )
-        .expect("Package.swift");
-        let manifest_path = root.join("Water.toml");
-        let mut manifest: toml_edit::DocumentMut = fs::read_to_string(&manifest_path)
-            .expect("Water.toml")
-            .parse()
-            .expect("Water.toml parses");
-        manifest["backends"]["apple"]["backend_path"] =
-            toml_edit::value(checkout.to_str().expect("temp dir path is UTF-8"));
-        fs::write(&manifest_path, manifest.to_string()).expect("edited Water.toml");
-
-        let project = smol::block_on(Project::open(&root, ManagedBackends::NONE))
-            .expect("project must reopen");
+        fs::write(&entitlements, "<plist/>").expect("edit entitlements");
         assert!(
             smol::block_on(AppleBackend::requires_regeneration(&project)).expect("staleness check"),
-            "a manifest backend_path the render predates is stale"
+            "an edited scaffold file is stale"
         );
         smol::block_on(reinit_backend::<AppleBackend>(&project)).expect("reinit");
-
-        let rendered = fs::read_to_string(&pbxproj).expect("re-rendered project.pbxproj");
-        assert!(
-            rendered.contains("XCLocalSwiftPackageReference"),
-            "the re-render pins the local checkout: {rendered}"
-        );
-        assert!(
-            !rendered.contains("XCRemoteSwiftPackageReference"),
-            "the remote package reference is gone: {rendered}"
-        );
-        assert!(derived_data.exists(), "reinit preserves DerivedData");
         assert!(
             !smol::block_on(AppleBackend::requires_regeneration(&project))
                 .expect("staleness check"),
             "the re-rendered backend is fresh again"
         );
+        assert!(derived_data.exists(), "reinit preserves DerivedData");
     }
 }
