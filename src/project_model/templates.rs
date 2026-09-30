@@ -18,7 +18,7 @@ use smol::fs;
 
 use crate::project_types::{BundleIdentifier, CrateName, RustIdent};
 
-/// Normalize a path to use forward slashes for config files (Cargo.toml, Xcode projects, etc.)
+/// Normalize a path to use forward slashes for config files (Cargo.toml, package manifests, etc.)
 /// This is necessary because Windows uses backslashes but these config files expect forward slashes.
 fn normalize_path_for_config(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
@@ -131,7 +131,7 @@ pub struct FontRegistrationTemplateEntry {
 }
 
 /// What the launch screen staged into the Apple asset catalog contains, so
-/// the generated Xcode project names only the assets that exist.
+/// the generated Apple scaffold names only the assets that exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchTemplateEntry {
     /// A `LaunchBackground` color set was staged (a background is configured).
@@ -853,7 +853,7 @@ impl TemplateContext {
     }
 
     /// The path to the local Apple backend checkout `[backends.apple]`
-    /// `backend_path` names, resolved from the Xcode project's directory.
+    /// `backend_path` names, resolved from the generated project's directory.
     /// `None` consumes the remote Swift package instead.
     ///
     /// Without a manifest override, `waterui_path/backends/apple` is used when
