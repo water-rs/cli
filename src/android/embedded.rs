@@ -21,9 +21,7 @@ use tracing::info;
 use crate::{
     android::{
         backend::AndroidBackend,
-        platform::{
-            AndroidAbi, AndroidPlatform, generate_font_registration_kotlin, run_gradle_tasks,
-        },
+        platform::{AndroidAbi, AndroidPlatform, run_gradle_tasks},
     },
     assets,
     build::{BuildOptions, BuiltTarget},
@@ -164,20 +162,11 @@ async fn stage_embedded_assets(
     resolved_fonts.extend(assets::scan_project_font_assets(&manifest)?);
 
     if !resolved_fonts.is_empty() {
-        assets::copy_fonts(&resolved_fonts, &assets_dir.join("fonts")).await?;
+        let fonts_dest = assets_dir.join("fonts");
+        assets::copy_fonts(&resolved_fonts, &fonts_dest).await?;
+        assets::write_font_manifest(&resolved_fonts, &fonts_dest, None).await?;
         info!("Copied {} fonts to embedded module", resolved_fonts.len());
     }
-
-    let namespace = format!(
-        "{}.waterui",
-        project.bundle_identifier().android_package_name()
-    );
-    generate_font_registration_kotlin(
-        &namespace,
-        &resolved_fonts,
-        &module_dir.join("src/main/java"),
-    )
-    .await?;
 
     Ok(())
 }

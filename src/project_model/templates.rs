@@ -2263,7 +2263,7 @@ mod tests {
         assert!(application.contains("if (runtime.generation != generation) return false"));
         assert!(application.contains("return application.releaseRuntime(generation)"));
         assert!(application.contains("Application(), WaterUiRuntimeOwner"));
-        assert!(application.contains("processEnvironment = WuiEnvironment.create()"));
+        assert!(application.contains("processEnvironment = WuiEnvironment.create(waterUiFonts)"));
         assert!(application.contains("createWaterUiEnvironment(): WuiEnvironment"));
         assert!(application.contains("}.clone()"));
 
