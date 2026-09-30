@@ -127,16 +127,20 @@ pub async fn package_binary_as_app(
     Ok(app_dir)
 }
 
-/// Signs a local macOS app bundle with an installed development identity.
+/// Signs a local macOS app bundle, preferring an installed development
+/// identity and falling back to ad-hoc signing when none exists.
 ///
-/// Apps declaring protected-resource usage descriptions require a stable
-/// identity so macOS can persist privacy grants across local rebuilds. Apps
-/// without protected resources use ad-hoc signing when no identity is installed.
+/// TCC records privacy grants against the code signature: an installed
+/// identity keeps grants valid across rebuilds, while an ad-hoc signature
+/// changes with every build and re-prompts. Apps declaring protected-resource
+/// usage descriptions therefore use the first installed identity when one is
+/// available; without one they are still signed ad hoc — the OS accepts it,
+/// only grant persistence is lost.
 ///
 /// # Errors
 ///
-/// Returns an error when a protected-resource app has no development identity,
-/// or when `security`/`codesign` cannot inspect or sign the assembled bundle.
+/// Returns an error when `security`/`codesign` cannot inspect or sign the
+/// assembled bundle.
 #[cfg(target_os = "macos")]
 pub async fn sign_macos_app(
     app_path: &Path,
@@ -154,11 +158,16 @@ pub async fn sign_macos_app(
     )
     .await?;
     let identity = if requires_stable_identity {
-        first_codesigning_identity(&identities).ok_or_else(|| {
-            eyre::eyre!(
-                "macOS apps using protected resources require an installed code-signing identity"
-            )
-        })?
+        first_codesigning_identity(&identities).map_or_else(
+            || {
+                tracing::warn!(
+                    "no code-signing identity installed; signing ad hoc — \
+                     privacy grants will be requested again after every rebuild"
+                );
+                "-"
+            },
+            |identity| identity,
+        )
     } else {
         "-"
     };
