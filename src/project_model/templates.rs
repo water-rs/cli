@@ -302,6 +302,15 @@ pub struct TemplateContext {
     /// `[backends.apple] backend_path` — a local Apple backend checkout that
     /// replaces the remote Swift package reference.
     pub apple_backend_path: Option<PathBuf>,
+    /// The generated ffi companion's package name as a crate identifier —
+    /// the entry-owning bin references it so rustc keeps the library's rlib
+    /// on the link line for the Swift seam's callbacks.
+    pub ffi_crate_name: Option<CrateName>,
+    /// Whether the project selected the Apple backend for this invocation —
+    /// the ffi companion only depends on `waterui-apple` and declares its
+    /// entry-owning bin when this is set, so an Android-only build never
+    /// resolves the Apple backend crate.
+    pub apple_backend_selected: bool,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
     /// Persisted framework source and native backend revisions.
@@ -364,6 +373,8 @@ impl TemplateContext {
             author: options.author.clone(),
             android_backend_path: None,
             apple_backend_path: None,
+            ffi_crate_name: None,
+            apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -405,6 +416,8 @@ impl TemplateContext {
             apple_backend_path: apple
                 .and_then(|backend| backend.backend_path.as_deref())
                 .map(PathBuf::from),
+            ffi_crate_name: None,
+            apple_backend_selected: apple.is_some(),
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -453,6 +466,8 @@ impl TemplateContext {
             author: String::new(),
             android_backend_path: None,
             apple_backend_path: None,
+            ffi_crate_name: None,
+            apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -490,6 +505,23 @@ impl TemplateContext {
     #[must_use]
     pub fn with_project_root_path(mut self, path: PathBuf) -> Self {
         self.project_root_path = Some(path);
+        self
+    }
+
+    /// Set the ffi companion's package name — the entry-owning bin names
+    /// the library through it so rustc keeps its rlib on the link line.
+    #[must_use]
+    pub fn with_ffi_crate_name(mut self, name: CrateName) -> Self {
+        self.ffi_crate_name = Some(name);
+        self
+    }
+
+    /// Set whether the project selected the Apple backend — the ffi
+    /// companion only emits its `waterui-apple` dependency and entry-owning
+    /// bin when this is set.
+    #[must_use]
+    pub const fn with_apple_backend_selected(mut self, selected: bool) -> Self {
+        self.apple_backend_selected = selected;
         self
     }
 
@@ -1267,6 +1299,8 @@ mod tests {
             author: String::new(),
             android_backend_path: None,
             apple_backend_path: None,
+            apple_backend_selected: true,
+            ffi_crate_name: None,
             waterui_path,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
@@ -2677,6 +2711,46 @@ mod tests {
         let helper = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-cef-helper.rs"))
             .expect("CEF helper source should be written");
         assert!(helper.contains("waterui_cef_run_packaged_subprocess"));
+    }
+
+    #[test]
+    fn ffi_scaffold_without_apple_backend_emits_no_apple_dependency() {
+        let tempdir = tempdir().expect("temporary ffi scaffold dir");
+        let ffi_dir = tempdir.path().join("managed_backends/ffi");
+        let ctx = project_ctx()
+            .with_backend_project_path(ffi_dir.clone())
+            .with_project_root_path(tempdir.path().to_path_buf())
+            .with_apple_backend_selected(false);
+
+        smol::block_on(crate::templates::ffi::scaffold(
+            &ffi_dir,
+            &ctx,
+            "android-ffi",
+        ))
+        .expect("Android-only ffi scaffold should succeed");
+
+        let manifest = std::fs::read_to_string(ffi_dir.join("Cargo.toml"))
+            .expect("ffi Cargo.toml should be written")
+            .parse::<toml::Table>()
+            .expect("ffi Cargo.toml should parse");
+        assert!(
+            manifest["dependencies"].get("waterui-apple").is_none(),
+            "an Android-only ffi companion must not depend on waterui-apple"
+        );
+        assert!(
+            manifest
+                .get("bin")
+                .and_then(toml::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "an Android-only ffi companion declares no entry-owning binary"
+        );
+
+        let lib = std::fs::read_to_string(ffi_dir.join("src/lib.rs"))
+            .expect("ffi lib.rs should be written");
+        assert!(
+            !lib.contains("export_app"),
+            "an Android-only ffi companion must not call waterui_apple::export_app!"
+        );
     }
 
     #[test]
@@ -5558,12 +5632,16 @@ pub mod ffi {
         // Entry-owning Apple packaging installs this binary as the
         // application executable: it calls `waterui_apple::entry::run` the
         // same way `waterui_apple::export_app!` does in the library, which
-        // keeps its own expansion for the embedding path.
-        manifest.bin.push(Product {
-            name: Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME.to_string()),
-            path: Some("src/bin/waterui-apple-main.rs".to_string()),
-            ..Default::default()
-        });
+        // keeps its own expansion for the embedding path. The companion is
+        // scaffolded for Android projects too, so the bin only exists when
+        // the Apple backend was actually selected.
+        if ctx.apple_backend_selected {
+            manifest.bin.push(Product {
+                name: Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME.to_string()),
+                path: Some("src/bin/waterui-apple-main.rs".to_string()),
+                ..Default::default()
+            });
+        }
         if ctx.cef_runtime_enabled() {
             manifest.bin.push(Product {
                 name: Some(crate::project_model::project_types::cef_helper_binary_name(
@@ -5617,12 +5695,16 @@ pub mod ffi {
         // `waterui_apple::export_app!`. It does not live in the `WaterUI`
         // workspace, so it resolves against the Apple backend checkout the
         // project already uses — never the framework registry source the
-        // loop above applies.
-        let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
-        manifest.dependencies.insert(
-            "waterui-apple".to_string(),
-            Dependency::Detailed(Box::new(waterui_apple)),
-        );
+        // loop above applies. Only a project that selected the Apple
+        // backend depends on it: an Android-only build never resolves,
+        // fetches, or compiles `waterui-apple`.
+        if ctx.apple_backend_selected {
+            let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
+            manifest.dependencies.insert(
+                "waterui-apple".to_string(),
+                Dependency::Detailed(Box::new(waterui_apple)),
+            );
+        }
         manifest.patch = match ctx.waterui_workspace_root() {
             Some(root) => {
                 smol::unblock(move || super::collect_framework_checkout_patches(&root)).await?

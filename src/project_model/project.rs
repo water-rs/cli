@@ -1142,7 +1142,8 @@ impl Project {
         .with_project_root_path(self.root.clone())
         .with_webview_enabled(webview_enabled)
         .with_chromium_enabled(chromium_enabled)
-        .with_browser_engine(browser_engine);
+        .with_browser_engine(browser_engine)
+        .with_ffi_crate_name(self.ffi_crate_name());
 
         templates::ffi::scaffold(&self.ffi_crate_path(), &ctx, &self.ffi_crate_name())
             .await

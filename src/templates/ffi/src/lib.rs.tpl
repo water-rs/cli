@@ -3,9 +3,11 @@
 use waterui::app::App;
 use waterui::env::Environment;
 
-fn app(env: Environment) -> App {
+pub fn app(env: Environment) -> App {
     {{ ctx.crate_name_ident() }}::app(env)
 }
 
 waterui_ffi::export!();
+{% if ctx.apple_backend_selected %}
 waterui_apple::export_app!(app);
+{% endif %}
