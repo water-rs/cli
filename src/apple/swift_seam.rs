@@ -183,8 +183,13 @@ fn swift_target_triple(
         TargetPlatform::VisionOSSimulator => ("xros", true),
         platform => bail!("Platform {platform:?} is not an Apple platform"),
     };
+    let arch = match platform.triple().architecture {
+        target_lexicon::Architecture::Aarch64(_) => "arm64",
+        target_lexicon::Architecture::X86_64 => "x86_64",
+        arch => bail!("Apple packaging does not support the {arch} architecture"),
+    };
     let suffix = if simulator { "-simulator" } else { "" };
-    Ok(format!("arm64-apple-{os}{deployment_target}{suffix}").into())
+    Ok(format!("{arch}-apple-{os}{deployment_target}{suffix}").into())
 }
 
 #[cfg(target_os = "macos")]
