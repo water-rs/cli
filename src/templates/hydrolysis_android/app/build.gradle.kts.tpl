@@ -111,12 +111,12 @@ tasks.matching { it.name.startsWith("merge") && it.name.contains("JniLibFolders"
 
 android {
     namespace = "{{ ctx.android_package_name() }}"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "{{ ctx.bundle_identifier }}"
         minSdk = {{ ctx.hydrolysis_android_min_api_level() }}
-        targetSdk = 36
+        targetSdk = 37
         versionCode = 1
         versionName = "1.0"
 
@@ -164,5 +164,5 @@ dependencies {
     // The launch screen: the platform SplashScreen API on 31+, backported below.
     implementation("androidx.core:core-splashscreen:1.2.0")
     // `MainActivity` extends `HydrolysisActivity`, a ComponentActivity.
-    implementation("androidx.activity:activity:1.11.0")
+    implementation("androidx.activity:activity-ktx:1.13.0")
 }

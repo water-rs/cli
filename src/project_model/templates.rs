@@ -4951,7 +4951,12 @@ pub mod hydrolysis {
 /// `<backend>/android` beside the launcher crate `templates::hydrolysis`
 /// scaffolds.
 pub mod hydrolysis_android {
-    use super::{Path, PathBuf, TemplateContext, TemplateNamespace, embedded, io, scaffold_dir};
+    use crate::android::toolchain::AndroidSdk;
+
+    use super::{
+        Path, PathBuf, TemplateContext, TemplateNamespace, embedded, fs, io,
+        normalize_path_for_config, scaffold_dir, write_file_if_changed,
+    };
 
     /// Write all Hydrolysis Android app templates to the given directory.
     ///
@@ -4965,7 +4970,35 @@ pub mod hydrolysis_android {
             base_dir,
             ctx,
         )
-        .await
+        .await?;
+        scaffold_dir(
+            TemplateNamespace::AndroidShared,
+            &embedded::ANDROID_SHARED,
+            base_dir,
+            ctx,
+        )
+        .await?;
+
+        // Make gradlew executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let gradlew_path = base_dir.join("gradlew");
+            if gradlew_path.exists() {
+                let mut perms = fs::metadata(&gradlew_path).await?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&gradlew_path, perms).await?;
+            }
+        }
+
+        // Generate local.properties with Android SDK path
+        if let Some(sdk_path) = AndroidSdk::detect_path(&crate::toolchain::Host::current()) {
+            let local_props = base_dir.join("local.properties");
+            let content = format!("sdk.dir={}\n", normalize_path_for_config(&sdk_path));
+            write_file_if_changed(&local_props, content.as_bytes()).await?;
+        }
+
+        Ok(())
     }
 
     /// Every file `scaffold` would write, as backend-relative path and
@@ -4975,11 +5008,17 @@ pub mod hydrolysis_android {
     ///
     /// Returns an error if template rendering fails.
     pub fn rendered_outputs(ctx: &TemplateContext) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
-        super::render_dir_outputs(
+        let mut outputs = super::render_dir_outputs(
             TemplateNamespace::HydrolysisAndroid,
             &embedded::HYDROLYSIS_ANDROID,
             ctx,
-        )
+        )?;
+        outputs.extend(super::render_dir_outputs(
+            TemplateNamespace::AndroidShared,
+            &embedded::ANDROID_SHARED,
+            ctx,
+        )?);
+        Ok(outputs)
     }
 }
 
