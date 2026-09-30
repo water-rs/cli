@@ -4966,8 +4966,8 @@ pub mod hydrolysis_android {
     use crate::android::toolchain::AndroidSdk;
 
     use super::{
-        Path, PathBuf, TemplateContext, TemplateNamespace, embedded, fs, io,
-        normalize_path_for_config, scaffold_dir, write_file_if_changed,
+        Path, PathBuf, TemplateContext, TemplateNamespace, embedded, io, normalize_path_for_config,
+        scaffold_dir, write_file_if_changed,
     };
 
     /// Write all Hydrolysis Android app templates to the given directory.
@@ -4994,6 +4994,7 @@ pub mod hydrolysis_android {
         // Make gradlew executable
         #[cfg(unix)]
         {
+            use super::fs;
             use std::os::unix::fs::PermissionsExt;
             let gradlew_path = base_dir.join("gradlew");
             if gradlew_path.exists() {
