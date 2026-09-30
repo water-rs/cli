@@ -208,6 +208,11 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let managed_backends = ManagedBackends::for_platform(lib_platform(args.platform));
     let project = Project::open(&project_path, managed_backends).await?;
+    if project.manifest().package.embedded {
+        bail!(
+            "`water package` does not apply to embedded projects: `water build --platform android` already produces the host-consumable artifact"
+        );
+    }
     let backend = resolve_backend(args.platform, args.backend)?;
 
     validate_arch_args(backend, &args.arch)?;

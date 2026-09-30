@@ -178,6 +178,7 @@ mod tests {
             bundle_identifier: BundleIdentifier::try_from("dev.waterui.demo").unwrap(),
             assets_path: "assets".to_string(),
             accessory: false,
+            embedded: false,
         });
         let ctx = TemplateContext::for_project_manifest(
             &manifest,
@@ -214,6 +215,7 @@ mod tests {
             bundle_identifier: BundleIdentifier::try_from("dev.waterui.demo").unwrap(),
             assets_path: "assets".to_string(),
             accessory: false,
+            embedded: false,
         });
         let ctx = TemplateContext::for_project_manifest(
             &manifest,

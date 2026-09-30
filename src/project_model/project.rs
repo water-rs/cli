@@ -1300,6 +1300,7 @@ impl Project {
                 bundle_identifier: options.bundle_identifier.clone(),
                 assets_path,
                 accessory: false,
+                embedded: false,
             },
             backends: Backends::default(),
             waterui_path: options
@@ -2200,6 +2201,14 @@ pub struct Package {
     /// Whether to build as an accessory (headless) app on macOS.
     #[serde(default, skip_serializing_if = "is_false")]
     pub accessory: bool,
+    /// Whether the crate is embedded into a host application rather than
+    /// owning the app entry itself.
+    ///
+    /// An embedded crate is a library: `water build` produces the artifact the
+    /// host's build system consumes (an AAR on Android) instead of a runnable
+    /// app, and `water run`/`water package` refuse.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub embedded: bool,
 }
 
 /// Reads the `package.name` of a project's `Cargo.toml` — the crate name the
@@ -2378,6 +2387,7 @@ mod channel_tests {
                 bundle_identifier,
                 assets_path: default_assets_path(),
                 accessory: false,
+                embedded: false,
             });
             manifest.waterui_path = Some("../framework".into());
             manifest.save(&project_root).await.unwrap();
@@ -3002,6 +3012,72 @@ mod local_patch_tests {
         assert_eq!(
             std::fs::read_to_string(&cargo_path).expect("manifest after the refusal"),
             manifest
+        );
+    }
+}
+
+#[cfg(test)]
+mod embedded_declaration_tests {
+    use super::Manifest;
+
+    fn parse(toml: &str) -> Manifest {
+        toml::from_str(toml).expect("manifest parses")
+    }
+
+    /// `[package] embedded = true` declares the crate a library a host app
+    /// embeds (water-rs/cli#223); absent the key the crate owns the app
+    /// entry as before.
+    #[test]
+    fn embedded_defaults_to_the_entry_owning_mode() {
+        let manifest = parse(
+            r#"
+                [package]
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+            "#,
+        );
+        assert!(!manifest.package.embedded);
+
+        let embedded = parse(
+            r#"
+                [package]
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+                embedded = true
+            "#,
+        );
+        assert!(embedded.package.embedded);
+    }
+
+    /// `embedded` serializes back out only when set — `Water.toml` stays
+    /// quiet about the default.
+    #[test]
+    fn embedded_serializes_only_when_true() {
+        let manifest = parse(
+            r#"
+                [package]
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+            "#,
+        );
+        assert!(
+            !toml::to_string(&manifest.package)
+                .expect("package serializes")
+                .contains("embedded")
+        );
+
+        let embedded = parse(
+            r#"
+                [package]
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+                embedded = true
+            "#,
+        );
+        assert!(
+            toml::to_string(&embedded.package)
+                .expect("package serializes")
+                .contains("embedded = true")
         );
     }
 }

@@ -10,10 +10,13 @@ use target_lexicon::{
 
 use super::TargetBackend;
 use crate::shell::Shell;
-use crate::{error, header, success};
+use crate::{error, header, line, success};
 use waterui_cli::toolchain_checks;
 use waterui_cli::{
-    android::platform::{AndroidAbi, AndroidPlatform},
+    android::{
+        embedded,
+        platform::{AndroidAbi, AndroidPlatform},
+    },
     apple::{platform::build_rust_lib, toolchain::AppleSdk},
     build::{BuildOptions, BuildProfile, BuiltTarget},
     esp32::platform::build_esp32,
@@ -130,10 +133,92 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         context.backend,
         args.release,
     );
+
+    if context.project.manifest().package.embedded {
+        return run_embedded_build(shell, &args, &context).await;
+    }
+
     check_build_toolchain(shell, args.platform, context.backend, args.arch).await?;
     let result = execute_build(shell, &args, &context).await;
 
     handle_build_result(shell, result, args.output_dir)
+}
+
+/// `water build` on an embedded project produces the artifact the host
+/// application consumes — the Android AAR — rather than a runnable binary.
+///
+/// The AAR carries every ABI unless `--arch` narrows the set, lands at
+/// `target/package/` inside the project, and is published to `mavenLocal`
+/// under `<bundle_identifier>:<crate_name>:<crate_version>` so the host's
+/// Gradle build picks up every rerun (water-rs/cli#223).
+async fn run_embedded_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<()> {
+    if args.output_dir.is_some() {
+        bail!(
+            "--output-dir does not apply to embedded projects: the AAR lands at target/package/ and publishes to mavenLocal"
+        );
+    }
+    if args.platform != TargetPlatform::Android {
+        bail!(
+            "embedded projects only support --platform android: the embedded artifact is an Android AAR"
+        );
+    }
+
+    let abis: Vec<AndroidAbi> = args.arch.map_or_else(
+        || embedded::ALL_ABIS.to_vec(),
+        |arch| vec![android_abi(arch)],
+    );
+
+    let spinner = shell.spinner("Checking toolchain...");
+    toolchain_checks::check_android_build_or_package_for_abis(
+        &waterui_cli::toolchain::Host::current(),
+        &abis,
+    )
+    .await?;
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+    success!(shell, "Toolchain ready");
+
+    let spinner = shell.spinner("Compiling...");
+    let result = shell
+        .display_output(embedded::build_aar(
+            &context.project,
+            &context.build_options,
+            &abis,
+        ))
+        .await;
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+
+    match result {
+        Ok(artifact) => {
+            success!(
+                shell,
+                "Embedded artifact at {}",
+                artifact.aar_path.display()
+            );
+            success!(shell, "Published to mavenLocal as {}", artifact.coordinate);
+            line!(shell, "In the host Gradle project, add:");
+            line!(shell, "    mavenLocal() to repositories");
+            line!(
+                shell,
+                "    implementation(\"{}\") to dependencies",
+                artifact.coordinate
+            );
+            line!(
+                shell,
+                "then mount the WaterUI root with WaterUiEmbedding + WaterUiRootView:"
+            );
+            line!(shell, "    val waterui = WaterUiEmbedding(this)");
+            line!(shell, "    setContentView(WaterUiRootView(this, waterui))");
+            Ok(())
+        }
+        Err(err) => {
+            error!(shell, "Build failed: {err}");
+            Err(err)
+        }
+    }
 }
 
 async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<BuildContext>> {
