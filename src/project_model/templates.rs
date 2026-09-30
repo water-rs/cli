@@ -522,6 +522,20 @@ impl TemplateContext {
         self.crate_name.rust_ident()
     }
 
+    /// The generated ffi companion crate's Rust identifier — the crate the
+    /// Apple entry binary imports `waterui_apple_main` from.
+    #[must_use]
+    pub fn ffi_crate_ident(&self) -> RustIdent {
+        crate::project_model::project_types::generated_crate_name(
+            &self.crate_name,
+            "ffi",
+            self.project_root_path
+                .as_deref()
+                .expect("ffi crate ident is rendered for a project"),
+        )
+        .rust_ident()
+    }
+
     #[must_use]
     pub fn android_package_name(&self) -> String {
         self.bundle_identifier.android_package_name().to_string()
@@ -2549,10 +2563,10 @@ mod tests {
             .map(|value| value.as_str().expect("crate type should be a string"))
             .collect::<Vec<_>>();
 
-        // Apple links the staticlib, Android loads the cdylib, and the
-        // entry-owning `waterui-apple-main` bin binds its externs through
-        // the staticlib — never the rlib, which would duplicate every
-        // exported symbol in the executable image.
+        // Apple embedders link the staticlib, Android loads the cdylib, and
+        // the entry-owning `waterui-apple-main` bin imports the companion
+        // crate through the rlib — the dependency that carries both its
+        // exports and its `#[link]` native declarations into the executable.
         assert_eq!(crate_types, ["staticlib", "cdylib", "rlib"]);
     }
 

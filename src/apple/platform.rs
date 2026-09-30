@@ -254,13 +254,14 @@ pub async fn build_rust_lib(
     }
 
     // The Swift seam's callbacks into the app (`_waterui_init`,
-    // `_waterui_app`) resolve inside the one image. Which artifact supplies
-    // them depends on the linkage: a static build links the whole crate as
-    // `libwaterui_app.a`, while a shared-runtime build re-threads the crate's
-    // `rlib` after the seam archive — a second `libwaterui_app.dylib` would
-    // register every ObjC class twice — because ld scans archives once,
-    // left to right, so the seam's references arrive after the crate's own
-    // slot in the link line.
+    // `_waterui_app`) and every `waterui_*` export resolve inside the one
+    // image through the entry binary's own lib dependency: the bin uses the
+    // companion crate, so Cargo threads its rlib into this link as crate
+    // metadata — which also carries the `#[link]` native dependencies the
+    // graph declares (frameworks like MapKit that a bare archive input
+    // would silently drop). A second `libwaterui_app.dylib` would register
+    // every ObjC class twice, so the shared-runtime build takes the crate's
+    // objects from that same rlib rather than a dylib of its own.
     let staged_dir = options.output_dir().map(PathBuf::from);
     let deps_dir = target_dir
         .join(&target)
@@ -274,29 +275,12 @@ pub async fn build_rust_lib(
         "lib{}.rlib",
         project.ffi_crate_name().as_str().replace('-', "_")
     ));
-    let app_module = if host_library == AppleHostLibrary::Dynamic {
-        // Same duplicate-symbol concern as the archive path: the rlib's
-        // codegen units also export `rust_eh_personality`. The copy lives
-        // in the build dir and is only consumed by this link, so localize
-        // it in place.
+    if host_library == AppleHostLibrary::Dynamic {
+        // The rlib's codegen units also export `rust_eh_personality`. The
+        // copy lives in the build dir and is only consumed by this link, so
+        // localize it in place.
         localize_archive_symbols(&ffi_rlib, &["rust_eh_personality"]).await?;
-        ffi_rlib
-    } else {
-        let archive = staged_dir.clone().map_or_else(
-            || built_target.artifact.clone(),
-            |dir| dir.join(host_library.linked_file_name()),
-        );
-        // `rust_eh_personality` rides in every unwind codegen unit — the
-        // archive's merged unit exports it next to the app symbols the seam
-        // needs while the bin's own units emit it too. Localize a copy for
-        // the executable's link so each symbol still comes from one
-        // artifact; the staged library keeps the export — embedding hosts
-        // have no other supplier for it.
-        let entry_archive = deps_dir.join(format!("lib{}_entry.a", project.ffi_crate_name()));
-        copy_file(&archive, &entry_archive).await?;
-        localize_archive_symbols(&entry_archive, &["rust_eh_personality"]).await?;
-        entry_archive
-    };
+    }
 
     let mut executable = build
         .clone()
@@ -306,8 +290,7 @@ pub async fn build_rust_lib(
         .with_final_rustc_arg("-Clink-arg=-framework")
         .with_final_rustc_arg("-Clink-arg=VideoToolbox")
         .with_final_rustc_arg(link_search_flag(&seam_library_dir))
-        .with_final_rustc_arg("-Clink-arg=-lWaterUISwift")
-        .with_final_rustc_arg(link_file_arg(&app_module));
+        .with_final_rustc_arg("-Clink-arg=-lWaterUISwift");
 
     // The companion archive's Swift-compiled objects reference clang
     // builtins (`__isPlatformVersionAtLeast` & friends) that resolve
@@ -378,12 +361,6 @@ async fn apple_swift_defines(project: &Project) -> eyre::Result<Vec<String>> {
 fn link_search_flag(dir: &OsStr) -> String {
     let mut flag = OsString::from("-Clink-arg=-L");
     flag.push(dir);
-    flag.to_string_lossy().into_owned()
-}
-
-fn link_file_arg(path: &Path) -> String {
-    let mut flag = OsString::from("-Clink-arg=");
-    flag.push(path.as_os_str());
     flag.to_string_lossy().into_owned()
 }
 
