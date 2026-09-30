@@ -200,7 +200,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.distribution,
     );
     check_packaging_toolchain(shell, args.platform, context.backend, &args.arch).await?;
-    let built = build_packaging_artifacts(shell, &args, &context).await?;
+    let built = Box::pin(build_packaging_artifacts(shell, &args, &context)).await?;
     package_artifact(shell, &args, &context, built.as_ref()).await
 }
 
@@ -298,12 +298,12 @@ async fn build_packaging_artifacts(
             .await
         }
         TargetBackend::Apple => {
-            build_apple_packaging_artifacts(
+            Box::pin(build_apple_packaging_artifacts(
                 shell,
                 &context.project,
                 args.platform,
                 context.build_options.clone(),
-            )
+            ))
             .await
         }
         TargetBackend::Gtk4 => {
@@ -357,11 +357,11 @@ async fn build_apple_packaging_artifacts(
 ) -> Result<Option<BuiltTarget>> {
     let spinner = shell.spinner("Building Rust library...");
     let built = shell
-        .display_output(build_rust_lib(
+        .display_output(Box::pin(build_rust_lib(
             project,
             lib_platform(platform),
             build_options,
-        ))
+        )))
         .await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
