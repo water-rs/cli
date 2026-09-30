@@ -362,7 +362,14 @@ fn build_main_manifest(project: &Project) -> eyre::Result<BundleManifest> {
 fn plan_main_assets(project: &Project) -> eyre::Result<Vec<PlannedAsset>> {
     let assets_dir = project.assets_dir();
     if assets_dir.is_dir() {
-        Ok(plan_mount(&assets_dir, "")?)
+        // `water create` writes `assets/README.md` to document the asset
+        // workflow — documentation, not an asset, so it never ships inside
+        // a packaged artifact. Bundles mounted with `include_bundle!` are
+        // declared wholesale and keep every file they name.
+        Ok(plan_mount(&assets_dir, "")?
+            .into_iter()
+            .filter(|asset| asset.logical_path != Path::new("README.md"))
+            .collect())
     } else {
         Ok(Vec::new())
     }
@@ -1091,7 +1098,49 @@ async fn write_png(image: &image::RgbaImage, path: &Path) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ManagedBackends;
     use waterui_assets_planner::LaunchConfig;
+
+    #[test]
+    fn the_scaffold_assets_readme_never_ships() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let root = tempdir.path().join("fixture");
+            std::fs::create_dir_all(root.join("src")).expect("src");
+            std::fs::create_dir_all(root.join("assets")).expect("assets");
+            std::fs::write(
+                root.join("Water.toml"),
+                "[package]\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
+            )
+            .expect("Water.toml");
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .expect("Cargo.toml");
+            std::fs::write(
+                root.join("Cargo.lock"),
+                "version = 4\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            )
+            .expect("Cargo.lock");
+            std::fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+            std::fs::write(root.join("assets/README.md"), "# Assets\n").expect("readme");
+            std::fs::write(root.join("assets/note.txt"), "hello").expect("asset");
+
+            let project = Project::open(&root, ManagedBackends::NONE)
+                .await
+                .expect("fixture project opens");
+            let assets = plan_main_assets(&project).expect("assets plan");
+            assert_eq!(
+                assets
+                    .iter()
+                    .map(|asset| asset.logical_path.as_path())
+                    .collect::<Vec<_>>(),
+                [Path::new("note.txt")],
+                "the scaffold README stays out of the package"
+            );
+        });
+    }
 
     #[test]
     fn android_icon_resources_write_launcher_pngs() {
