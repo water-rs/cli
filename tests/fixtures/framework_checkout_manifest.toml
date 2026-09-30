@@ -14,6 +14,9 @@ apple-backend-url = "https://github.com/water-rs/apple-backend.git"
 apple-backend-version = "0.3.0-dev.2"
 android-backend-url = "https://github.com/water-rs/android-backend.git"
 android-backend-revision = "cccccccccccccccccccccccccccccccccccccccc"
+hydrolysis-android-host-url = "https://github.com/water-rs/hydrolysis.git"
+hydrolysis-android-host-revision = "dddddddddddddddddddddddddddddddddddddddd"
+hydrolysis-android-host-subdirectory = "android"
 scaffold-packages = ["hydrolysis", "hydrolysis-m3", "waterui-dew", "waterui-gtk", "waterui-winui"]
 
 [workspace.dependencies]
