@@ -135,7 +135,10 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     );
 
     if context.project.manifest().package.embedded {
-        return run_embedded_build(shell, &args, &context).await;
+        // The embedded build's toolchain check and AAR compile futures cross
+        // clippy's `large_futures` threshold (16 KiB) on Windows, so the future
+        // is pinned on the heap instead of the caller's stack.
+        return Box::pin(run_embedded_build(shell, &args, &context)).await;
     }
 
     check_build_toolchain(shell, args.platform, context.backend, args.arch).await?;
@@ -180,13 +183,12 @@ async fn run_embedded_build(shell: &Shell, args: &Args, context: &BuildContext) 
     success!(shell, "Toolchain ready");
 
     let spinner = shell.spinner("Compiling...");
-    let result = shell
-        .display_output(embedded::build_aar(
-            &context.project,
-            &context.build_options,
-            &abis,
-        ))
-        .await;
+    let result = Box::pin(shell.display_output(embedded::build_aar(
+        &context.project,
+        &context.build_options,
+        &abis,
+    )))
+    .await;
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }

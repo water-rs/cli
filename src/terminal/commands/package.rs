@@ -210,7 +210,9 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.distribution,
     );
     check_packaging_toolchain(shell, args.platform, context.backend, &args.arch).await?;
-    let built = build_packaging_artifacts(shell, &args, &context).await?;
+    // The per-backend artifact builds cross clippy's `large_futures` threshold
+    // (16 KiB) on Windows, so the future is pinned on the heap.
+    let built = Box::pin(build_packaging_artifacts(shell, &args, &context)).await?;
     package_artifact(shell, &args, &context, built.as_ref()).await
 }
 
