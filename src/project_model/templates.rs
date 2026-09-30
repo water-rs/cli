@@ -241,6 +241,11 @@ pub struct HydrolysisAndroidTemplateEntry {
     /// The Gradle project inside the pinned host checkout, relative to the
     /// generated `android/` directory (e.g. `../android-host/<rev>/android`).
     pub host_project_dir: String,
+    /// The application project root, relative to the generated `android/`
+    /// directory — Gradle tasks that invoke `water` resolve the project
+    /// against it. The shared `project_root_relative_path` diffs against the
+    /// backend dir one level up, which only the launcher crate may use.
+    pub project_root: String,
     /// The `dev.waterui.hydrolysis` painter artifact the app module links
     /// (e.g. `dev.waterui.hydrolysis:gpu`).
     pub painter_dependency: String,
@@ -605,6 +610,13 @@ impl TemplateContext {
     #[must_use]
     pub fn hydrolysis_android_host_project_dir(&self) -> &str {
         &self.hydrolysis_android_entry().host_project_dir
+    }
+
+    /// The application project root relative to the generated `android/`
+    /// directory.
+    #[must_use]
+    pub fn hydrolysis_android_project_root(&self) -> &str {
+        &self.hydrolysis_android_entry().project_root
     }
 
     /// The `dev.waterui.hydrolysis` painter artifact the app module links.

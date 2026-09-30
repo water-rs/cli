@@ -290,6 +290,13 @@ async fn template_entry(
                 android_dir.display()
             )
         })?;
+    let project_root = pathdiff::diff_paths(project.root(), &android_dir).ok_or_else(|| {
+        eyre::eyre!(
+            "cannot express the project root at {} relative to {}",
+            project.root().display(),
+            android_dir.display()
+        )
+    })?;
 
     let framework_min = project
         .resolved_framework()
@@ -300,6 +307,7 @@ async fn template_entry(
             &project.hydrolysis_backend_crate_name(),
         ),
         host_project_dir: host_project_dir.to_string_lossy().replace('\\', "/"),
+        project_root: project_root.to_string_lossy().replace('\\', "/"),
         painter_dependency: painter.gradle_dependency(),
         painter_module: painter.host_module().to_string(),
         min_api_level: framework_min.max(painter.min_api_level()),
@@ -817,6 +825,50 @@ mod tests {
             // `require_aligned_shared_libraries` — the template level only
             // needs to not defeat it.
             assert!(files.contains_key("gradlew"), "gradle wrapper ships");
+        });
+    }
+
+    /// The generated Gradle script resolves `projectRoot` against the
+    /// `android/` Gradle project dir, so the entry must carry the root
+    /// relative to that dir — the launcher crate's backend-dir-relative path
+    /// (`project_root_relative_path`) lands one `..` short and was the F2
+    /// defect. Canonicalizing the joined path must land back on the project
+    /// root, and the rendered script must use this value.
+    #[test]
+    fn the_scaffolded_project_root_resolves_against_the_android_dir() {
+        smol::block_on(async {
+            let (_temporary, project) = fixture_project("").await;
+            let android_dir = android_dir(&project.backend_path::<HydrolysisBackend>());
+            std::fs::create_dir_all(&android_dir).expect("android dir");
+            let host_project_dir = project.root().join("android-host");
+
+            let entry = template_entry(&project, HydrolysisAndroidPainter::Gpu, &host_project_dir)
+                .await
+                .expect("template entry");
+            let resolved = android_dir
+                .join(&entry.project_root)
+                .canonicalize()
+                .expect("the scaffolded projectRoot resolves");
+            assert_eq!(
+                resolved,
+                project.root().canonicalize().expect("project root"),
+                "projectRoot must resolve to the application project root"
+            );
+
+            let files = rendered_files(
+                rendered_android_outputs(
+                    &project,
+                    HydrolysisAndroidPainter::Gpu,
+                    &host_project_dir,
+                )
+                .await
+                .expect("scaffold renders"),
+            );
+            let gradle = files["app/build.gradle.kts"].as_str();
+            assert!(
+                gradle.contains(&format!("resolve(\"{}\")", entry.project_root)),
+                "the rendered projectRoot uses the android-dir-relative path: {gradle}"
+            );
         });
     }
 
