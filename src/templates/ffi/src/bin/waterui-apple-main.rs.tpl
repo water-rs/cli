@@ -7,7 +7,12 @@
 use waterui::app::App;
 use waterui::env::Environment;
 
-fn app(env: Environment) -> App {
+fn app(mut env: Environment) -> App {
+    // The realizations this backend brings run inside `entry::run`'s launch
+    // handler so `spawn_local` users such as the CEF message pump see the
+    // local executor `run` installs at startup — and they still land on the
+    // environment before the application installs its own.
+    waterui_ffi::__configure_native_realizations(&mut env);
     {{ ctx.crate_name_ident() }}::app(env)
 }
 
@@ -19,7 +24,6 @@ fn main() -> ! {
     waterui_ffi::components::platform::browser_cef::waterui_cef_prepare_macos_application();
     {% endif %}
     let mut env = waterui::configure_environment!(waterui::Environment::new());
-    waterui_ffi::__configure_native_realizations(&mut env);
     // SAFETY: this is the process's entry on the main thread, and `env`
     // lives in this frame — `run` never returns.
     unsafe {
