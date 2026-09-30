@@ -6,7 +6,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use eyre::{Context, bail};
+use eyre::{Context, bail, eyre};
 use smol::fs;
 use tracing::info;
 
@@ -24,7 +24,7 @@ use crate::{
     device::Artifact,
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
-    utils::copy_file,
+    utils::{copy_file, run_command_os},
 };
 
 /// The generated FFI crate's application binary — the `[[bin]]` target
@@ -275,12 +275,27 @@ pub async fn build_rust_lib(
         project.ffi_crate_name().as_str().replace('-', "_")
     ));
     let app_module = if host_library == AppleHostLibrary::Dynamic {
+        // Same duplicate-symbol concern as the archive path: the rlib's
+        // codegen units also export `rust_eh_personality`. The copy lives
+        // in the build dir and is only consumed by this link, so localize
+        // it in place.
+        localize_archive_symbols(&ffi_rlib, &["rust_eh_personality"]).await?;
         ffi_rlib
     } else {
-        staged_dir.clone().map_or_else(
+        let archive = staged_dir.clone().map_or_else(
             || built_target.artifact.clone(),
             |dir| dir.join(host_library.linked_file_name()),
-        )
+        );
+        // `rust_eh_personality` rides in every unwind codegen unit — the
+        // archive's merged unit exports it next to the app symbols the seam
+        // needs while the bin's own units emit it too. Localize a copy for
+        // the executable's link so each symbol still comes from one
+        // artifact; the staged library keeps the export — embedding hosts
+        // have no other supplier for it.
+        let entry_archive = deps_dir.join(format!("lib{}_entry.a", project.ffi_crate_name()));
+        copy_file(&archive, &entry_archive).await?;
+        localize_archive_symbols(&entry_archive, &["rust_eh_personality"]).await?;
+        entry_archive
     };
 
     let mut executable = build
@@ -293,6 +308,17 @@ pub async fn build_rust_lib(
         .with_final_rustc_arg(link_search_flag(&seam_library_dir))
         .with_final_rustc_arg("-Clink-arg=-lWaterUISwift")
         .with_final_rustc_arg(link_file_arg(&app_module));
+
+    // The companion archive's Swift-compiled objects reference clang
+    // builtins (`__isPlatformVersionAtLeast` & friends) that resolve
+    // against the toolchain's clang runtime — thread the one platform
+    // archive, the same supplier Xcode's own link line picks.
+    if let Some(suffix) = clang_rt_suffix(platform) {
+        let rt_dir = clang_rt_lib_dir(platform).await?;
+        executable = executable
+            .with_final_rustc_arg(link_search_flag(rt_dir.as_os_str()))
+            .with_final_rustc_arg(format!("-Clink-arg=-lclang_rt.{suffix}"));
+    }
 
     if host_library == AppleHostLibrary::Dynamic {
         let runtime_dir = staged_dir.clone().unwrap_or(deps_dir);
@@ -359,6 +385,136 @@ fn link_file_arg(path: &Path) -> String {
     let mut flag = OsString::from("-Clink-arg=");
     flag.push(path.as_os_str());
     flag.to_string_lossy().into_owned()
+}
+
+/// The platform suffix of the `libclang_rt.<suffix>.a` archive inside the
+/// Xcode toolchain — `None` for non-Apple targets.
+const fn clang_rt_suffix(platform: TargetPlatform) -> Option<&'static str> {
+    match platform {
+        TargetPlatform::MacOS => Some("osx"),
+        TargetPlatform::IOS => Some("ios"),
+        TargetPlatform::IOSSimulator => Some("iossim"),
+        TargetPlatform::TvOS => Some("tvos"),
+        TargetPlatform::TvOSSimulator => Some("tvossim"),
+        TargetPlatform::WatchOS => Some("watchos"),
+        TargetPlatform::WatchOSSimulator => Some("watchossim"),
+        TargetPlatform::VisionOS => Some("xros"),
+        TargetPlatform::VisionOSSimulator => Some("xrossim"),
+        TargetPlatform::Android
+        | TargetPlatform::Linux
+        | TargetPlatform::Windows
+        | TargetPlatform::Web
+        | TargetPlatform::Esp32S3
+        | TargetPlatform::Esp32C3
+        | TargetPlatform::Esp32P4 => None,
+    }
+}
+
+/// Turns `symbols` (C names without the Mach-O underscore) into local
+/// symbols inside every archive member that defines them as global text.
+/// The archive keeps every member — only the symbol's visibility changes —
+/// so the symbols still resolve for the member's own internal references
+/// while stopping `ld`'s duplicate-symbol diagnostics.
+#[cfg(target_os = "macos")]
+async fn localize_archive_symbols(archive: &Path, symbols: &[&str]) -> eyre::Result<()> {
+    let scratch = archive.with_extension("localize-work");
+    fs::create_dir_all(&scratch).await?;
+    let members = run_command_os(
+        "ar",
+        ["t".into(), archive.as_os_str().to_owned()].map(OsString::from),
+    )
+    .await?;
+    for member in members
+        .lines()
+        .map(str::trim)
+        .filter(|member| !member.is_empty() && *member != "__.SYMDEF")
+    {
+        let member_path = scratch.join(member);
+        run_command_os(
+            "sh",
+            [
+                OsString::from("-c"),
+                OsString::from(format!(
+                    "ar p '{}' '{}' > '{}'",
+                    archive.display(),
+                    member,
+                    member_path.display()
+                )),
+            ],
+        )
+        .await?;
+        let nm = run_command_os("nm", [member_path.as_os_str().to_owned()])
+            .await
+            .unwrap_or_default();
+        let mut args = vec![member_path.as_os_str().to_owned()];
+        let mut changed = false;
+        for symbol in symbols {
+            if nm
+                .lines()
+                .any(|line| line.contains(&format!(" T _{symbol}")))
+            {
+                args.push("-unexported_symbol".into());
+                args.push(format!("_{symbol}").into());
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        args.push("-o".into());
+        args.push(member_path.as_os_str().to_owned());
+        run_command_os("ld", std::iter::once(OsString::from("-r")).chain(args)).await?;
+        run_command_os(
+            "ar",
+            [
+                "r".into(),
+                archive.as_os_str().to_owned(),
+                member_path.as_os_str().to_owned(),
+            ]
+            .map(OsString::from),
+        )
+        .await?;
+    }
+    let _ = fs::remove_dir_all(&scratch).await;
+    Ok(())
+}
+
+/// `<toolchain>/usr/lib/clang/<ver>/lib/darwin` — resolved from the clang
+/// the platform's SDK picks (`xcrun --find clang` → `usr/bin/clang`), so a
+/// toolchain upgrade moves the versioned directory with it.
+#[cfg(target_os = "macos")]
+async fn clang_rt_lib_dir(platform: TargetPlatform) -> eyre::Result<PathBuf> {
+    use smol::stream::StreamExt as _;
+    let sdk_name = platform
+        .sdk_name()
+        .ok_or_else(|| eyre!("Platform {platform:?} is not an Apple platform"))?;
+    let clang = run_command_os(
+        "xcrun",
+        ["--sdk", sdk_name, "--find", "clang"].map(OsString::from),
+    )
+    .await
+    .map(|stdout| PathBuf::from(stdout.trim()))
+    .wrap_err("xcrun could not resolve clang")?;
+    let usr_dir = clang.parent().and_then(Path::parent).ok_or_else(|| {
+        eyre!(
+            "xcrun resolved clang outside a toolchain: {}",
+            clang.display()
+        )
+    })?;
+    // `usr/lib/clang/<version>/lib/darwin` — the toolchain carries exactly
+    // one versioned directory.
+    let clang_lib = usr_dir.join("lib/clang");
+    let mut entries = fs::read_dir(&clang_lib).await?;
+    while let Some(entry) = entries.next().await {
+        let darwin = entry?.path().join("lib/darwin");
+        if darwin.is_dir() {
+            return Ok(darwin);
+        }
+    }
+    bail!(
+        "Xcode toolchain at {} has no lib/clang/<ver>/lib/darwin",
+        clang_lib.display()
+    )
 }
 
 /// Compile the backend's Swift seam into `DerivedData/SwiftSeam` and return

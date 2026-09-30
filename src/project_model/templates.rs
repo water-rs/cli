@@ -2550,8 +2550,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Apple links the staticlib, Android loads the cdylib, and the
-        // entry-owning `waterui-apple-main` bin consumes the rlib so its own
-        // crate dependency stays static inside the executable image.
+        // entry-owning `waterui-apple-main` bin binds its externs through
+        // the staticlib — never the rlib, which would duplicate every
+        // exported symbol in the executable image.
         assert_eq!(crate_types, ["staticlib", "cdylib", "rlib"]);
     }
 
@@ -5020,9 +5021,10 @@ pub mod ffi {
             ..Default::default()
         });
         // Entry-owning Apple packaging installs this binary as the
-        // application executable: it calls `waterui_apple::entry::run` the
-        // same way `waterui_apple::export_app!` does in the library, which
-        // keeps its own expansion for the embedding path.
+        // application executable: it calls the `waterui_apple_main` export
+        // `waterui_apple::export_app!` placed in the companion library, so
+        // every `waterui_*` symbol reaches the image from that one artifact
+        // rather than from both the staticlib and the bin's own codegen.
         manifest.bin.push(Product {
             name: Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME.to_string()),
             path: Some("src/bin/waterui-apple-main.rs".to_string()),
