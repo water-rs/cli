@@ -82,7 +82,7 @@ impl FontRegistry {
     }
 }
 const HYDROLYSIS_DEFAULT_FONT_FAMILY: &str = "Roboto";
-const HYDROLYSIS_WEB_FONT_MANIFEST_FILE_NAME: &str = "waterui-fonts.json";
+const FONT_MANIFEST_FILE_NAME: &str = "waterui-fonts.json";
 
 /// A font declaration — from `[[assets.font]]` in `Water.toml` or a crate's
 /// `[package.metadata.waterui.assets.font]` Cargo.toml metadata.
@@ -124,14 +124,19 @@ pub struct ResolvedFont {
     pub path: PathBuf,
 }
 
+/// The `waterui-fonts.json` manifest staged beside bundled font files: the
+/// declared-family → file-name map a runtime's font table loads at bootstrap.
+/// `default_family` is emitted only by the Hydrolysis web runtime, which has
+/// no system fonts to fall back on.
 #[derive(Debug, Serialize)]
-struct HydrolysisWebFontManifest {
-    default_family: String,
-    fonts: Vec<HydrolysisWebFontManifestEntry>,
+struct FontManifest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_family: Option<String>,
+    fonts: Vec<FontManifestEntry>,
 }
 
 #[derive(Debug, Serialize)]
-struct HydrolysisWebFontManifestEntry {
+struct FontManifestEntry {
     name: String,
     file_name: String,
 }
@@ -1461,40 +1466,37 @@ pub async fn stage_hydrolysis_web_fonts(
 
     let fonts_dest = site_root.join("fonts");
     copy_fonts(&resolved_fonts, &fonts_dest).await?;
-    write_hydrolysis_web_font_manifest(&resolved_fonts, &fonts_dest, &default_family).await?;
+    write_font_manifest(&resolved_fonts, &fonts_dest, Some(&default_family)).await?;
     Ok(())
 }
 
-async fn write_hydrolysis_web_font_manifest(
+/// Write `waterui-fonts.json` beside the font files `copy_fonts` staged:
+/// the declared-family → file-name map the consuming runtime loads at
+/// bootstrap (`WaterUiFontTable` on Android, `load_web_fonts` on the
+/// Hydrolysis web runtime). `default_family` is passed only for web, whose
+/// manifest carries the key.
+pub async fn write_font_manifest(
     fonts: &[ResolvedFont],
     fonts_dest: &Path,
-    default_family: &str,
+    default_family: Option<&str>,
 ) -> eyre::Result<()> {
-    let mut manifest_fonts = Vec::with_capacity(fonts.len());
-
-    for font in fonts {
-        let file_name = font
-            .path
-            .file_name()
-            .ok_or_eyre("Font path has no filename")?
-            .to_string_lossy()
-            .into_owned();
-        manifest_fonts.push(HydrolysisWebFontManifestEntry {
-            name: font.name.clone(),
-            file_name,
-        });
-    }
-
-    let manifest = HydrolysisWebFontManifest {
-        default_family: default_family.to_string(),
+    let manifest_fonts = fonts
+        .iter()
+        .map(|font| {
+            font.path
+                .file_name()
+                .ok_or_eyre("font path has no file name")
+                .map(|file_name| FontManifestEntry {
+                    name: font.name.clone(),
+                    file_name: file_name.to_string_lossy().into_owned(),
+                })
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    let payload = serde_json::to_vec_pretty(&FontManifest {
+        default_family: default_family.map(str::to_string),
         fonts: manifest_fonts,
-    };
-    let payload = serde_json::to_vec_pretty(&manifest)?;
-    fs::write(
-        fonts_dest.join(HYDROLYSIS_WEB_FONT_MANIFEST_FILE_NAME),
-        payload,
-    )
-    .await?;
+    })?;
+    fs::write(fonts_dest.join(FONT_MANIFEST_FILE_NAME), payload).await?;
     Ok(())
 }
 
@@ -2176,6 +2178,63 @@ mod tests {
             .expect("resolve should succeed")
             .expect("font should exist");
         assert_eq!(resolved, font_path.canonicalize().expect("canonical path"));
+    }
+
+    /// The manifest the Hydrolysis web runtime fetches carries
+    /// `default_family` first and one `{name, file_name}` entry per bundled
+    /// face — the writer must serialize exactly this shape, since the
+    /// runtime parses what it fetches.
+    #[test]
+    fn test_write_font_manifest_serializes_the_web_shape() {
+        let dir = tempdir().expect("temp dir");
+        let fonts = vec![
+            ResolvedFont {
+                name: "Roboto".to_string(),
+                path: dir.path().join("Roboto-Regular.ttf"),
+            },
+            ResolvedFont {
+                name: "Fixture Sans".to_string(),
+                path: dir.path().join("FixtureSans.ttf"),
+            },
+        ];
+        smol::block_on(write_font_manifest(&fonts, dir.path(), Some("Roboto")))
+            .expect("manifest writes");
+        let written =
+            std::fs::read(dir.path().join(FONT_MANIFEST_FILE_NAME)).expect("manifest file exists");
+        let expected = r#"{
+  "default_family": "Roboto",
+  "fonts": [
+    {
+      "name": "Roboto",
+      "file_name": "Roboto-Regular.ttf"
+    },
+    {
+      "name": "Fixture Sans",
+      "file_name": "FixtureSans.ttf"
+    }
+  ]
+}"#;
+        assert_eq!(written, expected.as_bytes());
+    }
+
+    /// The same writer omits `default_family` for Android, whose font table
+    /// reads only the entries.
+    #[test]
+    fn test_write_font_manifest_omits_default_family_for_android() {
+        let dir = tempdir().expect("temp dir");
+        let fonts = vec![ResolvedFont {
+            name: "DejaVuSerif".to_string(),
+            path: dir.path().join("DejaVuSerif.ttf"),
+        }];
+        smol::block_on(write_font_manifest(&fonts, dir.path(), None)).expect("manifest writes");
+        let written = std::fs::read_to_string(dir.path().join(FONT_MANIFEST_FILE_NAME))
+            .expect("manifest file exists");
+        assert!(!written.contains("default_family"), "{written}");
+        assert!(written.contains("\"name\": \"DejaVuSerif\""), "{written}");
+        assert!(
+            written.contains("\"file_name\": \"DejaVuSerif.ttf\""),
+            "{written}"
+        );
     }
 }
 

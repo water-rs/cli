@@ -121,9 +121,6 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Register custom fonts from dependencies
-        WaterUIFonts.register(this)
-
         // Bundled asset sync + the runtime's env defaults; the intent/property
         // overrides below still win by overwriting them.
         installWaterUiProcessEnvironment(this)
