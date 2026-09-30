@@ -138,7 +138,7 @@ pub fn apple_info_plist(
     if platform == TargetPlatform::MacOS {
         apply_macos_plist_entries(&mut dict, ctx, project);
     } else {
-        apply_mobile_plist_entries(&mut dict, ctx, project);
+        apply_mobile_plist_entries(&mut dict, ctx, project, deployment_target);
     }
     dict
 }
@@ -195,10 +195,17 @@ fn apply_mobile_plist_entries(
     dict: &mut plist::Dictionary,
     ctx: &TemplateContext,
     project: &Project,
+    deployment_target: &str,
 ) {
     let mut insert = |key: &str, value: plist::Value| {
         dict.insert(key.to_string(), value);
     };
+    // `MinimumOSVersion` is the floor `installd` enforces; it must not exceed
+    // the simulator runtime the bundle installs onto.
+    insert(
+        "MinimumOSVersion",
+        plist::Value::String(deployment_target.to_string()),
+    );
     insert(
         "UIDeviceFamily",
         plist::Value::Array(vec![
