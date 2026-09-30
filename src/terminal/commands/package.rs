@@ -235,7 +235,10 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
 
     validate_arch_args(args.platform, backend, &args.arch)?;
     validate_unsigned_args(args.platform, backend, args.unsigned)?;
-    validate_desktop_backend_platform_on_host(args.platform, backend)?;
+    backend
+        .cli_backend()
+        .lib_backend()
+        .validate_host_support(lib_platform(args.platform))?;
     if args.painter.is_some()
         && !(args.platform == TargetPlatform::Android && backend == TargetBackend::Hydrolysis)
     {
@@ -721,71 +724,6 @@ async fn check_toolchain_for_backend(
             toolchain_checks::check_winui(host).await?;
         }
     }
-    Ok(())
-}
-
-fn validate_desktop_backend_platform_on_host(
-    platform: TargetPlatform,
-    backend: TargetBackend,
-) -> Result<()> {
-    if platform == TargetPlatform::Web {
-        return Ok(());
-    }
-
-    match backend {
-        TargetBackend::Gtk4 => {
-            #[cfg(target_os = "linux")]
-            {
-                if platform != TargetPlatform::Linux {
-                    bail!("GTK4 backend on Linux host requires --platform linux");
-                }
-            }
-
-            #[cfg(not(target_os = "linux"))]
-            {
-                bail!("GTK4 backend is only supported on Linux hosts");
-            }
-        }
-        TargetBackend::Hydrolysis => {
-            // The Hydrolysis Android path cross-compiles from any host.
-            if platform == TargetPlatform::Android {
-                return Ok(());
-            }
-
-            #[cfg(target_os = "macos")]
-            if platform != TargetPlatform::Macos {
-                bail!("Hydrolysis backend on macOS host requires --platform macos");
-            }
-
-            #[cfg(target_os = "linux")]
-            if platform != TargetPlatform::Linux {
-                bail!("Hydrolysis backend on Linux host requires --platform linux");
-            }
-
-            #[cfg(target_os = "windows")]
-            if platform != TargetPlatform::Windows {
-                bail!("Hydrolysis backend on Windows host requires --platform windows");
-            }
-
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-            bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
-        }
-        TargetBackend::WinUi => {
-            #[cfg(target_os = "windows")]
-            if platform != TargetPlatform::Windows {
-                bail!("WinUI backend on Windows host requires --platform windows");
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            bail!("WinUI backend is only supported on Windows hosts");
-        }
-        TargetBackend::Apple => {
-            #[cfg(not(target_os = "macos"))]
-            bail!("Apple backend requires a macOS host");
-        }
-        TargetBackend::Android => {}
-    }
-
     Ok(())
 }
 

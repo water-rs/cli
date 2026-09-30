@@ -390,16 +390,20 @@ const fn managed_backends(platform: TargetPlatform, backend: TargetBackend) -> M
     if matches!(platform, TargetPlatform::Android) && matches!(backend, TargetBackend::Hydrolysis) {
         return ManagedBackends::NONE;
     }
+    ManagedBackends::for_platform(lib_platform(platform))
+}
+
+const fn lib_platform(platform: TargetPlatform) -> LibTargetPlatform {
     match platform {
-        TargetPlatform::Ios => ManagedBackends::for_platform(LibTargetPlatform::IOS),
-        TargetPlatform::Macos => ManagedBackends::for_platform(LibTargetPlatform::MacOS),
-        TargetPlatform::Android => ManagedBackends::for_platform(LibTargetPlatform::Android),
-        TargetPlatform::Linux => ManagedBackends::for_platform(LibTargetPlatform::Linux),
-        TargetPlatform::Windows => ManagedBackends::for_platform(LibTargetPlatform::Windows),
-        TargetPlatform::Web => ManagedBackends::for_platform(LibTargetPlatform::Web),
-        TargetPlatform::Esp32s3 => ManagedBackends::for_platform(LibTargetPlatform::Esp32S3),
-        TargetPlatform::Esp32c3 => ManagedBackends::for_platform(LibTargetPlatform::Esp32C3),
-        TargetPlatform::Esp32p4 => ManagedBackends::for_platform(LibTargetPlatform::Esp32P4),
+        TargetPlatform::Ios => LibTargetPlatform::IOS,
+        TargetPlatform::Macos => LibTargetPlatform::MacOS,
+        TargetPlatform::Android => LibTargetPlatform::Android,
+        TargetPlatform::Linux => LibTargetPlatform::Linux,
+        TargetPlatform::Windows => LibTargetPlatform::Windows,
+        TargetPlatform::Web => LibTargetPlatform::Web,
+        TargetPlatform::Esp32s3 => LibTargetPlatform::Esp32S3,
+        TargetPlatform::Esp32c3 => LibTargetPlatform::Esp32C3,
+        TargetPlatform::Esp32p4 => LibTargetPlatform::Esp32P4,
     }
 }
 
@@ -561,7 +565,9 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunCon
         );
     }
 
-    validate_desktop_backend_platform_on_host(platform, backend)?;
+    backend
+        .lib_backend()
+        .validate_host_support(lib_platform(platform))?;
     validate_device_arg(platform, backend, args.device.as_deref())?;
     validate_log_pipeline_args(platform, args.logs, args.native_logs)?;
     if args.painter.is_some()
@@ -1742,72 +1748,6 @@ fn validate_log_pipeline_args(
     Ok(())
 }
 
-fn validate_desktop_backend_platform_on_host(
-    platform: TargetPlatform,
-    backend: TargetBackend,
-) -> Result<()> {
-    if platform == TargetPlatform::Web {
-        return Ok(());
-    }
-
-    match backend {
-        TargetBackend::Gtk4 => {
-            #[cfg(target_os = "linux")]
-            {
-                if platform != TargetPlatform::Linux {
-                    bail!("GTK4 backend on Linux host requires --platform linux");
-                }
-            }
-
-            #[cfg(not(target_os = "linux"))]
-            {
-                bail!("GTK4 backend is only supported on Linux hosts");
-            }
-        }
-        TargetBackend::Hydrolysis => {
-            // The Hydrolysis Android path cross-compiles from any host.
-            if platform == TargetPlatform::Android {
-                return Ok(());
-            }
-
-            #[cfg(target_os = "macos")]
-            if platform != TargetPlatform::Macos {
-                bail!("Hydrolysis backend on macOS host requires --platform macos");
-            }
-
-            #[cfg(target_os = "linux")]
-            if platform != TargetPlatform::Linux {
-                bail!("Hydrolysis backend on Linux host requires --platform linux");
-            }
-
-            #[cfg(target_os = "windows")]
-            if platform != TargetPlatform::Windows {
-                bail!("Hydrolysis backend on Windows host requires --platform windows");
-            }
-
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-            bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
-        }
-        TargetBackend::WinUi => {
-            #[cfg(target_os = "windows")]
-            if platform != TargetPlatform::Windows {
-                bail!("WinUI backend on Windows host requires --platform windows");
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            bail!("WinUI backend is only supported on Windows hosts");
-        }
-        TargetBackend::Apple => {
-            #[cfg(not(target_os = "macos"))]
-            bail!("Apple backend requires a macOS host");
-        }
-        // The Dew/ESP32 firmware cross-compiles from any host with espup installed.
-        TargetBackend::Android | TargetBackend::Dew => {}
-    }
-
-    Ok(())
-}
-
 /// Handle a device event.
 ///
 /// Returns `true` if the event loop should break.
@@ -1858,9 +1798,8 @@ fn handle_device_event(
 mod tests {
     use super::{
         Args, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend, TargetPlatform,
-        default_backend, device_choice, handle_device_event, parse_env_assignment,
-        prompt_for_device, resolve_backend, resolve_platform, run_profile,
-        validate_desktop_backend_platform_on_host, validate_device_arg,
+        default_backend, device_choice, handle_device_event, lib_platform, parse_env_assignment,
+        prompt_for_device, resolve_backend, resolve_platform, run_profile, validate_device_arg,
     };
     use clap::Parser as _;
     use waterui_cli::build::BuildProfile;
@@ -2160,26 +2099,28 @@ mod tests {
     #[test]
     fn desktop_backend_platform_must_match_macos_host() {
         assert!(
-            validate_desktop_backend_platform_on_host(TargetPlatform::Macos, TargetBackend::Gtk4)
+            TargetBackend::Gtk4
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Macos))
                 .is_err()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(
-                TargetPlatform::Macos,
-                TargetBackend::Hydrolysis
-            )
-            .is_ok()
+            TargetBackend::Hydrolysis
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Macos))
+                .is_ok()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(TargetPlatform::Linux, TargetBackend::Gtk4)
+            TargetBackend::Gtk4
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Linux))
                 .is_err()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(
-                TargetPlatform::Linux,
-                TargetBackend::Hydrolysis
-            )
-            .is_err()
+            TargetBackend::Hydrolysis
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Linux))
+                .is_err()
         );
     }
 
@@ -2187,26 +2128,28 @@ mod tests {
     #[test]
     fn desktop_backend_platform_must_match_linux_host() {
         assert!(
-            validate_desktop_backend_platform_on_host(TargetPlatform::Linux, TargetBackend::Gtk4)
+            TargetBackend::Gtk4
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Linux))
                 .is_ok()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(
-                TargetPlatform::Linux,
-                TargetBackend::Hydrolysis
-            )
-            .is_ok()
+            TargetBackend::Hydrolysis
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Linux))
+                .is_ok()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(TargetPlatform::Macos, TargetBackend::Gtk4)
+            TargetBackend::Gtk4
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Macos))
                 .is_err()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(
-                TargetPlatform::Macos,
-                TargetBackend::Hydrolysis
-            )
-            .is_err()
+            TargetBackend::Hydrolysis
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Macos))
+                .is_err()
         );
     }
 
@@ -2214,22 +2157,22 @@ mod tests {
     #[test]
     fn desktop_backend_platform_must_match_windows_host() {
         assert!(
-            validate_desktop_backend_platform_on_host(
-                TargetPlatform::Windows,
-                TargetBackend::Hydrolysis
-            )
-            .is_ok()
+            TargetBackend::Hydrolysis
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Windows))
+                .is_ok()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(TargetPlatform::Windows, TargetBackend::Gtk4)
+            TargetBackend::Gtk4
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Windows))
                 .is_err()
         );
         assert!(
-            validate_desktop_backend_platform_on_host(
-                TargetPlatform::Macos,
-                TargetBackend::Hydrolysis
-            )
-            .is_err()
+            TargetBackend::Hydrolysis
+                .lib_backend()
+                .validate_host_support(lib_platform(TargetPlatform::Macos))
+                .is_err()
         );
     }
 }
