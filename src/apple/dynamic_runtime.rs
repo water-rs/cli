@@ -33,6 +33,35 @@ pub async fn prepare_host_runtime(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Give a module the canonical `@rpath/<file>` install name a bundled
+/// executable binds when it links the file by path. Idempotent.
+pub async fn canonicalize_install_name(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| eyre::eyre!("Module {} has no file name", path.display()))?;
+    let wanted = format!("@rpath/{}", file_name.to_string_lossy());
+    if install_name(path).await? != wanted {
+        run_command_os(
+            "install_name_tool",
+            [
+                OsStr::new("-id"),
+                OsStr::new(wanted.as_str()),
+                path.as_os_str(),
+            ],
+        )
+        .await
+        .wrap_err("Failed to assign the module install name")?;
+    }
+    if install_name(path).await? != wanted {
+        bail!(
+            "Module {} did not retain install name {}",
+            path.display(),
+            wanted
+        );
+    }
+    Ok(())
+}
+
 pub async fn retarget_module(module_path: &Path, runtime_path: &Path) -> Result<()> {
     require_runtime(runtime_path)?;
     let current_install_name = install_name(runtime_path).await?;

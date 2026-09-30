@@ -1207,6 +1207,8 @@ define_scaffold_templates! {
     AndroidEmbeddedManifestTemplate => (AndroidEmbedded, "src/templates/android_embedded/waterui/src/main/AndroidManifest.xml.tpl"),
     FfiBuildScriptTemplate => (Ffi, "src/templates/ffi/build.rs.tpl"),
     FfiLibTemplate => (Ffi, "src/templates/ffi/src/lib.rs.tpl"),
+    FfiAppleMainTemplate => (Ffi, "src/templates/ffi/src/bin/waterui-apple-main.rs.tpl"),
+    FfiCefHelperTemplate => (Ffi, "src/templates/ffi/src/bin/waterui-cef-helper.rs.tpl"),
     Gtk4BuildScriptTemplate => (Gtk4, "src/templates/gtk4/build.rs.tpl"),
     Gtk4MainTemplate => (Gtk4, "src/templates/gtk4/src/main.rs.tpl"),
     HydrolysisBuildScriptTemplate => (Hydrolysis, "src/templates/hydrolysis/build.rs.tpl"),
@@ -2858,9 +2860,36 @@ mod tests {
             .map(|value| value.as_str().expect("crate type should be a string"))
             .collect::<Vec<_>>();
 
-        // Apple links the staticlib, Android loads the cdylib, and nothing anywhere
-        // consumes an rlib of this crate.
-        assert_eq!(crate_types, ["staticlib", "cdylib"]);
+        // Apple links the staticlib, Android loads the cdylib, and the
+        // entry-owning `waterui-apple-main` bin consumes the rlib so its own
+        // crate dependency stays static inside the executable image.
+        assert_eq!(crate_types, ["staticlib", "cdylib", "rlib"]);
+    }
+
+    #[test]
+    fn generated_ffi_build_script_undefs_every_swift_seam_symbol() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let ffi_dir = temp.path().join("managed_backends").join("ffi");
+        let ctx = ctx(
+            Some(PathBuf::from("../waterui")),
+            Some(ffi_dir.clone()),
+            Some(temp.path().join("project")),
+        );
+
+        smol::block_on(crate::templates::ffi::scaffold(&ffi_dir, &ctx, "app-ffi"))
+            .expect("ffi scaffold should succeed");
+
+        let build_script = std::fs::read_to_string(ffi_dir.join("build.rs"))
+            .expect("ffi build.rs should be written");
+        // Cargo emits the ffi `cdylib` also as a dependency artifact of
+        // `cargo rustc --bin`, where this build's trailing rustc args never
+        // reach — the crate's own link-arg is the only route that covers both.
+        for symbol in crate::apple::swift_seam::SEAM_SYMBOL_NAMES {
+            assert!(
+                build_script.contains(&format!("\"{symbol}\"")),
+                "ffi build.rs must undef `_waterui_swift_*` seam symbol {symbol}"
+            );
+        }
     }
 
     #[test]
@@ -5511,11 +5540,19 @@ pub mod ffi {
         manifest.profile = generated_profiles();
 
         // Apple links `lib<ffi>.a` and Android loads `lib<ffi>.so`, so the manifest
-        // declares only that union; nothing ever consumes an `rlib` of this crate.
+        // declares only that union plus `rlib` — which Cargo requires for the
+        // entry-owning binary's dependency emission: the bin must link the
+        // crate statically so `_waterui_init`/`_waterui_app` live inside the
+        // executable image rather than in a second dylib carrying duplicate
+        // ObjC classes.
         // Each build then narrows further to the single crate type its platform
         // links, via `RustBuild::with_crate_type_override`.
         manifest.lib = Some(Product {
-            crate_type: vec!["staticlib".to_string(), "cdylib".to_string()],
+            crate_type: vec![
+                "staticlib".to_string(),
+                "cdylib".to_string(),
+                "rlib".to_string(),
+            ],
             ..Default::default()
         });
         // Entry-owning Apple packaging installs this binary as the
