@@ -2319,6 +2319,9 @@ mod tests {
             bins[0]["path"].as_str(),
             Some("src/bin/waterui-apple-main.rs")
         );
+        let main_bin = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-apple-main.rs"))
+            .expect("apple main source should be written");
+        assert!(!main_bin.contains("waterui_cef_prepare_macos_application"));
     }
 
     #[test]
@@ -2359,6 +2362,10 @@ mod tests {
         let helper = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-cef-helper.rs"))
             .expect("CEF helper source should be written");
         assert!(helper.contains("waterui_cef_run_packaged_subprocess"));
+
+        let main_bin = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-apple-main.rs"))
+            .expect("apple main source should be written");
+        assert!(main_bin.contains("waterui_cef_prepare_macos_application"));
     }
 
     #[test]

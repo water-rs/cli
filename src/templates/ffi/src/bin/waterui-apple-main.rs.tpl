@@ -12,6 +12,12 @@ fn app(env: Environment) -> App {
 }
 
 fn main() -> ! {
+    {% if ctx.cef_runtime_enabled() %}
+    // CEF must install its NSApplication subclass before AppKit creates it;
+    // this runs before `entry::run` touches `NSApplication.shared`.
+    #[cfg(target_os = "macos")]
+    waterui_ffi::components::platform::browser_cef::waterui_cef_prepare_macos_application();
+    {% endif %}
     let mut env = waterui::configure_environment!(waterui::Environment::new());
     waterui_ffi::__configure_native_realizations(&mut env);
     // SAFETY: this is the process's entry on the main thread, and `env`
