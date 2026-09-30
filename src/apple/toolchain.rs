@@ -84,12 +84,12 @@ impl AppleSdk {
 ///    signed-in account can mint both the provisioning profile and the
 ///    "Apple Development" certificate it needs, so these work even when the
 ///    keychain holds no matching identity yet.
-/// 2. The team embedded in a keychain development certificate —
-///    `security find-identity -v -p codesigning` prints identities as
-///    `… "Apple Development: Liu Yuhao (6C5VGHHJ59)"` where the parenthesized
-///    suffix is the team ID. Such a team is only usable when a matching
-///    profile is already installed locally; without an Xcode account the
-///    portal cannot mint one, which is why it ranks last.
+/// 2. The team embedded in a keychain development certificate — Apple
+///    records the team as the certificate subject's organizational unit
+///    (`OU`); the `(...)` suffix in the common name is the certificate's
+///    own identifier, not the team. Such a team is only usable when a
+///    matching profile is already installed locally; without an Xcode
+///    account the portal cannot mint one, which is why it ranks last.
 ///
 /// # Errors
 /// Fails when neither an Xcode account team nor a development certificate
@@ -98,18 +98,77 @@ pub async fn development_team_id(host: &Host) -> eyre::Result<String> {
     if let Some(team) = xcode_account_team(host).await {
         return Ok(team);
     }
+    for certificate in development_certificates(host).await? {
+        if let Some(team) = team_id_in_certificate(&certificate) {
+            return Ok(team);
+        }
+    }
+    Err(eyre::eyre!(
+        "No signing team found. Physical iOS builds must be signed: open \
+         Xcode → Settings → Accounts and sign in an Apple ID (a free \
+         account is enough), then re-run `water run`."
+    ))
+}
+
+/// The login keychain's development certificates as DER bytes.
+///
+/// `security find-certificate -a -Z -p` prints every keychain certificate
+/// as a PEM block preceded by its `SHA-256 hash:` line; the PEM reader
+/// keeps only the certificate blocks.
+#[cfg(target_os = "macos")]
+async fn development_certificates(host: &Host) -> eyre::Result<Vec<Vec<u8>>> {
     let output = host
-        .output("security", ["find-identity", "-v", "-p", "codesigning"])
+        .output("security", ["find-certificate", "-a", "-Z", "-p"])
         .await
-        .wrap_err("failed to run `security find-identity`")?;
+        .wrap_err("failed to run `security find-certificate`")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_development_team(&stdout).ok_or_else(|| {
-        eyre::eyre!(
-            "No signing team found. Physical iOS builds must be signed: open \
-             Xcode → Settings → Accounts and sign in an Apple ID (a free \
-             account is enough), then re-run `water run`."
-        )
-    })
+    Ok(pem_certificate_der(&stdout))
+}
+
+/// Device signing is impossible on a non-Apple host; there is no keychain
+/// to read.
+#[cfg(not(target_os = "macos"))]
+async fn development_certificates(_host: &Host) -> eyre::Result<Vec<Vec<u8>>> {
+    Ok(Vec::new())
+}
+
+/// Every PEM certificate block in `text` decoded to DER.
+#[cfg(target_os = "macos")]
+fn pem_certificate_der(text: &str) -> Vec<Vec<u8>> {
+    x509_parser::pem::Pem::iter_from_buffer(text.as_bytes())
+        .filter_map(std::result::Result::ok)
+        .filter(|pem| pem.label == "CERTIFICATE")
+        .map(|pem| pem.contents)
+        .collect()
+}
+
+/// The team ID a development certificate carries — the subject's first
+/// organizational unit. Returns `None` for non-development certificates.
+#[cfg(target_os = "macos")]
+fn team_id_in_certificate(der: &[u8]) -> Option<String> {
+    use x509_parser::prelude::FromDer as _;
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    let subject = certificate.subject();
+    let development = subject
+        .iter_common_name()
+        .filter_map(|name| name.as_str().ok())
+        .any(is_development_certificate_name);
+    if !development {
+        return None;
+    }
+    subject
+        .iter_organizational_unit()
+        .next()?
+        .as_str()
+        .ok()
+        .map(str::to_owned)
+}
+
+/// The common-name prefixes Apple's development certificates carry.
+pub(crate) fn is_development_certificate_name(common_name: &str) -> bool {
+    common_name.contains("Apple Development:")
+        || common_name.contains("iPhone Developer:")
+        || common_name.contains("iOS Development:")
 }
 
 /// A team Xcode can provision for: the account's last-selected team, or any
@@ -158,26 +217,6 @@ async fn xcode_account_team(host: &Host) -> Option<String> {
     }
     let teams: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
     teams.as_object()?.keys().next().cloned()
-}
-
-/// Extract the team ID from the first development identity in
-/// `security find-identity -v -p codesigning` output.
-fn parse_development_team(output: &str) -> Option<String> {
-    for line in output.lines() {
-        let is_development = line.contains("Apple Development:")
-            || line.contains("iPhone Developer:")
-            || line.contains("iOS Development:");
-        if !is_development {
-            continue;
-        }
-        if let Some(start) = line.rfind('(')
-            && let Some(end) = line.rfind(')')
-            && end > start
-        {
-            return Some(line[start + 1..end].to_string());
-        }
-    }
-    None
 }
 
 impl std::fmt::Display for AppleSdk {
@@ -265,5 +304,55 @@ mod tests {
             matches!(result, Err(ToolchainError::Unfixable(_))),
             "xcrun without an SDK path must be unfixable: {result:?}"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod signing_tests {
+    use super::{is_development_certificate_name, pem_certificate_der, team_id_in_certificate};
+
+    /// A self-signed certificate shaped like an `Apple Development` one:
+    /// `CN=Apple Development: <email> (<certificate-id>)`, `OU=<team>`.
+    /// Generated for these tests; identifies nothing real.
+    const DEVELOPMENT_CERT: &str = include_str!("../toolchain/testdata/apple_development.pem");
+    /// A self-signed certificate whose common name is not an Apple
+    /// development name.
+    const OTHER_CERT: &str = include_str!("../toolchain/testdata/other_signing.pem");
+
+    #[test]
+    fn team_id_comes_from_subject_organizational_unit() {
+        let [certificate] = pem_certificate_der(DEVELOPMENT_CERT)
+            .try_into()
+            .expect("the fixture holds exactly one certificate");
+        assert_eq!(
+            team_id_in_certificate(&certificate).as_deref(),
+            Some("TESTTEAM42"),
+            "the team is the subject OU, not the common name's (…) suffix"
+        );
+    }
+
+    #[test]
+    fn non_development_certificate_yields_no_team() {
+        let [certificate] = pem_certificate_der(OTHER_CERT)
+            .try_into()
+            .expect("the fixture holds exactly one certificate");
+        assert_eq!(team_id_in_certificate(&certificate), None);
+    }
+
+    #[test]
+    fn pem_reader_skips_find_certificate_hash_lines() {
+        // `security find-certificate -a -Z -p` interleaves `SHA-256 hash:` lines.
+        let output = format!("SHA-256 hash: 00FF\n{DEVELOPMENT_CERT}SHA-256 hash: ABCD\n");
+        let certificates = pem_certificate_der(&output);
+        assert_eq!(certificates.len(), 1);
+    }
+
+    #[test]
+    fn development_common_names() {
+        assert!(is_development_certificate_name(
+            "Apple Development: a@b.c (XYZ)"
+        ));
+        assert!(is_development_certificate_name("iPhone Developer: a@b.c"));
+        assert!(!is_development_certificate_name("Devin Signing Test"));
     }
 }

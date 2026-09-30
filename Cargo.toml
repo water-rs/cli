@@ -172,6 +172,12 @@ icns = { version = "0.4", default-features = false, features = ["pngio"] }
 # `plist::Value` is only used to read `Info.plist` during macOS device/bundle
 # probing, all under `#[cfg(target_os = "macos")]`.
 plist = "1.10"
+# Device provisioning pairs a provisioning profile with the development
+# certificate it names: `security find-certificate` PEMs are parsed for the
+# subject organizational unit (the team ID) and the profile's
+# `DeveloperCertificates` are matched against `find-identity` SHA-1s.
+x509-parser = "0.18"
+sha1 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
