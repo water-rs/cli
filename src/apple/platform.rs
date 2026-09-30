@@ -13,7 +13,7 @@ use tracing::info;
 #[cfg(target_os = "macos")]
 use crate::browser_runtime;
 #[cfg(target_os = "macos")]
-use crate::macos_bundle::{package_cef_helper_app, remove_cef_helper_apps};
+use crate::macos_bundle::package_cef_helper_app;
 use crate::{
     apple::app_bundle,
     apple::backend::AppleBackend,
@@ -38,7 +38,7 @@ pub const APPLE_ENTRY_BINARY_NAME: &str = "waterui-apple-main";
 // Build Utilities
 // ============================================================================
 
-/// The library shape an Apple build hands to Xcode.
+/// The library shape an Apple build hands to the final link.
 ///
 /// A packaged app links the runtime into itself and needs a self-contained archive. A
 /// development build resolves the runtime from `libwaterui_dylib.dylib` at load time, so
@@ -71,7 +71,7 @@ impl AppleHostLibrary {
         }
     }
 
-    /// Name Xcode links against, via `-lwaterui_app` in `OTHER_LDFLAGS`.
+    /// File name the built library is staged under for the host image.
     const fn linked_file_name(self) -> &'static str {
         match self {
             Self::Archive => "libwaterui_app.a",
@@ -653,9 +653,8 @@ pub async fn package_apple(
     )
     .await?;
 
-    // Xcode used "Debug-iphonesimulator"-style product configuration names;
-    // the same layout keeps `simctl`/`devicectl` installs pointed at a stable
-    // location.
+    // "Debug-iphonesimulator"-style product configuration names keep
+    // `simctl`/`devicectl` installs pointed at a stable location.
     let products_config = if sdk_name == "macosx" {
         configuration.to_string()
     } else {
@@ -667,12 +666,6 @@ pub async fn package_apple(
         .join(&products_config);
     let product_name = crate::apple::backend::apple_product_name(project)?.to_string();
     let app_path = products_dir.join(format!("{product_name}.app"));
-
-    #[cfg(target_os = "macos")]
-    if platform == TargetPlatform::MacOS {
-        browser_runtime::remove_macos_app(&app_path.join("Contents")).await?;
-        remove_cef_helper_apps(&app_path, &product_name).await?;
-    }
 
     let ctx = AppleBackend::template_context(project).await?;
     let layout = app_bundle::AppleAppLayout::for_app(&app_path, sdk_name);

@@ -64,7 +64,7 @@ impl CrashReportContext {
             whoami::hostname().map_err(|e| eyre::eyre!("Failed to determine hostname: {e}"))?;
 
         // A crash report is filed under the executable's name, which is the
-        // Xcode product name — the same one the bundle is built under.
+        // product name — the same one the bundle is built under.
         let process_name = waterui_cli::apple::backend::apple_product_name(project)?.to_string();
 
         Ok(Some(Self {

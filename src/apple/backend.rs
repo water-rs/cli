@@ -19,8 +19,8 @@ use crate::{
 /// Configuration for the Apple backend in a `WaterUI` project.
 ///
 /// `[backends.apple]` in `Water.toml` persists only `backend_path`; the
-/// project path and scheme describe the Xcode project the CLI generates in
-/// the managed build cache.
+/// project path and scheme describe the scaffold the CLI generates in the
+/// managed build cache.
 pub struct AppleBackend {
     /// Path to the generated Apple project below the managed backends root.
     #[serde(skip, default = "default_apple_project_path")]
@@ -35,10 +35,10 @@ pub struct AppleBackend {
 
 /// What this project's built application bundle is called.
 ///
-/// Deliberately not the scheme. The scheme is a fixed handle the CLI drives the
-/// Xcode project with — every project shares one, which is what lets one set
-/// of commands build any of them — while the product name is the one a person
-/// reads. macOS takes `CFBundleName`, and with it the menu bar, the Dock and
+/// Deliberately not the scheme. The scheme is a fixed handle the CLI
+/// addresses the generated scaffold with — every project shares one — while
+/// the product name is the one a person reads. macOS takes `CFBundleName`,
+/// and with it the menu bar, the Dock and
 /// Force Quit, from `PRODUCT_NAME`, so a project that leaves the two equal
 /// announces itself as the scaffold's target rather than as itself.
 ///
@@ -93,8 +93,7 @@ fn default_apple_project_path() -> PathBuf {
 
 impl AppleBackend {
     /// The `(scheme, app name, crate name)` the scaffold renders with: every
-    /// generated Apple project is the shared `WaterUIApp` host, and the scheme
-    /// must match its Xcode target name.
+    /// generated Apple project is the shared `WaterUIApp` host.
     fn scaffold_names() -> (String, String, CrateName) {
         (
             "WaterUIApp".to_string(),
@@ -183,7 +182,7 @@ impl AppleBackend {
 impl Backend for AppleBackend {
     const DEFAULT_PATH: &'static str = "apple";
 
-    // Preserve Xcode build caches during re-scaffolding.
+    // Preserve build caches during re-scaffolding.
     const CACHE_PATHS: &'static [&'static str] = &["DerivedData"];
 
     fn path(&self) -> &Path {
