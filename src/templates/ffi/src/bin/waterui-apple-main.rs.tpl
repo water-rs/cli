@@ -7,8 +7,12 @@
 use waterui::app::App;
 use waterui::env::Environment;
 
+// Delegating through the library keeps its rlib on the link line: rustc
+// drops an unused `--extern`, and the Swift seam resolves `waterui_init` /
+// `waterui_app` out of that archive during the normal left-to-right pass —
+// with no second, graph-bundling staticlib anywhere on the line.
 fn app(env: Environment) -> App {
-    {{ ctx.crate_name_ident() }}::app(env)
+    {{ ctx.ffi_crate_ident() }}::app(env)
 }
 
 fn main() -> ! {

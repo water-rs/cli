@@ -691,6 +691,16 @@ impl TemplateContext {
         self.crate_name.rust_ident()
     }
 
+    /// The ffi companion's crate identifier — falls back to the app crate
+    /// when the context never scoped one.
+    #[must_use]
+    pub fn ffi_crate_ident(&self) -> RustIdent {
+        self.ffi_crate_name
+            .as_ref()
+            .unwrap_or(&self.crate_name)
+            .rust_ident()
+    }
+
     #[must_use]
     pub fn android_package_name(&self) -> String {
         self.bundle_identifier.android_package_name().to_string()

@@ -157,11 +157,123 @@ async fn apple_ffi_build_features(
     Ok(features)
 }
 
+/// Stage the built host library (and, for the shared runtime, the runtime
+/// itself) into `output_dir` before the executable links: it resolves the
+/// Swift seam's callbacks into the app (`_waterui_init`, `_waterui_app`)
+/// and into `libwaterui_dylib` against these very files, and a `DT_NEEDED`
+/// entry records the install name it found — so the staged copy must
+/// already carry its final one.
+///
+/// # Errors
+/// Returns an error if copying or install-name surgery fails.
+async fn stage_apple_host_library(
+    project: &Project,
+    options: &BuildOptions,
+    built_target: &BuiltTarget,
+    triple: &target_lexicon::Triple,
+    host_library: AppleHostLibrary,
+) -> eyre::Result<()> {
+    let Some(output_dir) = options.output_dir() else {
+        return Ok(());
+    };
+    fs::create_dir_all(output_dir).await?;
+    let dest_lib = output_dir.join(host_library.linked_file_name());
+    copy_file(&built_target.artifact, &dest_lib).await?;
+    remove_superseded_host_library(output_dir, host_library).await?;
+    if options.linkage() == RustLinkage::SharedRuntime {
+        let libraries = RustDynamicLibraries::resolve(built_target, triple, project).await?;
+        libraries.stage(output_dir).await?;
+        let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
+        if host_library == AppleHostLibrary::Dynamic {
+            // The app library records the runtime's cargo-written install
+            // name; retarget while the canonical copy still carries it.
+            dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
+            // The executable binds the app dylib by its install name.
+            dynamic_runtime::canonicalize_install_name(&dest_lib).await?;
+        }
+        dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
+    }
+    Ok(())
+}
+
+/// The `-Clink-arg`s the entry-owning executable links with.
+///
+/// The Swift seam's callbacks into the app (`_waterui_init`, `_waterui_app`)
+/// resolve inside the one image: the bin's own source delegates to the
+/// library's `app`, so its `rlib` is a live `--extern` in the normal
+/// left-to-right archive scan, and `-Wl,-u` marks both callbacks undefined
+/// so their members are extracted there — every dependency they pull then
+/// resolves in the same pass. What must never join the line is
+/// `libwaterui_app.a`: an archive that bundles the whole dependency graph,
+/// so its `__objc_classlist` entries register every `ObjC` class a second
+/// time. The dynamic mode additionally re-asks for the same `rlib` behind
+/// the seam — its dependencies are dylibs then, immune to scan order.
+fn apple_entry_link_args(
+    seam_library_dir: &OsStr,
+    host_library: AppleHostLibrary,
+    ffi_rlib: &Path,
+    runtime_dir: &OsStr,
+) -> Vec<String> {
+    let mut args = vec![
+        "-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks".to_string(),
+        "-Clink-arg=-Wl,-rpath,@executable_path/Frameworks".to_string(),
+        "-Clink-arg=-lc++".to_string(),
+        "-Clink-arg=-framework".to_string(),
+        "-Clink-arg=VideoToolbox".to_string(),
+        "-Clink-arg=-Wl,-u,_waterui_init".to_string(),
+        "-Clink-arg=-Wl,-u,_waterui_app".to_string(),
+        link_search_flag(seam_library_dir),
+        "-Clink-arg=-lWaterUISwift".to_string(),
+    ];
+    if host_library == AppleHostLibrary::Dynamic {
+        args.push(link_file_arg(ffi_rlib));
+        args.push(link_search_flag(runtime_dir));
+        args.push("-Clink-arg=-lwaterui_dylib".to_string());
+    }
+    args
+}
+
+/// Build the entry-owning executable and, when the manifest declared it,
+/// the CEF subprocess helper.
+///
+/// # Errors
+/// Returns an error if either `cargo` invocation fails.
+async fn build_entry_binaries(
+    project: &Project,
+    build: &RustBuild,
+    link_args: Vec<String>,
+    release: bool,
+) -> eyre::Result<()> {
+    let mut executable = build.clone();
+    for arg in link_args {
+        executable = executable.with_final_rustc_arg(arg);
+    }
+    executable
+        .build_binary(APPLE_ENTRY_BINARY_NAME, release)
+        .await?;
+
+    // The helper `[[bin]]` exists only when the manifest declared it — the
+    // application's linked engine, not chromium alone — so the build gates
+    // on the manifest's own predicate or Cargo reports `no bin target`.
+    if project.declares_cef_helper().await? {
+        build
+            .clone()
+            .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
+            .build_binary(
+                &crate::project_model::project_types::cef_helper_binary_name(
+                    project.ffi_crate_name().as_str(),
+                ),
+                release,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 /// Build Rust library for an Apple platform.
 ///
 /// # Errors
 /// Returns an error if the Rust build fails or the expected Apple archive cannot be copied.
-#[allow(clippy::too_many_lines)]
 pub async fn build_rust_lib(
     project: &Project,
     platform: TargetPlatform,
@@ -207,9 +319,8 @@ pub async fn build_rust_lib(
         build = build.with_preferred_dynamic_linking();
     }
 
-    // The backend's Swift seam (`Sources/WaterUI`) was compiled by the
-    // generated Xcode project; entry-owning packaging compiles it into a
-    // static archive the application executable links instead. A `cdylib`
+    // The backend's Swift seam (`Sources/WaterUI`) compiles into a static
+    // archive the application executable links. A `cdylib`
     // keeps the host-provides-the-seam contract: the ffi crate's own build
     // script leaves its `waterui_swift_*` references explicitly undefined,
     // and they resolve against the image that loaded it.
@@ -219,41 +330,8 @@ pub async fn build_rust_lib(
     let target_dir = project.water_target_dir(options.linkage()).await?;
     let build = build.with_target_dir(target_dir.clone());
     let built_target = build.build_lib(options.is_release()).await?;
+    stage_apple_host_library(project, &options, &built_target, &triple, host_library).await?;
 
-    // Stage the host library (and, for the shared runtime, the runtime itself)
-    // before the executable links: it resolves the Swift seam's callbacks into
-    // the app (`_waterui_init`, `_waterui_app`) and into `libwaterui_dylib`
-    // against these very files, and a `DT_NEEDED` entry records the install
-    // name it found — so the staged copy must already carry its final one.
-    if let Some(output_dir) = options.output_dir() {
-        fs::create_dir_all(output_dir).await?;
-        let dest_lib = output_dir.join(host_library.linked_file_name());
-        copy_file(&built_target.artifact, &dest_lib).await?;
-        remove_superseded_host_library(output_dir, host_library).await?;
-        if options.linkage() == RustLinkage::SharedRuntime {
-            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
-            libraries.stage(output_dir).await?;
-            let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
-            if host_library == AppleHostLibrary::Dynamic {
-                // The app library records the runtime's cargo-written install
-                // name; retarget while the canonical copy still carries it.
-                dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
-                // The executable binds the app dylib by its install name.
-                dynamic_runtime::canonicalize_install_name(&dest_lib).await?;
-            }
-            dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
-        }
-    }
-
-    // The Swift seam's callbacks into the app (`_waterui_init`,
-    // `_waterui_app`) resolve inside the one image. Which artifact supplies
-    // them depends on the linkage: a static build links the whole crate as
-    // `libwaterui_app.a`, while a shared-runtime build re-threads the crate's
-    // `rlib` after the seam archive — a second `libwaterui_app.dylib` would
-    // register every ObjC class twice — because ld scans archives once,
-    // left to right, so the seam's references arrive after the crate's own
-    // slot in the link line.
-    let staged_dir = options.output_dir().map(PathBuf::from);
     let deps_dir = target_dir
         .join(&target)
         .join(if options.is_release() {
@@ -266,51 +344,21 @@ pub async fn build_rust_lib(
         "lib{}.rlib",
         project.ffi_crate_name().as_str().replace('-', "_")
     ));
-    let app_module = if host_library == AppleHostLibrary::Dynamic {
-        ffi_rlib
-    } else {
-        staged_dir.clone().map_or_else(
-            || built_target.artifact.clone(),
-            |dir| dir.join(host_library.linked_file_name()),
-        )
-    };
-
-    let mut executable = build
-        .clone()
-        .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
-        .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/Frameworks")
-        .with_final_rustc_arg("-Clink-arg=-lc++")
-        .with_final_rustc_arg("-Clink-arg=-framework")
-        .with_final_rustc_arg("-Clink-arg=VideoToolbox")
-        .with_final_rustc_arg(link_search_flag(&seam_library_dir))
-        .with_final_rustc_arg("-Clink-arg=-lWaterUISwift")
-        .with_final_rustc_arg(link_file_arg(&app_module));
-
-    if host_library == AppleHostLibrary::Dynamic {
-        let runtime_dir = staged_dir.clone().unwrap_or(deps_dir);
-        executable = executable
-            .with_final_rustc_arg(link_search_flag(runtime_dir.as_os_str()))
-            .with_final_rustc_arg("-Clink-arg=-lwaterui_dylib");
-    }
-    executable
-        .build_binary(APPLE_ENTRY_BINARY_NAME, options.is_release())
-        .await?;
-
-    // The helper `[[bin]]` exists only when the manifest declared it — the
-    // application's linked engine, not chromium alone — so the build gates
-    // on the manifest's own predicate or Cargo reports `no bin target`.
-    if project.declares_cef_helper().await? {
-        build
-            .clone()
-            .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
-            .build_binary(
-                &crate::project_model::project_types::cef_helper_binary_name(
-                    project.ffi_crate_name().as_str(),
-                ),
-                options.is_release(),
-            )
-            .await?;
-    }
+    let runtime_dir = options
+        .output_dir()
+        .map_or_else(|| deps_dir.clone(), PathBuf::from);
+    build_entry_binaries(
+        project,
+        &build,
+        apple_entry_link_args(
+            &seam_library_dir,
+            host_library,
+            &ffi_rlib,
+            runtime_dir.as_os_str(),
+        ),
+        options.is_release(),
+    )
+    .await?;
 
     Ok(built_target)
 }
@@ -386,10 +434,9 @@ async fn apple_swift_seam_dir(
 
 /// The deployment targets the Apple backend supports, as `SEMVER` strings.
 ///
-/// These were `*_DEPLOYMENT_TARGET` build settings in the generated Xcode
-/// project; entry-owning packaging has no project file, so they are declared
-/// here next to the backend that owns them — the same values `Package.swift`
-/// in `apple-backend` publishes.
+/// Entry-owning packaging has no project file, so they are declared here
+/// next to the backend that owns them — the same values `Package.swift` in
+/// `apple-backend` publishes.
 const fn apple_deployment_target_for(platform: TargetPlatform) -> Option<&'static str> {
     match platform {
         TargetPlatform::MacOS
