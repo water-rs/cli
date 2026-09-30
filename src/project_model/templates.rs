@@ -1429,7 +1429,10 @@ mod tests {
         );
         let local_settings = render("settings.gradle.kts.tpl", &local_ctx);
         assert!(
-            local_settings.contains(&format!("includeBuild(\"{}\")", checkout.path().display())),
+            local_settings.contains(&format!(
+                "includeBuild(\"{}\")",
+                local_ctx.android_backend_path()
+            )),
             "{local_settings}"
         );
         assert!(
