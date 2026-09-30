@@ -3,6 +3,7 @@
 //! This module provides utility functions for building and packaging Apple apps.
 //! These functions are used by `AppleBackend` to implement the `Backend` trait.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use eyre::{Context, bail};
@@ -17,6 +18,7 @@ use crate::{
     apple::app_bundle,
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
+    apple::swift_seam,
     assets,
     build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
@@ -159,6 +161,7 @@ async fn apple_ffi_build_features(
 ///
 /// # Errors
 /// Returns an error if the Rust build fails or the expected Apple archive cannot be copied.
+#[allow(clippy::too_many_lines)]
 pub async fn build_rust_lib(
     project: &Project,
     platform: TargetPlatform,
@@ -199,25 +202,97 @@ pub async fn build_rust_lib(
         .with_env(format!("PKG_CONFIG_ALLOW_CROSS_{target}"), "1");
     let (deployment_environment, deployment_target) =
         apple_deployment_target(project, platform).await?;
-    build = build.with_env(deployment_environment, deployment_target);
+    build = build.with_env(deployment_environment, deployment_target.clone());
     if options.linkage() == RustLinkage::SharedRuntime {
         build = build.with_preferred_dynamic_linking();
     }
-    build = build.with_target_dir(project.water_target_dir(options.linkage()).await?);
+
+    // The backend's Swift seam (`Sources/WaterUI`) was compiled by the
+    // generated Xcode project; entry-owning packaging compiles it into a
+    // static archive the application executable links instead. A `cdylib`
+    // keeps the host-provides-the-seam contract: the ffi crate's own build
+    // script leaves its `waterui_swift_*` references explicitly undefined,
+    // and they resolve against the image that loaded it.
+    let seam_library_dir =
+        apple_swift_seam_dir(project, platform, &deployment_target, !options.is_release()).await?;
+
+    let target_dir = project.water_target_dir(options.linkage()).await?;
+    let build = build.with_target_dir(target_dir.clone());
     let built_target = build.build_lib(options.is_release()).await?;
 
-    // Entry-owning packaging installs the ffi crate's own binary as the
-    // bundle executable — no Swift host links the library. The loader
-    // resolves bundle-local dylibs through both rpaths: `../Frameworks` for
-    // the macOS `Contents/` layout, `Frameworks` for the flat layout every
-    // other Apple platform uses.
-    build
+    // Stage the host library (and, for the shared runtime, the runtime itself)
+    // before the executable links: it resolves the Swift seam's callbacks into
+    // the app (`_waterui_init`, `_waterui_app`) and into `libwaterui_dylib`
+    // against these very files, and a `DT_NEEDED` entry records the install
+    // name it found — so the staged copy must already carry its final one.
+    if let Some(output_dir) = options.output_dir() {
+        fs::create_dir_all(output_dir).await?;
+        let dest_lib = output_dir.join(host_library.linked_file_name());
+        copy_file(&built_target.artifact, &dest_lib).await?;
+        remove_superseded_host_library(output_dir, host_library).await?;
+        if options.linkage() == RustLinkage::SharedRuntime {
+            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
+            libraries.stage(output_dir).await?;
+            let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
+            if host_library == AppleHostLibrary::Dynamic {
+                // The app library records the runtime's cargo-written install
+                // name; retarget while the canonical copy still carries it.
+                dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
+                // The executable binds the app dylib by its install name.
+                dynamic_runtime::canonicalize_install_name(&dest_lib).await?;
+            }
+            dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
+        }
+    }
+
+    // The Swift seam's callbacks into the app (`_waterui_init`,
+    // `_waterui_app`) resolve inside the one image. Which artifact supplies
+    // them depends on the linkage: a static build links the whole crate as
+    // `libwaterui_app.a`, while a shared-runtime build re-threads the crate's
+    // `rlib` after the seam archive — a second `libwaterui_app.dylib` would
+    // register every ObjC class twice — because ld scans archives once,
+    // left to right, so the seam's references arrive after the crate's own
+    // slot in the link line.
+    let staged_dir = options.output_dir().map(PathBuf::from);
+    let deps_dir = target_dir
+        .join(&target)
+        .join(if options.is_release() {
+            "release"
+        } else {
+            "debug"
+        })
+        .join("deps");
+    let ffi_rlib = deps_dir.join(format!(
+        "lib{}.rlib",
+        project.ffi_crate_name().as_str().replace('-', "_")
+    ));
+    let app_module = if host_library == AppleHostLibrary::Dynamic {
+        ffi_rlib
+    } else {
+        staged_dir.clone().map_or_else(
+            || built_target.artifact.clone(),
+            |dir| dir.join(host_library.linked_file_name()),
+        )
+    };
+
+    let mut executable = build
         .clone()
         .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
         .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/Frameworks")
         .with_final_rustc_arg("-Clink-arg=-lc++")
         .with_final_rustc_arg("-Clink-arg=-framework")
         .with_final_rustc_arg("-Clink-arg=VideoToolbox")
+        .with_final_rustc_arg(link_search_flag(&seam_library_dir))
+        .with_final_rustc_arg("-Clink-arg=-lWaterUISwift")
+        .with_final_rustc_arg(link_file_arg(&app_module));
+
+    if host_library == AppleHostLibrary::Dynamic {
+        let runtime_dir = staged_dir.clone().unwrap_or(deps_dir);
+        executable = executable
+            .with_final_rustc_arg(link_search_flag(runtime_dir.as_os_str()))
+            .with_final_rustc_arg("-Clink-arg=-lwaterui_dylib");
+    }
+    executable
         .build_binary(APPLE_ENTRY_BINARY_NAME, options.is_release())
         .await?;
 
@@ -237,26 +312,76 @@ pub async fn build_rust_lib(
             .await?;
     }
 
-    // If output_dir is specified, copy the library there
-    if let Some(output_dir) = options.output_dir() {
-        fs::create_dir_all(output_dir).await?;
-        let dest_lib = output_dir.join(host_library.linked_file_name());
-        copy_file(&built_target.artifact, &dest_lib).await?;
-        remove_superseded_host_library(output_dir, host_library).await?;
-        if options.linkage() == RustLinkage::SharedRuntime {
-            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
-            libraries.stage(output_dir).await?;
-            let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
-            if host_library == AppleHostLibrary::Dynamic {
-                // The app library records the runtime's cargo-written install
-                // name; retarget while the canonical copy still carries it.
-                dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
-            }
-            dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
+    Ok(built_target)
+}
+
+/// The `-D` flags the Swift seam compiles with, read off the application's
+/// resolved dependency graph the same way `capability_ffi_features` selects
+/// the FFI crate's exported C surface: `WATERUI_MAP`/`WATERUI_WEBVIEW` opt
+/// the matching bridge in, `WATERUI_NO_MEDIA`/`WATERUI_NO_GPU` opt the
+/// absent capability's C calls out so the archive never references symbols
+/// the dylib does not export.
+async fn apple_swift_defines(project: &Project) -> eyre::Result<Vec<String>> {
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
+    let mut defines = Vec::new();
+    for (capability, define) in [("map", "WATERUI_MAP"), ("webview", "WATERUI_WEBVIEW")] {
+        if crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
+            defines.push(define.to_string());
         }
     }
+    for (capability, define) in [("media", "WATERUI_NO_MEDIA"), ("gpu", "WATERUI_NO_GPU")] {
+        if !crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
+            defines.push(define.to_string());
+        }
+    }
+    Ok(defines)
+}
 
-    Ok(built_target)
+fn link_search_flag(dir: &OsStr) -> String {
+    let mut flag = OsString::from("-Clink-arg=-L");
+    flag.push(dir);
+    flag.to_string_lossy().into_owned()
+}
+
+fn link_file_arg(path: &Path) -> String {
+    let mut flag = OsString::from("-Clink-arg=");
+    flag.push(path.as_os_str());
+    flag.to_string_lossy().into_owned()
+}
+
+/// Compile the backend's Swift seam into `DerivedData/SwiftSeam` and return
+/// the archive's library directory for the executable's `-L`/`-l` flags. The
+/// `cdylib` side of the contract — the seam symbols explicitly undefined — is
+/// emitted by the ffi crate's own `build.rs`, which reaches the cdylib in
+/// every context including Cargo's `--bin` dependency artifact.
+async fn apple_swift_seam_dir(
+    project: &Project,
+    platform: TargetPlatform,
+    deployment_target: &str,
+    debug: bool,
+) -> eyre::Result<OsString> {
+    let backend_root = apple_backend_source_root(project).await?;
+    let seam_dir = project
+        .backend_path::<AppleBackend>()
+        .join("DerivedData/SwiftSeam");
+    let seam_archive = swift_seam::compile_swift_seam(
+        &backend_root,
+        platform,
+        deployment_target,
+        debug,
+        &apple_swift_defines(project).await?,
+        &seam_dir,
+    )
+    .await?;
+    Ok(seam_archive
+        .parent()
+        .ok_or_else(|| eyre::eyre!("Swift seam archive has no parent directory"))?
+        .as_os_str()
+        .to_os_string())
 }
 
 /// The deployment targets the Apple backend supports, as `SEMVER` strings.
@@ -343,6 +468,62 @@ fn validate_local_apple_backend(project: &Project) -> eyre::Result<()> {
          release from SwiftPM.",
         backend_root.display()
     );
+}
+
+/// The checkout the project's `waterui-apple` dependency compiles from:
+/// `[backends.apple] backend_path` when declared, otherwise the source
+/// directory `cargo metadata` resolved for the ffi crate's dependency.
+///
+/// # Errors
+/// Returns an error when the backend source cannot be located.
+async fn apple_backend_source_root(project: &Project) -> eyre::Result<PathBuf> {
+    if let Some(backend_path) = project
+        .manifest()
+        .backends
+        .apple()
+        .and_then(|backend| backend.backend_path.as_deref())
+    {
+        let candidate = PathBuf::from(backend_path);
+        return Ok(if candidate.is_absolute() {
+            candidate
+        } else {
+            project.root().join(candidate)
+        });
+    }
+
+    let manifest_path_arg: OsString = project.ffi_crate_path().join("Cargo.toml").into();
+    let output = crate::utils::run_command_os(
+        "cargo",
+        [
+            OsString::from("metadata"),
+            OsString::from("--format-version"),
+            OsString::from("1"),
+            OsString::from("--manifest-path"),
+            manifest_path_arg,
+        ],
+    )
+    .await
+    .wrap_err("cargo metadata failed to resolve the Apple backend source")?;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&output).wrap_err("cargo metadata returned unparseable JSON")?;
+    let manifest_path = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|packages| {
+            packages.iter().find_map(|package| {
+                (package.get("name").and_then(serde_json::Value::as_str) == Some("waterui-apple"))
+                    .then(|| {
+                    package
+                        .get("manifest_path")
+                        .and_then(serde_json::Value::as_str)
+                })?
+            })
+        })
+        .ok_or_else(|| eyre::eyre!("the ffi crate does not depend on a `waterui-apple` package"))?;
+    PathBuf::from(manifest_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| eyre::eyre!("`waterui-apple` manifest path has no parent"))
 }
 
 // ============================================================================
