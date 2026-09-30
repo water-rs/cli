@@ -186,6 +186,19 @@ fn load_project_icon(manifest: &BundleManifest) -> eyre::Result<IconSource> {
     )
 }
 
+/// The theme parent a generated Android app builds on: Material3 for the
+/// native View runtime's appcompat dependency closure, the platform's own
+/// Material theme for the Hydrolysis host, which ships neither library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AndroidThemeParent {
+    /// `Theme.Material3.DayNight.NoActionBar` — appcompat/Material color
+    /// attributes, only valid with `com.google.android.material` linked.
+    Material3,
+    /// `@android:style/Theme.Material.NoActionBar` — framework attributes
+    /// only; the Hydrolysis host declares no appcompat or Material dep.
+    Platform,
+}
+
 /// Stage the project's assets under the Android backend's `res`/`assets`
 /// tree. `symbols` is the target build's app library — see
 /// [`stage_for_apple`].
@@ -194,6 +207,7 @@ pub async fn stage_for_android(
     backend_path: &Path,
     symbols: &ArtifactSymbols,
     dev_server: bool,
+    theme_parent: AndroidThemeParent,
 ) -> eyre::Result<BundleManifest> {
     let manifest = build_manifest(project, symbols, dev_server).await?;
     let assets_dest = backend_path
@@ -211,7 +225,7 @@ pub async fn stage_for_android(
     let launch = launch_assets_from(project, &manifest)?;
 
     let theme = project.manifest().theme.as_ref();
-    write_android_theme_files(theme, icon_background, &launch, backend_path).await?;
+    write_android_theme_files(theme, icon_background, &launch, backend_path, theme_parent).await?;
 
     // Older CLI versions staged the foreground as a vector drawable; a PNG
     // and an XML with the same resource name cannot coexist.
@@ -348,7 +362,14 @@ fn build_main_manifest(project: &Project) -> eyre::Result<BundleManifest> {
 fn plan_main_assets(project: &Project) -> eyre::Result<Vec<PlannedAsset>> {
     let assets_dir = project.assets_dir();
     if assets_dir.is_dir() {
-        Ok(plan_mount(&assets_dir, "")?)
+        // `water create` writes `assets/README.md` to document the asset
+        // workflow — documentation, not an asset, so it never ships inside
+        // a packaged artifact. Bundles mounted with `include_bundle!` are
+        // declared wholesale and keep every file they name.
+        Ok(plan_mount(&assets_dir, "")?
+            .into_iter()
+            .filter(|asset| asset.logical_path != Path::new("README.md"))
+            .collect())
     } else {
         Ok(Vec::new())
     }
@@ -844,6 +865,7 @@ struct AndroidColorsTemplate {
 #[derive(Template)]
 #[template(path = "src/templates/android_res/themes.xml.tpl", escape = "xml")]
 struct AndroidThemesTemplate {
+    theme_parent: &'static str,
     theme_items: Vec<AndroidThemeItem>,
     launch_background: bool,
     launch_artwork: bool,
@@ -857,7 +879,8 @@ struct AndroidThemesTemplate {
 struct AndroidLaunchArtworkTemplate;
 
 /// The theme slots and the resources they bind to, in the order the
-/// generated `colors.xml` and `themes.xml` list them.
+/// generated `colors.xml` and `themes.xml` list them, under the Material3
+/// attribute namespace appcompat supplies.
 const fn android_theme_slots(
     theme: &ThemeConfig,
 ) -> [(&'static str, &'static str, Option<HexColor>); 8] {
@@ -889,6 +912,28 @@ const fn android_theme_slots(
     ]
 }
 
+/// The same theme tokens as framework attributes: what a generated app
+/// without appcompat or the Material components library — the Hydrolysis
+/// host — can bind against `Theme.Material`.
+const fn android_platform_theme_slots(
+    theme: &ThemeConfig,
+) -> [(&'static str, &'static str, Option<HexColor>); 4] {
+    [
+        (
+            "android:colorBackground",
+            "waterui_background",
+            theme.background,
+        ),
+        ("android:colorPrimary", "waterui_accent", theme.accent),
+        ("android:colorAccent", "waterui_accent", theme.accent),
+        (
+            "android:textColorPrimary",
+            "waterui_foreground",
+            theme.foreground,
+        ),
+    ]
+}
+
 /// The color behind an adaptive icon's foreground: the artwork's own edge
 /// color so the two layers join seamlessly, else `fallback`.
 fn android_adaptive_background(edge: Option<[u8; 3]>, fallback: HexColor) -> HexColor {
@@ -900,6 +945,7 @@ async fn write_android_theme_files(
     icon_background: Option<[u8; 3]>,
     launch: &LaunchAssets,
     backend_path: &Path,
+    theme_parent: AndroidThemeParent,
 ) -> eyre::Result<()> {
     let values_dir = backend_path.join(ANDROID_VALUES_DIR);
     let values_night_dir = backend_path.join(ANDROID_VALUES_NIGHT_DIR);
@@ -917,8 +963,18 @@ async fn write_android_theme_files(
 
     let plan = launch.plan();
     let themes = AndroidThemesTemplate {
+        theme_parent: match theme_parent {
+            AndroidThemeParent::Material3 => "Theme.Material3.DayNight.NoActionBar",
+            AndroidThemeParent::Platform => "@android:style/Theme.Material.NoActionBar",
+        },
         theme_items: theme.map_or_else(Vec::new, |theme| {
-            android_theme_slots(theme)
+            let slots: Vec<_> = match theme_parent {
+                AndroidThemeParent::Material3 => android_theme_slots(theme).into_iter().collect(),
+                AndroidThemeParent::Platform => {
+                    android_platform_theme_slots(theme).into_iter().collect()
+                }
+            };
+            slots
                 .into_iter()
                 .filter(|(_, _, value)| value.is_some())
                 .map(|(attr, color_name, _)| AndroidThemeItem { attr, color_name })
@@ -1042,7 +1098,49 @@ async fn write_png(image: &image::RgbaImage, path: &Path) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::ManagedBackends;
     use waterui_assets_planner::LaunchConfig;
+
+    #[test]
+    fn the_scaffold_assets_readme_never_ships() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let root = tempdir.path().join("fixture");
+            std::fs::create_dir_all(root.join("src")).expect("src");
+            std::fs::create_dir_all(root.join("assets")).expect("assets");
+            std::fs::write(
+                root.join("Water.toml"),
+                "[package]\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
+            )
+            .expect("Water.toml");
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .expect("Cargo.toml");
+            std::fs::write(
+                root.join("Cargo.lock"),
+                "version = 4\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            )
+            .expect("Cargo.lock");
+            std::fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+            std::fs::write(root.join("assets/README.md"), "# Assets\n").expect("readme");
+            std::fs::write(root.join("assets/note.txt"), "hello").expect("asset");
+
+            let project = Project::open(&root, ManagedBackends::NONE)
+                .await
+                .expect("fixture project opens");
+            let assets = plan_main_assets(&project).expect("assets plan");
+            assert_eq!(
+                assets
+                    .iter()
+                    .map(|asset| asset.logical_path.as_path())
+                    .collect::<Vec<_>>(),
+                [Path::new("note.txt")],
+                "the scaffold README stays out of the package"
+            );
+        });
+    }
 
     #[test]
     fn android_icon_resources_write_launcher_pngs() {
@@ -1191,6 +1289,7 @@ mod tests {
     #[test]
     fn android_themes_bind_only_configured_slots_and_the_launch_theme() {
         let xml = AndroidThemesTemplate {
+            theme_parent: "Theme.Material3.DayNight.NoActionBar",
             theme_items: vec![AndroidThemeItem {
                 attr: "colorPrimary",
                 color_name: "waterui_accent",
@@ -1210,6 +1309,7 @@ mod tests {
         assert!(!xml.contains("windowSplashScreenAnimatedIcon"));
 
         let xml = AndroidThemesTemplate {
+            theme_parent: "Theme.Material3.DayNight.NoActionBar",
             theme_items: Vec::new(),
             launch_background: false,
             launch_artwork: true,

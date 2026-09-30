@@ -550,6 +550,33 @@ impl ResolvedFramework {
             .map(String::as_str)
     }
 
+    /// The Hydrolysis Android host the framework pins — the
+    /// `hydrolysis-android-host-{url,revision,subdirectory}` coordinates the
+    /// CLI materializes into a managed checkout and `includeBuild`s.
+    ///
+    /// # Errors
+    /// Returns an error naming the missing key when the resolved framework
+    /// predates the host coordinates.
+    pub(crate) fn hydrolysis_android_host(&self) -> Result<HydrolysisAndroidHost<'_>> {
+        const PREFIX: &str = "hydrolysis-android-host-";
+        let value = |suffix: &str| {
+            self.scaffold
+                .get(&format!("{PREFIX}{suffix}"))
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    eyre!(
+                        "resolved framework carries no `{PREFIX}{suffix}` scaffold metadata: \
+                     the hydrolysis Android host needs the URL, revision and subdirectory pins"
+                    )
+                })
+        };
+        Ok(HydrolysisAndroidHost {
+            url: value("url")?,
+            revision: value("revision")?,
+            subdirectory: value("subdirectory")?,
+        })
+    }
+
     /// The Android API floor the selected framework's native runtime
     /// supports — the `android-min-api-level` its
     /// `[package.metadata.waterui]` table declares. The backend's Gradle
@@ -1564,7 +1591,9 @@ fn framework_metadata(manifest: &toml::Value) -> Result<toml::Table> {
 /// pins a repository — and every backend coordinate — `{name}-backend-url`,
 /// plus the `{name}-backend-version` of a backend pinned by release or the
 /// `{name}-backend-revision` of one pinned by commit, rather than by
-/// gitlink — from `[package.metadata.waterui]`.
+/// gitlink — and every host coordinate — `{name}-host-url`,
+/// `{name}-host-revision` and `{name}-host-subdirectory` — from
+/// `[package.metadata.waterui]`.
 ///
 /// `framework_manifest.py` emits exactly this table into every `framework.json`
 /// it publishes; both must produce the same table for the same tree.
@@ -1613,15 +1642,22 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
     for (key, value) in &metadata {
         if !(key.ends_with("-backend-url")
             || key.ends_with("-backend-version")
-            || key.ends_with("-backend-revision"))
+            || key.ends_with("-backend-revision")
+            || key.ends_with("-host-url")
+            || key.ends_with("-host-revision")
+            || key.ends_with("-host-subdirectory"))
         {
             continue;
         }
         let value = value
             .as_str()
             .ok_or_else(|| eyre!("package.metadata.waterui.{key} must be a string"))?;
-        if key.ends_with("-backend-revision") {
+        if key.ends_with("-backend-revision") || key.ends_with("-host-revision") {
             validate_revision(value).wrap_err_with(|| format!("package.metadata.waterui.{key}"))?;
+        }
+        if key.ends_with("-host-subdirectory") {
+            validate_host_subdirectory(value)
+                .wrap_err_with(|| format!("package.metadata.waterui.{key}"))?;
         }
         scaffold.insert(key.clone(), value.to_owned());
     }
@@ -2069,6 +2105,36 @@ fn validate_revision(revision: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Hydrolysis Android host coordinates a resolved framework carries:
+/// where to fetch the host repository, the exact commit to check out, and
+/// the subdirectory inside that checkout that is the Gradle project the
+/// generated app `includeBuild`s.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HydrolysisAndroidHost<'a> {
+    /// Git URL the host checkout is fetched from.
+    pub url: &'a str,
+    /// Full commit hash the checkout pins.
+    pub revision: &'a str,
+    /// Gradle root inside the checkout (e.g. `android`).
+    pub subdirectory: &'a str,
+}
+
+/// A `{name}-host-subdirectory` names the Gradle root inside the host
+/// checkout the generated project `includeBuild`s — a plain relative path,
+/// never absolute and never escaping the checkout.
+fn validate_host_subdirectory(subdirectory: &str) -> Result<()> {
+    let path = Path::new(subdirectory);
+    if subdirectory.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("host subdirectory must be a relative path inside the checkout");
+    }
+    Ok(())
+}
+
 async fn fetch(url: &str) -> Result<Vec<u8>> {
     fetch_optional(url)
         .await?
@@ -2142,6 +2208,15 @@ pub(crate) mod test_fixtures {
                     "https://github.com/water-rs/android-backend.git".to_owned(),
                 ),
                 ("android-backend-revision".to_owned(), revision('c')),
+                (
+                    "hydrolysis-android-host-url".to_owned(),
+                    "https://github.com/water-rs/hydrolysis.git".to_owned(),
+                ),
+                ("hydrolysis-android-host-revision".to_owned(), revision('d')),
+                (
+                    "hydrolysis-android-host-subdirectory".to_owned(),
+                    "android".to_owned(),
+                ),
             ])
             .collect();
         ResolvedFramework {
@@ -2189,6 +2264,66 @@ pub(crate) mod test_fixtures {
                 experimental("0.1.0", "https://github.com/water-rs/waterui-winui", 'e'),
             ),
         ])
+    }
+
+    /// A stable-channel resolution whose `scaffold` comes from running the
+    /// real `framework_scaffold` emission over the checkout fixture manifest
+    /// — the path the published `framework.json` takes — rather than a
+    /// hand-assembled map. Tests that exercise the scaffold contract
+    /// end-to-end resolve this, so a dropped or renamed
+    /// `[package.metadata.waterui]` key fails them instead of only the
+    /// emitter's unit test. `stable` still withholds the git-pinned scaffold
+    /// packages under `experimental-packages`; the emitted `-git`/`-rev`
+    /// facts move there.
+    pub fn stable_checkout_framework() -> ResolvedFramework {
+        let revision = |seed: char| seed.to_string().repeat(40);
+        let manifest = toml::Value::Table(
+            local_checkout_manifest()
+                .parse::<toml::Table>()
+                .expect("the checkout fixture manifest parses"),
+        );
+        let mut emitted =
+            framework_scaffold(&manifest).expect("the checkout fixture emits its scaffold");
+        let mut experimental_packages = BTreeMap::new();
+        for name in ["waterui-dew", "waterui-gtk", "waterui-winui"] {
+            experimental_packages.insert(
+                name.to_owned(),
+                ExperimentalPackage {
+                    version: emitted
+                        .remove(&format!("{name}-version"))
+                        .expect("the fixture pins the package version"),
+                    git: emitted
+                        .remove(&format!("{name}-git"))
+                        .expect("the fixture pins the package git source"),
+                    rev: emitted
+                        .remove(&format!("{name}-rev"))
+                        .expect("the fixture pins the package revision"),
+                },
+            );
+        }
+        let scaffold = FRAMEWORK_PACKAGES
+            .iter()
+            .map(|name| (format!("{name}-version"), "0.4.1".to_owned()))
+            .chain(emitted)
+            .collect();
+        ResolvedFramework {
+            source: Source::Stable {
+                release: Some(FrameworkRelease {
+                    repository: framework_repository().to_owned(),
+                    revision: revision('a'),
+                    tag: "v0.4.1".to_owned(),
+                }),
+            },
+            minimum_cli_version: None,
+            rust_version: None,
+            metadata: toml::toml! {
+                android-min-api-level = 26
+            },
+            scaffold,
+            experimental_packages,
+            packages: BTreeMap::new(),
+            patches: PatchSet::default(),
+        }
     }
 
     /// A `dev`-channel resolution: the manifest's scaffold facts — including
@@ -4308,6 +4443,18 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                     "https://github.com/water-rs/android-backend.git".to_owned()
                 ),
                 ("android-backend-revision".to_owned(), "c".repeat(40)),
+                (
+                    "hydrolysis-android-host-url".to_owned(),
+                    "https://github.com/water-rs/hydrolysis.git".to_owned()
+                ),
+                (
+                    "hydrolysis-android-host-revision".to_owned(),
+                    "d".repeat(40)
+                ),
+                (
+                    "hydrolysis-android-host-subdirectory".to_owned(),
+                    "android".to_owned()
+                ),
             ])
         );
     }
@@ -4339,6 +4486,41 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
         assert!(
             error.to_string().contains("android-backend-revision"),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn framework_scaffold_validates_the_hydrolysis_android_host_coordinates() {
+        for (key, value) in [
+            ("hydrolysis-android-host-revision", "dev"),
+            ("hydrolysis-android-host-subdirectory", "../outside"),
+            ("hydrolysis-android-host-subdirectory", "/absolute"),
+            ("hydrolysis-android-host-subdirectory", ""),
+        ] {
+            let mut root: toml::Value = toml::from_str(include_str!(
+                "../../tests/fixtures/framework_checkout_manifest.toml"
+            ))
+            .unwrap();
+            root["package"]["metadata"]["waterui"][key] = toml::Value::String(value.to_owned());
+            let error = framework_scaffold(&root).unwrap_err();
+            assert!(error.to_string().contains(key), "{key}={value}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn resolved_framework_carries_the_hydrolysis_android_host_pin() {
+        let framework = stable_framework();
+        let host = framework.hydrolysis_android_host().unwrap();
+        assert_eq!(host.url, "https://github.com/water-rs/hydrolysis.git");
+        assert_eq!(host.revision, "d".repeat(40));
+        assert_eq!(host.subdirectory, "android");
+
+        let mut missing = stable_framework();
+        missing.scaffold.remove("hydrolysis-android-host-revision");
+        let error = missing.hydrolysis_android_host().unwrap_err().to_string();
+        assert!(
+            error.contains("hydrolysis-android-host-revision"),
+            "{error}"
         );
     }
 
