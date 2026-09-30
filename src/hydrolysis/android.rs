@@ -569,7 +569,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        framework::test_fixtures::stable_framework,
+        framework::test_fixtures::stable_checkout_framework,
         project::{ManagedBackends, Manifest},
         toolchain::testing::{TestMachine, tool_file_name},
     };
@@ -584,7 +584,7 @@ mod tests {
             "[package]\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n{extra_manifest}"
         ))
         .expect("Water.toml parses");
-        manifest.framework = Some(stable_framework());
+        manifest.framework = Some(stable_checkout_framework());
         std::fs::write(
             root.join("Water.toml"),
             toml::to_string(&manifest).expect("manifest serializes"),

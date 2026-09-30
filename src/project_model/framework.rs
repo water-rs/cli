@@ -2266,6 +2266,66 @@ pub(crate) mod test_fixtures {
         ])
     }
 
+    /// A stable-channel resolution whose `scaffold` comes from running the
+    /// real `framework_scaffold` emission over the checkout fixture manifest
+    /// — the path the published `framework.json` takes — rather than a
+    /// hand-assembled map. Tests that exercise the scaffold contract
+    /// end-to-end resolve this, so a dropped or renamed
+    /// `[package.metadata.waterui]` key fails them instead of only the
+    /// emitter's unit test. `stable` still withholds the git-pinned scaffold
+    /// packages under `experimental-packages`; the emitted `-git`/`-rev`
+    /// facts move there.
+    pub fn stable_checkout_framework() -> ResolvedFramework {
+        let revision = |seed: char| seed.to_string().repeat(40);
+        let manifest = toml::Value::Table(
+            local_checkout_manifest()
+                .parse::<toml::Table>()
+                .expect("the checkout fixture manifest parses"),
+        );
+        let mut emitted =
+            framework_scaffold(&manifest).expect("the checkout fixture emits its scaffold");
+        let mut experimental_packages = BTreeMap::new();
+        for name in ["waterui-dew", "waterui-gtk", "waterui-winui"] {
+            experimental_packages.insert(
+                name.to_owned(),
+                ExperimentalPackage {
+                    version: emitted
+                        .remove(&format!("{name}-version"))
+                        .expect("the fixture pins the package version"),
+                    git: emitted
+                        .remove(&format!("{name}-git"))
+                        .expect("the fixture pins the package git source"),
+                    rev: emitted
+                        .remove(&format!("{name}-rev"))
+                        .expect("the fixture pins the package revision"),
+                },
+            );
+        }
+        let scaffold = FRAMEWORK_PACKAGES
+            .iter()
+            .map(|name| (format!("{name}-version"), "0.4.1".to_owned()))
+            .chain(emitted)
+            .collect();
+        ResolvedFramework {
+            source: Source::Stable {
+                release: Some(FrameworkRelease {
+                    repository: framework_repository().to_owned(),
+                    revision: revision('a'),
+                    tag: "v0.4.1".to_owned(),
+                }),
+            },
+            minimum_cli_version: None,
+            rust_version: None,
+            metadata: toml::toml! {
+                android-min-api-level = 26
+            },
+            scaffold,
+            experimental_packages,
+            packages: BTreeMap::new(),
+            patches: PatchSet::default(),
+        }
+    }
+
     /// A `dev`-channel resolution: the manifest's scaffold facts — including
     /// the git-pinned packages `stable` withholds, which `dev` distributes
     /// through `scaffold` — plus the `apple-backend-revision` `construct`
