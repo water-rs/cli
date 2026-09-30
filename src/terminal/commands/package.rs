@@ -10,26 +10,18 @@ use crate::{header, success};
 use waterui_cli::toolchain_checks;
 use waterui_cli::{
     android::platform::{AndroidAbi, AndroidPlatform},
-    apple::platform::{build_rust_lib, package_apple},
-    apple::toolchain::AppleSdk,
-    backend::reinit_backend,
+    apple::{
+        platform::{build_rust_lib, package_apple},
+        toolchain::AppleSdk,
+    },
     build::{BuildOptions, BuildProfile, BuiltTarget},
     device::Artifact,
-    gtk4::{
-        backend::Gtk4Backend,
-        platform::{build_gtk4, package_gtk4},
-    },
-    hydrolysis::{
-        backend::HydrolysisBackend,
-        platform::{build_hydrolysis, package_hydrolysis},
-    },
+    gtk4::platform::{build_gtk4, package_gtk4},
+    hydrolysis::platform::{build_hydrolysis, package_hydrolysis},
     package_output::place_in_project,
     platform::{DeviceSigning, PackageOptions, TargetPlatform as LibTargetPlatform},
     project::{ManagedBackends, Project},
-    winui::{
-        backend::WinUiBackend,
-        platform::{build_winui, package_winui},
-    },
+    winui::platform::{build_winui, package_winui},
 };
 
 /// Target platform for packaging.
@@ -72,6 +64,17 @@ impl TargetBackend {
     /// ahead of milestone releases — so selecting it asks for confirmation.
     const fn is_experimental(self) -> bool {
         matches!(self, Self::Gtk4 | Self::WinUi)
+    }
+
+    /// The shared command-line backend this packaging backend is.
+    const fn cli_backend(self) -> super::TargetBackend {
+        match self {
+            Self::Apple => super::TargetBackend::Apple,
+            Self::Android => super::TargetBackend::Android,
+            Self::Gtk4 => super::TargetBackend::Gtk4,
+            Self::Hydrolysis => super::TargetBackend::Hydrolysis,
+            Self::WinUi => super::TargetBackend::WinUi,
+        }
     }
 }
 
@@ -197,7 +200,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.distribution,
     );
     check_packaging_toolchain(shell, args.platform, context.backend, &args.arch).await?;
-    let built = build_packaging_artifacts(shell, &args, &context).await?;
+    let built = Box::pin(build_packaging_artifacts(shell, &args, &context)).await?;
     package_artifact(shell, &args, &context, built.as_ref()).await
 }
 
@@ -210,14 +213,13 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     validate_arch_args(backend, &args.arch)?;
     validate_unsigned_args(args.platform, backend, args.unsigned)?;
     validate_desktop_backend_platform_on_host(args.platform, backend)?;
-    ensure_packaging_backend_ready(&project, backend)?;
 
     if backend.is_experimental()
         && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
     {
         return Ok(None);
     }
-    let project = ensure_packaging_backend_generated(shell, project, backend).await?;
+    let project = super::ensure_generated_backend(shell, project, backend.cli_backend()).await?;
 
     let mut build_options =
         BuildOptions::packaging(args.profile()).with_progress(shell.build_progress());
@@ -232,97 +234,6 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
         backend,
         build_options,
     }))
-}
-
-fn ensure_packaging_backend_ready(project: &Project, backend: TargetBackend) -> Result<()> {
-    if project.is_playground() {
-        return Ok(());
-    }
-
-    match backend {
-        TargetBackend::Apple if project.apple_backend().is_none() => {
-            bail!("Apple backend is not configured. Run `water backend add apple`.");
-        }
-        TargetBackend::Android if project.android_backend().is_none() => {
-            bail!("Android backend is not configured. Run `water backend add android`.");
-        }
-        TargetBackend::Gtk4 if project.gtk4_backend().is_none() => {
-            bail!("GTK4 backend is not configured. Run `water backend add gtk4`.");
-        }
-        TargetBackend::Hydrolysis if project.hydrolysis_backend().is_none() => {
-            bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
-        }
-        TargetBackend::WinUi if project.winui_backend().is_none() => {
-            bail!("WinUI backend is not configured. Run `water backend add winui`.");
-        }
-        _ => Ok(()),
-    }
-}
-
-async fn ensure_packaging_backend_generated(
-    shell: &Shell,
-    project: Project,
-    backend: TargetBackend,
-) -> Result<Project> {
-    match backend {
-        TargetBackend::Gtk4 if project.is_playground() => {
-            let needs_reinit = Gtk4Backend::requires_regeneration(&project).await?;
-            ensure_packaging_generated_backend::<Gtk4Backend>(
-                shell,
-                project,
-                needs_reinit,
-                "Initializing GTK4 backend...",
-                "GTK4 backend initialized",
-            )
-            .await
-        }
-        TargetBackend::Hydrolysis if project.is_playground() => {
-            let needs_reinit = HydrolysisBackend::requires_regeneration(&project).await?;
-            ensure_packaging_generated_backend::<HydrolysisBackend>(
-                shell,
-                project,
-                needs_reinit,
-                "Initializing hydrolysis backend...",
-                "Hydrolysis backend initialized",
-            )
-            .await
-        }
-        TargetBackend::WinUi if project.is_playground() => {
-            let needs_reinit = WinUiBackend::requires_regeneration(&project).await?;
-            ensure_packaging_generated_backend::<WinUiBackend>(
-                shell,
-                project,
-                needs_reinit,
-                "Initializing WinUI backend...",
-                "WinUI backend initialized",
-            )
-            .await
-        }
-        _ => Ok(project),
-    }
-}
-
-async fn ensure_packaging_generated_backend<T>(
-    shell: &Shell,
-    project: Project,
-    needs_reinit: bool,
-    spinner_message: &str,
-    success_message: &str,
-) -> Result<Project>
-where
-    T: waterui_cli::backend::Backend,
-{
-    if !needs_reinit {
-        return Ok(project);
-    }
-
-    let spinner = shell.spinner(spinner_message);
-    reinit_backend::<T>(&project).await?;
-    if let Some(pb) = spinner {
-        pb.finish_and_clear();
-    }
-    success!(shell, "{success_message}");
-    Ok(project)
 }
 
 fn print_packaging_header(
@@ -387,12 +298,12 @@ async fn build_packaging_artifacts(
             .await
         }
         TargetBackend::Apple => {
-            build_apple_packaging_artifacts(
+            Box::pin(build_apple_packaging_artifacts(
                 shell,
                 &context.project,
                 args.platform,
                 context.build_options.clone(),
-            )
+            ))
             .await
         }
         TargetBackend::Gtk4 => {
@@ -446,11 +357,11 @@ async fn build_apple_packaging_artifacts(
 ) -> Result<Option<BuiltTarget>> {
     let spinner = shell.spinner("Building Rust library...");
     let built = shell
-        .display_output(build_rust_lib(
+        .display_output(Box::pin(build_rust_lib(
             project,
             lib_platform(platform),
             build_options,
-        ))
+        )))
         .await?;
     if let Some(pb) = spinner {
         pb.finish_and_clear();

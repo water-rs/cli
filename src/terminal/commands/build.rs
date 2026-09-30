@@ -14,16 +14,14 @@ use crate::{error, header, success};
 use waterui_cli::toolchain_checks;
 use waterui_cli::{
     android::platform::{AndroidAbi, AndroidPlatform},
-    apple::platform::build_rust_lib,
-    apple::toolchain::AppleSdk,
-    backend::reinit_backend,
+    apple::{platform::build_rust_lib, toolchain::AppleSdk},
     build::{BuildOptions, BuildProfile, BuiltTarget},
-    esp32::{backend::Esp32Backend, platform::build_esp32},
-    gtk4::{backend::Gtk4Backend, platform::build_gtk4},
-    hydrolysis::{backend::HydrolysisBackend, platform::build_hydrolysis},
+    esp32::platform::build_esp32,
+    gtk4::platform::build_gtk4,
+    hydrolysis::platform::build_hydrolysis,
     platform::TargetPlatform as LibTargetPlatform,
-    project::{ManagedBackends, PackageType, Project},
-    winui::{backend::WinUiBackend, platform::build_winui},
+    project::{ManagedBackends, Project},
+    winui::platform::build_winui,
 };
 
 /// Target platform for building.
@@ -133,7 +131,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.release,
     );
     check_build_toolchain(shell, args.platform, context.backend, args.arch).await?;
-    let result = execute_build(shell, &args, &context).await;
+    let result = Box::pin(execute_build(shell, &args, &context)).await;
 
     handle_build_result(shell, result, args.output_dir)
 }
@@ -142,10 +140,7 @@ async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<Buil
     let project_path = crate::project_path::canonicalize(&args.path)?;
     let managed_backends = ManagedBackends::for_platform(lib_platform(args.platform));
     let mut project = Project::open(&project_path, managed_backends).await?;
-    ensure_app_project(&project)?;
-
     let backend = resolve_and_validate_backend(args)?;
-    ensure_backend_configured(&project, backend)?;
 
     if backend.is_experimental()
         && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
@@ -159,7 +154,7 @@ async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<Buil
         project.set_esp32_chip(chip).await?;
     }
 
-    let project = ensure_generated_backend_ready(shell, project, backend).await?;
+    let project = super::ensure_generated_backend(shell, project, backend).await?;
     let build_options = build_options(shell, args, backend).await;
 
     Ok(Some(BuildContext {
@@ -169,110 +164,12 @@ async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<Buil
     }))
 }
 
-fn ensure_app_project(project: &Project) -> Result<()> {
-    if project.package_type() != PackageType::App {
-        bail!(
-            "`water build` is only supported for app mode projects.\n\
-             Playground projects are managed by `water run` and `water package`."
-        );
-    }
-    Ok(())
-}
-
 fn resolve_and_validate_backend(args: &Args) -> Result<TargetBackend> {
     let backend = resolve_backend(args.platform, args.backend)?;
     validate_desktop_backend_platform_on_host(args.platform, backend)?;
     validate_arch_args(backend, args.arch)?;
     validate_output_dir_args(backend, args.output_dir.as_ref())?;
     Ok(backend)
-}
-
-fn ensure_backend_configured(project: &Project, backend: TargetBackend) -> Result<()> {
-    match backend {
-        TargetBackend::Apple if project.apple_backend().is_none() => {
-            bail!("Apple backend is not configured. Run `water backend add apple`.");
-        }
-        TargetBackend::Android if project.android_backend().is_none() => {
-            bail!("Android backend is not configured. Run `water backend add android`.");
-        }
-        TargetBackend::Gtk4 if project.gtk4_backend().is_none() => {
-            bail!("GTK4 backend is not configured. Run `water backend add gtk4`.");
-        }
-        TargetBackend::Hydrolysis if project.hydrolysis_backend().is_none() => {
-            bail!("Hydrolysis backend is not configured. Run `water backend add hydrolysis`.");
-        }
-        TargetBackend::WinUi if project.winui_backend().is_none() => {
-            bail!("WinUI backend is not configured. Run `water backend add winui`.");
-        }
-        TargetBackend::Dew if project.esp32_backend().is_none() => {
-            bail!("ESP32 backend is not configured. Run `water backend add esp32`.");
-        }
-        _ => Ok(()),
-    }
-}
-
-async fn ensure_generated_backend_ready(
-    shell: &Shell,
-    project: Project,
-    backend: TargetBackend,
-) -> Result<Project> {
-    match backend {
-        TargetBackend::Gtk4 if Gtk4Backend::requires_regeneration(&project).await? => {
-            reinitialize_generated_backend::<Gtk4Backend>(
-                shell,
-                project,
-                "Re-initializing GTK4 backend...",
-                "GTK4 backend re-initialized",
-            )
-            .await
-        }
-        TargetBackend::Hydrolysis if HydrolysisBackend::requires_regeneration(&project).await? => {
-            reinitialize_generated_backend::<HydrolysisBackend>(
-                shell,
-                project,
-                "Re-initializing hydrolysis backend...",
-                "Hydrolysis backend re-initialized",
-            )
-            .await
-        }
-        TargetBackend::WinUi if WinUiBackend::requires_regeneration(&project).await? => {
-            reinitialize_generated_backend::<WinUiBackend>(
-                shell,
-                project,
-                "Re-initializing WinUI backend...",
-                "WinUI backend re-initialized",
-            )
-            .await
-        }
-        TargetBackend::Dew if Esp32Backend::requires_regeneration(&project)? => {
-            reinitialize_generated_backend::<Esp32Backend>(
-                shell,
-                project,
-                "Re-initializing ESP32 backend...",
-                "ESP32 backend re-initialized",
-            )
-            .await
-        }
-        _ => Ok(project),
-    }
-}
-
-async fn reinitialize_generated_backend<T>(
-    shell: &Shell,
-    project: Project,
-    spinner_message: &str,
-    success_message: &str,
-) -> Result<Project>
-where
-    T: waterui_cli::backend::Backend,
-{
-    let spinner = shell.spinner(spinner_message);
-    reinit_backend::<T>(&project).await?;
-    if let Some(pb) = spinner {
-        pb.finish_and_clear();
-    }
-    success!(shell, "{success_message}");
-    Ok(project)
 }
 
 /// Resolve the Cargo profile `water build` builds under.
@@ -371,7 +268,7 @@ async fn check_build_toolchain(
 async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<BuiltTarget> {
     let spinner = shell.spinner("Compiling...");
     let result = shell
-        .display_output(async {
+        .display_output(Box::pin(async {
             match context.backend {
                 TargetBackend::Apple => {
                     build_for_apple(
@@ -404,7 +301,7 @@ async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Re
                     build_esp32(&context.project, context.build_options.clone()).await
                 }
             }
-        })
+        }))
         .await;
 
     if let Some(pb) = spinner {
@@ -443,8 +340,7 @@ fn resolve_backend(
             TargetBackend::Apple
         }
         TargetPlatform::Android => TargetBackend::Android,
-        TargetPlatform::Linux => TargetBackend::Gtk4,
-        TargetPlatform::Windows => TargetBackend::Hydrolysis,
+        TargetPlatform::Linux | TargetPlatform::Windows => TargetBackend::Hydrolysis,
         TargetPlatform::Esp32s3 | TargetPlatform::Esp32c3 | TargetPlatform::Esp32p4 => {
             TargetBackend::Dew
         }
@@ -864,7 +760,7 @@ mod tests {
         );
         assert_eq!(
             resolve_backend(TargetPlatform::Linux, None).expect("linux backend"),
-            TargetBackend::Gtk4
+            TargetBackend::Hydrolysis
         );
         assert_eq!(
             resolve_backend(TargetPlatform::Windows, None).expect("windows backend"),

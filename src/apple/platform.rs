@@ -3,36 +3,36 @@
 //! This module provides utility functions for building and packaging Apple apps.
 //! These functions are used by `AppleBackend` to implement the `Backend` trait.
 
-use std::collections::BTreeSet;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use eyre::{Context, bail};
 use smol::fs;
-use target_lexicon::Architecture;
 use tracing::info;
 
 #[cfg(target_os = "macos")]
 use crate::browser_runtime;
 #[cfg(target_os = "macos")]
-use crate::macos_bundle::{package_cef_helper_app, remove_cef_helper_apps, sign_macos_app};
+use crate::macos_bundle::{package_cef_helper_app, remove_cef_helper_apps};
 use crate::{
+    apple::app_bundle,
     apple::backend::AppleBackend,
     apple::dynamic_runtime,
+    apple::swift_seam,
     assets,
     build::{BuildOptions, BuiltTarget, RustBuild, RustDynamicLibraries, RustLinkage},
     device::Artifact,
-    platform::{DeviceSigning, PackageOptions, TargetBackend, TargetPlatform},
+    platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
-    toolchain::Host,
-    utils::{copy_file, run_command_os},
+    utils::copy_file,
 };
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct AppleNativeLinkInputs {
-    archives: Vec<PathBuf>,
-    linker_flags: Vec<String>,
-}
+/// The generated FFI crate's application binary — the `[[bin]]` target
+/// `src/bin/waterui-apple-main.rs` declares.
+///
+/// Entry-owning Apple packaging installs it as the bundle executable; the
+/// library target stays for the embedding path.
+pub const APPLE_ENTRY_BINARY_NAME: &str = "waterui-apple-main";
 
 // ============================================================================
 // Build Utilities
@@ -161,6 +161,7 @@ async fn apple_ffi_build_features(
 ///
 /// # Errors
 /// Returns an error if the Rust build fails or the expected Apple archive cannot be copied.
+#[allow(clippy::too_many_lines)]
 pub async fn build_rust_lib(
     project: &Project,
     platform: TargetPlatform,
@@ -201,7 +202,7 @@ pub async fn build_rust_lib(
         .with_env(format!("PKG_CONFIG_ALLOW_CROSS_{target}"), "1");
     let (deployment_environment, deployment_target) =
         apple_deployment_target(project, platform).await?;
-    build = build.with_env(deployment_environment, deployment_target);
+    build = build.with_env(deployment_environment, deployment_target.clone());
     if options.linkage() == RustLinkage::SharedRuntime {
         build = build
             .with_preferred_dynamic_linking()
@@ -213,8 +214,96 @@ pub async fn build_rust_lib(
             // dylib's own link step demands the symbols up front and fails.
             .with_final_rustc_arg("-Clink-arg=-Wl,-undefined,dynamic_lookup");
     }
-    build = build.with_target_dir(project.water_target_dir(options.linkage()).await?);
+
+    // The backend's Swift seam (`Sources/WaterUI`) was compiled by the
+    // generated Xcode project; entry-owning packaging compiles it into a
+    // static archive the application executable links instead. A `cdylib`
+    // keeps the host-provides-the-seam contract: the ffi crate's own build
+    // script leaves its `waterui_swift_*` references explicitly undefined,
+    // and they resolve against the image that loaded it.
+    let seam_library_dir =
+        apple_swift_seam_dir(project, platform, &deployment_target, !options.is_release()).await?;
+
+    let target_dir = project.water_target_dir(options.linkage()).await?;
+    let build = build.with_target_dir(target_dir.clone());
     let built_target = build.build_lib(options.is_release()).await?;
+
+    // Stage the host library (and, for the shared runtime, the runtime itself)
+    // before the executable links: it resolves the Swift seam's callbacks into
+    // the app (`_waterui_init`, `_waterui_app`) and into `libwaterui_dylib`
+    // against these very files, and a `DT_NEEDED` entry records the install
+    // name it found — so the staged copy must already carry its final one.
+    if let Some(output_dir) = options.output_dir() {
+        fs::create_dir_all(output_dir).await?;
+        let dest_lib = output_dir.join(host_library.linked_file_name());
+        copy_file(&built_target.artifact, &dest_lib).await?;
+        remove_superseded_host_library(output_dir, host_library).await?;
+        if options.linkage() == RustLinkage::SharedRuntime {
+            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
+            libraries.stage(output_dir).await?;
+            let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
+            if host_library == AppleHostLibrary::Dynamic {
+                // The app library records the runtime's cargo-written install
+                // name; retarget while the canonical copy still carries it.
+                dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
+                // The executable binds the app dylib by its install name.
+                dynamic_runtime::canonicalize_install_name(&dest_lib).await?;
+            }
+            dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
+        }
+    }
+
+    // The Swift seam's callbacks into the app (`_waterui_init`,
+    // `_waterui_app`) resolve inside the one image. Which artifact supplies
+    // them depends on the linkage: a static build links the whole crate as
+    // `libwaterui_app.a`, while a shared-runtime build re-threads the crate's
+    // `rlib` after the seam archive — a second `libwaterui_app.dylib` would
+    // register every ObjC class twice — because ld scans archives once,
+    // left to right, so the seam's references arrive after the crate's own
+    // slot in the link line.
+    let staged_dir = options.output_dir().map(PathBuf::from);
+    let deps_dir = target_dir
+        .join(&target)
+        .join(if options.is_release() {
+            "release"
+        } else {
+            "debug"
+        })
+        .join("deps");
+    let ffi_rlib = deps_dir.join(format!(
+        "lib{}.rlib",
+        project.ffi_crate_name().as_str().replace('-', "_")
+    ));
+    let app_module = if host_library == AppleHostLibrary::Dynamic {
+        ffi_rlib
+    } else {
+        staged_dir.clone().map_or_else(
+            || built_target.artifact.clone(),
+            |dir| dir.join(host_library.linked_file_name()),
+        )
+    };
+
+    let mut executable = build
+        .clone()
+        .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
+        .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/Frameworks")
+        .with_final_rustc_arg("-Clink-arg=-lc++")
+        .with_final_rustc_arg("-Clink-arg=-framework")
+        .with_final_rustc_arg("-Clink-arg=VideoToolbox")
+        .with_final_rustc_arg(link_search_flag(&seam_library_dir))
+        .with_final_rustc_arg("-Clink-arg=-lWaterUISwift")
+        .with_final_rustc_arg(link_file_arg(&app_module));
+
+    if host_library == AppleHostLibrary::Dynamic {
+        let runtime_dir = staged_dir.clone().unwrap_or(deps_dir);
+        executable = executable
+            .with_final_rustc_arg(link_search_flag(runtime_dir.as_os_str()))
+            .with_final_rustc_arg("-Clink-arg=-lwaterui_dylib");
+    }
+    executable
+        .build_binary(APPLE_ENTRY_BINARY_NAME, options.is_release())
+        .await?;
+
     // The helper `[[bin]]` exists only when the manifest declared it — the
     // application's linked engine, not chromium alone — so the build gates
     // on the manifest's own predicate or Cargo reports `no bin target`.
@@ -231,80 +320,121 @@ pub async fn build_rust_lib(
             .await?;
     }
 
-    // If output_dir is specified, copy the library there
-    if let Some(output_dir) = options.output_dir() {
-        fs::create_dir_all(output_dir).await?;
-        let dest_lib = output_dir.join(host_library.linked_file_name());
-        copy_file(&built_target.artifact, &dest_lib).await?;
-        remove_superseded_host_library(output_dir, host_library).await?;
-        if options.linkage() == RustLinkage::SharedRuntime {
-            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
-            libraries.stage(output_dir).await?;
-            let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
-            if host_library == AppleHostLibrary::Dynamic {
-                // The app library records the runtime's cargo-written install
-                // name; retarget while the canonical copy still carries it.
-                dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
-            }
-            dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
+    Ok(built_target)
+}
+
+/// The `-D` flags the Swift seam compiles with, read off the application's
+/// resolved dependency graph the same way `capability_ffi_features` selects
+/// the FFI crate's exported C surface: `WATERUI_MAP`/`WATERUI_WEBVIEW` opt
+/// the matching bridge in, `WATERUI_NO_MEDIA`/`WATERUI_NO_GPU` opt the
+/// absent capability's C calls out so the archive never references symbols
+/// the dylib does not export.
+async fn apple_swift_defines(project: &Project) -> eyre::Result<Vec<String>> {
+    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
+    let mut defines = Vec::new();
+    for (capability, define) in [("map", "WATERUI_MAP"), ("webview", "WATERUI_WEBVIEW")] {
+        if crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
+            defines.push(define.to_string());
         }
     }
+    for (capability, define) in [("media", "WATERUI_NO_MEDIA"), ("gpu", "WATERUI_NO_GPU")] {
+        if !crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
+            .await?
+        {
+            defines.push(define.to_string());
+        }
+    }
+    Ok(defines)
+}
 
-    Ok(built_target)
+fn link_search_flag(dir: &OsStr) -> String {
+    let mut flag = OsString::from("-Clink-arg=-L");
+    flag.push(dir);
+    flag.to_string_lossy().into_owned()
+}
+
+fn link_file_arg(path: &Path) -> String {
+    let mut flag = OsString::from("-Clink-arg=");
+    flag.push(path.as_os_str());
+    flag.to_string_lossy().into_owned()
+}
+
+/// Compile the backend's Swift seam into `DerivedData/SwiftSeam` and return
+/// the archive's library directory for the executable's `-L`/`-l` flags. The
+/// `cdylib` side of the contract — the seam symbols explicitly undefined — is
+/// emitted by the ffi crate's own `build.rs`, which reaches the cdylib in
+/// every context including Cargo's `--bin` dependency artifact.
+async fn apple_swift_seam_dir(
+    project: &Project,
+    platform: TargetPlatform,
+    deployment_target: &str,
+    debug: bool,
+) -> eyre::Result<OsString> {
+    let backend_root = apple_backend_source_root(project).await?;
+    let seam_dir = project
+        .backend_path::<AppleBackend>()
+        .join("DerivedData/SwiftSeam");
+    let seam_archive = swift_seam::compile_swift_seam(
+        &backend_root,
+        platform,
+        deployment_target,
+        debug,
+        &apple_swift_defines(project).await?,
+        &seam_dir,
+    )
+    .await?;
+    Ok(seam_archive
+        .parent()
+        .ok_or_else(|| eyre::eyre!("Swift seam archive has no parent directory"))?
+        .as_os_str()
+        .to_os_string())
+}
+
+/// The deployment targets the Apple backend supports, as `SEMVER` strings.
+///
+/// These were `*_DEPLOYMENT_TARGET` build settings in the generated Xcode
+/// project; entry-owning packaging has no project file, so they are declared
+/// here next to the backend that owns them — the same values `Package.swift`
+/// in `apple-backend` publishes.
+const fn apple_deployment_target_for(platform: TargetPlatform) -> Option<&'static str> {
+    match platform {
+        TargetPlatform::MacOS
+        | TargetPlatform::IOS
+        | TargetPlatform::IOSSimulator
+        | TargetPlatform::TvOS
+        | TargetPlatform::TvOSSimulator
+        | TargetPlatform::WatchOS
+        | TargetPlatform::WatchOSSimulator => Some("26.0"),
+        TargetPlatform::VisionOS | TargetPlatform::VisionOSSimulator => Some("2.5"),
+        _ => None,
+    }
 }
 
 /// Resolve the deployment-target environment variable an Apple build must carry.
 ///
 /// # Errors
 ///
-/// Returns an error when the Xcode project does not define exactly one value.
+/// Returns an error when the platform has no Apple deployment target.
 pub async fn apple_deployment_target(
-    project: &Project,
+    _project: &Project,
     platform: TargetPlatform,
 ) -> eyre::Result<(&'static str, String)> {
-    let backend = project
-        .apple_backend()
-        .ok_or_else(|| eyre::eyre!("Apple backend must be configured"))?;
-    let (environment, build_setting) = match platform {
-        TargetPlatform::MacOS => ("MACOSX_DEPLOYMENT_TARGET", "MACOSX_DEPLOYMENT_TARGET"),
-        TargetPlatform::IOS | TargetPlatform::IOSSimulator => {
-            ("IPHONEOS_DEPLOYMENT_TARGET", "IPHONEOS_DEPLOYMENT_TARGET")
-        }
+    let environment = match platform {
+        TargetPlatform::MacOS => "MACOSX_DEPLOYMENT_TARGET",
+        TargetPlatform::IOS | TargetPlatform::IOSSimulator => "IPHONEOS_DEPLOYMENT_TARGET",
+        TargetPlatform::TvOS | TargetPlatform::TvOSSimulator => "TVOS_DEPLOYMENT_TARGET",
+        TargetPlatform::WatchOS | TargetPlatform::WatchOSSimulator => "WATCHOS_DEPLOYMENT_TARGET",
+        TargetPlatform::VisionOS | TargetPlatform::VisionOSSimulator => "XROS_DEPLOYMENT_TARGET",
         other => {
             bail!("Platform {other:?} does not have an Apple deployment target");
         }
     };
-    let project_file = project
-        .backend_path::<AppleBackend>()
-        .join(format!("{}.xcodeproj", backend.scheme))
-        .join("project.pbxproj");
-    let contents = fs::read_to_string(&project_file)
-        .await
-        .wrap_err_with(|| format!("Failed to read {}", project_file.display()))?;
-    let target = unique_xcode_build_setting(&contents, build_setting)?;
-    Ok((environment, target))
-}
-
-fn unique_xcode_build_setting(contents: &str, key: &str) -> eyre::Result<String> {
-    let prefix = format!("{key} = ");
-    let values = contents
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix(&prefix))
-        .filter_map(|value| value.strip_suffix(';'))
-        .map(|value| value.trim_matches('"').to_string())
-        .collect::<BTreeSet<_>>();
-    match values.len() {
-        1 => Ok(values.into_iter().next().expect("one build setting value")),
-        0 => {
-            bail!("Xcode project does not define {key}");
-        }
-        _ => {
-            bail!(
-                "Xcode project defines conflicting {key} values: {}",
-                values.into_iter().collect::<Vec<_>>().join(", ")
-            );
-        }
-    }
+    let target = apple_deployment_target_for(platform).ok_or_else(|| {
+        eyre::eyre!("Platform {platform:?} does not have an Apple deployment target")
+    })?;
+    Ok((environment, target.to_string()))
 }
 
 // ============================================================================
@@ -348,314 +478,83 @@ fn validate_local_apple_backend(project: &Project) -> eyre::Result<()> {
     );
 }
 
-async fn ensure_apple_linker_flags(
-    xcodeproj: &Path,
-    sdk_name: &str,
-    required_flags: &[String],
-) -> eyre::Result<()> {
-    let pbxproj_path = xcodeproj.join("project.pbxproj");
-    if !pbxproj_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&pbxproj_path)
-        .await
-        .wrap_err_with(|| format!("Failed to read {}", pbxproj_path.display()))?;
-    let (updated, changed) = inject_other_ldflags(&content, sdk_name, required_flags);
-    if changed {
-        fs::write(&pbxproj_path, updated)
-            .await
-            .wrap_err_with(|| format!("Failed to write {}", pbxproj_path.display()))?;
-        info!(
-            "Updated {} with required Apple linker flags",
-            pbxproj_path.display()
-        );
-    }
-
-    Ok(())
-}
-
-/// Writes the flags this build requires into the `OTHER_LDFLAGS[sdk=<sdk>*]`
-/// build setting for the SDK being packaged, never into the unqualified
-/// `OTHER_LDFLAGS` line. The Xcode project is shared across Apple platforms, so
-/// flags collected for one SDK (frameworks and archives found in that build's
-/// cargo output) must not leak into the settings another SDK's package reads.
-/// The per-SDK line is rewritten wholesale on each package, which keeps the
-/// injection idempotent and self-healing when the flag set changes (for
-/// example when the linkage switches between static and the shared runtime).
-fn inject_other_ldflags(
-    content: &str,
-    sdk_name: &str,
-    required_flags: &[String],
-) -> (String, bool) {
-    let sdk_key = format!("OTHER_LDFLAGS[sdk={sdk_name}*]");
-    let flags_value = required_flags.join(" ");
-    let mut changed = false;
-    // Per-SDK settings form a group directly after their block's base
-    // `OTHER_LDFLAGS` line — each SDK owns one line in it. Outside a group a
-    // per-SDK line is a stray, and inside it a second line for this SDK is a
-    // duplicate: both are dropped, along with the stale one when this build
-    // needs no injected flags at all.
-    let mut in_sdk_group = false;
-    let mut sdk_seen = false;
-    let mut lines = Vec::new();
-    let mut iter = content.lines().peekable();
-
-    while let Some(line) = iter.next() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("OTHER_LDFLAGS[sdk=") || trimmed.starts_with("\"OTHER_LDFLAGS[sdk=")
-        {
-            if let Some((prefix, rest)) = line.split_once(&sdk_key)
-                && let Some((_, tail)) = rest.split_once("= \"")
-                && let Some((existing, suffix)) = tail.split_once("\";")
-            {
-                if !in_sdk_group || sdk_seen || flags_value.is_empty() {
-                    changed = true;
-                    continue;
-                }
-                if existing != flags_value {
-                    changed = true;
-                }
-                // A quoted key leaves its opening quote in the split prefix;
-                // emit the canonical quoted form either way.
-                let prefix = prefix.strip_suffix('"').unwrap_or(prefix);
-                lines.push(format!(
-                    "{prefix}\"{sdk_key}\" = \"{flags_value}\";{suffix}"
-                ));
-                sdk_seen = true;
-                continue;
-            }
-            // A per-SDK setting for another platform stays untouched: that
-            // SDK's own packaging pass owns it.
-            lines.push(line.to_string());
-            continue;
-        }
-        if trimmed.starts_with("OTHER_LDFLAGS = \"")
-            && let Some((prefix, rest)) = line.split_once("OTHER_LDFLAGS = \"")
-            && let Some((flags, suffix)) = rest.split_once("\";")
-        {
-            // Scrub flags earlier CLI versions baked into the shared setting;
-            // everything else in the template/user value is preserved.
-            let (sanitized, scrubbed) = sanitize_other_ldflags(flags);
-            if scrubbed {
-                changed = true;
-            }
-            lines.push(format!("{prefix}OTHER_LDFLAGS = \"{sanitized}\";{suffix}"));
-            in_sdk_group = true;
-            sdk_seen = false;
-            // Each configuration block needs its own per-SDK line: inject one
-            // unless the next line already carries this SDK's setting.
-            let sdk_line_follows = iter
-                .peek()
-                .is_some_and(|next| next.contains(sdk_key.as_str()));
-            if !sdk_line_follows && !flags_value.is_empty() {
-                lines.push(format!("{prefix}\"{sdk_key}\" = \"{flags_value}\";"));
-                sdk_seen = true;
-                changed = true;
-            }
-            continue;
-        }
-        lines.push(line.to_string());
-        in_sdk_group = false;
-        sdk_seen = false;
-    }
-
-    let mut updated = lines.join("\n");
-    if content.ends_with('\n') {
-        updated.push('\n');
-    }
-    (updated, changed)
-}
-
-fn sanitize_other_ldflags(flags: &str) -> (String, bool) {
-    let normalized = flags
-        .split_whitespace()
-        .filter(|flag| !matches!(*flag, "-lwaterui_app" | "-lwaterui_dylib"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let changed = normalized != flags;
-    (normalized, changed)
-}
-
-async fn collect_apple_native_link_inputs(lib_dir: &Path) -> eyre::Result<AppleNativeLinkInputs> {
-    let lib_dir = lib_dir.to_path_buf();
-    smol::unblock(move || collect_apple_native_link_inputs_sync(&lib_dir)).await
-}
-
-fn collect_apple_native_link_inputs_sync(lib_dir: &Path) -> eyre::Result<AppleNativeLinkInputs> {
-    let build_root = lib_dir.join("build");
-    if !build_root.exists() {
-        return Ok(AppleNativeLinkInputs::default());
-    }
-
-    let mut archive_paths = BTreeSet::new();
-    let mut linker_flags = Vec::new();
-
-    for entry in std::fs::read_dir(&build_root)? {
-        let entry = entry?;
-        let crate_build_dir = entry.path();
-        if !crate_build_dir.is_dir() {
-            continue;
-        }
-
-        // Stable names each unit dir `<pkg>-<hash>`; current nightly nests one
-        // level deeper under `<pkg>/<hash>` (#901). A top-level dir that is a
-        // build-script unit is processed directly, otherwise its hash subdirs
-        // are.
-        if is_build_script_unit_dir(&crate_build_dir) {
-            collect_link_inputs_from_unit_dir(
-                &crate_build_dir,
-                &mut archive_paths,
-                &mut linker_flags,
-            )?;
+/// The checkout the project's `waterui-apple` dependency compiles from:
+/// `[backends.apple] backend_path` when declared, otherwise the source
+/// directory `cargo metadata` resolved for the ffi crate's dependency.
+///
+/// # Errors
+/// Returns an error when the backend source cannot be located.
+async fn apple_backend_source_root(project: &Project) -> eyre::Result<PathBuf> {
+    if let Some(backend_path) = project
+        .manifest()
+        .backends
+        .apple()
+        .and_then(|backend| backend.backend_path.as_deref())
+    {
+        let candidate = PathBuf::from(backend_path);
+        return Ok(if candidate.is_absolute() {
+            candidate
         } else {
-            for sub_entry in std::fs::read_dir(&crate_build_dir)?.flatten() {
-                let sub_dir = sub_entry.path();
-                if sub_dir.is_dir() && is_build_script_unit_dir(&sub_dir) {
-                    collect_link_inputs_from_unit_dir(
-                        &sub_dir,
-                        &mut archive_paths,
-                        &mut linker_flags,
-                    )?;
-                }
-            }
-        }
+            project.root().join(candidate)
+        });
     }
 
-    Ok(AppleNativeLinkInputs {
-        archives: archive_paths.into_iter().collect(),
-        linker_flags,
-    })
-}
-
-/// A build-script unit dir carries the script's captured stdout — `output` on
-/// stable, `run/stdout` on current nightly. Compile units get an `out/` dir
-/// for their own artifacts too, so `out/` alone is not proof of a
-/// build-script unit under nightly.
-fn is_build_script_unit_dir(dir: &Path) -> bool {
-    dir.join("output").is_file() || dir.join("run").join("stdout").is_file()
-}
-
-fn collect_link_inputs_from_unit_dir(
-    unit_dir: &Path,
-    archive_paths: &mut BTreeSet<PathBuf>,
-    linker_flags: &mut Vec<String>,
-) -> eyre::Result<()> {
-    // Every crate that ran a build script may have emitted
-    // `cargo:rustc-link-*` directives; `-sys` crates like
-    // `system-configuration-sys` emit only those, with no archive or Swift
-    // bridge artifact to show for it, so the parse cannot be gated on
-    // outputs.
-    for output_path in [unit_dir.join("output"), unit_dir.join("run").join("stdout")] {
-        if output_path.is_file() {
-            let output = std::fs::read_to_string(&output_path)?;
-            for flag in apple_linker_flags_from_build_output(&output) {
-                push_unique_flag(linker_flags, flag);
-            }
-        }
-    }
-
-    // For a build-script unit, `out/` is OUT_DIR (nightly records it in
-    // `run/root-output`), so a `lib*.a` inside is an artifact the crate ships
-    // for linking, with or without a Swift bridge alongside it.
-    let out_dir = unit_dir.join("out");
-    if !out_dir.is_dir() {
-        return Ok(());
-    }
-
-    for out_entry in std::fs::read_dir(&out_dir)? {
-        let out_entry = out_entry?;
-        let path = out_entry.path();
-        if path.extension().is_some_and(|ext| ext == "a")
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("lib"))
-        {
-            archive_paths.insert(path.clone());
-            if let Some(flag) = static_archive_link_flag(&path) {
-                push_unique_flag(linker_flags, flag);
-            }
-        }
-    }
-    Ok(())
-}
-
-fn static_archive_link_flag(archive_path: &Path) -> Option<String> {
-    let file_name = archive_path.file_name()?.to_str()?;
-    let library_name = file_name
-        .strip_prefix("lib")?
-        .strip_suffix(".a")
-        .unwrap_or(file_name);
-    Some(format!("-l{library_name}"))
-}
-
-fn apple_linker_flags_from_build_output(output: &str) -> Vec<String> {
-    let mut flags = Vec::new();
-    for line in output.lines() {
-        if let Some(framework) = line.strip_prefix("cargo:rustc-link-lib=framework=") {
-            push_unique_flag(&mut flags, format!("-framework {framework}"));
-        } else if let Some(arg) = line.strip_prefix("cargo:rustc-link-arg=") {
-            push_unique_flag(&mut flags, arg.to_string());
-        } else if let Some(search) = line.strip_prefix("cargo:rustc-link-search=") {
-            // A `-l<lib>` link arg a build script emits (waterkit-build's
-            // `-lclang_rt.osx`, resolved from the toolchain's
-            // `lib/clang/<ver>/lib/darwin`) only resolves at Xcode's link
-            // alongside the search path the same script declared for it.
-            // `native=`/`all=`/bare paths are `-L`, `framework=` is `-F`.
-            let (kind, dir) = search
-                .split_once('=')
-                .map_or(("all", search), |(kind, dir)| (kind, dir));
-            match kind {
-                "framework" => push_unique_flag(&mut flags, format!("-F{dir}")),
-                "native" | "all" => push_unique_flag(&mut flags, format!("-L{dir}")),
-                // `crate=` and `dependency=` name rustc's own artifact lookups,
-                // which Xcode's clang never performs.
-                _ => {}
-            }
-        }
-    }
-    flags
-}
-
-fn push_unique_flag(flags: &mut Vec<String>, flag: String) {
-    if !flags.iter().any(|existing| existing == &flag) {
-        flags.push(flag);
-    }
+    let manifest_path_arg: OsString = project.ffi_crate_path().join("Cargo.toml").into();
+    let output = crate::utils::run_command_os(
+        "cargo",
+        [
+            OsString::from("metadata"),
+            OsString::from("--format-version"),
+            OsString::from("1"),
+            OsString::from("--manifest-path"),
+            manifest_path_arg,
+        ],
+    )
+    .await
+    .wrap_err("cargo metadata failed to resolve the Apple backend source")?;
+    let metadata: serde_json::Value =
+        serde_json::from_str(&output).wrap_err("cargo metadata returned unparseable JSON")?;
+    let manifest_path = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|packages| {
+            packages.iter().find_map(|package| {
+                (package.get("name").and_then(serde_json::Value::as_str) == Some("waterui-apple"))
+                    .then(|| {
+                    package
+                        .get("manifest_path")
+                        .and_then(serde_json::Value::as_str)
+                })?
+            })
+        })
+        .ok_or_else(|| eyre::eyre!("the ffi crate does not depend on a `waterui-apple` package"))?;
+    PathBuf::from(manifest_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| eyre::eyre!("`waterui-apple` manifest path has no parent"))
 }
 
 // ============================================================================
 // Clean
 // ============================================================================
 
-/// Clean Xcode build artifacts for an Apple platform.
+/// Clean build artifacts for an Apple platform.
+///
+/// Entry-owning packaging keeps only the assembled products directory; the
+/// Rust target dir is cleaned by the shared target-dir cache logic.
 ///
 /// # Errors
-/// Returns an error if `xcodebuild clean` fails or generated build directories cannot be removed.
+/// Returns an error when the generated build directories cannot be removed.
 pub async fn clean_apple(project: &Project) -> eyre::Result<()> {
-    let Some(backend) = project.apple_backend() else {
+    if project.apple_backend().is_none() {
         return Ok(()); // Nothing to clean if no backend configured
-    };
-
-    let project_path = project.backend_path::<AppleBackend>();
-    let xcodeproj = project_path.join(format!("{}.xcodeproj", backend.scheme));
-
-    if !xcodeproj.exists() {
-        return Ok(());
     }
 
-    let args: Vec<OsString> = vec![
-        "-project".into(),
-        xcodeproj.as_os_str().to_owned(),
-        "-scheme".into(),
-        backend.scheme.as_str().into(),
-        "clean".into(),
-    ];
-    run_command_os("xcodebuild", args).await?;
-
-    let build_dir = project_path.join("build");
-    if build_dir.exists() {
-        fs::remove_dir_all(&build_dir).await?;
+    let project_path = project.backend_path::<AppleBackend>();
+    for directory in [project_path.join("DerivedData"), project_path.join("build")] {
+        if directory.exists() {
+            fs::remove_dir_all(&directory).await?;
+        }
     }
 
     Ok(())
@@ -665,10 +564,16 @@ pub async fn clean_apple(project: &Project) -> eyre::Result<()> {
 // Package
 // ============================================================================
 
-/// Package an Apple app using xcodebuild.
+/// Package an Apple app in entry-owning mode.
+///
+/// The `.app` bundle is assembled directly — the ffi crate's
+/// `waterui-apple-main` binary as the executable, resources copied in,
+/// `actool` compiling the asset catalog, `codesign` signing — with no Xcode
+/// project anywhere in the generated tree.
 ///
 /// # Errors
-/// Returns an error if the backend is missing, packaging prerequisites are invalid, or `xcodebuild` fails.
+/// Returns an error if the backend is missing, packaging prerequisites are
+/// invalid, or bundle assembly/signing fails.
 #[allow(clippy::too_many_lines)]
 pub async fn package_apple(
     project: &Project,
@@ -684,241 +589,122 @@ pub async fn package_apple(
         .await?;
 
     let project_path = project.backend_path::<AppleBackend>();
-    let xcodeproj = project_path.join(format!("{}.xcodeproj", backend.scheme));
-
-    if !xcodeproj.exists() {
-        bail!(
-            "Xcode project not found at {}. Did you run 'water create'?",
-            xcodeproj.display()
-        );
-    }
-
     validate_local_apple_backend(project)?;
-
-    // Copy project assets and fonts
-    let app_resources_dir = project_path.join(&backend.scheme);
-    copy_assets_and_fonts(
-        project,
-        &app_resources_dir,
-        &built.app_symbols()?,
-        options.uses_dev_server(),
-    )
-    .await?;
 
     let configuration = if options.is_debug() {
         "Debug"
     } else {
         "Release"
     };
-
-    let derived_data = project_path.join("DerivedData");
     let triple = platform.triple();
-
-    // Copy the built Rust library to where Xcode expects it
-    let linkage = if options.uses_shared_rust_runtime() {
-        RustLinkage::SharedRuntime
-    } else {
-        RustLinkage::Static
-    };
-    let lib_dir = &built.profile_dir;
-    let host_library = AppleHostLibrary::for_linkage(linkage);
-    let source_lib = &built.artifact;
-
-    // Get SDK name - must be an Apple platform
     let sdk_name = platform
         .sdk_name()
-        .ok_or_else(|| eyre::eyre!("Platform {:?} is not an Apple platform", platform))?;
+        .ok_or_else(|| eyre::eyre!("Platform {platform:?} is not an Apple platform"))?;
+    let (_, deployment_target) = apple_deployment_target(project, platform).await?;
 
-    // Xcode uses "Debug-iphonesimulator" for simulators, "Debug" for macOS
+    // Assets are staged into a scratch directory; the bundle copies them out
+    // from there (`waterui_assets`, `fonts`) and `actool` compiles the asset
+    // catalog (`WaterUIAssets.xcassets`).
+    let staging_dir = project_path.join("DerivedData/AssetStaging");
+    copy_assets_and_fonts(
+        project,
+        &staging_dir,
+        &built.app_symbols()?,
+        options.uses_dev_server(),
+    )
+    .await?;
+
+    // Xcode used "Debug-iphonesimulator"-style product configuration names;
+    // the same layout keeps `simctl`/`devicectl` installs pointed at a stable
+    // location.
     let products_config = if sdk_name == "macosx" {
         configuration.to_string()
     } else {
         format!("{configuration}-{sdk_name}")
     };
-    let products_dir = derived_data.join("Build/Products").join(&products_config);
-    fs::create_dir_all(&products_dir).await?;
-    // The bundle is named after the project, not after the scheme, so that
-    // macOS shows the application's own name rather than the scaffold's.
-    let product_name = crate::apple::backend::apple_product_name(project)?;
+    let products_dir = project_path
+        .join("DerivedData")
+        .join("Build/Products")
+        .join(&products_config);
+    let product_name = crate::apple::backend::apple_product_name(project)?.to_string();
     let app_path = products_dir.join(format!("{product_name}.app"));
 
     #[cfg(target_os = "macos")]
     if platform == TargetPlatform::MacOS {
         browser_runtime::remove_macos_app(&app_path.join("Contents")).await?;
-        remove_cef_helper_apps(&app_path, product_name).await?;
+        remove_cef_helper_apps(&app_path, &product_name).await?;
     }
 
-    let dest_lib = products_dir.join(host_library.linked_file_name());
-    copy_file(&source_lib, &dest_lib).await?;
-    remove_superseded_host_library(&products_dir, host_library).await?;
-    if host_library == AppleHostLibrary::Dynamic {
-        dynamic_runtime::set_rpath_install_name(&dest_lib, host_library.linked_file_name()).await?;
-    }
+    let ctx = AppleBackend::template_context(project).await?;
+    let layout = app_bundle::AppleAppLayout::for_app(&app_path, sdk_name);
 
+    let executable = built.profile_dir.join(APPLE_ENTRY_BINARY_NAME);
+    let info_plist = app_bundle::apple_info_plist(
+        &ctx,
+        project,
+        platform,
+        &deployment_target,
+        &product_name,
+        project.bundle_identifier(),
+    );
+
+    app_bundle::assemble_app_bundle(
+        &layout,
+        &executable,
+        &product_name,
+        &staging_dir,
+        &info_plist,
+        sdk_name,
+        &deployment_target,
+    )
+    .await?;
+
+    // The shared-runtime development linkage ships `libwaterui_dylib` and the
+    // Rust standard library inside the bundle's Frameworks directory; a
+    // statically linked package carries neither.
     let shared_runtime = if options.uses_shared_rust_runtime() {
-        let libraries = RustDynamicLibraries::resolve(built, &triple, project).await?;
-        libraries.stage(&products_dir).await?;
-        let staged_runtime = libraries.stage_apple_canonical(&products_dir).await?;
-        if host_library == AppleHostLibrary::Dynamic {
-            // The app library records the runtime's cargo-written install
-            // name; retarget it while the canonical copy still carries that name.
-            dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
-        }
+        let bin_built = BuiltTarget {
+            profile_dir: built.profile_dir.clone(),
+            artifact: layout.executable_file(&product_name),
+            shared_runtime: built.shared_runtime.clone(),
+            app_library: None,
+        };
+        let libraries = RustDynamicLibraries::resolve(&bin_built, &triple, project).await?;
+        libraries.stage(&layout.frameworks_dir).await?;
+        let staged_runtime = libraries
+            .stage_apple_canonical(&layout.frameworks_dir)
+            .await?;
+        // Redirect the executable's recorded runtime dependency to the
+        // canonical `@rpath` name, the way the Swift host library was
+        // retargeted before.
+        dynamic_runtime::retarget_module(&layout.executable_file(&product_name), &staged_runtime)
+            .await?;
         dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
         Some(libraries)
     } else {
-        RustDynamicLibraries::remove_staged(&products_dir, &triple).await?;
+        RustDynamicLibraries::remove_staged(&layout.frameworks_dir, &triple).await?;
         None
     };
-
-    let native_link_inputs = collect_apple_native_link_inputs(lib_dir).await?;
-    for archive in &native_link_inputs.archives {
-        let file_name = archive.file_name().ok_or_else(|| {
-            eyre::eyre!(
-                "Bridge archive path had no file name: {}",
-                archive.display()
-            )
-        })?;
-        copy_file(archive, &products_dir.join(file_name)).await?;
-    }
-
-    let mut required_link_flags = vec![
-        "-framework VideoToolbox".to_string(),
-        // The Xcode project no longer names the Rust library, because its shape depends
-        // on the linkage this build selected. `-lwaterui_app` resolves to whichever of
-        // `libwaterui_app.a` / `libwaterui_app.dylib` this build left in
-        // `BUILT_PRODUCTS_DIR`; the other is removed so the choice is unambiguous.
-        "-lwaterui_app".to_string(),
-    ];
-    if shared_runtime.is_some() {
-        required_link_flags.push("-lwaterui_dylib".to_string());
-    }
-    for flag in native_link_inputs.linker_flags {
-        push_unique_flag(&mut required_link_flags, flag);
-    }
-    ensure_apple_linker_flags(&xcodeproj, sdk_name, &required_link_flags).await?;
-
-    // Build with xcodebuild
-    // Determine the Xcode arch name from the platform architecture
-    let arch_name = match platform.arch() {
-        Architecture::Aarch64(_) => "arm64",
-        Architecture::X86_64 => "x86_64",
-        other => {
-            bail!("Unsupported Apple architecture for xcodebuild ARCHS: {other:?}");
-        }
-    };
-    let archs_arg = format!("ARCHS={arch_name}");
-
-    let mut args = vec![
-        OsString::from("-project"),
-        xcodeproj.as_os_str().to_owned(),
-        OsString::from("-scheme"),
-        backend.scheme.as_str().into(),
-        OsString::from("-configuration"),
-        configuration.into(),
-        OsString::from("-sdk"),
-        sdk_name.into(),
-        OsString::from("-derivedDataPath"),
-        derived_data.as_os_str().to_owned(),
-        archs_arg.into(),
-        OsString::from("ONLY_ACTIVE_ARCH=YES"),
-        OsString::from("build"),
-    ];
-
-    // Physical Apple OSes refuse unsigned code in every profile, so signing
-    // is disabled only for simulators, for local macOS debug builds, and for
-    // a device build explicitly packaged unsigned (a host without a signing
-    // identity; the artifact is signed before install). Otherwise a device
-    // target builds with automatic signing and the developer team resolved
-    // from the keychain — the generated Xcode project cannot know it.
-    let device_platform = matches!(
-        platform,
-        TargetPlatform::IOS
-            | TargetPlatform::TvOS
-            | TargetPlatform::WatchOS
-            | TargetPlatform::VisionOS
-    );
-    if device_platform && options.device_signing() == DeviceSigning::Automatic {
-        let team = crate::apple::toolchain::development_team_id(&Host::current()).await?;
-        // `-allowProvisioningUpdates` lets automatic signing mint the
-        // development provisioning profile a fresh bundle id does not have
-        // yet; without it xcodebuild fails GatherProvisioningInputs.
-        args.extend([
-            OsString::from("-allowProvisioningUpdates"),
-            OsString::from("CODE_SIGN_STYLE=Automatic"),
-            OsString::from(format!("DEVELOPMENT_TEAM={team}")),
-        ]);
-    } else if device_platform || platform.is_simulator() || options.is_debug() {
-        args.extend([
-            OsString::from("CODE_SIGNING_ALLOWED=NO"),
-            OsString::from("CODE_SIGNING_REQUIRED=NO"),
-            OsString::from("CODE_SIGN_IDENTITY=-"),
-        ]);
-    }
-
-    // Optional capabilities are compiled out of the backend unless the app
-    // enabled the matching FFI feature, which is what exports their symbols.
-    let swift_conditions = apple_swift_conditions(project).await?;
-    if !swift_conditions.is_empty() {
-        args.push(format!("OTHER_SWIFT_FLAGS={}", swift_conditions.join(" ")).into());
-    }
-
-    // Tell Xcode's run-script phases not to call `water build` again (the
-    // Rust library is already built). The flag is scoped to the xcodebuild
-    // child and propagates to its script phases; it must never be set on
-    // this process.
-    Host::current()
-        .with_env("WATERUI_SKIP_RUST_BUILD", "1")
-        .run("xcodebuild", args)
-        .await?;
-
-    if !app_path.exists() {
-        bail!(
-            "Built app not found at {}. Check xcodebuild output for errors.",
-            app_path.display()
-        );
-    }
-
-    let frameworks_dir = apple_frameworks_dir(&app_path, sdk_name);
-    if let Some(libraries) = shared_runtime {
-        fs::create_dir_all(&frameworks_dir).await?;
-        libraries.stage(&frameworks_dir).await?;
-        // The canonical `libwaterui_dylib.dylib` the retargeted modules and
-        // the `-lwaterui_dylib` link resolve, beside the recorded name.
-        let staged_runtime = libraries.stage_apple_canonical(&frameworks_dir).await?;
-        dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
-        // The executable resolves `@rpath/libwaterui_app.dylib` through the bundle's
-        // Frameworks directory, the same way it resolves the shared runtime.
-        copy_file(
-            &dest_lib,
-            &frameworks_dir.join(host_library.linked_file_name()),
-        )
-        .await?;
-    } else {
-        RustDynamicLibraries::remove_staged(&frameworks_dir, &triple).await?;
-    }
-
-    // The dylibs staged above land after `xcodebuild` signed the bundle, so
-    // they carry no signature. A device refuses them at `dyld`; sign them
-    // with the identity Xcode resolved for the app.
-    #[cfg(target_os = "macos")]
-    if device_platform {
-        crate::macos_bundle::sign_staged_device_libraries(&app_path, &frameworks_dir).await?;
-    }
+    let _ = shared_runtime;
 
     #[cfg(target_os = "macos")]
     if platform == TargetPlatform::MacOS && browser_runtime_plan.requires_cef() {
-        browser_runtime::stage_macos_app(browser_runtime_plan, lib_dir, &app_path.join("Contents"))
-            .await?;
+        browser_runtime::stage_macos_app(
+            browser_runtime_plan,
+            &built.profile_dir,
+            &app_path.join("Contents"),
+        )
+        .await?;
         // Helper bundles wrap the helper `[[bin]]`, which the manifest
         // declares only when the application links the CEF engine crate —
         // chromium alone stages the runtime but builds no helper.
         if project.declares_cef_helper().await? {
-            let main_binary = app_path.join("Contents/MacOS").join(product_name);
-            let helper_binary =
-                lib_dir.join(crate::project_model::project_types::cef_helper_binary_name(
+            let main_binary = layout.executable_file(&product_name);
+            let helper_binary = built.profile_dir.join(
+                crate::project_model::project_types::cef_helper_binary_name(
                     project.ffi_crate_name().as_str(),
-                ));
+                ),
+            );
             package_cef_helper_app(
                 &app_path,
                 &main_binary,
@@ -927,29 +713,19 @@ pub async fn package_apple(
             )
             .await?;
         }
-        let requires_stable_identity = project.manifest().permissions.iter().any(|(key, entry)| {
-            entry.is_enabled() && !key.macos_usage_description_keys().is_empty()
-        });
-        sign_macos_app(
-            &app_path,
-            project.bundle_identifier(),
-            requires_stable_identity,
-        )
-        .await?;
     }
 
-    #[cfg(not(target_os = "macos"))]
-    let _ = browser_runtime_plan;
+    app_bundle::sign_apple_app(
+        &layout,
+        platform,
+        &options,
+        backend,
+        project_path.as_path(),
+        project,
+    )
+    .await?;
 
     Ok(Artifact::new(project.bundle_identifier(), app_path))
-}
-
-fn apple_frameworks_dir(app_path: &Path, sdk_name: &str) -> PathBuf {
-    if sdk_name == "macosx" {
-        app_path.join("Contents/Frameworks")
-    } else {
-        app_path.join("Frameworks")
-    }
 }
 
 // ============================================================================
@@ -1006,322 +782,4 @@ pub const fn is_apple_platform(platform: TargetPlatform) -> bool {
             | TargetPlatform::VisionOS
             | TargetPlatform::VisionOSSimulator
     )
-}
-
-/// Swift compilation conditions matching the optional capabilities this app's
-/// graph carries, so the backend compiles exactly the components whose symbols
-/// exist.
-///
-/// The decision must come from [`assets::capability_enabled`] — the same
-/// predicate that forwards each capability's feature to the FFI build. The FFI
-/// features travel on the build command line, never into the generated
-/// manifest, so re-resolving `waterui-ffi`'s features from the manifest graph
-/// reads every capability as off and prunes components whose symbols the
-/// dylib does export.
-///
-/// The two lists mirror each capability's default polarity, so a bare
-/// `swift build` of the backend package — no conditions at all — still
-/// compiles what a default-featured app links. A default-off capability gets a
-/// positive condition when carried; a default-on capability gets a negative
-/// condition when dropped.
-///
-/// [`assets::capability_enabled`]: crate::project_model::assets::capability_enabled
-async fn apple_swift_conditions(project: &Project) -> eyre::Result<Vec<String>> {
-    /// Default-off capabilities, named when the app's graph carries them.
-    const OPTIONAL_COMPONENTS: &[(&str, &str)] =
-        &[("map", "WATERUI_MAP"), ("webview", "WATERUI_WEBVIEW")];
-    /// Default-on capabilities, named when the app's graph drops them.
-    const DEFAULT_COMPONENTS: &[(&str, &str)] =
-        &[("gpu", "WATERUI_NO_GPU"), ("media", "WATERUI_NO_MEDIA")];
-
-    let build_manifest = project.ffi_crate_path().join("Cargo.toml");
-    let mut conditions = Vec::new();
-    for (capability, condition) in OPTIONAL_COMPONENTS {
-        if crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
-            .await?
-        {
-            conditions.push(format!("-D{condition}"));
-        }
-    }
-    for (capability, condition) in DEFAULT_COMPONENTS {
-        if !crate::project_model::assets::capability_enabled(project, &build_manifest, capability)
-            .await?
-        {
-            conditions.push(format!("-D{condition}"));
-        }
-    }
-    Ok(conditions)
-}
-
-#[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use super::{
-        apple_linker_flags_from_build_output, collect_apple_native_link_inputs_sync,
-        inject_other_ldflags, unique_xcode_build_setting,
-    };
-
-    #[test]
-    fn derives_a_unique_xcode_deployment_target() {
-        let settings = "MACOSX_DEPLOYMENT_TARGET = 15.0;\nMACOSX_DEPLOYMENT_TARGET = 15.0;\n";
-        assert_eq!(
-            unique_xcode_build_setting(settings, "MACOSX_DEPLOYMENT_TARGET")
-                .expect("unique deployment target"),
-            "15.0"
-        );
-    }
-
-    #[test]
-    fn rejects_conflicting_xcode_deployment_targets() {
-        let settings = "MACOSX_DEPLOYMENT_TARGET = 14.0;\nMACOSX_DEPLOYMENT_TARGET = 15.0;\n";
-        let error = unique_xcode_build_setting(settings, "MACOSX_DEPLOYMENT_TARGET")
-            .expect_err("conflicting targets must fail");
-        assert!(error.to_string().contains("14.0, 15.0"));
-    }
-
-    #[test]
-    fn injects_required_flags_into_a_per_sdk_setting() {
-        let input = "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n";
-        let required_flags = vec!["-lwaterui_app".to_string(), "-L/some/build".to_string()];
-        let (output, changed) = inject_other_ldflags(input, "macosx", &required_flags);
-        assert!(changed);
-        assert_eq!(
-            output,
-            "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n\
-             \"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app -L/some/build\";\n"
-        );
-    }
-
-    #[test]
-    fn linker_flag_injection_is_idempotent() {
-        let required_flags = vec![
-            "-framework VideoToolbox".to_string(),
-            "-lwaterui_app".to_string(),
-        ];
-        let (first, changed) = inject_other_ldflags(
-            "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n",
-            "macosx",
-            &required_flags,
-        );
-        assert!(changed);
-        let (second, changed) = inject_other_ldflags(&first, "macosx", &required_flags);
-        assert!(!changed);
-        assert_eq!(second, first);
-    }
-
-    #[test]
-    fn per_sdk_settings_do_not_contaminate_other_platforms() {
-        // An iphoneos packaging pass must leave the macosx setting alone and
-        // vice versa, so consecutive platform packages share one project file.
-        let flags = vec!["-lwaterui_app".to_string()];
-        let (macos, _) = inject_other_ldflags("OTHER_LDFLAGS = \"-lc++\";\n", "macosx", &flags);
-        let (ios, _) = inject_other_ldflags(&macos, "iphoneos", &flags);
-        assert!(ios.contains("\"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app\""));
-        assert!(ios.contains("\"OTHER_LDFLAGS[sdk=iphoneos*]\" = \"-lwaterui_app\""));
-        assert_eq!(
-            ios.matches("OTHER_LDFLAGS = \"-lc++\";").count(),
-            1,
-            "shared setting untouched: {ios}"
-        );
-    }
-
-    #[test]
-    fn every_configuration_block_keeps_its_per_sdk_setting() {
-        // Debug and Release each own an OTHER_LDFLAGS group; a rerun must not
-        // collapse the second block's per-SDK line into the first's.
-        let input = "OTHER_LDFLAGS = \"-lc++\";\n\
-                     PRODUCT_NAME = \"app\";\n\
-                     OTHER_LDFLAGS = \"-lc++\";\n";
-        let flags = vec!["-lwaterui_app".to_string()];
-        let (first, _) = inject_other_ldflags(input, "macosx", &flags);
-        assert_eq!(first.matches("OTHER_LDFLAGS[sdk=macosx*]").count(), 2);
-        let (second, changed) = inject_other_ldflags(&first, "macosx", &flags);
-        assert!(!changed, "second pass rewrote the file: {second}");
-        assert_eq!(second.matches("OTHER_LDFLAGS[sdk=macosx*]").count(), 2);
-    }
-
-    #[test]
-    fn removes_redundant_waterui_app_link_flag_from_shared_setting() {
-        // Older versions baked -lwaterui_* into the shared setting; scrub it.
-        let input = "OTHER_LDFLAGS = \"-lwaterui_app -lc++ -framework VideoToolbox\";\n";
-        let required_flags = vec!["-lwaterui_app".to_string()];
-        let (output, changed) = inject_other_ldflags(input, "macosx", &required_flags);
-        assert!(changed);
-        assert!(output.contains("OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";"));
-        assert!(output.contains("\"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app\";"));
-    }
-
-    #[test]
-    fn switches_between_shared_runtime_and_static_link_flags() {
-        let input = "OTHER_LDFLAGS = \"-lc++ -framework VideoToolbox\";\n";
-        let dynamic_flags = vec!["-lwaterui_app".to_string(), "-lwaterui_dylib".to_string()];
-        let (dynamic, changed) = inject_other_ldflags(input, "macosx", &dynamic_flags);
-        assert!(changed);
-        assert!(dynamic.contains("-lwaterui_dylib"));
-
-        let static_flags = vec!["-lwaterui_app".to_string()];
-        let (static_linked, changed) = inject_other_ldflags(&dynamic, "macosx", &static_flags);
-        assert!(changed);
-        assert!(!static_linked.contains("-lwaterui_dylib"));
-        assert!(static_linked.contains("\"OTHER_LDFLAGS[sdk=macosx*]\" = \"-lwaterui_app\";"));
-    }
-
-    #[test]
-    fn parses_frameworks_and_link_args_from_build_output() {
-        let output = "cargo:rustc-link-lib=framework=AppKit\ncargo:rustc-link-arg=-rpath\ncargo:rustc-link-arg=/usr/lib/swift\ncargo:rustc-link-lib=framework=Foundation\n";
-        let flags = apple_linker_flags_from_build_output(output);
-        assert_eq!(
-            flags,
-            vec![
-                "-framework AppKit".to_string(),
-                "-rpath".to_string(),
-                "/usr/lib/swift".to_string(),
-                "-framework Foundation".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn forwards_link_search_dirs_that_link_args_depend_on() {
-        // waterkit-build 0.1.3 declares the compiler-rt builtins this way; the
-        // `-l` alone made Xcode's link fail with "library 'clang_rt.osx' not
-        // found" on every macOS and iOS package in the Apple nightly.
-        let output = "cargo:rustc-link-search=native=/Xcode/lib/clang/17/lib/darwin\ncargo:rustc-link-arg=-lclang_rt.osx\ncargo:rustc-link-search=framework=/Frameworks\ncargo:rustc-link-search=/plain\ncargo:rustc-link-search=crate=/target/deps\ncargo:rustc-link-search=native=/Xcode/lib/clang/17/lib/darwin\n";
-        let flags = apple_linker_flags_from_build_output(output);
-        assert_eq!(
-            flags,
-            vec![
-                "-L/Xcode/lib/clang/17/lib/darwin".to_string(),
-                "-lclang_rt.osx".to_string(),
-                "-F/Frameworks".to_string(),
-                "-L/plain".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn collects_swift_bridge_archives_and_flags_from_target_build_dir() {
-        let dir = tempdir().expect("tempdir");
-        let lib_dir = dir.path().join("aarch64-apple-darwin/debug");
-        let build_dir = lib_dir.join("build/waterkit-haptic-1234");
-        let out_dir = build_dir.join("out");
-        std::fs::create_dir_all(&out_dir).expect("create out dir");
-        std::fs::write(out_dir.join("CombinedHelper.swift"), "// bridge").expect("write swift");
-        std::fs::write(out_dir.join("libHelper.a"), "").expect("write archive");
-        std::fs::write(
-            build_dir.join("output"),
-            "cargo:rustc-link-lib=framework=AppKit\ncargo:rustc-link-arg=-rpath\ncargo:rustc-link-arg=/usr/lib/swift\n",
-        )
-        .expect("write build output");
-
-        let link_inputs =
-            collect_apple_native_link_inputs_sync(&lib_dir).expect("collect native link inputs");
-
-        assert_eq!(link_inputs.archives, vec![out_dir.join("libHelper.a")]);
-        assert_eq!(
-            link_inputs.linker_flags,
-            vec![
-                "-framework AppKit".to_string(),
-                "-rpath".to_string(),
-                "/usr/lib/swift".to_string(),
-                "-lHelper".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn collects_link_flags_from_crates_without_swift_or_archives() {
-        // A `-sys` crate that only emits `cargo:rustc-link-lib` directives has
-        // nothing in `out/`; its flags must still reach the linker.
-        let dir = tempdir().expect("tempdir");
-        let lib_dir = dir.path().join("aarch64-apple-darwin/release");
-        let sys_build_dir = lib_dir.join("build/system-configuration-sys-1234");
-        std::fs::create_dir_all(sys_build_dir.join("out")).expect("create out dir");
-        std::fs::write(
-            sys_build_dir.join("output"),
-            "cargo:rustc-link-lib=framework=SystemConfiguration\n",
-        )
-        .expect("write build output");
-
-        // A crate can also ship an archive with no Swift bridge at all; the
-        // archive and its `-l` flag must still be collected.
-        let plain_build_dir = lib_dir.join("build/some-native-5678");
-        let plain_out_dir = plain_build_dir.join("out");
-        std::fs::create_dir_all(&plain_out_dir).expect("create out dir");
-        std::fs::write(plain_out_dir.join("libwrapper.a"), "").expect("write archive");
-        std::fs::write(
-            plain_build_dir.join("output"),
-            "cargo:rustc-link-lib=static=wrapper\n",
-        )
-        .expect("write build output");
-
-        let link_inputs =
-            collect_apple_native_link_inputs_sync(&lib_dir).expect("collect native link inputs");
-
-        assert_eq!(
-            link_inputs.archives,
-            vec![plain_out_dir.join("libwrapper.a")]
-        );
-        let mut flags = link_inputs.linker_flags;
-        flags.sort_unstable();
-        assert_eq!(
-            flags,
-            vec![
-                "-framework SystemConfiguration".to_string(),
-                "-lwrapper".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn collects_framework_flags_from_crates_without_swift_archives() {
-        let dir = tempdir().expect("tempdir");
-        let lib_dir = dir.path().join("aarch64-apple-darwin/debug");
-        let build_dir = lib_dir.join("build/system-configuration-sys-1234");
-        std::fs::create_dir_all(build_dir.join("out")).expect("create out dir");
-        std::fs::write(
-            build_dir.join("output"),
-            "cargo:rustc-link-lib=framework=SystemConfiguration\n",
-        )
-        .expect("write build output");
-
-        let link_inputs =
-            collect_apple_native_link_inputs_sync(&lib_dir).expect("collect native link inputs");
-
-        assert!(link_inputs.archives.is_empty());
-        assert_eq!(
-            link_inputs.linker_flags,
-            vec!["-framework SystemConfiguration".to_string()]
-        );
-    }
-    #[test]
-    fn collects_link_inputs_from_nightly_build_layout() {
-        // Nightly cargo nests unit dirs as `build/<pkg>/<hash>` and records the
-        // script's captured stdout at `run/stdout` instead of `output` (#901).
-        let dir = tempdir().expect("tempdir");
-        let lib_dir = dir.path().join("aarch64-apple-darwin/debug");
-        let sys_unit = lib_dir.join("build/system-configuration-sys/1234abcd");
-        std::fs::create_dir_all(sys_unit.join("run")).expect("create run dir");
-        std::fs::write(
-            sys_unit.join("run/stdout"),
-            "cargo:rustc-link-lib=framework=SystemConfiguration\n",
-        )
-        .expect("write build stdout");
-
-        // A compile unit's `out/` holds its own artifacts, not OUT_DIR — it
-        // must not be mined for archives.
-        let compile_unit = lib_dir.join("build/plain-crate/5678efgh");
-        std::fs::create_dir_all(compile_unit.join("out")).expect("create out dir");
-        std::fs::write(compile_unit.join("out/libplain_crate.a"), "").expect("write archive");
-
-        let link_inputs =
-            collect_apple_native_link_inputs_sync(&lib_dir).expect("collect native link inputs");
-
-        assert!(link_inputs.archives.is_empty());
-        assert_eq!(
-            link_inputs.linker_flags,
-            vec!["-framework SystemConfiguration".to_string()]
-        );
-    }
 }

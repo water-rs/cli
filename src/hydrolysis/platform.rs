@@ -653,7 +653,8 @@ async fn package_hydrolysis_web_site(
     let lib_rs = backend_path.join("src/lib.rs");
     if !cargo_toml.exists() {
         bail!(
-            "Hydrolysis backend not found at {}. Run `water backend add hydrolysis` first.",
+            "The generated Hydrolysis backend is missing at {}; `water build`, `water run` \
+             and `water package` generate it.",
             backend_path.display(),
         );
     }
@@ -881,7 +882,7 @@ mod tests {
     };
 
     fn demo_context() -> TemplateContext {
-        TemplateContext::for_support_playground(
+        TemplateContext::for_support_app(
             "Demo",
             CrateName::try_from("demo").expect("crate name must be valid"),
             BundleIdentifier::try_from("dev.waterui.demo").expect("bundle id must be valid"),
@@ -955,9 +956,8 @@ mod tests {
             std::fs::create_dir_all(root.join("src")).expect("crate src");
             std::fs::write(
                 root.join("Water.toml"),
-                "[package]\ntype = \"app\"\nname = \"Fixture\"\n\
+                "[package]\nname = \"Fixture\"\n\
                  bundle_identifier = \"dev.waterui.fixture\"\n\n\
-                 [backends]\npath = \"managed_backends\"\n\n\
                  [[assets.font]]\nname = \"Fixture Sans\"\n\
                  local_path = \"assets/fonts/FixtureSans.ttf\"\n",
             )
@@ -978,9 +978,13 @@ mod tests {
             )
             .expect("fixture font");
 
+            let project = Project::open(&root, ManagedBackends::NONE)
+                .await
+                .expect("fixture project opens");
             // The managed backend crate the build compiles, kept dependency-
             // free so its `cargo metadata` resolves without the network.
-            let backend_path = root.join("managed_backends/hydrolysis");
+            let backend_path =
+                project.backend_path::<crate::hydrolysis::backend::HydrolysisBackend>();
             std::fs::create_dir_all(backend_path.join("src")).expect("backend src");
             let backend_crate = generated_crate_name(
                 &CrateName::try_from("fixture").expect("crate name"),
@@ -998,9 +1002,6 @@ mod tests {
             .expect("backend manifest");
             std::fs::write(backend_path.join("src/main.rs"), "fn main() {}\n").expect("main.rs");
 
-            let project = Project::open(&root, ManagedBackends::NONE)
-                .await
-                .expect("fixture project opens");
             let built = crate::build::RustBuild::new(&backend_path, target_lexicon::Triple::host())
                 .with_target_dir(temporary.path().join("target"))
                 .build_binary(backend_crate.as_str(), false)

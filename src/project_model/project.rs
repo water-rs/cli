@@ -16,9 +16,9 @@ enum OpenMode {
     PreviewBuild,
 }
 
-/// The managed native backends a playground [`Project::open`] initialises.
+/// The managed native backends [`Project::open`] initialises.
 ///
-/// A playground delegates its Apple and Android projects to the CLI, which
+/// A project delegates its Apple and Android projects to the CLI, which
 /// scaffolds them into the build cache when the project is opened. Each
 /// scaffold costs time and leaves a generated project behind, so a command
 /// declares the platforms it is about to act on and only their backends are
@@ -158,39 +158,19 @@ impl Project {
         let cargo_path = path.join("Cargo.toml");
         let mut water: toml_edit::DocumentMut =
             smol::fs::read_to_string(&water_path).await?.parse()?;
-        let previous: Manifest = toml::from_str(&water.to_string())?;
+        let previous = Manifest::parse(&water.to_string())?;
         let mut cargo: toml_edit::DocumentMut =
             smol::fs::read_to_string(&cargo_path).await?.parse()?;
-        let crate_name = CrateName::try_from(
-            cargo["package"]["name"]
-                .as_str()
-                .ok_or_else(|| eyre::eyre!("channel selection requires a project Cargo.toml"))?,
-        )
-        .map_err(|error| eyre::eyre!(error))?;
         let (framework, lockfile) = ResolvedFramework::resolve(channel).await?;
         // A configured backend whose scaffold packages the target channel
         // withholds could never be regenerated — refuse the switch before a
         // manifest is rewritten.
-        for (configured, backend) in [
-            (previous.backends.gtk4().is_some(), TargetBackend::Gtk4),
-            (
-                previous.backends.hydrolysis().is_some(),
-                TargetBackend::Hydrolysis,
-            ),
-            (previous.backends.winui().is_some(), TargetBackend::WinUi),
-            (previous.backends.esp32().is_some(), TargetBackend::Dew),
-        ] {
-            if configured {
-                for package in backend.scaffold_packages() {
-                    framework.require_distributable(package)?;
-                }
+        if previous.backends.esp32().is_some() {
+            for package in TargetBackend::Dew.scaffold_packages() {
+                framework.require_distributable(package)?;
             }
         }
-        let mut next = previous.clone();
-        next.waterui_path = None;
-        next.framework = Some(framework.clone());
-        let mut updates =
-            templates::framework_updates(&path, &previous, &next, &crate_name).await?;
+        let mut updates = Vec::new();
         framework.update_manifest(&mut cargo, &templates::project_patches(&path, &previous)?)?;
         water.remove("waterui_path");
         water["framework"] =
@@ -449,7 +429,7 @@ impl Project {
         &self.crate_name
     }
 
-    /// Get configured or default FFI crate name for app mode.
+    /// Get configured or default FFI crate name.
     ///
     /// The default is tagged with this project's root — see
     /// [`generated_crate_name`]; an explicit `[crates]` override is verbatim.
@@ -478,7 +458,7 @@ impl Project {
         self.preview_ffi_crate_name()
     }
 
-    /// Get configured or default GTK backend crate name for app mode.
+    /// Get configured or default GTK backend crate name.
     #[must_use]
     pub fn gtk_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
@@ -486,7 +466,7 @@ impl Project {
             .unwrap_or_else(|| generated_crate_name(&self.crate_name, "gtk4", &self.root))
     }
 
-    /// Get configured or default hydrolysis backend crate name for app mode.
+    /// Get configured or default hydrolysis backend crate name.
     #[must_use]
     pub fn hydrolysis_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
@@ -494,7 +474,7 @@ impl Project {
             .unwrap_or_else(|| generated_crate_name(&self.crate_name, "hydrolysis", &self.root))
     }
 
-    /// Get configured or default `WinUI` backend crate name for app mode.
+    /// Get configured or default `WinUI` backend crate name.
     #[must_use]
     pub fn winui_backend_crate_name(&self) -> CrateName {
         self.app_crate_overrides()
@@ -567,38 +547,17 @@ impl Project {
         self.shipped_backend_binary_name("esp32", None)
     }
 
-    /// Get package type declared in `Water.toml`.
-    #[must_use]
-    pub const fn package_type(&self) -> PackageType {
-        self.manifest.package.package_type
-    }
-
-    /// Returns true when this project is a playground project.
-    #[must_use]
-    pub fn is_playground(&self) -> bool {
-        self.package_type() == PackageType::Playground
-    }
-
     /// Get the Apple backend configuration if available.
     #[must_use]
     pub const fn apple_backend(&self) -> Option<&AppleBackend> {
         self.manifest.backends.apple()
     }
 
-    /// Get the full path to a backend directory.
-    ///
-    /// Returns `project.root() / backends.path / B::DEFAULT_PATH`.
+    /// Get the full path to a generated backend directory in the managed
+    /// build cache.
     #[must_use]
     pub fn backend_path<B: Backend>(&self) -> PathBuf {
         self.managed_backends_root.join(B::DEFAULT_PATH)
-    }
-
-    /// Get the relative path to a backend directory from project root.
-    ///
-    /// Returns `backends.path / B::DEFAULT_PATH`.
-    #[must_use]
-    pub fn backend_relative_path<B: Backend>(&self) -> PathBuf {
-        self.manifest.backends.path().join(B::DEFAULT_PATH)
     }
 
     /// Get the full path to the managed native FFI companion crate.
@@ -625,36 +584,10 @@ impl Project {
         workspace_root.join(self.preview_module_member_path())
     }
 
-    /// Get the relative path to the managed native FFI companion crate from project root.
-    #[must_use]
-    pub fn ffi_crate_relative_path(&self) -> PathBuf {
-        self.manifest.backends.path().join("ffi")
-    }
-
     /// Get the Android backend configuration if available.
     #[must_use]
     pub const fn android_backend(&self) -> Option<&AndroidBackend> {
         self.manifest.backends.android()
-    }
-
-    /// Get the GTK4 backend configuration if available.
-    #[must_use]
-    pub const fn gtk4_backend(&self) -> Option<&crate::gtk4::backend::Gtk4Backend> {
-        self.manifest.backends.gtk4()
-    }
-
-    /// Get the hydrolysis backend configuration if available.
-    #[must_use]
-    pub const fn hydrolysis_backend(
-        &self,
-    ) -> Option<&crate::hydrolysis::backend::HydrolysisBackend> {
-        self.manifest.backends.hydrolysis()
-    }
-
-    /// Get the `WinUI` backend configuration if available.
-    #[must_use]
-    pub const fn winui_backend(&self) -> Option<&crate::winui::backend::WinUiBackend> {
-        self.manifest.backends.winui()
     }
 
     /// Get the ESP32 backend configuration if available.
@@ -686,7 +619,11 @@ impl Project {
     /// withholds. Runs before the backend writes a file, so a withheld
     /// package fails the init with the channel fix rather than partway
     /// through the generated tree.
-    async fn require_distributable_backend(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the withheld package and the channel fix.
+    pub async fn require_distributable_backend(
         &self,
         backend: TargetBackend,
     ) -> Result<(), crate::backend::FailToInitBackend> {
@@ -938,87 +875,27 @@ impl Project {
 
     /// Clean all build artifacts for the project.
     ///
-    /// This cleans:
-    /// - Rust target directory
-    /// - this project's own units in the shared Cargo target directory
-    /// - Apple build artifacts (if backend configured)
-    /// - Android build artifacts (if backend configured)
-    /// - GTK4 build artifacts (if backend configured)
-    ///
-    /// Dependency artifacts in the shared Cargo target directory are left in
-    /// place: every project on the machine resolves them identically, and
-    /// `water gc build-cache --shared-target` drops them all.
+    /// This removes this project's own units in the shared Cargo target
+    /// directory and its managed build cache, where every generated backend
+    /// lives. Dependency artifacts in the shared Cargo target directory are
+    /// left in place: every project on the machine resolves them identically,
+    /// and `water gc build-cache --shared-target` drops them all.
     ///
     /// # Errors
     ///
     /// Returns an error if any cleaning operation fails.
     pub async fn clean_all(&self) -> Result<(), eyre::Report> {
-        use crate::{
-            android::platform::clean_android, apple::platform::clean_apple,
-            esp32::platform::clean_esp32, gtk4::platform::clean_gtk4,
-            hydrolysis::platform::clean_hydrolysis, winui::platform::clean_winui,
-        };
-
-        if self.is_playground() {
-            // The generated backends' units go first: once the managed
-            // manifests below are gone, nothing else names them.
-            self.clean_shared_target_units().await?;
-            crate::water_dir::remove_project_build_cache(self.root()).await?;
-            // Dependency artifacts live in the per-user shared target
-            // directory and outlive any single project, so they stay. What
-            // remains to sweep here is the `water-backends` subtree older CLI
-            // layouts left under the project's own Cargo target directory —
-            // never the user's other compiled artifacts.
-            let water_backends_root = self.target_dir().await?.join("water-backends");
-            if water_backends_root.exists() {
-                smol::fs::remove_dir_all(&water_backends_root).await?;
-            }
-            return Ok(());
-        }
-
-        // Clean Rust target directory
-        let target_dir = self.target_dir().await?;
-        if target_dir.exists() {
-            smol::fs::remove_dir_all(&target_dir).await?;
-        }
-
+        // The generated backends' units go first: once the managed manifests
+        // below are gone, nothing else names them.
         self.clean_shared_target_units().await?;
-
-        // Clean Apple backend if configured
-        if self.apple_backend().is_some() {
-            clean_apple(self).await?;
+        crate::water_dir::remove_project_build_cache(self.root()).await?;
+        // What remains to sweep is the `water-backends` subtree older CLI
+        // layouts left under the project's own Cargo target directory — never
+        // the user's other compiled artifacts.
+        let water_backends_root = self.target_dir().await?.join("water-backends");
+        if water_backends_root.exists() {
+            smol::fs::remove_dir_all(&water_backends_root).await?;
         }
-
-        // Clean Android backend if configured
-        if self.android_backend().is_some() {
-            clean_android(self).await?;
-        }
-
-        // Clean GTK4 backend if configured
-        if self.gtk4_backend().is_some() || (self.is_playground() && cfg!(target_os = "linux")) {
-            clean_gtk4(self).await?;
-        }
-
-        // Clean hydrolysis backend if configured
-        if self.hydrolysis_backend().is_some() || self.is_playground() {
-            clean_hydrolysis(self).await?;
-        }
-
-        // Clean `WinUI` backend if configured
-        if self.winui_backend().is_some() || (self.is_playground() && cfg!(target_os = "windows")) {
-            clean_winui(self).await?;
-        }
-
-        // Clean ESP32 backend if configured
-        if self.esp32_backend().is_some() {
-            clean_esp32(self).await?;
-        }
-
-        let ffi_target_dir = self.ffi_crate_path().join("target");
-        if ffi_target_dir.exists() {
-            smol::fs::remove_dir_all(&ffi_target_dir).await?;
-        }
-
         Ok(())
     }
 
@@ -1072,19 +949,7 @@ pub enum FailToOpenProject {
     #[error("Invalid Cargo.toml crate name: {0}")]
     InvalidCrateName(String),
 
-    /// Project permissions are not allowed in non-playground projects.
-    #[error("Project permissions are not allowed in non-playground projects")]
-    PermissionsNotAllowedInNonPlayground,
-
-    /// Backend-project configuration is not allowed in playground manifests.
-    #[error(
-        "Backend project configuration is not allowed in playground projects \
-         ([backends.esp32] device settings and `backend_path` source \
-         selections are the exceptions)"
-    )]
-    BackendsNotAllowedInPlayground,
-
-    /// Failed to initialize backend for playground project.
+    /// Failed to initialize a managed backend.
     #[error("Failed to initialize backend: {0}")]
     BackendInit(#[from] crate::backend::FailToInitBackend),
 
@@ -1144,8 +1009,6 @@ pub struct CreateOptions {
     pub name: String,
     /// Bundle identifier (e.g., "dev.waterui.waterexample").
     pub bundle_identifier: BundleIdentifier,
-    /// Package type for the project.
-    pub package_type: PackageType,
     /// Path to local `WaterUI` repository for development.
     pub waterui_path: Option<PathBuf>,
     /// Framework channel, mutually exclusive with a local source path and a
@@ -1165,11 +1028,6 @@ pub struct CreateOptions {
     pub framework_lock: Option<Vec<u8>>,
     /// Author name for Cargo.toml.
     pub author: String,
-    /// The backends the caller will scaffold after creation: each one's
-    /// scaffold packages are held against the resolved channel before a
-    /// file is written, so a package the channel withholds — the git-pinned
-    /// experimental set — fails the create rather than the backend init.
-    pub backends: Vec<TargetBackend>,
     /// The declared web frontend: `Some` generates the `include_web!` root
     /// view and writes `[web] package_manager`.
     pub web: Option<WebScaffold>,
@@ -1339,24 +1197,11 @@ impl Project {
         Ok(crate_path)
     }
 
-    async fn remove_ffi_companion_if_unused(&self) -> eyre::Result<()> {
-        if self.apple_backend().is_some() || self.android_backend().is_some() {
-            return Ok(());
-        }
-
-        let ffi_path = self.ffi_crate_path();
-        if ffi_path.exists() {
-            smol::fs::remove_dir_all(&ffi_path).await?;
-        }
-
-        Ok(())
-    }
-
     /// Create a new `WaterUI` project at the specified path.
     ///
     /// This creates the project directory, scaffolds root files (Cargo.toml, src/lib.rs),
-    /// and saves the Water.toml manifest. Use `init_apple_backend()` and `init_android_backend()`
-    /// to scaffold platform backends after creation.
+    /// and saves the Water.toml manifest. Backend projects are generated and
+    /// managed by the CLI in the build cache, never in the project directory.
     ///
     /// # Errors
     /// - `FailToCreateProject::DirectoryExists`: If the directory already exists.
@@ -1411,16 +1256,6 @@ impl Project {
             .await
             .map_err(FailToCreateProject::Framework)?;
 
-        // A backend whose scaffold packages the channel withholds cannot be
-        // scaffolded at all — reject before a single file lands.
-        for backend in &options.backends {
-            for package in backend.scaffold_packages() {
-                framework
-                    .require_distributable(package)
-                    .map_err(FailToCreateProject::Framework)?;
-            }
-        }
-
         // Framework validation precedes directory creation so a rejected
         // local checkout leaves nothing behind; on `init` the directory
         // already exists and this is a no-op.
@@ -1459,21 +1294,14 @@ impl Project {
                 .map_err(FailToCreateProject::Scaffold)?;
         }
 
-        // Build manifest
-        let mut backends = Backends::default();
-        if options.package_type == PackageType::App {
-            backends.set_path("backends");
-        }
-
         let manifest = Manifest {
             package: Package {
-                package_type: options.package_type,
                 name: options.name.clone(),
                 bundle_identifier: options.bundle_identifier.clone(),
                 assets_path,
                 accessory: false,
             },
-            backends,
+            backends: Backends::default(),
             waterui_path: options
                 .waterui_path
                 .as_ref()
@@ -1497,13 +1325,9 @@ impl Project {
         // Initialize git repository if not already in one
         Self::ensure_git_init(&path).await?;
 
-        let managed_backends_root = if options.package_type == PackageType::Playground {
-            crate::water_dir::project_build_cache_dir(&path)
-                .await
-                .map_err(FailToCreateProject::BuildCache)?
-        } else {
-            path.join(manifest.backends.path())
-        };
+        let managed_backends_root = crate::water_dir::project_build_cache_dir(&path)
+            .await
+            .map_err(FailToCreateProject::BuildCache)?;
 
         let cargo_layout = if let Some(framework) = &manifest.framework {
             let layout =
@@ -1559,145 +1383,6 @@ impl Project {
         Ok(())
     }
 
-    /// Initialize the Apple backend for this project.
-    ///
-    /// This scaffolds the Apple backend files and updates the manifest.
-    ///
-    /// # Errors
-    /// Returns an error if scaffolding fails.
-    pub async fn init_apple_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
-        use crate::backend::Backend;
-
-        let backend = AppleBackend::init(self).await?;
-        self.scaffold_ffi_companion().await?;
-        self.manifest.backends.set_apple(backend);
-        self.manifest
-            .save(&self.root)
-            .await
-            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
-        Ok(())
-    }
-
-    /// Initialize the Android backend for this project.
-    ///
-    /// This scaffolds the Android backend files and updates the manifest.
-    ///
-    /// # Errors
-    /// Returns an error if scaffolding fails.
-    pub async fn init_android_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
-        use crate::backend::Backend;
-
-        let backend = AndroidBackend::init(self).await?;
-        self.scaffold_ffi_companion().await?;
-        self.manifest.backends.set_android(backend);
-        self.manifest
-            .save(&self.root)
-            .await
-            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
-        Ok(())
-    }
-
-    /// Initialize the GTK4 backend for an existing project.
-    ///
-    /// Creates necessary files/folders for the GTK4 backend under `backend_path::<Gtk4Backend>()`.
-    ///
-    /// # Errors
-    /// Returns an error if scaffolding fails.
-    pub async fn init_gtk4_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
-        use crate::{backend::Backend, gtk4::backend::Gtk4Backend};
-
-        self.require_distributable_backend(TargetBackend::Gtk4)
-            .await?;
-        if !cfg!(target_os = "linux") {
-            return Err(crate::backend::FailToInitBackend::Io(
-                std::io::Error::other("GTK4 backend is only supported on Linux hosts"),
-            ));
-        }
-
-        let backend = Gtk4Backend::init(self).await?;
-        self.manifest.backends.set_gtk4(backend);
-        self.manifest
-            .save(&self.root)
-            .await
-            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
-        Ok(())
-    }
-
-    /// Initialize the hydrolysis backend for an existing project.
-    ///
-    /// Creates necessary files/folders for the hydrolysis backend under
-    /// `backend_path::<HydrolysisBackend>()`.
-    ///
-    /// # Errors
-    /// Returns an error if scaffolding fails.
-    pub async fn init_hydrolysis_backend(
-        &mut self,
-    ) -> Result<(), crate::backend::FailToInitBackend> {
-        use crate::{backend::Backend, hydrolysis::backend::HydrolysisBackend};
-
-        self.require_distributable_backend(TargetBackend::Hydrolysis)
-            .await?;
-        let backend = HydrolysisBackend::init(self).await?;
-        self.manifest.backends.set_hydrolysis(backend);
-        self.manifest
-            .save(&self.root)
-            .await
-            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
-
-        // The Hydrolysis backend is what `water mcp` drives, so adding it is
-        // what makes the project MCP-servable; the file is user-owned and
-        // only written when absent.
-        crate::mcp::ensure_mcp_json(&self.root).await?;
-        Ok(())
-    }
-
-    /// Initialize the `WinUI` backend for an existing project.
-    ///
-    /// Creates necessary files/folders for the `WinUI` backend under `backend_path::<WinUiBackend>()`.
-    ///
-    /// # Errors
-    /// Returns an error if scaffolding fails.
-    pub async fn init_winui_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
-        use crate::{backend::Backend, winui::backend::WinUiBackend};
-
-        self.require_distributable_backend(TargetBackend::WinUi)
-            .await?;
-        if !cfg!(target_os = "windows") {
-            return Err(crate::backend::FailToInitBackend::Io(
-                std::io::Error::other("WinUI backend is only supported on Windows hosts"),
-            ));
-        }
-
-        let backend = WinUiBackend::init(self).await?;
-        self.manifest.backends.set_winui(backend);
-        self.manifest
-            .save(&self.root)
-            .await
-            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
-        Ok(())
-    }
-
-    /// Initialize the ESP32 backend for an existing project.
-    ///
-    /// Creates necessary files/folders for the ESP32 firmware harness under
-    /// `backend_path::<Esp32Backend>()`.
-    ///
-    /// # Errors
-    /// Returns an error if scaffolding fails.
-    pub async fn init_esp32_backend(&mut self) -> Result<(), crate::backend::FailToInitBackend> {
-        use crate::{backend::Backend, esp32::backend::Esp32Backend};
-
-        self.require_distributable_backend(TargetBackend::Dew)
-            .await?;
-        let backend = Esp32Backend::init(self).await?;
-        self.manifest.backends.set_esp32(backend);
-        self.manifest
-            .save(&self.root)
-            .await
-            .map_err(|e| crate::backend::FailToInitBackend::Io(std::io::Error::other(e)))?;
-        Ok(())
-    }
-
     /// Select the ESP32 target chip, persisting it to `Water.toml`.
     ///
     /// The chip is the single source of truth for the ESP32 backend's target
@@ -1720,91 +1405,11 @@ impl Project {
         self.save_manifest().await
     }
 
-    /// Remove Apple backend configuration and generated files.
-    ///
-    /// # Errors
-    /// Returns an error if deleting files or saving manifest fails.
-    pub async fn remove_apple_backend(&mut self) -> eyre::Result<()> {
-        if let Some(backend) = self.apple_backend() {
-            let path = backend.project_path().to_path_buf();
-            self.remove_backend_relative_dir(&path).await?;
-        }
-        self.manifest.backends.clear_apple();
-        self.remove_ffi_companion_if_unused().await?;
-        self.save_manifest().await
-    }
-
-    /// Remove Android backend configuration and generated files.
-    ///
-    /// # Errors
-    /// Returns an error if deleting files or saving manifest fails.
-    pub async fn remove_android_backend(&mut self) -> eyre::Result<()> {
-        if let Some(backend) = self.android_backend() {
-            let path = backend.project_path().clone();
-            self.remove_backend_relative_dir(&path).await?;
-        }
-        self.manifest.backends.clear_android();
-        self.remove_ffi_companion_if_unused().await?;
-        self.save_manifest().await
-    }
-
-    /// Remove GTK4 backend configuration and generated files.
-    ///
-    /// # Errors
-    /// Returns an error if deleting files or saving manifest fails.
-    pub async fn remove_gtk4_backend(&mut self) -> eyre::Result<()> {
-        if let Some(backend) = self.gtk4_backend() {
-            let path = backend.project_path().clone();
-            self.remove_backend_relative_dir(&path).await?;
-        }
-        self.manifest.backends.clear_gtk4();
-        self.save_manifest().await
-    }
-
-    /// Remove `WinUI` backend configuration and generated files.
-    ///
-    /// # Errors
-    /// Returns an error if deleting files or saving manifest fails.
-    pub async fn remove_winui_backend(&mut self) -> eyre::Result<()> {
-        if let Some(backend) = self.winui_backend() {
-            let path = backend.project_path().clone();
-            self.remove_backend_relative_dir(&path).await?;
-        }
-        self.manifest.backends.clear_winui();
-        self.save_manifest().await
-    }
-
-    /// Remove hydrolysis backend configuration and generated files.
-    ///
-    /// # Errors
-    /// Returns an error if deleting files or saving manifest fails.
-    pub async fn remove_hydrolysis_backend(&mut self) -> eyre::Result<()> {
-        if let Some(backend) = self.hydrolysis_backend() {
-            let path = backend.project_path().clone();
-            self.remove_backend_relative_dir(&path).await?;
-        }
-        self.manifest.backends.clear_hydrolysis();
-        self.save_manifest().await
-    }
-
-    /// Remove ESP32 backend configuration and generated files.
-    ///
-    /// # Errors
-    /// Returns an error if deleting files or saving manifest fails.
-    pub async fn remove_esp32_backend(&mut self) -> eyre::Result<()> {
-        if let Some(backend) = self.esp32_backend() {
-            let path = backend.project_path().clone();
-            self.remove_backend_relative_dir(&path).await?;
-        }
-        self.manifest.backends.clear_esp32();
-        self.save_manifest().await
-    }
-
     /// Open a `WaterUI` project located at the specified path.
     ///
     /// This loads both the `Water.toml` manifest and the `Cargo.toml` file.
-    /// For playground projects, the managed backends in `backends` — those the
-    /// caller's target platforms need — are initialised; the accessor of a
+    /// The managed backends in `backends` — those the caller's target
+    /// platforms need — are initialised; the accessor of a
     /// backend not selected returns `None`.
     ///
     /// # Errors
@@ -1820,7 +1425,7 @@ impl Project {
 
     /// Open a project for preview dylib builds without initializing native app backends.
     ///
-    /// Playground preview dylib builds only need the managed preview wrapper crate. Native
+    /// Preview dylib builds only need the managed preview wrapper crate. Native
     /// backend initialization is reserved for support app projects that actually launch apps.
     ///
     /// # Errors
@@ -1841,7 +1446,7 @@ impl Project {
     /// only when the tables differ, so an up-to-date project stays untouched.
     ///
     /// A project that is itself a member of the checkout's workspace — every
-    /// example and playground in this repository — needs no copy, because the
+    /// example in this repository — needs no copy, because the
     /// tables Cargo reads are the checkout's own. Writing one anyway put a
     /// `[patch.crates-io]` table into a member manifest, where Cargo ignores it
     /// and says so on every single build.
@@ -1943,24 +1548,6 @@ impl Project {
                 CrateName::try_from(value).map_err(FailToOpenProject::InvalidCrateName)
             })?;
 
-        let is_playground = manifest.package.package_type == PackageType::Playground;
-
-        // Check that permissions are only set for playground projects
-        if !is_playground && !manifest.permissions.is_empty() {
-            return Err(FailToOpenProject::PermissionsNotAllowedInNonPlayground);
-        }
-
-        // Playgrounds delegate backend projects to the CLI, so backend
-        // scaffolding configuration is rejected. Two kinds of entries are
-        // exceptions: `[backends.esp32]`, which is device configuration
-        // (chip, panel geometry, bundled fonts) only the app author can
-        // supply while its harness still lives in the managed build cache,
-        // and `backend_path`, which selects where a backend's runtime source
-        // comes from without configuring a project.
-        if is_playground && manifest.backends.configures_backend_projects() {
-            return Err(FailToOpenProject::BackendsNotAllowedInPlayground);
-        }
-
         let cargo_layout = spawn_cargo_layout_resolution(
             &path,
             manifest.framework.clone(),
@@ -1971,21 +1558,16 @@ impl Project {
             .await
             .map_err(|error| FailToOpenProject::Framework(eyre::eyre!(error)))?;
 
-        let managed_backends_root = if is_playground {
-            let build_cache_start = std::time::Instant::now();
-            let root = crate::water_dir::ensure_project_build_cache(&path)
-                .await
-                .map_err(FailToOpenProject::BuildCache)?;
-            info!(
-                path = %path.display(),
-                open_mode = ?open_mode,
-                elapsed_ms = build_cache_start.elapsed().as_millis(),
-                "Project::open ensured project build cache"
-            );
-            root
-        } else {
-            path.join(manifest.backends.path())
-        };
+        let build_cache_start = std::time::Instant::now();
+        let managed_backends_root = crate::water_dir::ensure_project_build_cache(&path)
+            .await
+            .map_err(FailToOpenProject::BuildCache)?;
+        info!(
+            path = %path.display(),
+            open_mode = ?open_mode,
+            elapsed_ms = build_cache_start.elapsed().as_millis(),
+            "Project::open ensured project build cache"
+        );
 
         let mut project = Self {
             root: path,
@@ -1997,7 +1579,7 @@ impl Project {
             managed_backends_root,
         };
 
-        // For playground projects, auto-initialize backends
+        // Initialize the managed backends the caller selected.
         // Always re-scaffold templates on each run to pick up manifest changes (e.g., permissions)
         // Build cache (build/, .gradle/, DerivedData/) is preserved since scaffold only writes template files
         //
@@ -2010,7 +1592,7 @@ impl Project {
             || std::env::var("ACTION").is_ok() // Xcode sets this during builds
             || std::env::var("XCODE_PRODUCT_BUILD_VERSION").is_ok();
 
-        if is_playground && !skip_backend_init && open_mode == OpenMode::Full {
+        if !skip_backend_init && open_mode == OpenMode::Full {
             if backends.apple() {
                 let apple_backend_start = std::time::Instant::now();
                 let apple_backend = AppleBackend::init(&project)
@@ -2051,23 +1633,6 @@ impl Project {
             }
         }
 
-        if !is_playground
-            && !skip_backend_init
-            && open_mode == OpenMode::Full
-            && (project.apple_backend().is_some() || project.android_backend().is_some())
-        {
-            let ffi_companion_start = std::time::Instant::now();
-            project
-                .scaffold_ffi_companion()
-                .await
-                .map_err(FailToOpenProject::BackendInit)?;
-            info!(
-                path = %project.root.display(),
-                elapsed_ms = ffi_companion_start.elapsed().as_millis(),
-                "Project::open refreshed native ffi companion"
-            );
-        }
-
         info!(
             path = %project.root.display(),
             open_mode = ?open_mode,
@@ -2082,14 +1647,6 @@ impl Project {
 impl Project {
     async fn save_manifest(&self) -> eyre::Result<()> {
         self.manifest.save(&self.root).await.map_err(Into::into)
-    }
-
-    async fn remove_backend_relative_dir(&self, relative_path: &Path) -> eyre::Result<()> {
-        let backend_path = self.managed_backends_root.join(relative_path);
-        if backend_path.exists() {
-            smol::fs::remove_dir_all(&backend_path).await?;
-        }
-        Ok(())
     }
 }
 
@@ -2319,7 +1876,7 @@ pub struct Manifest {
     /// Exact framework and backend selection, resolved only by explicit version operations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework: Option<ResolvedFramework>,
-    /// Permission configuration for playground projects.
+    /// Permission configuration.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub permissions: BTreeMap<PermissionKey, PermissionEntry>,
     /// App-only configuration.
@@ -2340,7 +1897,7 @@ pub struct Manifest {
     pub assets: Option<AssetsConfig>,
 }
 
-/// Permission entry for playground projects.
+/// Permission entry in `[permissions]`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PermissionEntry {
     enable: bool,
@@ -2384,6 +1941,10 @@ pub enum FailToOpenManifest {
     /// The manifest file was not found at the specified path.
     #[error("Manifest file not found at the specified path")]
     NotFound,
+
+    /// The project carries configuration from the removed app mode.
+    #[error("{0}")]
+    AppMode(crate::project_model::app_mode::AppModeLeftovers),
 }
 
 /// Errors that can occur when saving a `Water.toml` manifest file.
@@ -2403,15 +1964,27 @@ impl Manifest {
     /// - `FailToOpenManifest::ReadError`: If there was an error reading the file.
     /// - `FailToOpenManifest::InvalidManifest`: If the file contents are not valid TOML.
     /// - `FailToOpenManifest::NotFound`: If the file does not exist at the specified path.
+    /// - `FailToOpenManifest::AppMode`: If the project carries app-mode keys.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, FailToOpenManifest> {
-        let path = path.as_ref();
-        let result = read_to_string(path).await;
-
-        match result {
-            Ok(c) => toml::from_str(&c).map_err(FailToOpenManifest::InvalidManifest),
+        match read_to_string(path.as_ref()).await {
+            Ok(text) => Self::parse(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(FailToOpenManifest::NotFound),
             Err(e) => Err(FailToOpenManifest::ReadError(e)),
         }
+    }
+
+    /// Parse `Water.toml` text, refusing a project that still carries
+    /// app-mode leftovers.
+    ///
+    /// # Errors
+    /// - `FailToOpenManifest::InvalidManifest`: If the text is not a valid manifest.
+    /// - `FailToOpenManifest::AppMode`: If the project carries app-mode keys.
+    pub fn parse(text: &str) -> Result<Self, FailToOpenManifest> {
+        let table: toml::Table = text.parse().map_err(FailToOpenManifest::InvalidManifest)?;
+        if let Some(leftovers) = crate::project_model::app_mode::AppModeLeftovers::find(&table) {
+            return Err(FailToOpenManifest::AppMode(leftovers));
+        }
+        toml::from_str(text).map_err(FailToOpenManifest::InvalidManifest)
     }
 
     /// Save the manifest to a `Water.toml` file at the specified directory.
@@ -2594,7 +2167,7 @@ pub struct AppConfig {
     pub crates: Option<AppCrates>,
 }
 
-/// Crate name overrides for app mode.
+/// Crate name overrides for the generated crates (`[app.crates]`).
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct AppCrates {
     /// Optional override crate name for generated FFI crate.
@@ -2614,9 +2187,6 @@ pub struct AppCrates {
 /// `[package]` section in `Water.toml`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Package {
-    /// Type of the package (e.g., "app").
-    #[serde(rename = "type")]
-    pub package_type: PackageType,
     /// Human-readable name of the application (e.g., "Water Demo").
     pub name: String,
     /// Bundle identifier for the application (e.g., "dev.waterui.waterdemo").
@@ -2674,18 +2244,6 @@ fn is_default_assets_path(path: &str) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_false(value: &bool) -> bool {
     !*value
-}
-
-/// Package type indicating what kind of project this is.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PackageType {
-    /// A standalone application with platform-specific backends.
-    #[default]
-    App,
-    /// A playground project for quick experimentation.
-    /// Platform projects are created in a temporary directory.
-    Playground,
 }
 
 #[cfg(test)]
@@ -2795,14 +2353,12 @@ mod channel_tests {
             let options = CreateOptions {
                 name: "Compatibility".into(),
                 bundle_identifier: bundle_identifier.clone(),
-                package_type: PackageType::Playground,
                 waterui_path: Some(framework_root),
                 channel: None,
                 framework_manifest: None,
                 framework: None,
                 framework_lock: None,
                 author: String::new(),
-                backends: Vec::new(),
                 web: None,
             };
             let error = Project::create(&project_root, options)
@@ -2820,7 +2376,6 @@ mod channel_tests {
             let mut manifest = Manifest::new(Package {
                 name: "Compatibility".into(),
                 bundle_identifier,
-                package_type: PackageType::Playground,
                 assets_path: default_assets_path(),
                 accessory: false,
             });
@@ -3104,9 +2659,7 @@ mod webview_backend_tests {
 mod scaffold_tests {
     use std::path::Path;
 
-    use super::{
-        BundleIdentifier, CreateOptions, ManagedBackends, PackageType, Project, TargetBackend,
-    };
+    use super::{BundleIdentifier, CreateOptions, ManagedBackends, Project};
 
     /// The documented `assets!` workflow requires the assets root to exist: the
     /// planner walks it recursively, so a missing directory fails the first
@@ -3123,7 +2676,6 @@ mod scaffold_tests {
                 name: "Water Example".to_string(),
                 bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
                     .expect("bundle identifier"),
-                package_type: PackageType::Playground,
                 waterui_path: None,
                 channel: None,
                 framework_manifest: None,
@@ -3132,7 +2684,6 @@ mod scaffold_tests {
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
                 framework_lock: None,
                 author: "Lexo Liu".to_string(),
-                backends: Vec::new(),
                 web: None,
             },
         ))
@@ -3155,50 +2706,6 @@ mod scaffold_tests {
         );
     }
 
-    /// `stable` withholds the git-pinned experimental scaffold packages, so a
-    /// backend whose generated crate links one — GTK4, `WinUI`, Dew — must fail
-    /// `create` before a file lands, naming the package and the channel fix
-    /// rather than dying partway through the backend's own scaffold.
-    #[test]
-    fn create_rejects_backends_whose_packages_stable_withholds() {
-        for backend in [
-            TargetBackend::Gtk4,
-            TargetBackend::WinUi,
-            TargetBackend::Dew,
-        ] {
-            let dir = tempfile::tempdir().expect("temp dir");
-            let root = dir.path().join("water-example");
-            let error = smol::block_on(Project::create(
-                &root,
-                CreateOptions {
-                    name: "Water Example".to_string(),
-                    bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
-                        .expect("bundle identifier"),
-                    package_type: PackageType::App,
-                    waterui_path: None,
-                    channel: None,
-                    framework_manifest: None,
-                    framework: Some(crate::framework::test_fixtures::stable_framework()),
-                    framework_lock: None,
-                    author: "Lexo Liu".to_string(),
-                    backends: vec![backend],
-                    web: None,
-                },
-            ))
-            .expect_err("a withheld scaffold package must reject create");
-            let error = error.to_string();
-            for package in backend.scaffold_packages() {
-                assert!(error.contains(package), "{error}");
-            }
-            assert!(error.contains("stable"), "{error}");
-            assert!(error.contains("--channel dev"), "{error}");
-            assert!(
-                !root.exists(),
-                "the rejection precedes any file write: {error}"
-            );
-        }
-    }
-
     /// Generated crate names carry the project-root tag that keeps a shared
     /// Cargo target directory unambiguous; the names packaged binaries ship
     /// under drop it — a checkout path must never appear in a shipped
@@ -3213,14 +2720,12 @@ mod scaffold_tests {
                 name: "Water Example".to_string(),
                 bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
                     .expect("bundle identifier"),
-                package_type: PackageType::Playground,
                 waterui_path: None,
                 channel: None,
                 framework_manifest: None,
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
                 framework_lock: None,
                 author: "Lexo Liu".to_string(),
-                backends: Vec::new(),
                 web: None,
             },
         ))
@@ -3253,32 +2758,30 @@ mod scaffold_tests {
         }
     }
 
-    fn create_playground(root: &Path) -> Project {
+    fn create_project(root: &Path) -> Project {
         smol::block_on(Project::create(
             root,
             CreateOptions {
                 name: "Water Example".to_string(),
                 bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
                     .expect("bundle identifier"),
-                package_type: PackageType::Playground,
                 waterui_path: None,
                 channel: None,
                 framework_manifest: None,
                 framework: Some(crate::framework::test_fixtures::stable_framework()),
                 framework_lock: None,
                 author: "Lexo Liu".to_string(),
-                backends: Vec::new(),
                 web: None,
             },
         ))
         .expect("project creation must succeed")
     }
 
-    /// Opening a playground for one platform scaffolds the managed backend
+    /// Opening a project for one platform scaffolds the managed backend
     /// that platform builds with and nothing else: a macOS open must not
     /// leave an Android project behind, and an Android open no Apple project.
     #[test]
-    fn opening_a_playground_scaffolds_only_the_platforms_managed_backend() {
+    fn opening_a_project_scaffolds_only_the_platforms_managed_backend() {
         use crate::android::backend::AndroidBackend;
         use crate::apple::backend::AppleBackend;
         use crate::platform::TargetPlatform;
@@ -3289,13 +2792,13 @@ mod scaffold_tests {
         ] {
             let dir = tempfile::tempdir().expect("temp dir");
             let root = dir.path().join("water-example");
-            create_playground(&root);
+            create_project(&root);
 
             let project = smol::block_on(Project::open(
                 &root,
                 ManagedBackends::for_platform(platform),
             ))
-            .expect("opening the playground must succeed");
+            .expect("opening the project must succeed");
 
             let apple_path = project.backend_path::<AppleBackend>();
             let android_path = project.backend_path::<AndroidBackend>();
@@ -3339,14 +2842,12 @@ mod scaffold_tests {
                     name: "Water Example".to_string(),
                     bundle_identifier: BundleIdentifier::try_from("dev.waterui.waterexample")
                         .expect("bundle identifier"),
-                    package_type: PackageType::App,
                     waterui_path: None,
                     channel: None,
                     framework_manifest: None,
                     framework: Some(crate::framework::test_fixtures::stable_framework()),
                     framework_lock: None,
                     author: "Lexo Liu".to_string(),
-                    backends: Vec::new(),
                     web: None,
                 },
             ))

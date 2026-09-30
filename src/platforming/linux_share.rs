@@ -56,7 +56,7 @@ pub async fn write_linux_share_material(
 
 #[cfg(test)]
 mod tests {
-    use crate::project::{CreateOptions, PackageType, Project};
+    use crate::project::{CreateOptions, Project};
     use crate::project_model::project_types::BundleIdentifier;
 
     #[test]
@@ -70,7 +70,6 @@ mod tests {
                     name: "Share Example".to_string(),
                     bundle_identifier: BundleIdentifier::try_from("dev.waterui.shareexample")
                         .expect("bundle identifier"),
-                    package_type: PackageType::Playground,
                     waterui_path: None,
                     channel: None,
                     framework_manifest: None,
@@ -79,7 +78,6 @@ mod tests {
                     framework: Some(crate::framework::test_fixtures::stable_framework()),
                     framework_lock: None,
                     author: "Lexo Liu".to_string(),
-                    backends: Vec::new(),
                     web: None,
                 },
             )

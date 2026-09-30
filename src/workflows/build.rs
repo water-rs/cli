@@ -2179,6 +2179,14 @@ Automatic meson installation failed: {install_err}\n\n{}",
         user_rustflags: &[String],
     ) -> Vec<String> {
         let mut args = Vec::new();
+        // A `--crate-type` override only has meaning for the library target;
+        // on a `--bin` unit it would fight rustc's own `bin` crate type.
+        if cargo_target.accepts_crate_type_override()
+            && let Some(crate_type) = &self.crate_type_override
+        {
+            args.push("--crate-type".to_owned());
+            args.push(crate_type.clone());
+        }
         args.extend(self.final_rustc_args.iter().cloned());
         if matches!(cargo_target, CargoTarget::Binary(_)) {
             args.push(format!(
@@ -4755,7 +4763,7 @@ mod tests {
                 );
             let temporary = tempdir().expect("tempdir");
             let root = temporary.path().join("release-app");
-            let mut project = crate::project::Project::create(
+            let project = crate::project::Project::create(
                 &root,
                 crate::project::CreateOptions {
                     name: "Release App".to_string(),
@@ -4764,14 +4772,12 @@ mod tests {
                             "dev.waterui.releaseapp",
                         )
                         .expect("bundle identifier"),
-                    package_type: crate::project::PackageType::App,
                     waterui_path: Some(checkout),
                     channel: None,
                     framework_manifest: None,
                     framework: None,
                     framework_lock: None,
                     author: String::new(),
-                    backends: Vec::new(),
                     web: None,
                 },
             )
@@ -4785,10 +4791,11 @@ mod tests {
             source.push_str("\nwaterui::include_bundle!(\"bundle\", as = media);\n");
             std::fs::write(&lib_rs, source).expect("write lib.rs");
 
-            project
-                .init_hydrolysis_backend()
-                .await
-                .expect("hydrolysis backend scaffolds");
+            crate::backend::reinit_backend::<crate::hydrolysis::backend::HydrolysisBackend>(
+                &project,
+            )
+            .await
+            .expect("hydrolysis backend scaffolds");
             crate::hydrolysis::platform::build_hydrolysis(
                 &project,
                 crate::platform::TargetPlatform::Linux,
@@ -4797,7 +4804,9 @@ mod tests {
             .await
             .expect("release build must succeed");
 
-            let staged = root.join("backends/hydrolysis/resources/waterui_assets/media/hello.txt");
+            let staged = project
+                .backend_path::<crate::hydrolysis::backend::HydrolysisBackend>()
+                .join("resources/waterui_assets/media/hello.txt");
             assert!(
                 staged.metadata().is_ok_and(|meta| meta.len() > 0),
                 "release build stages a non-empty mount at {}",

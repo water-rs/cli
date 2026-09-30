@@ -233,7 +233,7 @@ async fn ensure_inspector_support_app(
 }
 
 async fn scaffold_inspector_app(path: &Path, requirements: &InspectorRequirements) -> Result<()> {
-    use crate::project::{CreateOptions, Manifest as WaterManifest, PackageType};
+    use crate::project::{CreateOptions, Manifest as WaterManifest};
 
     let waterui_path = requirements.waterui_path.clone();
 
@@ -243,14 +243,12 @@ async fn scaffold_inspector_app(path: &Path, requirements: &InspectorRequirement
             "dev.waterui.inspector",
         )
         .expect("inspector support bundle identifier must be valid"),
-        package_type: PackageType::Playground,
         waterui_path: waterui_path.clone(),
         channel: None,
         framework_manifest: None,
         framework: None,
         framework_lock: None,
         author: String::new(),
-        backends: Vec::new(),
         web: None,
     };
 
@@ -262,7 +260,7 @@ async fn scaffold_inspector_app(path: &Path, requirements: &InspectorRequirement
     manifest.package.accessory = false;
     manifest.save(project.root()).await?;
 
-    let ctx = TemplateContext::for_support_playground(
+    let ctx = TemplateContext::for_support_app(
         "WaterUI Inspector",
         project.crate_name().clone(),
         crate::project_types::BundleIdentifier::try_from("dev.waterui.inspector")

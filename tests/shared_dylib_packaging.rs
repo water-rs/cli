@@ -16,7 +16,7 @@
 //! [`RustLinkage::SharedRuntime`] — `cargo rustc` on the backend crate's
 //! `--bin` unit with `-Cprefer-dynamic`, loader search paths, and the
 //! `-Cextra-filename` marker — so the artifact handed to packaging is the
-//! marked `deps/` binary a playground run produces (water-rs/cli#161).
+//! marked `deps/` binary a `water run` produces (water-rs/cli#161).
 //! Built twice, the second invocation reports the shared dylib unit
 //! `fresh`, so the stale check must find the dep-info rustc wrote as
 //! `deps/<crate>-<metadata>.d` — the hashed name a git-sourced dylib
@@ -279,7 +279,7 @@ fn scaffold_fixture(root: &Path) -> PathBuf {
     // project's toolchain (which the fallback libstd lookup needs).
     write(
         &app_dir.join("Water.toml"),
-        "[package]\ntype = \"app\"\nname = \"app\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
+        "[package]\nname = \"app\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
     );
     app_dir
 }
@@ -288,7 +288,7 @@ fn scaffold_fixture(root: &Path) -> PathBuf {
 /// backend)` directories: an `app` library crate carrying the git-sourced
 /// `waterui-dylib` dependency and the `dev` feature `with_linkage` enables,
 /// and a standalone-workspace `backend` crate whose `--bin` calls into it —
-/// the shape `build_hydrolysis` compiles for a playground project.
+/// the shape `build_hydrolysis` compiles for a project.
 fn scaffold_run_fixture(root: &Path) -> (PathBuf, PathBuf) {
     let dylib_url = scaffold_dylib(root);
 
@@ -305,7 +305,7 @@ fn scaffold_run_fixture(root: &Path) -> (PathBuf, PathBuf) {
     );
     write(
         &app_dir.join("Water.toml"),
-        "[package]\ntype = \"app\"\nname = \"app\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
+        "[package]\nname = \"app\"\nbundle_identifier = \"dev.waterui.fixture\"\n",
     );
 
     let backend_dir = root.join("backend");
