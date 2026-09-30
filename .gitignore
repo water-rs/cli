@@ -8,7 +8,7 @@ target
 
 # A local water-rs/waterui clone for exercising `water create --waterui-path`
 # or the ignored pinned-revision tests. `cargo publish` would package it.
-waterui/
+/waterui/
 
 # Personal/temporary files
 *.skill

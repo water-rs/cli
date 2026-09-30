@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use askama::Template;
 use eyre::{self, bail};
 use smol::{fs, unblock};
-use target_lexicon::{Aarch64Architecture, Architecture, Triple};
+use target_lexicon::{
+    Aarch64Architecture, Architecture, BinaryFormat, Environment, OperatingSystem, Triple, Vendor,
+};
 
 use tracing::{debug, info};
 
@@ -30,10 +32,57 @@ use crate::{
     utils::copy_file,
 };
 
-fn gradle_cmd(gradlew: &Path, backend_path: &Path, task: &str) -> smol::process::Command {
+fn gradle_cmd(gradlew: &Path, backend_path: &Path, tasks: &[&str]) -> smol::process::Command {
     let mut cmd = smol::process::Command::new(gradlew);
-    cmd.arg(task).arg("--project-dir").arg(backend_path);
+    cmd.args(tasks).arg("--project-dir").arg(backend_path);
     cmd
+}
+
+/// Run the Gradle wrapper inside `backend_path` on `tasks`, wiring the JDK
+/// and SDK the toolchain resolves plus any corporate proxy properties, and
+/// bail with the captured output when the build fails. The shared tail of
+/// every Gradle invocation the CLI drives — app packaging and the embedded
+/// library's assemble/publish alike.
+pub(crate) async fn run_gradle_tasks(
+    backend_path: &Path,
+    tasks: &[&str],
+    extra_envs: &[(&str, String)],
+) -> eyre::Result<()> {
+    let gradlew = backend_path.join(if cfg!(windows) {
+        "gradlew.bat"
+    } else {
+        "gradlew"
+    });
+
+    // Set JAVA_HOME to Android Studio's bundled JDK to avoid JDK version conflicts
+    // (e.g., Homebrew's JDK 25 is not supported by Android Gradle Plugin)
+    let mut cmd = gradle_cmd(&gradlew, backend_path, tasks);
+    let host = Host::current();
+    if let Some(java_home) = Java::detect_home(&host).await {
+        cmd.env("JAVA_HOME", java_home);
+    }
+    if let Some(sdk_path) = AndroidSdk::detect_path(&host) {
+        cmd.env("ANDROID_HOME", &sdk_path)
+            .env("ANDROID_SDK_ROOT", &sdk_path);
+    }
+    for (key, value) in extra_envs {
+        cmd.env(key, value);
+    }
+    apply_gradle_proxy_env(&host, &mut cmd)?;
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "Gradle build failed in {}:\n{}\n{}",
+            backend_path.display(),
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 fn apply_gradle_proxy_env(host: &Host, cmd: &mut smol::process::Command) -> eyre::Result<()> {
@@ -390,18 +439,30 @@ impl AndroidPlatform {
     /// Get the target triple for this Android platform.
     #[must_use]
     pub const fn triple(&self) -> Triple {
-        let architecture = match self.abi {
-            AndroidAbi::Arm64V8a => Architecture::Aarch64(Aarch64Architecture::Aarch64),
-            AndroidAbi::X86_64 => Architecture::X86_64,
-            AndroidAbi::ArmeabiV7a => Architecture::Arm(target_lexicon::ArmArchitecture::Armv7),
-            AndroidAbi::X86 => Architecture::X86_32(target_lexicon::X86_32Architecture::I686),
+        let (architecture, environment) = match self.abi {
+            AndroidAbi::Arm64V8a => (
+                Architecture::Aarch64(Aarch64Architecture::Aarch64),
+                Environment::Android,
+            ),
+            AndroidAbi::X86_64 => (Architecture::X86_64, Environment::Android),
+            // rustc's armv7 Android target carries the `androideabi`
+            // environment (`armv7-linux-androideabi`); `android` alone names
+            // no target.
+            AndroidAbi::ArmeabiV7a => (
+                Architecture::Arm(target_lexicon::ArmArchitecture::Armv7),
+                Environment::Androideabi,
+            ),
+            AndroidAbi::X86 => (
+                Architecture::X86_32(target_lexicon::X86_32Architecture::I686),
+                Environment::Android,
+            ),
         };
         Triple {
             architecture,
-            vendor: target_lexicon::Vendor::Unknown,
-            operating_system: target_lexicon::OperatingSystem::Linux,
-            environment: target_lexicon::Environment::Android,
-            binary_format: target_lexicon::BinaryFormat::Elf,
+            vendor: Vendor::Unknown,
+            operating_system: OperatingSystem::Linux,
+            environment,
+            binary_format: BinaryFormat::Elf,
         }
     }
 
@@ -501,12 +562,6 @@ impl AndroidPlatform {
         )
         .await?;
 
-        let gradlew = backend_path.join(if cfg!(windows) {
-            "gradlew.bat"
-        } else {
-            "gradlew"
-        });
-
         let (command_name, output_kind, variant) =
             match (options.is_distribution(), options.is_debug()) {
                 (true, false) => ("bundleRelease", OutputKind::Bundle, "release"),
@@ -522,29 +577,15 @@ impl AndroidPlatform {
             .collect::<Vec<_>>()
             .join(",");
 
-        // Set JAVA_HOME to Android Studio's bundled JDK to avoid JDK version conflicts
-        // (e.g., Homebrew's JDK 25 is not supported by Android Gradle Plugin)
-        let mut cmd = gradle_cmd(&gradlew, &backend_path, command_name);
-        cmd.env("WATERUI_SKIP_RUST_BUILD", "1")
-            .env("WATERUI_ANDROID_ABIS", &abis_str);
-
-        let host = Host::current();
-        if let Some(java_home) = Java::detect_home(&host).await {
-            cmd.env("JAVA_HOME", java_home);
-        }
-        if let Some(sdk_path) = AndroidSdk::detect_path(&host) {
-            cmd.env("ANDROID_HOME", &sdk_path)
-                .env("ANDROID_SDK_ROOT", &sdk_path);
-        }
-        apply_gradle_proxy_env(&host, &mut cmd)?;
-
-        let output = cmd.output().await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            bail!("Gradle build failed:\n{}\n{}", stdout.trim(), stderr.trim());
-        }
+        run_gradle_tasks(
+            &backend_path,
+            &[command_name],
+            &[
+                ("WATERUI_SKIP_RUST_BUILD", "1".to_string()),
+                ("WATERUI_ANDROID_ABIS", abis_str),
+            ],
+        )
+        .await?;
 
         let path = packaged_artifact(&backend_path, output_kind, variant).await?;
         Ok(Artifact::new(project.bundle_identifier(), path))
@@ -1031,7 +1072,7 @@ pub async fn clean_android(project: &Project) -> eyre::Result<()> {
 
     // Set JAVA_HOME to Android Studio's bundled JDK to avoid JDK version conflicts
     let host = Host::current();
-    let mut cmd = gradle_cmd(&gradlew, &backend_path, "clean");
+    let mut cmd = gradle_cmd(&gradlew, &backend_path, &["clean"]);
 
     if let Some(java_home) = Java::detect_home(&host).await {
         cmd.env("JAVA_HOME", java_home);
@@ -1098,7 +1139,8 @@ async fn copy_assets_and_fonts(
 
     // Always generate WaterUIFonts.kt (even if empty) since MainActivity references it
     let java_dir = backend_path.join("app/src/main/java");
-    generate_font_registration_kotlin(project, &resolved_fonts, &java_dir).await?;
+    let namespace = project.bundle_identifier().android_package_name();
+    generate_font_registration_kotlin(&namespace, &resolved_fonts, &java_dir).await?;
 
     Ok(())
 }
@@ -1114,14 +1156,11 @@ struct WaterUiFontsKotlinTemplate<'a> {
 }
 
 /// Generate WaterUIFonts.kt file for registering custom fonts.
-async fn generate_font_registration_kotlin(
-    project: &Project,
+pub(crate) async fn generate_font_registration_kotlin(
+    namespace: &str,
     fonts: &[ResolvedFont],
     java_dir: &Path,
 ) -> eyre::Result<()> {
-    // Get the package namespace from the project
-    let namespace = project.bundle_identifier().android_package_name();
-
     // Clean up legacy layout: older CLI versions wrote `WaterUIFonts.kt` directly under
     // `app/src/main/java/` (but still declared the app package), which can cause
     // Kotlin redeclaration errors after we started generating into the package dir.
@@ -1143,14 +1182,14 @@ async fn generate_font_registration_kotlin(
         .collect::<Vec<_>>();
 
     let content = WaterUiFontsKotlinTemplate {
-        namespace: namespace.as_str(),
+        namespace,
         font_entries: &font_entries,
     }
     .render()
     .map_err(|error| eyre::eyre!("Failed to render WaterUIFonts.kt template: {error}"))?;
 
     // Create the package directory structure
-    let package_dir = java_dir.join(namespace.as_str().replace('.', "/"));
+    let package_dir = java_dir.join(namespace.replace('.', "/"));
     fs::create_dir_all(&package_dir).await?;
 
     let kotlin_path = package_dir.join("WaterUIFonts.kt");

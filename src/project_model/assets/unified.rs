@@ -222,6 +222,26 @@ pub async fn stage_for_android(
     Ok(manifest)
 }
 
+/// Stage the project's assets under an embedded-mode Android library
+/// module's `assets` tree. A host mounts `waterui_assets` out of the AAR's
+/// merged assets, so only the raw asset files and their sync stamp ship —
+/// the app-level `res`/`theme`/launcher artwork belongs to the host.
+/// `symbols` is the target build's app library — see [`stage_for_apple`].
+pub async fn stage_for_android_library(
+    project: &Project,
+    module_dir: &Path,
+    symbols: &ArtifactSymbols,
+    dev_server: bool,
+) -> eyre::Result<BundleManifest> {
+    let manifest = build_manifest(project, symbols, dev_server).await?;
+    let assets_dest = module_dir.join("src/main/assets").join(ASSET_ROOT_DIR);
+    reset_dir(&assets_dest).await?;
+    copy_manifest_assets(&manifest, &assets_dest).await?;
+    write_manifest_stamp(&manifest, &assets_dest).await?;
+
+    Ok(manifest)
+}
+
 /// Renders the project's macOS `.icns` app icon for hand-assembled bundles
 /// (self-drawn backends that do not go through an Xcode asset catalog).
 ///
@@ -484,7 +504,7 @@ async fn write_manifest_stamp(manifest: &BundleManifest, dest_root: &Path) -> ey
         hasher.update(&bytes);
     }
     let stamp = hex::encode(hasher.finalize());
-    fs::write(dest_root.join(".waterui-sync-stamp"), stamp).await?;
+    fs::write(dest_root.join("waterui-sync-stamp"), stamp).await?;
     Ok(())
 }
 

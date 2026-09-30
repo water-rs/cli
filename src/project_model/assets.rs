@@ -1339,6 +1339,19 @@ pub async fn stage_project_assets_for_android(
     unified::stage_for_android(project, backend_path, symbols, dev_server).await
 }
 
+/// Stage project assets for an embedded-mode Android library module
+/// (`waterui_assets` + sync stamp only — no app-level `res` files).
+/// `symbols` is the target build's app library — see
+/// [`stage_project_assets_for_apple`].
+pub async fn stage_project_assets_for_android_library(
+    project: &Project,
+    module_dir: &Path,
+    symbols: &crate::artifact_symbols::ArtifactSymbols,
+    dev_server: bool,
+) -> eyre::Result<BundleManifest> {
+    unified::stage_for_android_library(project, module_dir, symbols, dev_server).await
+}
+
 /// Render the project's macOS `.icns` app icon for hand-assembled bundles.
 ///
 /// Gated to macOS along with the rest of the `.icns` chain, whose only caller is

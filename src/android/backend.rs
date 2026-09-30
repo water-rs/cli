@@ -76,8 +76,9 @@ impl Default for AndroidBackend {
 impl Backend for AndroidBackend {
     const DEFAULT_PATH: &'static str = "android";
 
-    // Preserve Gradle build caches during re-scaffolding
-    const CACHE_PATHS: &'static [&'static str] = &[".gradle", "build", "app"];
+    // Preserve Gradle build caches during re-scaffolding: `app` is the
+    // entry-owning module, `waterui` the embedded-mode library module.
+    const CACHE_PATHS: &'static [&'static str] = &[".gradle", "build", "app", "waterui"];
 
     fn path(&self) -> &Path {
         &self.project_path
@@ -136,9 +137,20 @@ impl Backend for AndroidBackend {
         .with_project_root_path(project.root().to_path_buf())
         .with_android_permissions(android_permissions);
 
-        templates::android::scaffold(&project.backend_path::<Self>(), &ctx)
-            .await
-            .map_err(crate::backend::FailToInitBackend::Io)?;
+        if manifest.package.embedded {
+            let ctx = ctx.with_crate_version(
+                crate::android::embedded::read_crate_version(project.root())
+                    .await
+                    .map_err(crate::backend::FailToInitBackend::Config)?,
+            );
+            templates::android_embedded::scaffold(&project.backend_path::<Self>(), &ctx)
+                .await
+                .map_err(crate::backend::FailToInitBackend::Io)?;
+        } else {
+            templates::android::scaffold(&project.backend_path::<Self>(), &ctx)
+                .await
+                .map_err(crate::backend::FailToInitBackend::Io)?;
+        }
 
         Ok(Self {
             project_path: default_android_project_path(),
