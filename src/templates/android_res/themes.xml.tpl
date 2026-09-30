@@ -1,5 +1,5 @@
 <resources>
-    <style name="Theme.WaterUIApp" parent="Theme.Material3.DayNight.NoActionBar">
+    <style name="Theme.WaterUIApp" parent="{{ theme_parent }}">
 {%- for item in theme_items %}
         <item name="{{ item.attr }}">@color/{{ item.color_name }}</item>
 {%- endfor %}

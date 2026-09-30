@@ -26,13 +26,27 @@ pub struct Backends {
     android: Option<AndroidBackend>,
     apple: Option<AppleBackend>,
     esp32: Option<Esp32Backend>,
+    hydrolysis: Option<HydrolysisConfig>,
+}
+
+/// The `[backends.hydrolysis]` table: per-backend selections the project
+/// author declares for the Hydrolysis backend.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct HydrolysisConfig {
+    /// The Android painter the generated app mounts on the shared Hydrolysis
+    /// host. Absent means the GPU painter; an explicit painter the pinned
+    /// host cannot serve is an error at scaffold time, never a substitute.
+    pub painter: Option<crate::hydrolysis::android::HydrolysisAndroidPainter>,
 }
 
 impl Backends {
     /// Check if no backends are configured.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.android.is_none() && self.apple.is_none() && self.esp32.is_none()
+        self.android.is_none()
+            && self.apple.is_none()
+            && self.esp32.is_none()
+            && self.hydrolysis.is_none()
     }
 
     /// Get the Android backend configuration, if any.
@@ -81,6 +95,22 @@ impl Backends {
     /// Remove ESP32 backend configuration.
     pub fn clear_esp32(&mut self) {
         self.esp32 = None;
+    }
+
+    /// Get the Hydrolysis backend configuration, if any.
+    #[must_use]
+    pub const fn hydrolysis(&self) -> Option<&HydrolysisConfig> {
+        self.hydrolysis.as_ref()
+    }
+
+    /// Set the Hydrolysis backend configuration.
+    pub const fn set_hydrolysis(&mut self, config: HydrolysisConfig) {
+        self.hydrolysis = Some(config);
+    }
+
+    /// Remove Hydrolysis backend configuration.
+    pub const fn clear_hydrolysis(&mut self) {
+        self.hydrolysis = None;
     }
 }
 

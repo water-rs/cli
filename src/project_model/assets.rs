@@ -1340,8 +1340,9 @@ pub async fn stage_project_assets_for_android(
     backend_path: &Path,
     symbols: &crate::artifact_symbols::ArtifactSymbols,
     dev_server: bool,
+    theme_parent: unified::AndroidThemeParent,
 ) -> eyre::Result<BundleManifest> {
-    unified::stage_for_android(project, backend_path, symbols, dev_server).await
+    unified::stage_for_android(project, backend_path, symbols, dev_server, theme_parent).await
 }
 
 /// Stage project assets for an embedded-mode Android library module
@@ -1393,7 +1394,7 @@ pub fn scan_project_font_assets(manifest: &BundleManifest) -> eyre::Result<Vec<R
     unified::scan_project_fonts(manifest)
 }
 
-pub use unified::LaunchAssets;
+pub use unified::{AndroidThemeParent, LaunchAssets};
 
 /// Resolve the project's launch screen and load its artwork.
 pub fn project_launch_assets(project: &Project) -> eyre::Result<LaunchAssets> {

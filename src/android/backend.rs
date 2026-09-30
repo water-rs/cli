@@ -114,15 +114,7 @@ impl Backend for AndroidBackend {
         }
 
         // Extract enabled permissions from the manifest
-        let android_permissions = manifest
-            .permissions
-            .iter()
-            .filter(|(_, entry)| entry.is_enabled())
-            .filter_map(|(key, _)| {
-                key.android_permission_name()
-                    .map(|name| templates::AndroidPermissionTemplateEntry { name })
-            })
-            .collect();
+        let android_permissions = manifest_permissions(manifest);
 
         let ctx = TemplateContext::for_project_manifest(
             manifest,
@@ -196,4 +188,21 @@ impl Backend for AndroidBackend {
 
 fn default_android_project_path() -> PathBuf {
     PathBuf::from("android")
+}
+
+/// The `<uses-permission>` entries the project manifest enables, for any
+/// backend that scaffolds an `AndroidManifest.xml` — the View-based backend
+/// and the Hydrolysis host alike.
+pub(crate) fn manifest_permissions(
+    manifest: &crate::project::Manifest,
+) -> Vec<templates::AndroidPermissionTemplateEntry> {
+    manifest
+        .permissions
+        .iter()
+        .filter(|(_, entry)| entry.is_enabled())
+        .filter_map(|(key, _)| {
+            key.android_permission_name()
+                .map(|name| templates::AndroidPermissionTemplateEntry { name })
+        })
+        .collect()
 }

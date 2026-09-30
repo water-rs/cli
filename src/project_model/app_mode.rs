@@ -20,7 +20,7 @@ const APP_MODE_KEYS: &[(&[&str], &str)] = &[
     (&["backends", "android"], "version"),
     (&["backends", "esp32"], "project_path"),
     (&["backends", "gtk4"], ""),
-    (&["backends", "hydrolysis"], ""),
+    (&["backends", "hydrolysis"], "project_path"),
     (&["backends", "winui"], ""),
 ];
 

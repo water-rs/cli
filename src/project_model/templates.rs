@@ -95,6 +95,8 @@ pub mod embedded {
     pub static FFI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/ffi");
     pub static GTK4: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/gtk4");
     pub static HYDROLYSIS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/hydrolysis");
+    pub static HYDROLYSIS_ANDROID: Dir<'_> =
+        include_dir!("$CARGO_MANIFEST_DIR/src/templates/hydrolysis_android");
     pub static ESP32: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/esp32");
     pub static PREVIEW: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/preview");
     pub static PREVIEW_FFI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/preview_ffi");
@@ -229,6 +231,35 @@ impl Default for Esp32TemplateEntry {
     }
 }
 
+/// The Hydrolysis Android app scaffold's parameters: the managed host
+/// checkout it `includeBuild`s, the painter module that checkout supplies,
+/// and the app's native library name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HydrolysisAndroidTemplateEntry {
+    /// The cdylib `System.loadLibrary` name (e.g. `waterui_hydrolysis_backend_lib`).
+    pub native_library_name: String,
+    /// The Gradle project inside the pinned host checkout, relative to the
+    /// generated `android/` directory (e.g. `../android-host/<rev>/android`).
+    pub host_project_dir: String,
+    /// The `dev.waterui.hydrolysis` painter artifact the app module links
+    /// (e.g. `dev.waterui.hydrolysis:gpu`).
+    pub painter_dependency: String,
+    /// The painter's Gradle project inside the host checkout (e.g. `gpu`) —
+    /// the `includeBuild` `dependencySubstitution` uses it for both the
+    /// `dev.waterui.hydrolysis` module name and the substituted project.
+    pub painter_module: String,
+    /// The generated app's `minSdk`: the higher of the framework's Android
+    /// API floor and the selected painter's.
+    pub min_api_level: u32,
+    /// Import path of the band `View` the painter mounts as child 0 of the
+    /// host view — `None` for a painter that draws through the host view
+    /// itself and ships no band.
+    pub painter_band_import: Option<String>,
+    /// The band class [`painter_band_import`](Self::painter_band_import)
+    /// supplies, when set.
+    pub painter_band_class: Option<String>,
+}
+
 /// What the application's own dependency graph says about browser components.
 ///
 /// Nothing here is configuration: the engine that draws a `WebView` is a crate
@@ -299,6 +330,9 @@ pub struct TemplateContext {
     pub esp32: Esp32TemplateEntry,
     /// The launch screen assets the Apple templates refer to.
     pub launch: LaunchTemplateEntry,
+    /// Hydrolysis Android scaffold parameters — set only while the
+    /// `hydrolysis_android` templates render.
+    pub hydrolysis_android: Option<HydrolysisAndroidTemplateEntry>,
 }
 
 impl TemplateContext {
@@ -339,6 +373,7 @@ impl TemplateContext {
             web_frontend_arg: options.web.as_ref().map(|web| web.include_arg.clone()),
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
+            hydrolysis_android: None,
         }
     }
 
@@ -379,6 +414,7 @@ impl TemplateContext {
             web_frontend_arg: manifest.web.as_ref().map(|_| "web".to_string()),
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
+            hydrolysis_android: None,
         }
     }
 
@@ -426,6 +462,7 @@ impl TemplateContext {
             web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
+            hydrolysis_android: None,
         }
     }
 
@@ -542,6 +579,76 @@ impl TemplateContext {
     pub fn with_esp32(mut self, esp32: Esp32TemplateEntry) -> Self {
         self.esp32 = esp32;
         self
+    }
+
+    /// Set the Hydrolysis Android scaffold parameters.
+    #[must_use]
+    pub fn with_hydrolysis_android(mut self, entry: HydrolysisAndroidTemplateEntry) -> Self {
+        self.hydrolysis_android = Some(entry);
+        self
+    }
+
+    const fn hydrolysis_android_entry(&self) -> &HydrolysisAndroidTemplateEntry {
+        self.hydrolysis_android
+            .as_ref()
+            .expect("TemplateContext missing the Hydrolysis Android entry")
+    }
+
+    /// The cdylib name the generated `MainActivity` loads.
+    #[must_use]
+    pub fn hydrolysis_android_native_library_name(&self) -> &str {
+        &self.hydrolysis_android_entry().native_library_name
+    }
+
+    /// The pinned host checkout's Gradle root, relative to the generated
+    /// `android/` directory, that `settings.gradle.kts` `includeBuild`s.
+    #[must_use]
+    pub fn hydrolysis_android_host_project_dir(&self) -> &str {
+        &self.hydrolysis_android_entry().host_project_dir
+    }
+
+    /// The `dev.waterui.hydrolysis` painter artifact the app module links.
+    #[must_use]
+    pub fn hydrolysis_android_painter_dependency(&self) -> &str {
+        &self.hydrolysis_android_entry().painter_dependency
+    }
+
+    /// The painter's Gradle project inside the host checkout
+    /// ([`HydrolysisAndroidTemplateEntry::painter_module`]).
+    pub fn hydrolysis_android_painter_module(&self) -> &str {
+        &self.hydrolysis_android_entry().painter_module
+    }
+
+    /// The generated app's `minSdk`.
+    #[must_use]
+    pub const fn hydrolysis_android_min_api_level(&self) -> u32 {
+        self.hydrolysis_android_entry().min_api_level
+    }
+
+    /// Whether the selected painter mounts a band `View` under the host.
+    #[must_use]
+    pub const fn hydrolysis_android_has_painter_band(&self) -> bool {
+        self.hydrolysis_android_entry().painter_band_class.is_some()
+    }
+
+    /// The painter band `View`'s import path; only valid when
+    /// [`Self::hydrolysis_android_has_painter_band`].
+    #[must_use]
+    pub fn hydrolysis_android_painter_band_import(&self) -> &str {
+        self.hydrolysis_android_entry()
+            .painter_band_import
+            .as_deref()
+            .expect("Hydrolysis Android entry has no painter band")
+    }
+
+    /// The painter band `View`'s class name; only valid when
+    /// [`Self::hydrolysis_android_has_painter_band`].
+    #[must_use]
+    pub fn hydrolysis_android_painter_band_class(&self) -> &str {
+        self.hydrolysis_android_entry()
+            .painter_band_class
+            .as_deref()
+            .expect("Hydrolysis Android entry has no painter band")
     }
 
     #[must_use]
@@ -885,6 +992,7 @@ enum TemplateNamespace {
     Ffi,
     Gtk4,
     Hydrolysis,
+    HydrolysisAndroid,
     Esp32,
     Inspector,
     Preview,
@@ -904,6 +1012,7 @@ impl TemplateNamespace {
             Self::Ffi => "src/templates/ffi",
             Self::Gtk4 => "src/templates/gtk4",
             Self::Hydrolysis => "src/templates/hydrolysis",
+            Self::HydrolysisAndroid => "src/templates/hydrolysis_android",
             Self::Esp32 => "src/templates/esp32",
             Self::Inspector => "src/templates/inspector",
             Self::Preview => "src/templates/preview",
@@ -1167,6 +1276,11 @@ define_scaffold_templates! {
     Gtk4BuildScriptTemplate => (Gtk4, "src/templates/gtk4/build.rs.tpl"),
     Gtk4MainTemplate => (Gtk4, "src/templates/gtk4/src/main.rs.tpl"),
     HydrolysisBuildScriptTemplate => (Hydrolysis, "src/templates/hydrolysis/build.rs.tpl"),
+    HydrolysisAndroidSettingsTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/settings.gradle.kts.tpl"),
+    HydrolysisAndroidStringsTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/src/main/res/values/strings.xml.tpl"),
+    HydrolysisAndroidBuildGradleTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/build.gradle.kts.tpl"),
+    HydrolysisAndroidManifestTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/src/main/AndroidManifest.xml.tpl"),
+    HydrolysisAndroidMainActivityTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/src/main/java/MainActivity.kt.tpl"),
     RootWebLibTemplate => (Root, "src/templates/web_lib.rs.tpl"),
     HydrolysisLibTemplate => (Hydrolysis, "src/templates/hydrolysis/src/lib.rs.tpl"),
     HydrolysisMainTemplate => (Hydrolysis, "src/templates/hydrolysis/src/main.rs.tpl"),
@@ -1230,6 +1344,7 @@ mod tests {
             preview_app_dependency: None,
             web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
+            hydrolysis_android: None,
             launch: LaunchTemplateEntry::default(),
         }
     }
@@ -2414,8 +2529,8 @@ mod tests {
         let manifest = cargo_toml
             .parse::<toml::Table>()
             .expect("hydrolysis Cargo.toml should parse");
-        let native_dependencies =
-            &manifest["target"]["cfg(not(target_arch = \"wasm32\"))"]["dependencies"];
+        let native_dependencies = &manifest["target"]["cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))"]
+            ["dependencies"];
         assert_eq!(
             native_dependencies["waterui-preview"]["version"].as_str(),
             Some(pinned("waterui-preview-version").as_str()),
@@ -2575,7 +2690,8 @@ mod tests {
             .expect("hydrolysis Cargo.toml should parse");
 
         for cfg in [
-            "cfg(not(target_arch = \"wasm32\"))",
+            "cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))",
+            "cfg(target_os = \"android\")",
             "cfg(target_arch = \"wasm32\")",
         ] {
             let dependencies = &manifest["target"][cfg]["dependencies"];
@@ -2601,8 +2717,8 @@ mod tests {
         }
 
         // In-tree crates still resolve by path into the checkout.
-        let native_dependencies =
-            &manifest["target"]["cfg(not(target_arch = \"wasm32\"))"]["dependencies"];
+        let native_dependencies = &manifest["target"]["cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))"]
+            ["dependencies"];
         assert_eq!(
             native_dependencies["waterui-core"]["path"].as_str(),
             Some(normalize_path_for_config(&checkout.join("core")).as_str()),
@@ -4547,9 +4663,15 @@ pub mod hydrolysis {
     ) -> io::Result<BTreeMap<String, GeneratedTargetSection<GeneratedDependencyValue>>> {
         Ok(BTreeMap::from([
             (
-                "cfg(not(target_arch = \"wasm32\"))".to_string(),
+                "cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))".to_string(),
                 GeneratedTargetSection {
                     dependencies: native_target_dependencies(ctx)?,
+                },
+            ),
+            (
+                "cfg(target_os = \"android\")".to_string(),
+                GeneratedTargetSection {
+                    dependencies: android_target_dependencies(ctx)?,
                 },
             ),
             (
@@ -4557,6 +4679,78 @@ pub mod hydrolysis {
                 GeneratedTargetSection {
                     dependencies: wasm_target_dependencies(ctx)?,
                 },
+            ),
+        ]))
+    }
+
+    /// The dependencies only the Android launcher compiles: the Hydrolysis
+    /// runner's Android host, the JNI declarations `JNI_OnLoad` needs, and
+    /// the GPU-capable `waterui` the registered app builds with. The
+    /// desktop-only stack (winit, pollster, preview and MCP runtimes) stays
+    /// out — the Android launcher never binaries or previews.
+    fn android_target_dependencies(
+        ctx: &TemplateContext,
+    ) -> io::Result<BTreeMap<String, GeneratedDependencyValue>> {
+        Ok(BTreeMap::from([
+            (
+                "hydrolysis".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "hydrolysis",
+                            &["accessibility"],
+                            NativeBackendDependencySource::WorkspaceDependency,
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "waterui".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "waterui",
+                            &["gpu"],
+                            NativeBackendDependencySource::WateruiRoot,
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "waterui-core".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "waterui-core",
+                            &[],
+                            NativeBackendDependencySource::WorkspaceSubdir("core"),
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "hydrolysis-m3".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "hydrolysis-m3",
+                            &[],
+                            NativeBackendDependencySource::WorkspaceDependency,
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "jni".to_string(),
+                GeneratedDependencyValue::simple("0.21.1"),
             ),
         ]))
     }
@@ -4748,6 +4942,44 @@ pub mod hydrolysis {
                 ),
             ),
         ]))
+    }
+}
+
+/// The generated Gradle app that runs a `WaterUI` application through the
+/// Hydrolysis Android host: a Kotlin `HydrolysisActivity` subclass, the
+/// painter band, and the Rust cdylib wiring — rendered under
+/// `<backend>/android` beside the launcher crate `templates::hydrolysis`
+/// scaffolds.
+pub mod hydrolysis_android {
+    use super::{Path, PathBuf, TemplateContext, TemplateNamespace, embedded, io, scaffold_dir};
+
+    /// Write all Hydrolysis Android app templates to the given directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file operations fail.
+    pub async fn scaffold(base_dir: &Path, ctx: &TemplateContext) -> io::Result<()> {
+        scaffold_dir(
+            TemplateNamespace::HydrolysisAndroid,
+            &embedded::HYDROLYSIS_ANDROID,
+            base_dir,
+            ctx,
+        )
+        .await
+    }
+
+    /// Every file `scaffold` would write, as backend-relative path and
+    /// content, without touching the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if template rendering fails.
+    pub fn rendered_outputs(ctx: &TemplateContext) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+        super::render_dir_outputs(
+            TemplateNamespace::HydrolysisAndroid,
+            &embedded::HYDROLYSIS_ANDROID,
+            ctx,
+        )
     }
 }
 

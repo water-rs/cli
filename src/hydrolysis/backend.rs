@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    android::platform::AndroidAbi,
     backend::Backend,
     build::BuildOptions,
     device::Artifact,
@@ -14,6 +15,7 @@ use crate::{
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::Project,
     templates::{self, TemplateContext},
+    toolchain::Host,
 };
 
 /// Configuration for the hydrolysis backend in a `WaterUI` project.
@@ -78,8 +80,9 @@ impl HydrolysisBackend {
     }
 
     /// The template context the CLI manages this backend with; regeneration
-    /// compares the backend on disk against exactly this rendering.
-    async fn template_context(project: &Project) -> eyre::Result<TemplateContext> {
+    /// compares the backend on disk against exactly this rendering, and the
+    /// Android app scaffold layers its parameters on top of it.
+    pub(crate) async fn template_context(project: &Project) -> eyre::Result<TemplateContext> {
         let manifest = project.manifest();
         let app_name = manifest
             .package
@@ -115,7 +118,16 @@ impl Backend for HydrolysisBackend {
     // resolved versions stay stable across template updates. The `.seed`
     // copy records which application lockfile last seeded it, so it is
     // preserved on the same grounds.
-    const CACHE_PATHS: &'static [&'static str] = &["Cargo.lock", templates::LOCKFILE_SEED];
+    const CACHE_PATHS: &'static [&'static str] = &[
+        "Cargo.lock",
+        templates::LOCKFILE_SEED,
+        // The generated Gradle app and the pinned host checkout survive
+        // regeneration: the checkout is an expensive fetch and the app only
+        // changes when the painter or project does, which re-scaffolds
+        // directly rather than through `reinit_backend`.
+        "android",
+        "android-host",
+    ];
 
     fn path(&self) -> &Path {
         &self.project_path
@@ -139,7 +151,10 @@ impl Backend for HydrolysisBackend {
     }
 
     fn supports(&self, platform: TargetPlatform) -> bool {
-        is_hydrolysis_platform(platform)
+        // Android goes through `hydrolysis::android` — the launcher crate,
+        // the managed host checkout and the generated Gradle app — rather
+        // than the desktop `build_hydrolysis` path.
+        is_hydrolysis_platform(platform) || platform == TargetPlatform::Android
     }
 
     async fn build(
@@ -148,6 +163,15 @@ impl Backend for HydrolysisBackend {
         platform: TargetPlatform,
         options: BuildOptions,
     ) -> eyre::Result<crate::build::BuiltTarget> {
+        if platform == TargetPlatform::Android {
+            return crate::hydrolysis::android::build(
+                project,
+                &Host::current(),
+                AndroidAbi::Arm64V8a,
+                options,
+            )
+            .await;
+        }
         project
             .browser_runtime_plan(platform, TargetBackend::Hydrolysis)
             .await?;
@@ -161,6 +185,17 @@ impl Backend for HydrolysisBackend {
         options: PackageOptions,
         built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
+        if platform == TargetPlatform::Android {
+            return crate::hydrolysis::android::package_with_abis(
+                project,
+                &Host::current(),
+                crate::hydrolysis::android::resolve_painter(project, None),
+                &options,
+                &[AndroidAbi::Arm64V8a],
+                built,
+            )
+            .await;
+        }
         package_hydrolysis(project, platform, options, Some(built)).await
     }
 

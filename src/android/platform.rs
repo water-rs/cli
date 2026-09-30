@@ -239,7 +239,7 @@ fn ndk_cxx_path(ndk_path: &Path, abi: AndroidAbi, api_level: u32) -> PathBuf {
 ///
 /// NDK r23+ ships it under `sysroot/usr/lib/<triple>/`, while older Android
 /// NDK releases used `sources/cxx-stl/llvm-libc++/libs/<abi>/`.
-fn ndk_libcxx_path(ndk_path: &Path, abi: AndroidAbi) -> PathBuf {
+pub(crate) fn ndk_libcxx_path(ndk_path: &Path, abi: AndroidAbi) -> PathBuf {
     let new_path = ndk_path
         .join("toolchains/llvm/prebuilt")
         .join(ndk_host_tag(ndk_path))
@@ -354,24 +354,24 @@ pub struct AndroidPlatform {
     abi: AndroidAbi,
 }
 
-struct AndroidBuildContext {
-    abi: AndroidAbi,
-    ndk_path: PathBuf,
-    linker: PathBuf,
-    ar: PathBuf,
-    cxx: PathBuf,
-    target_underscore: String,
-    target_upper: String,
-    llvm_envs: Vec<(String, std::ffi::OsString)>,
-    java_home: PathBuf,
-    java_bin_dir: PathBuf,
-    kotlin_compiler: PathBuf,
-    kotlin_bin_dir: PathBuf,
-    kotlin_home: PathBuf,
-    sdk_path: PathBuf,
-    android_jar: PathBuf,
-    wrapper_toolchain: PathBuf,
-    android_platform: String,
+pub(crate) struct AndroidBuildContext {
+    pub(crate) abi: AndroidAbi,
+    pub(crate) ndk_path: PathBuf,
+    pub(crate) linker: PathBuf,
+    pub(crate) ar: PathBuf,
+    pub(crate) cxx: PathBuf,
+    pub(crate) target_underscore: String,
+    pub(crate) target_upper: String,
+    pub(crate) llvm_envs: Vec<(String, std::ffi::OsString)>,
+    pub(crate) java_home: PathBuf,
+    pub(crate) java_bin_dir: PathBuf,
+    pub(crate) kotlin_compiler: PathBuf,
+    pub(crate) kotlin_bin_dir: PathBuf,
+    pub(crate) kotlin_home: PathBuf,
+    pub(crate) sdk_path: PathBuf,
+    pub(crate) android_jar: PathBuf,
+    pub(crate) wrapper_toolchain: PathBuf,
+    pub(crate) android_platform: String,
 }
 
 impl AndroidPlatform {
@@ -610,7 +610,7 @@ impl AndroidPlatform {
     }
 }
 
-async fn resolve_android_build_context(
+pub(crate) async fn resolve_android_build_context(
     host: &Host,
     abi: AndroidAbi,
     triple: &Triple,
@@ -800,17 +800,26 @@ async fn configure_android_rust_build(
 
     build = build.with_envs(android_cargo_envs(context, triple));
 
+    let new_path = android_path_env(host, context).await?;
+    Ok(build.with_env("PATH", new_path))
+}
+
+/// The `PATH` an Android cargo invocation runs under: the resolved JDK and
+/// Kotlin compiler bin directories ahead of the host's, so NDK-side build
+/// scripts find the same toolchain the doctor verified.
+pub(crate) async fn android_path_env(
+    host: &Host,
+    context: &AndroidBuildContext,
+) -> eyre::Result<std::ffi::OsString> {
     let current_path = host
         .env("PATH")
         .ok_or_else(|| eyre::eyre!("PATH environment variable is not set"))?;
     let mut paths: Vec<PathBuf> = std::env::split_paths(&current_path).collect();
     paths.insert(0, context.java_bin_dir.clone());
     paths.insert(0, context.kotlin_bin_dir.clone());
-    let new_path = std::env::join_paths(paths).map_err(|error| {
+    std::env::join_paths(paths).map_err(|error| {
         eyre::eyre!("Failed to construct PATH for Java/Kotlin compiler resolution: {error}")
-    })?;
-
-    Ok(build.with_env("PATH", new_path))
+    })
 }
 
 /// The environment every Cargo invocation targeting an Android ABI needs:
@@ -821,7 +830,7 @@ async fn configure_android_rust_build(
 /// The support app and the preview module it loads must compile their shared
 /// dependency graph identically, so both take their environment from this one
 /// list rather than each spelling it out.
-fn android_cargo_envs(
+pub(crate) fn android_cargo_envs(
     context: &AndroidBuildContext,
     triple: &Triple,
 ) -> Vec<(String, std::ffi::OsString)> {
@@ -997,7 +1006,7 @@ async fn copy_android_build_outputs(
 /// An unreadable or unparsable library counts as needing it: including the STL
 /// when in doubt is the same behavior the packaging had before, and a corrupt
 /// native library is going to fail loudly on the device anyway.
-async fn staged_libs_need_libcxx(output_dir: &Path) -> eyre::Result<bool> {
+pub(crate) async fn staged_libs_need_libcxx(output_dir: &Path) -> eyre::Result<bool> {
     let output_dir = output_dir.to_path_buf();
     unblock(move || {
         let mut needs = false;
@@ -1117,9 +1126,14 @@ async fn copy_assets_and_fonts(
     let assets_dir = backend_path.join("app/src/main/assets");
 
     // Stage project assets using platform-native conventions.
-    let manifest =
-        assets::stage_project_assets_for_android(project, backend_path, symbols, dev_server)
-            .await?;
+    let manifest = assets::stage_project_assets_for_android(
+        project,
+        backend_path,
+        symbols,
+        dev_server,
+        assets::AndroidThemeParent::Material3,
+    )
+    .await?;
 
     // Scan and resolve dependency fonts
     let font_declarations =
