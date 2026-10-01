@@ -97,6 +97,7 @@ if /i "%tool%"=="meson" goto :simple_version
 if /i "%tool%"=="sccache" goto :sccache
 if /i "%tool%"=="git" goto :git
 if /i "%tool%"=="wasm-pack" goto :simple_version
+if /i "%tool%"=="spirv-opt" goto :simple_version
 if /i "%tool%"=="sh" goto :simple_version
 if /i "%tool%"=="bash" goto :simple_version
 if /i "%tool%"=="brew" goto :exit_ok
