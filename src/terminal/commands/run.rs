@@ -1264,7 +1264,7 @@ fn prompt_for_device(
     };
     // The scan spinner would redraw over the prompt; hide it while the user
     // answers.
-    Ok(spinner.map_or_else(&pick, |pb| pb.suspend(pick))?)
+    Ok(spinner.map_or_else(pick, |pb| pb.suspend(pick))?)
 }
 
 /// Pick one device out of `candidates`: the remembered last-used device when
