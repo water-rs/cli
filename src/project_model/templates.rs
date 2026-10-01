@@ -368,7 +368,10 @@ impl TemplateContext {
                 .and_then(|backend| backend.backend_path.as_deref())
                 .map(PathBuf::from),
             ffi_crate_name: None,
-            apple_backend_selected: apple.is_some(),
+            // Selected at invocation, never from declared config: a project
+            // that declares `[backends.apple]` but builds for Android must
+            // still emit no `waterui-apple` pieces.
+            apple_backend_selected: false,
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -2818,6 +2821,16 @@ async fn scaffold_dir(
         for file in current_dir.files() {
             let relative_path = file.path();
 
+            // The entry-owning Apple binary names a `waterui-apple`
+            // dependency only an apple-selected scaffold declares; nothing
+            // else renders it.
+            if namespace == TemplateNamespace::Ffi
+                && !ctx.apple_backend_selected
+                && relative_path == Path::new("src/bin/waterui-apple-main.rs.tpl")
+            {
+                continue;
+            }
+
             // Determine if this is a template file and compute destination path
             let is_template = relative_path
                 .extension()
@@ -2879,6 +2892,12 @@ fn render_dir_outputs(
     while let Some(current_dir) = dirs_to_process.pop() {
         for file in current_dir.files() {
             let relative_path = file.path();
+            if namespace == TemplateNamespace::Ffi
+                && !ctx.apple_backend_selected
+                && relative_path == Path::new("src/bin/waterui-apple-main.rs.tpl")
+            {
+                continue;
+            }
             let is_template = relative_path
                 .extension()
                 .and_then(|ext| ext.to_str())
@@ -5055,7 +5074,19 @@ pub mod ffi {
         package_name: &str,
     ) -> io::Result<()> {
         generate_cargo_toml(base_dir, ctx, package_name).await?;
-        scaffold_dir(TemplateNamespace::Ffi, &embedded::FFI, base_dir, ctx).await
+        scaffold_dir(TemplateNamespace::Ffi, &embedded::FFI, base_dir, ctx).await?;
+        // A previous apple-selected render leaves the entry binary behind;
+        // a non-apple scaffold must not ship a file naming an undeclared
+        // dependency.
+        if !ctx.apple_backend_selected {
+            let stale = base_dir.join("src/bin/waterui-apple-main.rs");
+            match fs::remove_file(&stale).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     async fn generate_cargo_toml(

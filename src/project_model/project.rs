@@ -142,6 +142,11 @@ pub struct Project {
     linked_packages: Arc<async_lock::OnceCell<Result<BTreeMap<String, String>, String>>>,
     enabled_features: Arc<async_lock::OnceCell<Result<BTreeSet<String>, String>>>,
     managed_backends_root: PathBuf,
+    /// Whether the ffi companion's manifest existed before this open
+    /// re-rendered it — a backend init audits only a companion carried
+    /// over from a prior open, not the fresh render its own build
+    /// resolves next anyway.
+    pub(crate) ffi_companion_preexisting: bool,
 }
 
 impl Project {
@@ -1106,8 +1111,12 @@ impl CreateOptions {
 }
 
 impl Project {
+    /// `apple_selected` is whether this invocation selected the Apple backend —
+    /// the companion's `waterui-apple` dependency and entry-owning bin exist
+    /// only then, so an Android build never resolves the Apple backend crate.
     pub(crate) async fn scaffold_ffi_companion(
         &self,
+        apple_selected: bool,
     ) -> Result<(), crate::backend::FailToInitBackend> {
         let manifest = self.manifest();
         let app_name = manifest
@@ -1143,7 +1152,8 @@ impl Project {
         .with_webview_enabled(webview_enabled)
         .with_chromium_enabled(chromium_enabled)
         .with_browser_engine(browser_engine)
-        .with_ffi_crate_name(self.ffi_crate_name());
+        .with_ffi_crate_name(self.ffi_crate_name())
+        .with_apple_backend_selected(apple_selected);
 
         templates::ffi::scaffold(&self.ffi_crate_path(), &ctx, &self.ffi_crate_name())
             .await
@@ -1349,6 +1359,7 @@ impl Project {
             linked_packages: Arc::new(async_lock::OnceCell::new()),
             enabled_features: Arc::new(async_lock::OnceCell::new()),
             managed_backends_root,
+            ffi_companion_preexisting: false,
         })
     }
 
@@ -1578,6 +1589,7 @@ impl Project {
             linked_packages: Arc::new(async_lock::OnceCell::new()),
             enabled_features: Arc::new(async_lock::OnceCell::new()),
             managed_backends_root,
+            ffi_companion_preexisting: false,
         };
 
         // Initialize the managed backends the caller selected.
@@ -1594,6 +1606,25 @@ impl Project {
             || std::env::var("XCODE_PRODUCT_BUILD_VERSION").is_ok();
 
         if !skip_backend_init && open_mode == OpenMode::Full {
+            // The ffi companion is rendered for THIS invocation's selection
+            // before either backend runs — both `init`s read its manifest, so
+            // a companion left over from a different selection must never be
+            // the one they see.
+            if backends.apple() || backends.android() {
+                project.ffi_companion_preexisting =
+                    project.ffi_crate_path().join("Cargo.toml").exists();
+                let ffi_companion_start = std::time::Instant::now();
+                project
+                    .scaffold_ffi_companion(backends.apple())
+                    .await
+                    .map_err(FailToOpenProject::BackendInit)?;
+                info!(
+                    path = %project.root.display(),
+                    elapsed_ms = ffi_companion_start.elapsed().as_millis(),
+                    "Project::open scaffolded native ffi companion"
+                );
+            }
+
             if backends.apple() {
                 let apple_backend_start = std::time::Instant::now();
                 let apple_backend = AppleBackend::init(&project)
@@ -1618,19 +1649,6 @@ impl Project {
                     "Project::open initialized Android backend"
                 );
                 project.manifest.backends.set_android(android_backend);
-            }
-
-            if project.apple_backend().is_some() || project.android_backend().is_some() {
-                let ffi_companion_start = std::time::Instant::now();
-                project
-                    .scaffold_ffi_companion()
-                    .await
-                    .map_err(FailToOpenProject::BackendInit)?;
-                info!(
-                    path = %project.root.display(),
-                    elapsed_ms = ffi_companion_start.elapsed().as_millis(),
-                    "Project::open scaffolded native ffi companion"
-                );
             }
         }
 
@@ -2826,6 +2844,98 @@ mod scaffold_tests {
                 android_path.display()
             );
         }
+    }
+
+    /// The ffi companion is rendered for this invocation's selection before
+    /// any backend init reads it: a project that declares `[backends.apple]`
+    /// but opens for Android must not see a companion still carrying
+    /// `waterui-apple` from an earlier apple-selected open — the Android
+    /// backend runs `cargo metadata` on that manifest and a stale path
+    /// dependency wedges it.
+    #[test]
+    fn android_open_re_renders_a_stale_apple_ffi_manifest_before_backend_init() {
+        use crate::platform::TargetPlatform;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("water-example");
+        create_project(&root);
+
+        // The project declares an apple backend it is not building for.
+        let missing_apple = dir.path().join("apple-backend");
+        let water_toml = root.join("Water.toml");
+        let manifest = std::fs::read_to_string(&water_toml).expect("Water.toml exists");
+        std::fs::write(
+            &water_toml,
+            format!(
+                "{manifest}\n[backends.apple]\nbackend_path = \"{}\"\n",
+                missing_apple.display()
+            ),
+        )
+        .expect("declare the apple backend");
+
+        // The stale companion an earlier apple-selected open left behind: a
+        // manifest carrying a `waterui-apple` path dependency that no longer
+        // resolves, so `cargo metadata` on it fails.
+        let ffi_dir = smol::block_on(crate::water_dir::project_build_cache_dir(&root))
+            .expect("build cache dir")
+            .join("ffi");
+        std::fs::create_dir_all(ffi_dir.join("src")).expect("stale ffi dir");
+        std::fs::write(
+            ffi_dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"water-example-ffi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies.waterui-apple]\npath = \"{}\"\n",
+                missing_apple.display()
+            ),
+        )
+        .expect("seed the stale ffi manifest");
+        std::fs::write(ffi_dir.join("src/lib.rs"), "").expect("seed the stale ffi lib");
+
+        // The backend audits the re-rendered manifest with `cargo metadata`,
+        // and the fixture's registry pins resolve to local stubs so the test
+        // runs without a crates.io index.
+        for (name, dir_name) in [("waterui-ffi", "waterui-ffi"), ("waterui", "waterui")] {
+            let stub = ffi_dir.join("vendor").join(dir_name);
+            std::fs::create_dir_all(stub.join("src")).expect("stub crate dir");
+            std::fs::write(
+                stub.join("Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.4.1\"\nedition = \"2021\"\n"),
+            )
+            .expect("stub manifest");
+            std::fs::write(stub.join("src/lib.rs"), "").expect("stub lib");
+        }
+        std::fs::create_dir_all(ffi_dir.join(".cargo")).expect("cargo config dir");
+        std::fs::write(
+            ffi_dir.join(".cargo/config.toml"),
+            "[patch.crates-io]\nwaterui-ffi = { path = \"../vendor/waterui-ffi\" }\nwaterui = { path = \"../vendor/waterui\" }\n",
+        )
+        .expect("patch config");
+
+        let project = smol::block_on(Project::open(
+            &root,
+            ManagedBackends::for_platform(TargetPlatform::Android),
+        ))
+        .expect("android open re-renders the companion before the backend reads it");
+
+        let rendered = std::fs::read_to_string(project.ffi_crate_path().join("Cargo.toml"))
+            .expect("the re-rendered ffi manifest");
+        assert!(!rendered.contains("waterui-apple"), "{rendered}");
+        let manifest = rendered
+            .parse::<toml::Table>()
+            .expect("the re-rendered manifest parses");
+        assert!(
+            manifest
+                .get("bin")
+                .and_then(toml::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "an android-selected companion declares no entry-owning bin"
+        );
+        assert!(
+            !project
+                .ffi_crate_path()
+                .join("src/bin/waterui-apple-main.rs")
+                .exists(),
+            "an android-selected companion renders no apple entry file"
+        );
     }
 
     /// Packaged executables stage under the project's own managed backend
