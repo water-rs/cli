@@ -1144,22 +1144,35 @@ impl ResolvedFramework {
     /// compilation gate; `nightly` and `stable` resolve the newest eligible
     /// GitHub release carrying a `framework.json` — a published `nightly-*`
     /// prerelease, a published `v<semver>` release — and pin what it
-    /// certifies.
+    /// certifies. `rev` pins `dev` to an exact commit of the branch's own
+    /// history instead of its head; a certified channel is already exact and
+    /// rejects the pin.
     ///
     /// # Errors
     /// Returns an error when the channel has no eligible release, the manifest
     /// fails verification, or the certified revision cannot be fetched.
-    pub(crate) async fn resolve(channel: FrameworkChannel) -> Result<(Self, Option<Vec<u8>>)> {
+    pub(crate) async fn resolve(
+        channel: FrameworkChannel,
+        rev: Option<&str>,
+    ) -> Result<(Self, Option<Vec<u8>>)> {
         let repository = framework_repository();
         let slug = repository_slug(repository)?;
         match channel {
             FrameworkChannel::Stable | FrameworkChannel::Nightly => {
+                if rev.is_some() {
+                    bail!(
+                        "--rev pins a commit of the dev channel; a {channel} release is already an exact revision"
+                    );
+                }
                 let certification = latest_certification(repository, channel).await?;
                 let revision = certification.revision.clone();
                 Self::construct(repository, slug, &revision, Some(certification)).await
             }
             FrameworkChannel::Dev => {
-                let revision = resolve_dev(repository, slug).await?;
+                let revision = match rev {
+                    Some(rev) => resolve_dev_at(repository, slug, rev).await?,
+                    None => resolve_dev(repository, slug).await?,
+                };
                 Self::construct(repository, slug, &revision, None).await
             }
         }
@@ -2571,6 +2584,74 @@ async fn resolve_dev(repository: &str, slug: &str) -> Result<String> {
     gated_dev_head(repository, slug, "dev.yml", "framework").await
 }
 
+/// A `dev` selection pinned to an exact commit: `rev` names a commit of the
+/// integration branch's own history, verified against the branch's head
+/// through the same GitHub API the tip resolution already uses. Anything
+/// else — a fork commit, another branch's tip, a commit `dev` never merged —
+/// is not dev history and cannot stand in for the channel.
+async fn resolve_dev_at(repository: &str, slug: &str, rev: &str) -> Result<String> {
+    validate_rev(rev)?;
+    let head = remote_dev_head(repository, "framework").await?;
+    let revision = normalize_revision(slug, rev).await?;
+    let status = dev_ancestor_status(slug, &revision, &head).await?;
+    ensure_dev_ancestor(&status, &revision, &head)?;
+    if !gate_passed(slug, "dev.yml", &revision).await? {
+        bail!("no successful dev gate run exists for --rev {revision}");
+    }
+    Ok(revision)
+}
+
+/// The spelling `--rev` accepts: a commit hash — hex only, at least the four
+/// characters a unique abbreviation needs and at most the full forty.
+/// Anything else is a ref, which ancestry cannot pin.
+fn validate_rev(rev: &str) -> Result<()> {
+    if !(4..=40).contains(&rev.len()) || !rev.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("--rev must be a commit hash of 4-40 hex characters, got `{rev}`");
+    }
+    Ok(())
+}
+
+/// The full commit id `rev` names in `slug` — the object the commits API
+/// names back, so an abbreviation `225259c80` persists the same forty
+/// characters the tip resolution would.
+async fn normalize_revision(slug: &str, rev: &str) -> Result<String> {
+    let response = fetch(&format!(
+        "https://api.github.com/repos/{slug}/commits/{rev}"
+    ))
+    .await
+    .wrap_err_with(|| format!("--rev {rev} does not name a commit in {slug}"))?;
+    let commit: serde_json::Value = serde_json::from_slice(&response)?;
+    commit["sha"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| eyre!("--rev {rev} did not resolve to a commit in {slug}"))
+}
+
+/// The compare status of `revision...head` — the ancestry fact the compare
+/// API reports for the pin against the branch's own head.
+async fn dev_ancestor_status(slug: &str, revision: &str, head: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{slug}/compare/{revision}...{head}");
+    let response = fetch(&url).await?;
+    let compare: serde_json::Value = serde_json::from_slice(&response)?;
+    compare["status"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| eyre!("malformed compare response from {url}: `status` is missing"))
+}
+
+/// The compare statuses a pin is accepted under: `ahead` — `dev` moved past
+/// the pin — or `identical` — the pin is the head itself. `behind` and
+/// `diverged` name a commit carrying work `dev` never contained.
+fn ensure_dev_ancestor(status: &str, revision: &str, head: &str) -> Result<()> {
+    if matches!(status, "ahead" | "identical") {
+        return Ok(());
+    }
+    bail!(
+        "--rev {revision} is not an ancestor of the framework's dev head {head} \
+         (compare status: {status})"
+    );
+}
+
 /// The Apple backend's `dev` HEAD for a `dev` framework selection. The
 /// backend moved out of the framework tree, so nothing records the backend
 /// revision a `dev` framework was built against — `apple-backend-version`
@@ -2586,10 +2667,8 @@ async fn backend_dev_revision(url: &str) -> Result<String> {
     .await
 }
 
-/// The `dev` HEAD of `repository`, held to the channel's promise that the
-/// resolved commit passed `gate` — the workflow file gating `dev` in that
-/// repository: `dev.yml` for the framework, `ci.yml` for a backend.
-async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) -> Result<String> {
+/// The `dev` branch head of `repository` — the tip `git ls-remote` reports.
+async fn remote_dev_head(repository: &str, what: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["ls-remote", repository, "refs/heads/dev"])
         .output()
@@ -2606,14 +2685,34 @@ async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) ->
         .ok_or_else(|| eyre!("{what} repository has no dev branch"))?
         .to_owned();
     validate_revision(&revision)?;
+    Ok(revision)
+}
+
+/// Whether `revision` carries a successful `gate` run on `dev` — the query
+/// behind the channel's promise that a resolved commit passed its
+/// compilation gate. `event=push` scopes the run to the branch itself: a
+/// pull-request run on the same commit is not the gate.
+async fn gate_passed(slug: &str, gate: &str, revision: &str) -> Result<bool> {
     let response = fetch(&format!("https://api.github.com/repos/{slug}/actions/workflows/{gate}/runs?branch=dev&head_sha={revision}&status=success&event=push&per_page=1")).await?;
     let runs: serde_json::Value = serde_json::from_slice(&response)?;
-    let checked = runs["workflow_runs"].as_array().is_some_and(|runs| {
-        runs.iter().any(|run| {
-            run["head_sha"].as_str() == Some(&revision) && run["conclusion"] == "success"
-        })
-    });
-    if !checked {
+    Ok(gate_run_succeeded(&runs, revision))
+}
+
+/// The successful-run decision over a workflow-runs response: some listed
+/// run names the revision and concluded `success`.
+fn gate_run_succeeded(runs: &serde_json::Value, revision: &str) -> bool {
+    runs["workflow_runs"].as_array().is_some_and(|runs| {
+        runs.iter()
+            .any(|run| run["head_sha"].as_str() == Some(revision) && run["conclusion"] == "success")
+    })
+}
+
+/// The `dev` HEAD of `repository`, held to the channel's promise that the
+/// resolved commit passed `gate` — the workflow file gating `dev` in that
+/// repository: `dev.yml` for the framework, `ci.yml` for a backend.
+async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) -> Result<String> {
+    let revision = remote_dev_head(repository, what).await?;
+    if !gate_passed(slug, gate, &revision).await? {
         bail!("{what} dev revision {revision} has not passed its compilation gate");
     }
     Ok(revision)
@@ -4690,5 +4789,74 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             framework.scaffold_value("android-backend-revision"),
             "c".repeat(40)
         );
+    }
+
+    #[test]
+    fn rev_argument_accepts_only_a_commit_hash() {
+        assert!(validate_rev("225259c80").is_ok());
+        assert!(validate_rev(&"a".repeat(40)).is_ok());
+        for rev in ["abc", "main", "dev", "HEAD~1", "", &"a".repeat(41)] {
+            assert!(validate_rev(rev).is_err(), "`{rev}` must be rejected");
+        }
+    }
+
+    #[test]
+    fn dev_ancestry_accepts_only_dev_history() {
+        let head = "b".repeat(40);
+        let pin = "a".repeat(40);
+        assert!(ensure_dev_ancestor("ahead", &pin, &head).is_ok());
+        assert!(ensure_dev_ancestor("identical", &pin, &head).is_ok());
+        for status in ["behind", "diverged", "unknown"] {
+            let message = ensure_dev_ancestor(status, &pin, &head)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(&pin), "{message} must name the commit");
+            assert!(message.contains(&head), "{message} must name the dev head");
+            assert!(
+                message.contains(status),
+                "{message} must name the compare status"
+            );
+        }
+    }
+
+    /// A pinned revision is held to the tip's own promise: the gate decision
+    /// accepts only a successful run that names the commit itself — a run on
+    /// another sha, a failed conclusion, or a response without runs all fail.
+    #[test]
+    fn the_gate_decision_requires_a_successful_run_on_the_commit() {
+        let pin = "a".repeat(40);
+        let other = "b".repeat(40);
+        let run = |sha: &str, conclusion: &str| serde_json::json!({"head_sha": sha, "conclusion": conclusion});
+        assert!(gate_run_succeeded(
+            &serde_json::json!({"workflow_runs": [run(&pin, "success")]}),
+            &pin
+        ));
+        assert!(gate_run_succeeded(
+            &serde_json::json!({"workflow_runs": [run(&other, "success"), run(&pin, "success")]}),
+            &pin
+        ));
+        for response in [
+            serde_json::json!({"workflow_runs": [run(&pin, "failure")]}),
+            serde_json::json!({"workflow_runs": [run(&other, "success")]}),
+            serde_json::json!({"workflow_runs": []}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                !gate_run_succeeded(&response, &pin),
+                "{response} must not pass the gate for {pin}"
+            );
+        }
+    }
+
+    /// A `--rev` pin beside a certified channel fails inside `resolve` —
+    /// before any release is listed — the same refusal the flag layer makes.
+    #[test]
+    fn a_certified_channel_rejects_a_rev_pin_before_resolving() {
+        for channel in [FrameworkChannel::Stable, FrameworkChannel::Nightly] {
+            let message = smol::block_on(ResolvedFramework::resolve(channel, Some("225259c80")))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("dev"), "{message} must name dev");
+        }
     }
 }
