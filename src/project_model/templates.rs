@@ -3246,7 +3246,7 @@ fn render_dir_outputs(
     Ok(outputs)
 }
 
-async fn write_file_if_changed(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub async fn write_file_if_changed(path: &Path, contents: &[u8]) -> io::Result<()> {
     match fs::read(path).await {
         Ok(existing) if existing == contents => return Ok(()),
         Ok(_) | Err(_) => {}

@@ -21,7 +21,9 @@ use tracing::info;
 use crate::{
     android::{
         backend::AndroidBackend,
-        platform::{AndroidAbi, AndroidPlatform, run_gradle_tasks},
+        platform::{
+            AndroidAbi, AndroidPlatform, android_ffi_dependency_features, run_gradle_tasks,
+        },
     },
     assets,
     build::{BuildOptions, BuiltTarget},
@@ -96,6 +98,20 @@ pub async fn build_aar(
 
     // Assets and fonts ship inside the AAR exactly as they ship inside an APK.
     stage_embedded_assets(project, &module_dir, &built.app_symbols()?).await?;
+
+    // Kotlin helpers and Maven dependencies likewise belong on the classpath
+    // the host app resolves classes from; `api` exports them through the
+    // published POM so a consumer's build sees them too. The scan mirrors the
+    // Rust build's feature selection so helpers behind optional features are
+    // not missed.
+    crate::assets::stage_android_classpath(
+        project,
+        &project.ffi_crate_path().join("Cargo.toml"),
+        &module_dir,
+        crate::assets::AndroidDependencyScope::Api,
+        &android_ffi_dependency_features(project).await?,
+    )
+    .await?;
 
     // A local runtime checkout must be published too: the embedded module's
     // POM names `dev.waterui.android:runtime:<version>`, which the host can

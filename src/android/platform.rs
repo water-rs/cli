@@ -560,6 +560,20 @@ impl AndroidPlatform {
         )
         .await?;
 
+        // Stage dependency-declared Kotlin helpers and Maven coordinates onto
+        // the app module's classpath so Gradle compiles them into the dex. The
+        // scan must see the same feature selection the Rust build compiles
+        // with: helpers declared by crates behind optional features (e.g.
+        // waterkit-screen via `gpu`) otherwise miss the resolved graph.
+        crate::assets::stage_android_classpath(
+            project,
+            &project.ffi_crate_path().join("Cargo.toml"),
+            &backend_path.join("app"),
+            crate::assets::AndroidDependencyScope::Implementation,
+            &android_ffi_dependency_features(project).await?,
+        )
+        .await?;
+
         let (command_name, output_kind, variant) =
             match (options.is_distribution(), options.is_debug()) {
                 (true, false) => ("bundleRelease", OutputKind::Bundle, "release"),

@@ -155,6 +155,9 @@ android {
 }
 
 dependencies {
+    // --- begin waterui android classpath dependencies ---
+    // --- end waterui android classpath dependencies ---
+
     // The host and painter come from the pinned checkout this project
     // `includeBuild`s; the substitutions are declared in settings.gradle.kts.
     implementation("dev.waterui.hydrolysis:host")
