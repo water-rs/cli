@@ -196,8 +196,8 @@ if "!args:~0,14!"=="component list" (
 )
 if "!args:~0,13!"=="component add" (>>"%state_components%" echo !last_arg! & exit /b 0)
 if "!args:~0,3!"=="run" goto :rustup_run
-if "%1"=="--version" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
-if "%1"=="-V" (echo rustup 1.28.2 (waterui-test) & exit /b 0)
+if "%1"=="--version" (echo rustup 1.28.2 ^(waterui-test^) & exit /b 0)
+if "%1"=="-V" (echo rustup 1.28.2 ^(waterui-test^) & exit /b 0)
 exit /b 2
 
 rem `rustup toolchain install`/`add` records the channel and lays down its
@@ -235,7 +235,7 @@ if defined WATERUI_FAKE_RUSTUP_NO_ACTIVE_TOOLCHAIN exit /b 1
 if defined WATERUI_FAKE_RUSTUP_TOOLCHAIN_NOT_INSTALLED goto :rustup_pinned_toolchain
 set "def_channel="
 if exist "%state_default%" for /f "usebackq delims=" %%l in ("%state_default%") do set "def_channel=%%l"
-if defined def_channel (echo !def_channel!-%WATERUI_FAKE_RUSTC_HOST% (default) & exit /b 0)
+if defined def_channel (echo !def_channel!-%WATERUI_FAKE_RUSTC_HOST% ^(default^) & exit /b 0)
 call :respond RUSTUP_ACTIVE_TOOLCHAIN
 exit /b %errorlevel%
 
@@ -259,17 +259,17 @@ if /i "!pin!"=="stable" set "pin_suffixed=1"
 if /i "!pin!"=="beta" set "pin_suffixed=1"
 if /i "!pin!"=="nightly" set "pin_suffixed=1"
 for %%d in (0 1 2 3 4 5 6 7 8 9) do if "!pin:~0,1!"=="%%d" set "pin_suffixed=1"
-if defined pin_suffixed (echo !pin!-%WATERUI_FAKE_RUSTC_HOST% (overridden by rust-toolchain.toml) & exit /b 0)
+if defined pin_suffixed (echo !pin!-%WATERUI_FAKE_RUSTC_HOST% ^(overridden by rust-toolchain.toml^) & exit /b 0)
 echo !pin! (overridden by rust-toolchain.toml)
 exit /b 0
 
 :rustc
 set "rustc_version=%WATERUI_FAKE_RUSTC_VERSION%"
 if exist "%HOME%\.fake-rustc-version" for /f "usebackq delims=" %%v in ("%HOME%\.fake-rustc-version") do set "rustc_version=%%v"
-if "%1"=="--version" (echo rustc %rustc_version% (waterui-test 2026-01-01) & exit /b 0)
+if "%1"=="--version" (echo rustc %rustc_version% ^(waterui-test 2026-01-01^) & exit /b 0)
 if "%1"=="-vV" (
     if defined WATERUI_FAKE_RUSTC_HOST (
-        echo rustc %rustc_version% (waterui-test)
+        echo rustc %rustc_version% ^(waterui-test^)
         echo binary: rustc
         echo commit-hash: fake
         echo commit-date: 2026-01-01
@@ -284,7 +284,7 @@ exit /b 2
 
 :cargo
 if not defined WATERUI_FAKE_CARGO_VERSION set "WATERUI_FAKE_CARGO_VERSION=1.95.0"
-if "%1"=="--version" (echo cargo %WATERUI_FAKE_CARGO_VERSION% (waterui-test) & exit /b 0)
+if "%1"=="--version" (echo cargo %WATERUI_FAKE_CARGO_VERSION% ^(waterui-test^) & exit /b 0)
 if "%1"=="install" goto :cargo_install
 if "%1"=="binstall" goto :cargo_install
 exit /b 0
@@ -357,19 +357,19 @@ call :contains args -list-avds && (call :respond_or_empty EMULATOR_AVDS & exit /
 exit /b 0
 
 :kotlinc
-if "%1"=="-version" (echo info: kotlinc-jvm %WATERUI_FAKE_KOTLINC_VERSION% (JRE 17.0.0) & exit /b 0)
+if "%1"=="-version" (echo info: kotlinc-jvm %WATERUI_FAKE_KOTLINC_VERSION% ^(JRE 17.0.0^) & exit /b 0)
 exit /b 0
 
 :sccache
-if "%1"=="--version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
-if "%1"=="-version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
-if "%1"=="-v" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% (waterui-test) & exit /b 0)
+if "%1"=="--version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% ^(waterui-test^) & exit /b 0)
+if "%1"=="-version" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% ^(waterui-test^) & exit /b 0)
+if "%1"=="-v" (echo sccache %WATERUI_FAKE_SCCACHE_VERSION% ^(waterui-test^) & exit /b 0)
 exit /b 0
 
 :simple_version
-if "%1"=="--version" (echo %tool% 1.0.0 (waterui-test) & exit /b 0)
-if "%1"=="-version" (echo %tool% 1.0.0 (waterui-test) & exit /b 0)
-if "%1"=="-v" (echo %tool% 1.0.0 (waterui-test) & exit /b 0)
+if "%1"=="--version" (echo %tool% 1.0.0 ^(waterui-test^) & exit /b 0)
+if "%1"=="-version" (echo %tool% 1.0.0 ^(waterui-test^) & exit /b 0)
+if "%1"=="-v" (echo %tool% 1.0.0 ^(waterui-test^) & exit /b 0)
 exit /b 0
 
 :vswhere
