@@ -266,7 +266,7 @@ fn apply_mobile_plist_entries(
     let mut scene_manifest = plist::Dictionary::new();
     scene_manifest.insert(
         "UIApplicationSupportsMultipleScenes".to_string(),
-        plist::Value::Boolean(false),
+        plist::Value::Boolean(true),
     );
     scene_manifest.insert(
         "UISceneConfigurations".to_string(),
