@@ -709,7 +709,7 @@ impl ResolvedFramework {
         metadata: &cargo_metadata::Metadata,
         contents: &[u8],
     ) -> Result<()> {
-        let source = match &self.source {
+        let (repository, revision) = match &self.source {
             Source::Stable { .. } | Source::Local { .. } => return Ok(()),
             Source::Dev {
                 repository,
@@ -720,8 +720,9 @@ impl ResolvedFramework {
                 repository,
                 revision,
                 ..
-            } => format!("git+{repository}?rev={revision}#{revision}"),
+            } => (repository, revision),
         };
+        let source = format!("git+{repository}?rev={revision}#{revision}");
         let locked = self.cargo_lock(contents)?;
         let allowed = self.allowed_packages(&locked.packages);
         let packages: BTreeMap<_, _> = metadata
@@ -745,7 +746,7 @@ impl ResolvedFramework {
                 .is_some_and(|candidate| candidate.repr == source)
         };
         if !metadata.packages.iter().any(is_framework_source) {
-            bail!("the project does not resolve its selected framework revision");
+            return Err(self.unresolved_revision_error(metadata, repository, revision));
         }
         let mut pending: Vec<_> = metadata
             .packages
@@ -799,6 +800,46 @@ impl ResolvedFramework {
             );
         }
         Ok(())
+    }
+
+    /// The error a project resolving none of its selected framework source
+    /// hits: the resolution carried the framework repository at another
+    /// revision, or at no git revision at all. Name the selected revision,
+    /// what the resolved lock carries and the `water channel` command that
+    /// re-pins the project — the shape the lock-divergence errors above
+    /// take.
+    fn unresolved_revision_error(
+        &self,
+        metadata: &cargo_metadata::Metadata,
+        repository: &str,
+        revision: &str,
+    ) -> eyre::Report {
+        let revisions: Vec<String> = metadata
+            .packages
+            .iter()
+            .filter_map(|package| package.source.as_ref())
+            .filter_map(|source| source.repr.parse::<cargo_lock::SourceId>().ok())
+            .filter(|source| {
+                source.is_git()
+                    && canonical_git_url(source.url().as_str()) == canonical_git_url(repository)
+            })
+            .filter_map(|source| source.precise().map(str::to_owned))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let resolved = match revisions.as_slice() {
+            [] => "no framework revision".to_owned(),
+            [revision] => format!("framework revision {revision}"),
+            revisions => format!("framework revisions {}", revisions.join(", ")),
+        };
+        let channel = self
+            .channel()
+            .expect("stable and local selections return early");
+        eyre!(
+            "the project does not resolve its selected framework revision {revision}; \
+             the resolved lock carries {resolved} for the framework repository; \
+             run `water channel {channel}` to reconcile the project"
+        )
     }
 
     pub(crate) async fn prepare_build(
@@ -3080,6 +3121,80 @@ mod tests {
                 include_bytes!("../../tests/fixtures/dev_channel/Water.lock"),
             )
             .expect("a fresh dev-channel resolution replaces no locked package");
+    }
+
+    /// A project whose resolution carries none of the selected framework
+    /// source fails naming the selected revision, the revision the resolved
+    /// lock carries for the framework repository — or that it carries none —
+    /// and the `water channel` command that re-pins the project (#236).
+    #[test]
+    fn a_divergent_framework_resolution_names_the_revisions_and_the_command() {
+        let repository = framework_repository();
+        let selected = 'a'.to_string().repeat(40);
+        let resolved = 'b'.to_string().repeat(40);
+        let contents = test_lock().to_string();
+        let mut framework = dev_framework();
+        framework.source = Source::Dev {
+            repository: repository.to_owned(),
+            revision: selected.clone(),
+            lock_sha256: hex::encode(Sha256::digest(contents.as_bytes())),
+        };
+        let package = |name: &str, version: &str, source: &str| {
+            serde_json::json!({
+                "name": name,
+                "version": version,
+                "id": source,
+                "source": source,
+                "dependencies": [],
+                "targets": [],
+                "features": {},
+                "manifest_path": "/project/Cargo.toml",
+                "edition": "2024"
+            })
+        };
+        let metadata = |packages: serde_json::Value| {
+            serde_json::from_value::<cargo_metadata::Metadata>(serde_json::json!({
+                "version": 1,
+                "packages": packages,
+                "workspace_members": [],
+                "resolve": {"nodes": [], "root": null},
+                "workspace_root": "/project",
+                "target_directory": "/project/target",
+                "workspace_metadata": {}
+            }))
+            .unwrap()
+        };
+        // The resolved lock carries the framework repository at another
+        // revision than the selection records.
+        let error = framework
+            .validate_dependencies(
+                &metadata(serde_json::json!([package(
+                    "waterui",
+                    "0.5.2",
+                    &format!("git+{repository}?rev={resolved}#{resolved}")
+                )])),
+                contents.as_bytes(),
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&selected), "{message}");
+        assert!(message.contains(&resolved), "{message}");
+        assert!(message.contains("water channel dev"), "{message}");
+        // The resolved lock carries no framework revision at all.
+        let error = framework
+            .validate_dependencies(
+                &metadata(serde_json::json!([package(
+                    "serde",
+                    "1.0.0",
+                    "registry+https://github.com/rust-lang/crates.io-index"
+                )])),
+                contents.as_bytes(),
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&selected), "{message}");
+        assert!(message.contains("no framework revision"), "{message}");
+        assert!(message.contains("water channel dev"), "{message}");
     }
 
     /// `water create` seeds the generated crate's lock the way the build
