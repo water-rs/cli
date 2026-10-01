@@ -18,7 +18,7 @@ use smol::fs;
 
 use crate::project_types::{BundleIdentifier, CrateName, RustIdent};
 
-/// Normalize a path to use forward slashes for config files (Cargo.toml, Xcode projects, etc.)
+/// Normalize a path to use forward slashes for config files (Cargo.toml, package manifests, etc.)
 /// This is necessary because Windows uses backslashes but these config files expect forward slashes.
 fn normalize_path_for_config(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
@@ -124,14 +124,8 @@ impl IosPermissionTemplateEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FontRegistrationTemplateEntry {
-    pub family_name: String,
-    pub file_name: String,
-}
-
 /// What the launch screen staged into the Apple asset catalog contains, so
-/// the generated Xcode project names only the assets that exist.
+/// the generated Apple scaffold names only the assets that exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchTemplateEntry {
     /// A `LaunchBackground` color set was staged (a background is configured).
@@ -302,6 +296,15 @@ pub struct TemplateContext {
     /// `[backends.apple] backend_path` — a local Apple backend checkout that
     /// replaces the remote Swift package reference.
     pub apple_backend_path: Option<PathBuf>,
+    /// The generated ffi companion's package name as a crate identifier —
+    /// the entry-owning bin references it so rustc keeps the library's rlib
+    /// on the link line for the Swift seam's callbacks.
+    pub ffi_crate_name: Option<CrateName>,
+    /// Whether the project selected the Apple backend for this invocation —
+    /// the ffi companion only depends on `waterui-apple` and declares its
+    /// entry-owning bin when this is set, so an Android-only build never
+    /// resolves the Apple backend crate.
+    pub apple_backend_selected: bool,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
     /// Persisted framework source and native backend revisions.
@@ -364,6 +367,8 @@ impl TemplateContext {
             author: options.author.clone(),
             android_backend_path: None,
             apple_backend_path: None,
+            ffi_crate_name: None,
+            apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -405,6 +410,11 @@ impl TemplateContext {
             apple_backend_path: apple
                 .and_then(|backend| backend.backend_path.as_deref())
                 .map(PathBuf::from),
+            ffi_crate_name: None,
+            // Selected at invocation, never from declared config: a project
+            // that declares `[backends.apple]` but builds for Android must
+            // still emit no `waterui-apple` pieces.
+            apple_backend_selected: false,
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -453,6 +463,8 @@ impl TemplateContext {
             author: String::new(),
             android_backend_path: None,
             apple_backend_path: None,
+            ffi_crate_name: None,
+            apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
@@ -493,6 +505,23 @@ impl TemplateContext {
         self
     }
 
+    /// Set the ffi companion's package name — the entry-owning bin names
+    /// the library through it so rustc keeps its rlib on the link line.
+    #[must_use]
+    pub fn with_ffi_crate_name(mut self, name: CrateName) -> Self {
+        self.ffi_crate_name = Some(name);
+        self
+    }
+
+    /// Set whether the project selected the Apple backend — the ffi
+    /// companion only emits its `waterui-apple` dependency and entry-owning
+    /// bin when this is set.
+    #[must_use]
+    pub const fn with_apple_backend_selected(mut self, selected: bool) -> Self {
+        self.apple_backend_selected = selected;
+        self
+    }
+
     /// Set whether the application runtime graph links `waterui-webview`.
     #[must_use]
     pub const fn with_webview_enabled(mut self, enabled: bool) -> Self {
@@ -526,15 +555,6 @@ impl TemplateContext {
         } else {
             None
         }
-    }
-
-    const fn chromium_enabled(&self) -> bool {
-        self.browser.chromium_enabled
-    }
-
-    /// Whether the standard `WebView` in this application is drawn by CEF.
-    const fn cef_webview_enabled(&self) -> bool {
-        self.browser.webview_enabled && self.cef_runtime_enabled()
     }
 
     const fn cef_runtime_enabled(&self) -> bool {
@@ -666,6 +686,17 @@ impl TemplateContext {
     #[must_use]
     pub fn crate_name_ident(&self) -> RustIdent {
         self.crate_name.rust_ident()
+    }
+
+    /// The ffi companion's crate identifier. Only the ffi scaffold renders
+    /// it, and its context always carries the companion's name — a missing
+    /// name is a scaffold bug, so there is no fallback.
+    #[must_use]
+    pub fn ffi_crate_ident(&self) -> RustIdent {
+        self.ffi_crate_name
+            .as_ref()
+            .expect("the ffi scaffold context must carry the companion crate name")
+            .rust_ident()
     }
 
     #[must_use]
@@ -820,7 +851,7 @@ impl TemplateContext {
     }
 
     /// The path to the local Apple backend checkout `[backends.apple]`
-    /// `backend_path` names, resolved from the Xcode project's directory.
+    /// `backend_path` names, resolved from the generated project's directory.
     /// `None` consumes the remote Swift package instead.
     ///
     /// Without a manifest override, `waterui_path/backends/apple` is used when
@@ -912,86 +943,47 @@ impl TemplateContext {
         (0..depth).map(|_| "..").collect::<Vec<_>>().join("/")
     }
 
-    /// Generate the `XCode` package reference entry line for the project file.
-    fn swift_package_reference_entry(&self) -> String {
-        const PACKAGE_ID: &str = "D01867782E6C82CA00802E96";
-        const INDENT: &str = "\t\t\t\t";
-        let repository_name =
-            github_repository_name(self.framework.scaffold_value("apple-backend-url"));
-
-        self.compute_apple_backend_path().map_or_else(
-            || {
-                format!(
-                    "{INDENT}{PACKAGE_ID} /* XCRemoteSwiftPackageReference \"{repository_name}\" */,"
-                )
-            },
-            |backend_path| {
-                format!(
-                    "{INDENT}{PACKAGE_ID} /* XCLocalSwiftPackageReference \"{backend_path}\" */,"
-                )
-            },
-        )
-    }
-
-    /// The `SwiftPM` requirement the generated `XCRemoteSwiftPackageReference`
-    /// pins the Apple backend at: the pin the framework's channel carries. `dev` and `nightly` pin `apple-backend-revision`, the
-    /// backend commit the channel resolved or certified, before the stable
-    /// `apple-backend-version` tag; `stable` and a local checkout do the
-    /// reverse, falling to the `apple-backend-revision` gitlink pin a
-    /// framework older than the submodule's removal records.
-    fn apple_backend_requirement(&self) -> String {
-        let revision =
-            |revision: &str| format!("kind = revision;\n\t\t\t\trevision = \"{revision}\";");
-        let version =
-            |version: &str| format!("kind = exactVersion;\n\t\t\t\tversion = \"{version}\";");
-        match self.framework.channel() {
-            Some(FrameworkChannel::Dev | FrameworkChannel::Nightly) => self
-                .framework
-                .apple_backend_revision()
-                .map(revision)
-                .or_else(|| self.framework.apple_backend_version().map(version)),
-            Some(FrameworkChannel::Stable) | None => self
-                .framework
-                .apple_backend_version()
-                .map(version)
-                .or_else(|| self.framework.apple_backend_revision().map(revision)),
+    /// The `waterui-apple` dependency the generated FFI crate declares: a
+    /// `path` into a local Apple backend checkout when `[backends.apple]`
+    /// `backend_path` names one, and the backend repository's git source at
+    /// the resolved pin otherwise — the same `[backends.apple]`-then-channel
+    /// order the scaffolded project applied.
+    fn waterui_apple_dependency(&self) -> GeneratedDependencyDetail {
+        if let Some(backend_path) = self.compute_apple_backend_path() {
+            return GeneratedDependencyDetail {
+                path: Some(backend_path),
+                ..GeneratedDependencyDetail::default()
+            };
         }
-        .unwrap_or_else(|| panic!("resolved framework carries no Apple backend pin"))
-    }
-
-    /// Generate the `XCode` package reference section for the project file.
-    fn swift_package_reference_section(&self) -> String {
-        const PACKAGE_ID: &str = "D01867782E6C82CA00802E96";
-        let repository_name =
-            github_repository_name(self.framework.scaffold_value("apple-backend-url"));
-
-        self.compute_apple_backend_path().map_or_else(
-            || {
-                format!(
-                    "/* Begin XCRemoteSwiftPackageReference section */\n\
-                    \t\t{PACKAGE_ID} /* XCRemoteSwiftPackageReference \"{repository_name}\" */ = {{\n\
-                    \t\t\tisa = XCRemoteSwiftPackageReference;\n\
-                    \t\t\trepositoryURL = \"{}\";\n\
-                    \t\t\trequirement = {{\n\
-                    \t\t\t\t{}\n\
-                    \t\t\t}};\n\
-                    \t\t}};\n\
-                    /* End XCRemoteSwiftPackageReference section */",
-                    self.framework.scaffold_value("apple-backend-url"),
-                    self.apple_backend_requirement(),
-                )
-            },
-            |backend_path| {
-                format!(
-                    "/* Begin XCLocalSwiftPackageReference section */\n\
-                    \t\t{PACKAGE_ID} /* XCLocalSwiftPackageReference \"{backend_path}\" */ = {{\n\
-                    \t\t\tisa = XCLocalSwiftPackageReference;\n\
-                    \t\t\trelativePath = \"{backend_path}\";\n\
-                    \t\t}};\n\
-                    /* End XCLocalSwiftPackageReference section */"
-                )
-            },
-        )
+        let mut detail = GeneratedDependencyDetail {
+            git: Some(
+                self.framework
+                    .scaffold_value("apple-backend-url")
+                    .to_string(),
+            ),
+            ..GeneratedDependencyDetail::default()
+        };
+        match self.framework.channel() {
+            Some(FrameworkChannel::Dev | FrameworkChannel::Nightly) => {
+                if let Some(revision) = self.framework.apple_backend_revision() {
+                    detail.rev = Some(revision.to_string());
+                } else if let Some(version) = self.framework.apple_backend_version() {
+                    detail.tag = Some(version.to_string());
+                } else {
+                    panic!("resolved framework carries no Apple backend pin");
+                }
+            }
+            Some(FrameworkChannel::Stable) | None => {
+                if let Some(version) = self.framework.apple_backend_version() {
+                    detail.tag = Some(version.to_string());
+                } else if let Some(revision) = self.framework.apple_backend_revision() {
+                    detail.rev = Some(revision.to_string());
+                } else {
+                    panic!("resolved framework carries no Apple backend pin");
+                }
+            }
+        }
+        detail
     }
 }
 
@@ -1095,11 +1087,6 @@ fn github_repository_owner_and_name(repository_url: &str) -> (&str, &str) {
     (owner, repo)
 }
 
-fn github_repository_name(repository_url: &str) -> &str {
-    let (_, repo) = github_repository_owner_and_name(repository_url);
-    repo
-}
-
 fn jitpack_dependency_coordinate(repository_url: &str, revision: &str) -> String {
     let (owner, repo) = github_repository_owner_and_name(repository_url);
     format!("com.github.{owner}:{repo}:{revision}")
@@ -1124,19 +1111,6 @@ macro_rules! define_scaffold_templates {
             let display_path = relative_path.to_string_lossy();
             let dispatch_path = scaffold_template_dispatch_path(namespace, relative_path);
             match dispatch_path.as_str() {
-                "src/templates/apple/AppName/WaterUIFonts.swift.tpl" => {
-                    let empty_font_entries: &[FontRegistrationTemplateEntry] = &[];
-                    ScaffoldAppleFontTemplate {
-                        font_entries: empty_font_entries,
-                    }
-                    .render()
-                    .map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("Failed to render template {display_path}: {error}"),
-                        )
-                    })
-                }
                 "src/templates/esp32/Cargo.toml.tpl" => Esp32CargoTomlTemplate::from_ctx(ctx)
                     .and_then(|template| {
                         template.render().map_err(|error| {
@@ -1179,15 +1153,6 @@ macro_rules! define_scaffold_templates {
             }
         }
     };
-}
-
-#[derive(Template)]
-#[template(
-    path = "src/templates/apple/AppName/WaterUIFonts.swift.tpl",
-    escape = "none"
-)]
-struct ScaffoldAppleFontTemplate<'a> {
-    font_entries: &'a [FontRegistrationTemplateEntry],
 }
 
 /// Generated `Cargo.toml` for the ESP32 firmware harness crate.
@@ -1271,9 +1236,6 @@ impl Esp32CargoTomlTemplate {
 
 define_scaffold_templates! {
     AssetsReadmeTemplate => (Root, "src/templates/assets_readme.md.tpl"),
-    AppleProjectTemplate => (Apple, "src/templates/apple/AppName.xcodeproj/project.pbxproj.tpl"),
-    AppleAppTemplate => (Apple, "src/templates/apple/AppName/AppNameApp.swift.tpl"),
-    AppleInfoPlistTemplate => (Apple, "src/templates/apple/AppName/Info.plist.tpl"),
     AndroidGradleAppTemplate => (Android, "src/templates/android/app/build.gradle.kts.tpl"),
     AndroidManifestTemplate => (Android, "src/templates/android/app/src/main/AndroidManifest.xml.tpl"),
     AndroidMainActivityTemplate => (Android, "src/templates/android/app/src/main/java/MainActivity.kt.tpl"),
@@ -1285,6 +1247,8 @@ define_scaffold_templates! {
     AndroidEmbeddedManifestTemplate => (AndroidEmbedded, "src/templates/android_embedded/waterui/src/main/AndroidManifest.xml.tpl"),
     FfiBuildScriptTemplate => (Ffi, "src/templates/ffi/build.rs.tpl"),
     FfiLibTemplate => (Ffi, "src/templates/ffi/src/lib.rs.tpl"),
+    FfiAppleMainTemplate => (Ffi, "src/templates/ffi/src/bin/waterui-apple-main.rs.tpl"),
+    FfiCefHelperTemplate => (Ffi, "src/templates/ffi/src/bin/waterui-cef-helper.rs.tpl"),
     Gtk4BuildScriptTemplate => (Gtk4, "src/templates/gtk4/build.rs.tpl"),
     Gtk4MainTemplate => (Gtk4, "src/templates/gtk4/src/main.rs.tpl"),
     HydrolysisBuildScriptTemplate => (Hydrolysis, "src/templates/hydrolysis/build.rs.tpl"),
@@ -1343,6 +1307,10 @@ mod tests {
             author: String::new(),
             android_backend_path: None,
             apple_backend_path: None,
+            apple_backend_selected: true,
+            ffi_crate_name: Some(
+                CrateName::try_from("waterui_test_ffi").expect("test ffi crate name must be valid"),
+            ),
             waterui_path,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
@@ -2074,83 +2042,34 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn apple_project_enables_picture_in_picture_background_mode_by_default() {
-        let ctx = project_ctx();
-        let template = embedded::APPLE
-            .get_file("AppName.xcodeproj/project.pbxproj.tpl")
-            .expect("apple project template must exist")
-            .contents_utf8()
-            .expect("apple project template must be utf-8");
-
-        let rendered = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
-            template,
-            &ctx,
-        )
-        .expect("apple project render");
-
-        assert!(
-            rendered.contains("\"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*][0]\" = audio;")
-        );
-        assert!(
-            rendered
-                .contains("\"INFOPLIST_KEY_UIBackgroundModes[sdk=iphonesimulator*][0]\" = audio;")
-        );
-        // The project must not name the Rust library: its shape depends on the linkage
-        // the running command selected (archive when packaging, shared library for a
-        // development build), so the CLI injects `-lwaterui_app` into OTHER_LDFLAGS at
-        // build time and leaves exactly one matching file in BUILT_PRODUCTS_DIR.
-        assert!(!rendered.contains("libwaterui_app"));
-        assert!(rendered.contains("LIBRARY_SEARCH_PATHS = \"$(BUILT_PRODUCTS_DIR)\";"));
-        assert!(rendered.contains(ctx.framework.scaffold_value("apple-backend-url")));
-        assert!(rendered.contains(ctx.framework.apple_backend_version().unwrap()));
-        assert!(rendered.contains("kind = exactVersion;"));
-    }
-
     /// The Apple backend follows the framework's channel: `dev` and
     /// `nightly` pin the `apple-backend-revision` the channel resolved or
     /// certified, never the stable `apple-backend-version` tag — and a
     /// `[backends.apple]` override still outranks either.
     #[test]
-    fn apple_project_pins_the_channel_backend_on_dev_and_nightly() {
-        let project = |framework: ResolvedFramework| {
+    fn apple_dependency_pins_the_channel_backend_on_dev_and_nightly() {
+        let dependency = |framework: ResolvedFramework| {
             let mut context = project_ctx();
             context.framework = framework;
-            let template = embedded::APPLE
-                .get_file("AppName.xcodeproj/project.pbxproj.tpl")
-                .expect("apple project template must exist")
-                .contents_utf8()
-                .expect("apple project template must be utf-8");
-            render_scaffold_template(
-                TemplateNamespace::Apple,
-                std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
-                template,
-                &context,
-            )
-            .expect("apple project render")
+            context.waterui_apple_dependency()
         };
         let revision = 'd'.to_string().repeat(40);
-        for (channel, rendered) in [
-            ("dev", project(dev_framework())),
-            ("nightly", project(nightly_framework(true))),
+        for (channel, detail) in [
+            ("dev", dependency(dev_framework())),
+            ("nightly", dependency(nightly_framework(true))),
         ] {
-            assert!(
-                rendered.contains(&format!("revision = \"{revision}\";")),
-                "{channel} must pin the backend revision:\n{rendered}"
-            );
-            assert!(!rendered.contains("kind = exactVersion;"), "{channel}");
+            assert_eq!(detail.rev.as_deref(), Some(revision.as_str()), "{channel}");
+            assert!(detail.tag.is_none(), "{channel}");
         }
         // A nightly certification that names no backend revision certifies
         // the manifest's declared tag.
-        let rendered = project(nightly_framework(false));
-        assert!(rendered.contains("kind = exactVersion;"));
-        assert!(rendered.contains("version = \"0.3.0-dev.2\";"));
+        let detail = dependency(nightly_framework(false));
+        assert_eq!(detail.tag.as_deref(), Some("0.3.0-dev.2"));
+        assert!(detail.rev.is_none());
     }
 
     #[test]
-    fn declared_apple_revision_becomes_an_exact_package_requirement() {
+    fn declared_apple_revision_becomes_the_ffi_dependency_rev() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("waterui");
         let revision = "dddddddddddddddddddddddddddddddddddddddd";
@@ -2158,159 +2077,8 @@ mod tests {
         let mut context = project_ctx();
         context.framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
 
-        assert_eq!(
-            context.apple_backend_requirement(),
-            "kind = revision;\n\t\t\t\trevision = \"dddddddddddddddddddddddddddddddddddddddd\";"
-        );
-    }
-
-    #[test]
-    fn apple_project_names_only_the_launch_assets_that_were_staged() {
-        let render = |ctx: &TemplateContext, file: &str| {
-            let template = embedded::APPLE
-                .get_file(file)
-                .expect("apple template must exist")
-                .contents_utf8()
-                .expect("apple template must be utf-8");
-            render_scaffold_template(
-                TemplateNamespace::Apple,
-                std::path::Path::new(file),
-                template,
-                ctx,
-            )
-            .expect("apple template render")
-        };
-        let project = "AppName.xcodeproj/project.pbxproj.tpl";
-        let info_plist = "AppName/Info.plist.tpl";
-
-        let bare = project_ctx();
-        let rendered = render(&bare, project);
-        assert!(rendered.contains(&format!(
-            "INFOPLIST_FILE = \"{}/Info.plist\";",
-            bare.app_name
-        )));
-        assert!(rendered.contains("GENERATE_INFOPLIST_FILE = YES;"));
-        // UILaunchScreen has no INFOPLIST_KEY_ build setting for its sub-keys;
-        // Xcode silently drops such keys, so the project must not carry them.
-        assert!(!rendered.contains("INFOPLIST_KEY_UILaunchScreen"));
-        // Info.plist lives in the synchronized app folder; without this
-        // exception Xcode also copies it as a bundle resource and the build
-        // fails with two producers of the app's Info.plist.
-        assert!(
-            rendered.contains("membershipExceptions = (\n\t\t\t\tInfo.plist,\n\t\t\t);"),
-            "{rendered}"
-        );
-        let plist = render(&bare, info_plist);
-        assert!(
-            plist.contains("<key>UILaunchScreen</key>\n\t<dict>\n\t</dict>"),
-            "{plist}"
-        );
-        // The iOS 27 SDK refuses to launch an app without the scene life
-        // cycle; the manifest names the scaffold's scene delegate by its
-        // Objective-C name so the module name stays out of the plist.
-        assert!(
-            plist.contains(
-                "<key>UISceneDelegateClassName</key>\n\t\t\t\t\t<string>SceneDelegate</string>"
-            ),
-            "{plist}"
-        );
-
-        let configured = project_ctx().with_launch(LaunchTemplateEntry {
-            has_background: true,
-            has_image: true,
-        });
-        let plist = render(&configured, info_plist);
-        assert!(plist.contains("<key>UIColorName</key>\n\t\t<string>LaunchBackground</string>"));
-        assert!(plist.contains("<key>UIImageName</key>\n\t\t<string>LaunchImage</string>"));
-        assert!(plist.contains("<key>UIImageRespectsSafeAreaInsets</key>\n\t\t<true/>"));
-
-        let color_only = project_ctx().with_launch(LaunchTemplateEntry {
-            has_background: true,
-            has_image: false,
-        });
-        let plist = render(&color_only, info_plist);
-        assert!(plist.contains("LaunchBackground"));
-        assert!(!plist.contains("LaunchImage"));
-    }
-
-    #[test]
-    fn apple_chromium_template_links_and_initializes_cef_before_appkit() {
-        let ctx = project_ctx()
-            .with_chromium_enabled(true)
-            .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
-        let project_template = embedded::APPLE
-            .get_file("AppName.xcodeproj/project.pbxproj.tpl")
-            .expect("apple project template must exist")
-            .contents_utf8()
-            .expect("apple project template must be utf-8");
-        let project = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
-            project_template,
-            &ctx,
-        )
-        .expect("apple Chromium project render");
-        assert!(project.contains("WaterUICEF in Frameworks"));
-        assert!(project.contains("WaterUIChromium in Frameworks"));
-        assert!(!project.contains("WaterUICefWebView in Frameworks"));
-
-        let app_template = embedded::APPLE
-            .get_file("AppName/AppNameApp.swift.tpl")
-            .expect("apple app template must exist")
-            .contents_utf8()
-            .expect("apple app template must be utf-8");
-        let app = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName/AppNameApp.swift.tpl"),
-            app_template,
-            &ctx,
-        )
-        .expect("apple Chromium app render");
-        assert!(app.contains("import WaterUICEF"));
-        assert!(app.contains("import WaterUIChromium"));
-        assert!(app.contains("installWaterUIChromium()"));
-        assert!(
-            app.find("prepareWaterUICEFApplication()") < app.find("let app = NSApplication.shared")
-        );
-        assert!(!app.contains("runWaterUICEFSubprocessIfNeeded()"));
-    }
-
-    #[test]
-    fn apple_cef_webview_template_links_only_the_standard_cef_component() {
-        let ctx = project_ctx()
-            .with_webview_enabled(true)
-            .with_browser_engine(Some(ResolvedWebViewBackend::Cef));
-        let project_template = embedded::APPLE
-            .get_file("AppName.xcodeproj/project.pbxproj.tpl")
-            .expect("apple project template must exist")
-            .contents_utf8()
-            .expect("apple project template must be utf-8");
-        let project = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
-            project_template,
-            &ctx,
-        )
-        .expect("apple CEF WebView project render");
-        assert!(project.contains("WaterUICEF in Frameworks"));
-        assert!(project.contains("WaterUICefWebView in Frameworks"));
-        assert!(!project.contains("WaterUIChromium in Frameworks"));
-
-        let app_template = embedded::APPLE
-            .get_file("AppName/AppNameApp.swift.tpl")
-            .expect("apple app template must exist")
-            .contents_utf8()
-            .expect("apple app template must be utf-8");
-        let app = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName/AppNameApp.swift.tpl"),
-            app_template,
-            &ctx,
-        )
-        .expect("apple CEF WebView app render");
-        assert!(app.contains("import WaterUICefWebView"));
-        assert!(app.contains("installWaterUICefWebView()"));
-        assert!(!app.contains("installWaterUIChromium()"));
+        let detail = context.waterui_apple_dependency();
+        assert_eq!(detail.rev.as_deref(), Some(revision));
     }
 
     #[test]
@@ -2901,7 +2669,18 @@ mod tests {
             Some(false)
         );
         assert_eq!(manifest["package"]["autobins"].as_bool(), Some(false));
-        assert!(manifest.get("bin").is_none());
+        let bins = manifest["bin"]
+            .as_array()
+            .expect("the FFI crate declares its entry-owning Apple binary");
+        assert_eq!(bins.len(), 1);
+        assert_eq!(
+            bins[0]["name"].as_str(),
+            Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME)
+        );
+        assert_eq!(
+            bins[0]["path"].as_str(),
+            Some("src/bin/waterui-apple-main.rs")
+        );
     }
 
     #[test]
@@ -2927,17 +2706,61 @@ mod tests {
             .expect("ffi Cargo.toml should parse");
         let bins = manifest["bin"]
             .as_array()
-            .expect("CEF FFI companion should declare a helper binary");
-        assert_eq!(bins.len(), 1);
-        assert_eq!(bins[0]["name"].as_str(), Some("chromium-ffi-cef-helper"));
+            .expect("CEF FFI companion should declare binaries");
+        assert_eq!(bins.len(), 2);
         assert_eq!(
-            bins[0]["path"].as_str(),
+            bins[0]["name"].as_str(),
+            Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME)
+        );
+        assert_eq!(bins[1]["name"].as_str(), Some("chromium-ffi-cef-helper"));
+        assert_eq!(
+            bins[1]["path"].as_str(),
             Some("src/bin/waterui-cef-helper.rs")
         );
 
         let helper = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-cef-helper.rs"))
             .expect("CEF helper source should be written");
         assert!(helper.contains("waterui_cef_run_packaged_subprocess"));
+    }
+
+    #[test]
+    fn ffi_scaffold_without_apple_backend_emits_no_apple_dependency() {
+        let tempdir = tempdir().expect("temporary ffi scaffold dir");
+        let ffi_dir = tempdir.path().join("managed_backends/ffi");
+        let ctx = project_ctx()
+            .with_backend_project_path(ffi_dir.clone())
+            .with_project_root_path(tempdir.path().to_path_buf())
+            .with_apple_backend_selected(false);
+
+        smol::block_on(crate::templates::ffi::scaffold(
+            &ffi_dir,
+            &ctx,
+            "android-ffi",
+        ))
+        .expect("Android-only ffi scaffold should succeed");
+
+        let manifest = std::fs::read_to_string(ffi_dir.join("Cargo.toml"))
+            .expect("ffi Cargo.toml should be written")
+            .parse::<toml::Table>()
+            .expect("ffi Cargo.toml should parse");
+        assert!(
+            manifest["dependencies"].get("waterui-apple").is_none(),
+            "an Android-only ffi companion must not depend on waterui-apple"
+        );
+        assert!(
+            manifest
+                .get("bin")
+                .and_then(toml::Value::as_array)
+                .is_none_or(Vec::is_empty),
+            "an Android-only ffi companion declares no entry-owning binary"
+        );
+
+        let lib = std::fs::read_to_string(ffi_dir.join("src/lib.rs"))
+            .expect("ffi lib.rs should be written");
+        assert!(
+            !lib.contains("export_app"),
+            "an Android-only ffi companion must not call waterui_apple::export_app!"
+        );
     }
 
     #[test]
@@ -3121,9 +2944,36 @@ mod tests {
             .map(|value| value.as_str().expect("crate type should be a string"))
             .collect::<Vec<_>>();
 
-        // Apple links the staticlib, Android loads the cdylib, and nothing anywhere
-        // consumes an rlib of this crate.
-        assert_eq!(crate_types, ["staticlib", "cdylib"]);
+        // Apple links the staticlib, Android loads the cdylib, and the
+        // entry-owning `waterui-apple-main` bin consumes the rlib so its own
+        // crate dependency stays static inside the executable image.
+        assert_eq!(crate_types, ["staticlib", "cdylib", "rlib"]);
+    }
+
+    #[test]
+    fn generated_ffi_build_script_undefs_every_swift_seam_symbol() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let ffi_dir = temp.path().join("managed_backends").join("ffi");
+        let ctx = ctx(
+            Some(PathBuf::from("../waterui")),
+            Some(ffi_dir.clone()),
+            Some(temp.path().join("project")),
+        );
+
+        smol::block_on(crate::templates::ffi::scaffold(&ffi_dir, &ctx, "app-ffi"))
+            .expect("ffi scaffold should succeed");
+
+        let build_script = std::fs::read_to_string(ffi_dir.join("build.rs"))
+            .expect("ffi build.rs should be written");
+        // Cargo emits the ffi `cdylib` also as a dependency artifact of
+        // `cargo rustc --bin`, where this build's trailing rustc args never
+        // reach — the crate's own link-arg is the only route that covers both.
+        for symbol in crate::apple::swift_seam::SEAM_SYMBOL_NAMES {
+            assert!(
+                build_script.contains(&format!("\"{symbol}\"")),
+                "ffi build.rs must undef `_waterui_swift_*` seam symbol {symbol}"
+            );
+        }
     }
 
     #[test]
@@ -3279,35 +3129,6 @@ mod tests {
         assert!(rendered.contains("android:resizeableActivity=\"true\""));
         assert!(rendered.contains("android:supportsPictureInPicture=\"true\""));
     }
-
-    #[test]
-    fn support_app_apple_project_enables_picture_in_picture_background_mode_by_default() {
-        let ctx = support_ctx();
-        let template = embedded::APPLE
-            .get_file("AppName.xcodeproj/project.pbxproj.tpl")
-            .expect("apple project template must exist")
-            .contents_utf8()
-            .expect("apple project template must be utf-8");
-
-        let rendered = render_scaffold_template(
-            TemplateNamespace::Apple,
-            std::path::Path::new("AppName.xcodeproj/project.pbxproj.tpl"),
-            template,
-            &ctx,
-        )
-        .expect("apple project render");
-
-        assert!(
-            rendered.contains("\"INFOPLIST_KEY_UIBackgroundModes[sdk=iphoneos*][0]\" = audio;")
-        );
-        assert!(
-            rendered
-                .contains("\"INFOPLIST_KEY_UIBackgroundModes[sdk=iphonesimulator*][0]\" = audio;")
-        );
-        // As for a project's own backend: the project never names the Rust library, because its
-        // shape is chosen per build and injected as a linker flag.
-        assert!(!rendered.contains("libwaterui_app"));
-    }
 }
 
 /// Scaffold a directory from embedded templates (non-recursive, uses stack).
@@ -3324,6 +3145,16 @@ async fn scaffold_dir(
         // Process all files in this directory
         for file in current_dir.files() {
             let relative_path = file.path();
+
+            // The entry-owning Apple binary names a `waterui-apple`
+            // dependency only an apple-selected scaffold declares; nothing
+            // else renders it.
+            if namespace == TemplateNamespace::Ffi
+                && !ctx.apple_backend_selected
+                && relative_path == Path::new("src/bin/waterui-apple-main.rs.tpl")
+            {
+                continue;
+            }
 
             // Determine if this is a template file and compute destination path
             let is_template = relative_path
@@ -3386,6 +3217,12 @@ fn render_dir_outputs(
     while let Some(current_dir) = dirs_to_process.pop() {
         for file in current_dir.files() {
             let relative_path = file.path();
+            if namespace == TemplateNamespace::Ffi
+                && !ctx.apple_backend_selected
+                && relative_path == Path::new("src/bin/waterui-apple-main.rs.tpl")
+            {
+                continue;
+            }
             let is_template = relative_path
                 .extension()
                 .and_then(|ext| ext.to_str())
@@ -4024,7 +3861,7 @@ async fn write_generated_cargo_toml(base_dir: &Path, toml_string: String) -> io:
 /// Apple backend templates.
 pub mod apple {
     use super::{
-        Path, PathBuf, TemplateContext, TemplateNamespace, embedded, fs, io, render_dir_outputs,
+        Path, PathBuf, TemplateContext, TemplateNamespace, embedded, io, render_dir_outputs,
         scaffold_dir,
     };
 
@@ -4035,12 +3872,6 @@ pub mod apple {
     /// Returns an error if file operations fail.
     pub async fn scaffold(base_dir: &Path, ctx: &TemplateContext) -> io::Result<()> {
         scaffold_dir(TemplateNamespace::Apple, &embedded::APPLE, base_dir, ctx).await?;
-
-        // The synchronized group lists `waterui_assets` as an explicit folder
-        // so Xcode copies it into the bundle with its structure intact; the
-        // directory must exist before the first staging run or the sync errors.
-        fs::create_dir_all(base_dir.join(&ctx.app_name).join("waterui_assets")).await?;
-
         Ok(())
     }
 
@@ -5793,7 +5624,19 @@ pub mod ffi {
         package_name: &str,
     ) -> io::Result<()> {
         generate_cargo_toml(base_dir, ctx, package_name).await?;
-        scaffold_dir(TemplateNamespace::Ffi, &embedded::FFI, base_dir, ctx).await
+        scaffold_dir(TemplateNamespace::Ffi, &embedded::FFI, base_dir, ctx).await?;
+        // A previous apple-selected render leaves the entry binary behind;
+        // a non-apple scaffold must not ship a file naming an undeclared
+        // dependency.
+        if !ctx.apple_backend_selected {
+            let stale = base_dir.join("src/bin/waterui-apple-main.rs");
+            match fs::remove_file(&stale).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     async fn generate_cargo_toml(
@@ -5809,13 +5652,34 @@ pub mod ffi {
         manifest.profile = generated_profiles();
 
         // Apple links `lib<ffi>.a` and Android loads `lib<ffi>.so`, so the manifest
-        // declares only that union; nothing ever consumes an `rlib` of this crate.
+        // declares only that union plus `rlib` — which Cargo requires for the
+        // entry-owning binary's dependency emission: the bin must link the
+        // crate statically so `_waterui_init`/`_waterui_app` live inside the
+        // executable image rather than in a second dylib carrying duplicate
+        // ObjC classes.
         // Each build then narrows further to the single crate type its platform
         // links, via `RustBuild::with_crate_type_override`.
         manifest.lib = Some(Product {
-            crate_type: vec!["staticlib".to_string(), "cdylib".to_string()],
+            crate_type: vec![
+                "staticlib".to_string(),
+                "cdylib".to_string(),
+                "rlib".to_string(),
+            ],
             ..Default::default()
         });
+        // Entry-owning Apple packaging installs this binary as the
+        // application executable: it calls `waterui_apple::entry::run` the
+        // same way `waterui_apple::export_app!` does in the library, which
+        // keeps its own expansion for the embedding path. The companion is
+        // scaffolded for Android projects too, so the bin only exists when
+        // the Apple backend was actually selected.
+        if ctx.apple_backend_selected {
+            manifest.bin.push(Product {
+                name: Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME.to_string()),
+                path: Some("src/bin/waterui-apple-main.rs".to_string()),
+                ..Default::default()
+            });
+        }
         if ctx.cef_runtime_enabled() {
             manifest.bin.push(Product {
                 name: Some(crate::project_model::project_types::cef_helper_binary_name(
@@ -5863,6 +5727,21 @@ pub mod ffi {
             manifest
                 .dependencies
                 .insert(name.to_owned(), Dependency::Detailed(Box::new(dependency)));
+        }
+
+        // The Rust backend owns the app's whole startup through
+        // `waterui_apple::export_app!`. It does not live in the `WaterUI`
+        // workspace, so it resolves against the Apple backend checkout the
+        // project already uses — never the framework registry source the
+        // loop above applies. Only a project that selected the Apple
+        // backend depends on it: an Android-only build never resolves,
+        // fetches, or compiles `waterui-apple`.
+        if ctx.apple_backend_selected {
+            let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
+            manifest.dependencies.insert(
+                "waterui-apple".to_string(),
+                Dependency::Detailed(Box::new(waterui_apple)),
+            );
         }
         manifest.patch = match ctx.waterui_workspace_root() {
             Some(root) => {

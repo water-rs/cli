@@ -98,10 +98,12 @@ impl Backend for AndroidBackend {
         // Android is where a missing declaration actually breaks things, so
         // surface anything a dependency needs that the app has not enabled.
         // The audit resolves the FFI companion's graph — the crate the Android
-        // build compiles. On a first init the companion is not scaffolded yet,
-        // so there is nothing to seed or scan until the next reinit.
+        // build compiles. `Project::open` re-renders the companion for this
+        // invocation's selection before any backend runs; only a companion
+        // carried over from a prior open is audited here — the fresh render's
+        // graph is resolved by the build that follows anyway.
         let ffi_manifest = project.ffi_crate_path().join("Cargo.toml");
-        if ffi_manifest.exists() {
+        if project.ffi_companion_preexisting && ffi_manifest.exists() {
             crate::assets::seed_managed_crate_lock(project, &ffi_manifest)
                 .await
                 .map_err(crate::backend::FailToInitBackend::Config)?;

@@ -2170,7 +2170,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
         user_rustflags: &[String],
     ) -> Vec<String> {
         let mut args = Vec::new();
-        if let Some(crate_type) = &self.crate_type_override {
+        // A `--crate-type` override only has meaning for the library target;
+        // on a `--bin` unit it would fight rustc's own `bin` crate type.
+        if cargo_target.accepts_crate_type_override()
+            && let Some(crate_type) = &self.crate_type_override
+        {
             args.push("--crate-type".to_owned());
             args.push(crate_type.clone());
         }
@@ -4650,10 +4654,14 @@ mod tests {
             let crate_dir = fixture.join("crate");
             rustflags_probe_crate(&crate_dir, "water_target_probe");
             let host_triple = Triple::host().to_string();
+            let mut config = toml_edit::DocumentMut::new();
+            config["target"][&host_triple]["rustflags"] = toml_edit::Item::Value(
+                toml_edit::Array::from_iter(["--cfg=water_target_probe"]).into(),
+            );
             std::fs::create_dir_all(fixture.join(".cargo")).expect("config dir");
             std::fs::write(
                 fixture.join(".cargo").join("config.toml"),
-                format!("[target.'{host_triple}']\nrustflags = [\"--cfg=water_target_probe\"]\n"),
+                config.to_string(),
             )
             .expect("config");
 

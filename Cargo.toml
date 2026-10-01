@@ -120,6 +120,10 @@ base64 = "0.23"
 tempfile = "3.27"
 walkdir = "2.5"
 pathdiff = "0.2"
+# `Info.plist` assembly/serialization for Apple app bundles. `app_bundle`
+# compiles on every host — its actool/codesign arms bail at run time off
+# macOS — so the plist code paths must compile everywhere too.
+plist = "1.10"
 url = "2.5"
 fs4 = "1.1.0"
 fontcull-klippa = { version = "0.1.2", optional = true }
@@ -169,9 +173,6 @@ nix = { version = "0.31", features = ["process", "signal", "user"] }
 # default would pull a whole JPEG 2000 decoder (hayro-jpeg2000) for entries we
 # never read or emit.
 icns = { version = "0.4", default-features = false, features = ["pngio"] }
-# `plist::Value` is only used to read `Info.plist` during macOS device/bundle
-# probing, all under `#[cfg(target_os = "macos")]`.
-plist = "1.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

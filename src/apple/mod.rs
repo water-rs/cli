@@ -1,5 +1,7 @@
 //! Apple platform support.
 
+/// `.app` bundle assembly without an Xcode project.
+pub mod app_bundle;
 /// Apple backend implementation.
 pub mod backend;
 /// Apple device detection and management.
@@ -108,5 +110,7 @@ pub mod local {
 /// Apple platform configuration.
 pub mod physical;
 pub mod platform;
+/// Compiling the backend's Swift seam without `xcodebuild`.
+pub mod swift_seam;
 /// Apple toolchain management.
 pub mod toolchain;

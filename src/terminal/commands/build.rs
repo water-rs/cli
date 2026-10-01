@@ -142,7 +142,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
     }
 
     check_build_toolchain(shell, args.platform, context.backend, args.arch).await?;
-    let result = execute_build(shell, &args, &context).await;
+    let result = Box::pin(execute_build(shell, &args, &context)).await;
 
     handle_build_result(shell, result, args.output_dir)
 }
@@ -365,7 +365,7 @@ async fn check_build_toolchain(
 async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<BuiltTarget> {
     let spinner = shell.spinner("Compiling...");
     let result = shell
-        .display_output(async {
+        .display_output(Box::pin(async {
             match context.backend {
                 TargetBackend::Apple => {
                     build_for_apple(
@@ -409,7 +409,7 @@ async fn execute_build(shell: &Shell, args: &Args, context: &BuildContext) -> Re
                     build_esp32(&context.project, context.build_options.clone()).await
                 }
             }
-        })
+        }))
         .await;
 
     if let Some(pb) = spinner {

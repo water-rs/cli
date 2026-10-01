@@ -33,31 +33,32 @@ pub async fn prepare_host_runtime(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Give a freshly built dynamic library an `@rpath` install name.
-///
-/// Cargo stamps a `cdylib` with a bare file name, so an executable linking it records
-/// that bare name and the loader looks for it in the system search paths rather than in
-/// the application bundle. Rewriting the install name to `@rpath/<name>` makes it resolve
-/// through the bundle's Frameworks directory, the same way the shared runtime does.
-///
-/// # Errors
-/// Returns an error if the library is missing or `install_name_tool` fails.
-pub async fn set_rpath_install_name(path: &Path, file_name: &str) -> Result<()> {
-    require_runtime(path)?;
-    let desired = format!("@rpath/{file_name}");
-    if install_name(path).await? == desired {
-        return Ok(());
+/// Give a module the canonical `@rpath/<file>` install name a bundled
+/// executable binds when it links the file by path. Idempotent.
+pub async fn canonicalize_install_name(path: &Path) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| eyre::eyre!("Module {} has no file name", path.display()))?;
+    let wanted = format!("@rpath/{}", file_name.to_string_lossy());
+    if install_name(path).await? != wanted {
+        run_command_os(
+            "install_name_tool",
+            [
+                OsStr::new("-id"),
+                OsStr::new(wanted.as_str()),
+                path.as_os_str(),
+            ],
+        )
+        .await
+        .wrap_err("Failed to assign the module install name")?;
     }
-    run_command_os(
-        "install_name_tool",
-        [
-            OsStr::new("-id"),
-            OsStr::new(desired.as_str()),
-            path.as_os_str(),
-        ],
-    )
-    .await
-    .wrap_err_with(|| format!("Failed to set install name for {}", path.display()))?;
+    if install_name(path).await? != wanted {
+        bail!(
+            "Module {} did not retain install name {}",
+            path.display(),
+            wanted
+        );
+    }
     Ok(())
 }
 
