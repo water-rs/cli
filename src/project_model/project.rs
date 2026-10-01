@@ -2873,15 +2873,13 @@ mod scaffold_tests {
         // The project declares an apple backend it is not building for.
         let missing_apple = dir.path().join("apple-backend");
         let water_toml = root.join("Water.toml");
-        let manifest = std::fs::read_to_string(&water_toml).expect("Water.toml exists");
-        std::fs::write(
-            &water_toml,
-            format!(
-                "{manifest}\n[backends.apple]\nbackend_path = \"{}\"\n",
-                missing_apple.display()
-            ),
-        )
-        .expect("declare the apple backend");
+        let mut document: toml_edit::DocumentMut = std::fs::read_to_string(&water_toml)
+            .expect("Water.toml exists")
+            .parse()
+            .expect("Water.toml parses");
+        document["backends"]["apple"]["backend_path"] =
+            toml_edit::value(missing_apple.to_string_lossy().as_ref());
+        std::fs::write(&water_toml, document.to_string()).expect("declare the apple backend");
 
         // The stale companion an earlier apple-selected open left behind: a
         // manifest carrying a `waterui-apple` path dependency that no longer
@@ -2890,14 +2888,14 @@ mod scaffold_tests {
             .expect("build cache dir")
             .join("ffi");
         std::fs::create_dir_all(ffi_dir.join("src")).expect("stale ffi dir");
-        std::fs::write(
-            ffi_dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"water-example-ffi\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies.waterui-apple]\npath = \"{}\"\n",
-                missing_apple.display()
-            ),
-        )
-        .expect("seed the stale ffi manifest");
+        let mut stale_ffi = toml_edit::DocumentMut::new();
+        stale_ffi["package"]["name"] = toml_edit::value("water-example-ffi");
+        stale_ffi["package"]["version"] = toml_edit::value("0.1.0");
+        stale_ffi["package"]["edition"] = toml_edit::value("2021");
+        stale_ffi["dependencies"]["waterui-apple"]["path"] =
+            toml_edit::value(missing_apple.to_string_lossy().as_ref());
+        std::fs::write(ffi_dir.join("Cargo.toml"), stale_ffi.to_string())
+            .expect("seed the stale ffi manifest");
         std::fs::write(ffi_dir.join("src/lib.rs"), "").expect("seed the stale ffi lib");
 
         // The backend audits the re-rendered manifest with `cargo metadata`,
@@ -2906,19 +2904,22 @@ mod scaffold_tests {
         for (name, dir_name) in [("waterui-ffi", "waterui-ffi"), ("waterui", "waterui")] {
             let stub = ffi_dir.join("vendor").join(dir_name);
             std::fs::create_dir_all(stub.join("src")).expect("stub crate dir");
-            std::fs::write(
-                stub.join("Cargo.toml"),
-                format!("[package]\nname = \"{name}\"\nversion = \"0.4.1\"\nedition = \"2021\"\n"),
-            )
-            .expect("stub manifest");
+            let mut stub_manifest = toml_edit::DocumentMut::new();
+            stub_manifest["package"]["name"] = toml_edit::value(name);
+            stub_manifest["package"]["version"] = toml_edit::value("0.4.1");
+            stub_manifest["package"]["edition"] = toml_edit::value("2021");
+            std::fs::write(stub.join("Cargo.toml"), stub_manifest.to_string())
+                .expect("stub manifest");
             std::fs::write(stub.join("src/lib.rs"), "").expect("stub lib");
         }
         std::fs::create_dir_all(ffi_dir.join(".cargo")).expect("cargo config dir");
-        std::fs::write(
-            ffi_dir.join(".cargo/config.toml"),
-            "[patch.crates-io]\nwaterui-ffi = { path = \"../vendor/waterui-ffi\" }\nwaterui = { path = \"../vendor/waterui\" }\n",
-        )
-        .expect("patch config");
+        let mut patch_config = toml_edit::DocumentMut::new();
+        patch_config["patch"]["crates-io"]["waterui-ffi"]["path"] =
+            toml_edit::value("../vendor/waterui-ffi");
+        patch_config["patch"]["crates-io"]["waterui"]["path"] =
+            toml_edit::value("../vendor/waterui");
+        std::fs::write(ffi_dir.join(".cargo/config.toml"), patch_config.to_string())
+            .expect("patch config");
 
         let project = smol::block_on(Project::open(
             &root,
