@@ -870,9 +870,17 @@ async fn ensure_font_scan_manifests(
     if ffi_scanned {
         let manifest = project.ffi_crate_path().join("Cargo.toml");
         if !manifest.is_file() {
-            project.scaffold_ffi_companion().await.map_err(|error| {
-                eyre::eyre!("could not scaffold the Apple/Android FFI companion crate: {error}")
-            })?;
+            // Same selection rule `Project::open` applies: the companion's
+            // Apple pieces exist only when this invocation's scope is Apple
+            // (or unscoped).
+            let apple_selected = scope
+                .is_none_or(|backend| matches!(backend, crate::platform::TargetBackend::Apple));
+            project
+                .scaffold_ffi_companion(apple_selected)
+                .await
+                .map_err(|error| {
+                    eyre::eyre!("could not scaffold the Apple/Android FFI companion crate: {error}")
+                })?;
         }
         manifests.push(manifest);
     }
