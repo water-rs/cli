@@ -3,7 +3,7 @@
 //! requests to it over the child's own MCP stdio link.
 //!
 //! The proxy is the [`ToolDispatch`] the fronting `McpServer` registers its
-//! nine tools against. It answers `initialize`/`tools/list` through the
+//! tools against. It answers `initialize`/`tools/list` through the
 //! static protocol crate immediately — while the child is still building —
 //! and parks `tools/call` on a readiness cell until the child is up.
 
@@ -29,8 +29,8 @@ use smol::Task;
 use smol::process::Child;
 use tracing::{debug, error, info};
 use waterui_mcp_protocol::{
-    ActArgs, AdvanceArgs, FindArgs, KeyArgs, PointerArgs, RestartArgs, ScreenshotArgs,
-    SnapshotArgs, ToolDispatch, TypeTextArgs, WaitArgs,
+    ActArgs, AdvanceArgs, DropFilesArgs, FindArgs, KeyArgs, PointerArgs, RestartArgs,
+    ScreenshotArgs, SnapshotArgs, ToolDispatch, TypeTextArgs, WaitArgs,
 };
 use waterui_preview_protocol::hydrolysis::{MCP_RUN_CONFIG_ENV, McpRunConfig};
 
@@ -236,6 +236,10 @@ impl ToolDispatch for ChildProxy {
 
     fn key(&self, args: KeyArgs) -> impl Future<Output = ToolResult> + Send {
         self.forward_call("key", args)
+    }
+
+    fn drop_files(&self, args: DropFilesArgs) -> impl Future<Output = ToolResult> + Send {
+        self.forward_call("drop_files", args)
     }
 
     fn type_text(&self, args: TypeTextArgs) -> impl Future<Output = ToolResult> + Send {
