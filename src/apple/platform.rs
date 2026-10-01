@@ -188,7 +188,6 @@ pub async fn build_rust_lib(
         .with_features(
             apple_ffi_build_features(project, browser_runtime_plan, options.linkage()).await?,
         )
-        .with_crate_type_override(host_library.crate_type())
         .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
@@ -226,7 +225,24 @@ pub async fn build_rust_lib(
 
     let target_dir = project.water_target_dir(options.linkage()).await?;
     let build = build.with_target_dir(target_dir.clone());
-    let built_target = build.build_lib(options.is_release()).await?;
+    let built_target = match host_library {
+        // The shared runtime's lib build emits every crate type the
+        // manifest declares — not a `--crate-type` selection, which
+        // writes only the chosen artifact — because this build feeds
+        // two consumers: the staged cdylib and the unhashed
+        // `deps/lib<ffi>.rlib` that `localize_archive_symbols` edits
+        // below and the entry binary's `--extern` resolves. Selecting
+        // `cdylib` alone leaves the rlib unwritten on a clean target
+        // dir; the dylib is picked out of Cargo's report by extension.
+        AppleHostLibrary::Dynamic => build.build_dylib(options.is_release()).await?,
+        AppleHostLibrary::Archive => {
+            build
+                .clone()
+                .with_crate_type_override(host_library.crate_type())
+                .build_lib(options.is_release())
+                .await?
+        }
+    };
 
     // Stage the host library (and, for the shared runtime, the runtime itself)
     // before the executable links: it resolves the Swift seam's callbacks into
