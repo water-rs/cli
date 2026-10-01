@@ -1,5 +1,6 @@
 //! Native FFI companion crate for {{ ctx.app_display_name }}.
 
+{% if ctx.apple_backend_selected %}
 use waterui::app::App;
 use waterui::env::Environment;
 
@@ -7,8 +8,11 @@ fn app(env: Environment) -> App {
     {{ ctx.crate_name_ident() }}::app(env)
 }
 
+{% endif %}
 waterui_ffi::export!();
+{% if ctx.apple_backend_selected %}
 waterui_apple::export_app!(app);
+{% endif %}
 
 {% if ctx.cef_runtime_enabled() %}
 // Re-exported so the entry-owning bin can call it through the lib
