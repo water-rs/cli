@@ -43,6 +43,13 @@ pub const SEAM_SYMBOL_NAMES: &[&str] = &[
     "waterui_swift_when_ready",
 ];
 
+/// The symbols the application exports back across the seam.
+///
+/// `export_app!` defines `waterui_init`/`waterui_app` in the ffi rlib and
+/// `entry::run` calls them, so the entry link marks them explicitly
+/// undefined (`-Wl,-u`) to keep their archive members on the image.
+pub const APP_SEAM_CALLBACK_SYMBOLS: &[&str] = &["waterui_init", "waterui_app"];
+
 /// Compile `backend_root/Sources/WaterUI` into `out_dir/libWaterUISwift.a`
 /// for the target `platform` builds at `deployment_target`.
 ///
@@ -183,13 +190,19 @@ fn swift_target_triple(
         TargetPlatform::VisionOSSimulator => ("xros", true),
         platform => bail!("Platform {platform:?} is not an Apple platform"),
     };
-    let arch = match platform.triple().architecture {
-        target_lexicon::Architecture::Aarch64(_) => "arm64",
-        target_lexicon::Architecture::X86_64 => "x86_64",
-        arch => bail!("Apple packaging does not support the {arch} architecture"),
-    };
+    let arch = swift_arch(platform.triple().architecture)?;
     let suffix = if simulator { "-simulator" } else { "" };
     Ok(format!("{arch}-apple-{os}{deployment_target}{suffix}").into())
+}
+
+/// The `swiftc -target` arch segment for a Rust triple's architecture.
+#[cfg(target_os = "macos")]
+fn swift_arch(arch: target_lexicon::Architecture) -> eyre::Result<&'static str> {
+    match arch {
+        target_lexicon::Architecture::Aarch64(_) => Ok("arm64"),
+        target_lexicon::Architecture::X86_64 => Ok("x86_64"),
+        arch => bail!("Apple packaging does not support the {arch} architecture"),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -206,4 +219,50 @@ async fn collect_swift_sources(dir: &Path, out: &mut Vec<PathBuf>) -> eyre::Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn app_seam_callback_symbols_are_the_export_app_contract() {
+        assert_eq!(
+            super::APP_SEAM_CALLBACK_SYMBOLS,
+            ["waterui_init", "waterui_app"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_target_triple_maps_the_supported_arch_arms() {
+        let arch_of = |triple: &str| {
+            triple
+                .parse::<target_lexicon::Triple>()
+                .expect("a Rust triple")
+                .architecture
+        };
+        assert_eq!(
+            super::swift_arch(arch_of("aarch64-apple-darwin")).expect("arm64 maps"),
+            "arm64"
+        );
+        assert_eq!(
+            super::swift_arch(arch_of("x86_64-apple-darwin")).expect("x86_64 maps"),
+            "x86_64"
+        );
+        assert!(
+            super::swift_arch(arch_of("armv7-unknown-linux-gnueabihf")).is_err(),
+            "a non-Apple arch is an error, not a silent default"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_target_triple_marks_simulator_platforms() {
+        let platform = crate::platform::TargetPlatform::IOSSimulator;
+        let rendered =
+            super::swift_target_triple(platform, "26.0").expect("a simulator triple renders");
+        let rendered = rendered.to_str().expect("the triple is always valid UTF-8");
+        let arch =
+            super::swift_arch(platform.triple().architecture).expect("the host arch is supported");
+        assert_eq!(rendered, format!("{arch}-apple-ios26.0-simulator").as_str());
+    }
 }
