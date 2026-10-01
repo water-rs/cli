@@ -176,7 +176,7 @@ impl Installation for SpirvToolsInstallation {
 mod host_tests {
     use super::{SpirvTools, SpirvToolsInstallation};
     use crate::toolchain::testing::TestMachine;
-    use crate::toolchain::{Installation, Toolchain, ToolchainError};
+    use crate::toolchain::{Toolchain, ToolchainError};
 
     fn check(machine: &TestMachine) -> Result<(), ToolchainError<SpirvToolsInstallation>> {
         let host = machine.host(Vec::<(String, String)>::new());
@@ -237,6 +237,8 @@ mod host_tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn install_runs_the_package_manager() {
+        use crate::toolchain::Installation;
+
         let machine = TestMachine::new();
         #[cfg(target_os = "macos")]
         machine.install("brew");
