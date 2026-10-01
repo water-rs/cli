@@ -146,12 +146,15 @@ pub struct Project {
 
 impl Project {
     /// Select or update a framework channel and persist its exact dependency selection.
+    /// `rev` pins `dev` to an exact commit of the branch's history; the
+    /// certified channels reject it.
     ///
     /// # Errors
     /// Returns an error when resolution, native-project merging, or dependency verification fails.
     pub async fn select_channel(
         path: impl AsRef<Path>,
         channel: FrameworkChannel,
+        rev: Option<&str>,
     ) -> eyre::Result<Self> {
         let path = smol::fs::canonicalize(path.as_ref()).await?;
         let water_path = path.join("Water.toml");
@@ -161,7 +164,7 @@ impl Project {
         let previous = Manifest::parse(&water.to_string())?;
         let mut cargo: toml_edit::DocumentMut =
             smol::fs::read_to_string(&cargo_path).await?.parse()?;
-        let (framework, lockfile) = ResolvedFramework::resolve(channel).await?;
+        let (framework, lockfile) = ResolvedFramework::resolve(channel, rev).await?;
         // A configured backend whose scaffold packages the target channel
         // withholds could never be regenerated — refuse the switch before a
         // manifest is rewritten.
@@ -1101,7 +1104,7 @@ impl CreateOptions {
         if let Some(framework) = &self.framework {
             return Ok((framework.clone(), self.framework_lock.take()));
         }
-        ResolvedFramework::resolve(self.channel.unwrap_or_default()).await
+        ResolvedFramework::resolve(self.channel.unwrap_or_default(), None).await
     }
 }
 
