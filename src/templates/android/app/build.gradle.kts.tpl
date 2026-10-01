@@ -157,9 +157,8 @@ android {
 }
 
 dependencies {
-    // Vendored jars dependency crates stage here at package time (the CLI's
-    // android classpath staging writes into `libs/`).
-    implementation(fileTree("libs") { include("*.jar") })
+    // --- begin waterui android classpath dependencies ---
+    // --- end waterui android classpath dependencies ---
 
     // Use the backend revision embedded into the CLI build in remote mode, local backend otherwise
     if ({{ ctx.use_remote_dev_backend() }}) {

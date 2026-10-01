@@ -560,12 +560,13 @@ impl AndroidPlatform {
         )
         .await?;
 
-        // Stage dependency-declared Kotlin helpers and vendored jars onto the
-        // app module's classpath so Gradle compiles them into the dex.
+        // Stage dependency-declared Kotlin helpers and Maven coordinates onto
+        // the app module's classpath so Gradle compiles them into the dex.
         crate::assets::stage_android_classpath(
             project,
             &project.ffi_crate_path().join("Cargo.toml"),
             &backend_path.join("app"),
+            crate::assets::AndroidDependencyScope::Implementation,
         )
         .await?;
 

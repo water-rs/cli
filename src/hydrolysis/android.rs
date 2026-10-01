@@ -527,12 +527,13 @@ pub async fn package_with_abis(
 
     let android_dir = android_dir(&project.backend_path::<HydrolysisBackend>());
 
-    // Kotlin helpers and vendored jars declared by the dependency graph go on
-    // the app module's classpath so Gradle compiles them into the dex.
+    // Kotlin helpers and Maven coordinates declared by the dependency graph go
+    // on the app module's classpath so Gradle compiles them into the dex.
     crate::assets::stage_android_classpath(
         project,
         &project.ffi_crate_path().join("Cargo.toml"),
         &android_dir.join("app"),
+        crate::assets::AndroidDependencyScope::Implementation,
     )
     .await?;
 

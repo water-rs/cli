@@ -149,8 +149,8 @@ struct WaterUIMetadata {
     /// Permissions this crate cannot work without, keyed by logical permission.
     #[serde(default)]
     permissions: BTreeMap<PermissionKey, PermissionRequirement>,
-    /// Kotlin sources and vendored jars to place on the Android application
-    /// classpath, from `[package.metadata.waterui.android]`.
+    /// Kotlin sources and Maven dependencies to place on the Android
+    /// application classpath, from `[package.metadata.waterui.android]`.
     #[serde(default)]
     android: AndroidMetadata,
 }
@@ -158,18 +158,18 @@ struct WaterUIMetadata {
 /// One crate's `[package.metadata.waterui.android]` table.
 ///
 /// A crate whose Rust side resolves helper classes through the application
-/// class loader declares the `.kt` files (and any vendored jars they depend
-/// on) that must be compiled into the app dex. The generated Gradle module
-/// performs the compile — the crate's build script does not.
+/// class loader declares the `.kt` files that must be compiled into the app
+/// dex and the Maven coordinates the helpers need. The generated Gradle
+/// module performs the compile — the crate's build script does not.
 #[derive(Debug, Default, Deserialize)]
 struct AndroidMetadata {
     /// Crate-relative `.kt` files to stage into the generated module.
     #[serde(default, rename = "kotlin-sources")]
     kotlin_sources: Vec<PathBuf>,
-    /// Crate-relative entries naming vendored jars: a `.jar` file, or a
-    /// directory scanned recursively for `.jar` files.
+    /// Maven `group:artifact:version` coordinates the helpers compile and
+    /// run against.
     #[serde(default)]
-    jars: Vec<PathBuf>,
+    maven: Vec<String>,
     /// Only required when this cargo feature is enabled on the declaring crate.
     #[serde(default, rename = "required-feature")]
     required_feature: Option<String>,
@@ -414,16 +414,13 @@ async fn scan_crate_font_declarations(
         };
 
         // Parse the metadata
-        let waterui_meta: WaterUIMetadata = match serde_json::from_value(waterui.clone()) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    "Failed to parse waterui metadata for {}: {}",
-                    package.name, e
-                );
-                continue;
-            }
-        };
+        let waterui_meta: WaterUIMetadata =
+            serde_json::from_value(waterui.clone()).map_err(|error| {
+                eyre::eyre!(
+                    "crate {} declares malformed `[package.metadata.waterui]`: {error}",
+                    package.name
+                )
+            })?;
 
         // Get enabled features for this package from resolve
         let enabled_features = enabled_features_map
@@ -485,14 +482,36 @@ async fn scan_crate_font_declarations(
     Ok(fonts)
 }
 
-/// Kotlin sources and vendored jars the dependency graph asks to place on the
-/// Android application classpath, after `required-feature` gating.
+/// Kotlin sources and Maven coordinates the dependency graph asks to place on
+/// the Android application classpath, after `required-feature` gating.
 #[derive(Debug, Default)]
 pub struct AndroidClasspath {
     /// Absolute paths of `.kt` files to stage into the generated module.
     pub kotlin_sources: Vec<PathBuf>,
-    /// Absolute paths of vendored `.jar` files to stage into `libs/`.
-    pub jars: Vec<PathBuf>,
+    /// `group:artifact:version` coordinates to emit as Gradle dependencies.
+    pub maven: BTreeSet<String>,
+}
+
+/// Which Gradle configuration a module's classpath dependencies land on.
+///
+/// `implementation` hides them from consumers — correct for an application
+/// module. `api` exports them through the published POM — required for the
+/// embedded AAR, whose host app resolves the classes at run time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AndroidDependencyScope {
+    /// `implementation(...)`: app module and hydrolysis app.
+    Implementation,
+    /// `api(...)`: the embedded `waterui` module consumers depend on.
+    Api,
+}
+
+impl AndroidDependencyScope {
+    const fn gradle_keyword(self) -> &'static str {
+        match self {
+            Self::Implementation => "implementation",
+            Self::Api => "api",
+        }
+    }
 }
 
 /// Scans `build_manifest`'s dependency graph for
@@ -530,18 +549,14 @@ pub async fn scan_android_sources(
         let Some(waterui) = package.metadata.get("waterui") else {
             continue;
         };
-        let parsed: WaterUIMetadata = match serde_json::from_value(waterui.clone()) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                warn!(
-                    "Failed to parse waterui metadata for {}: {error}",
-                    package.name
-                );
-                continue;
-            }
-        };
+        let parsed: WaterUIMetadata = serde_json::from_value(waterui.clone()).map_err(|error| {
+            eyre::eyre!(
+                "crate {} declares malformed `[package.metadata.waterui]`: {error}",
+                package.name
+            )
+        })?;
         let android = parsed.android;
-        if android.kotlin_sources.is_empty() && android.jars.is_empty() {
+        if android.kotlin_sources.is_empty() && android.maven.is_empty() {
             continue;
         }
         if let Some(gate) = &android.required_feature
@@ -573,35 +588,14 @@ pub async fn scan_android_sources(
             }
             classpath.kotlin_sources.push(path);
         }
-        for entry in android.jars {
-            let path = crate_root.join(&entry);
-            if path.is_dir() {
-                for jar in WalkDir::new(&path)
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
-                    .wrap_err_with(|| {
-                        format!(
-                            "{} declares jar directory `{}` that could not be walked",
-                            package.name,
-                            entry.display()
-                        )
-                    })?
-                {
-                    let jar = jar.path();
-                    if jar.is_file() && jar.extension() == Some(std::ffi::OsStr::new("jar")) {
-                        classpath.jars.push(jar.to_path_buf());
-                    }
-                }
-            } else if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("jar")) {
-                classpath.jars.push(path);
-            } else {
-                eyre::bail!(
-                    "{} declares jar entry `{}`: expected a `.jar` file or a directory containing them at {}",
-                    package.name,
-                    entry.display(),
-                    path.display()
-                );
-            }
+        for coordinate in android.maven {
+            let parts: Vec<&str> = coordinate.split(':').collect();
+            eyre::ensure!(
+                parts.len() == 3 && parts.iter().all(|part| !part.is_empty()),
+                "{} declares Maven coordinate `{coordinate}`: expected `group:artifact:version`",
+                package.name
+            );
+            classpath.maven.insert(coordinate);
         }
     }
     Ok(classpath)
@@ -615,8 +609,10 @@ const ANDROID_KEEPS_END: &str = "# --- end waterui android classpath keeps ---";
 
 /// Stages a dependency graph's Android classpath declarations into a Gradle
 /// module: `.kt` files under `src/main/java/waterui/` — a directory the
-/// module's Kotlin compile picks up — and vendored jars under `libs/`, which
-/// the module's build script reads through `fileTree`.
+/// module's Kotlin compile picks up — and the Maven coordinates the helpers
+/// compile and run against, emitted into the module's managed dependencies
+/// block as `implementation(...)` for application modules or `api(...)` for
+/// the embedded AAR so the published POM propagates them to consumers.
 ///
 /// Both destinations are managed: whatever an earlier stage left is removed
 /// first, so a dependency or feature that is no longer in the graph stops
@@ -626,14 +622,16 @@ const ANDROID_KEEPS_END: &str = "# --- end waterui android classpath keeps ---";
 /// via `context.getClassLoader().loadClass` — which R8 cannot see, so release
 /// builds would shrink or rename them away. The stage therefore also rewrites
 /// a managed keep block in the module's `proguard-rules.pro`, one rule per
-/// package a staged source or jar carries.
+/// package a staged source carries. Maven artifacts stay untouched: their
+/// classes are referenced statically from the helpers, which R8 sees.
 pub async fn stage_android_classpath(
     project: &Project,
     build_manifest: &Path,
     module_dir: &Path,
+    scope: AndroidDependencyScope,
 ) -> eyre::Result<()> {
     let classpath = scan_android_sources(project, build_manifest).await?;
-    stage_classpath_files(&classpath, module_dir).await
+    stage_classpath_files(&classpath, module_dir, scope).await
 }
 
 /// The file half of [`stage_android_classpath`], split from the cargo-metadata
@@ -641,6 +639,7 @@ pub async fn stage_android_classpath(
 async fn stage_classpath_files(
     classpath: &AndroidClasspath,
     module_dir: &Path,
+    scope: AndroidDependencyScope,
 ) -> eyre::Result<()> {
     let mut keep_packages = BTreeSet::new();
 
@@ -681,60 +680,93 @@ async fn stage_classpath_files(
         );
     }
 
+    // A stale `libs/` belongs to the vendored-jar era the classpath staging
+    // replaced; drop it so an earlier stage's output cannot linger.
     let libs_dir = module_dir.join("libs");
     if libs_dir.exists() {
         fs::remove_dir_all(&libs_dir).await?;
     }
-    if !classpath.jars.is_empty() {
-        fs::create_dir_all(&libs_dir).await?;
-        let mut staged = HashSet::new();
-        for jar in &classpath.jars {
-            let Some(name) = jar.file_name() else {
-                eyre::bail!("jar {} has no file name", jar.display());
-            };
-            eyre::ensure!(
-                staged.insert(name.to_owned()),
-                "two crates declare a jar named `{}`",
-                name.to_string_lossy()
-            );
-            for package in jar_packages(jar)? {
-                keep_packages.insert(package);
-            }
-            fs::copy(jar, libs_dir.join(name)).await?;
-        }
-        info!(
-            "Staged {} vendored jars into {}",
-            classpath.jars.len(),
-            module_dir.display()
-        );
-    }
 
+    write_android_dependencies(module_dir, &classpath.maven, scope).await?;
     write_android_keeps(module_dir, &keep_packages).await?;
     Ok(())
 }
 
-/// The package names a vendored jar's class entries live in, e.g.
-/// `androidx.health.connect.client` for
-/// `androidx/health/connect/client/HealthConnectClient.class`.
-fn jar_packages(jar: &Path) -> eyre::Result<BTreeSet<String>> {
-    let file = std::fs::File::open(jar)?;
-    let mut archive = zip::ZipArchive::new(file)?;
-    let mut packages = BTreeSet::new();
-    for index in 0..archive.len() {
-        let entry = archive.by_index(index)?;
-        let name = entry.name();
-        if !entry.is_file()
-            || !std::path::Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("class"))
-        {
-            continue;
-        }
-        if let Some(dir) = name.rsplit_once('/').map(|(dir, _)| dir) {
-            packages.insert(dir.replace('/', "."));
-        }
+/// Markers bracketing the dependency block [`stage_android_classpath`]
+/// maintains inside a module's `build.gradle.kts` `dependencies` block.
+/// The templates emit the marker pair empty; the stage fills it.
+const ANDROID_DEPS_BEGIN: &str = "    // --- begin waterui android classpath dependencies ---";
+const ANDROID_DEPS_END: &str = "    // --- end waterui android classpath dependencies ---";
+
+/// Positions of `begin`/`end` marker pairs for a managed block: exactly one
+/// well-formed pair, or none. Anything else — a stray marker, a duplicated
+/// block, an `end` ahead of its `begin` — is a corrupt managed region and an
+/// error rather than a second appended block.
+fn managed_block_span(
+    existing: &str,
+    path: &Path,
+    begin_marker: &str,
+    end_marker: &str,
+) -> eyre::Result<Option<(usize, usize)>> {
+    let begins: Vec<usize> = existing
+        .match_indices(begin_marker)
+        .map(|(i, _)| i)
+        .collect();
+    let ends: Vec<usize> = existing.match_indices(end_marker).map(|(i, _)| i).collect();
+    eyre::ensure!(
+        begins.len() <= 1 && ends.len() <= 1,
+        "{} contains more than one managed block between `{begin_marker}` and `{end_marker}`; remove the duplicates",
+        path.display()
+    );
+    match (begins.first(), ends.first()) {
+        (Some(begin), Some(end)) if begin < end => Ok(Some((*begin, *end + end_marker.len()))),
+        (None, None) => Ok(None),
+        _ => eyre::bail!(
+            "{} has a malformed managed block: `{begin_marker}` and `{end_marker}` must appear as one ordered pair",
+            path.display()
+        ),
     }
-    Ok(packages)
+}
+
+/// Rewrites the managed dependencies block inside `module_dir`'s
+/// `build.gradle.kts`: one `<scope>("group:artifact:version")` line per
+/// coordinate the classpath carries. The templates ship the marker pair
+/// inside `dependencies {}`; a file missing it was hand-edited or generated
+/// before this mechanism and is an error.
+async fn write_android_dependencies(
+    module_dir: &Path,
+    maven: &BTreeSet<String>,
+    scope: AndroidDependencyScope,
+) -> eyre::Result<()> {
+    let build_file = module_dir.join("build.gradle.kts");
+    let existing = fs::read_to_string(&build_file)
+        .await
+        .wrap_err_with(|| format!("reading module build script {}", build_file.display()))?;
+    let span = managed_block_span(&existing, &build_file, ANDROID_DEPS_BEGIN, ANDROID_DEPS_END)?
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "{} has no managed dependencies block ({ANDROID_DEPS_BEGIN} / {ANDROID_DEPS_END}); the module template must emit the marker pair inside `dependencies {{}}`",
+                build_file.display()
+            )
+        })?;
+
+    let mut body = String::with_capacity(existing.len());
+    body.push_str(&existing[..span.0]);
+    body.push_str(ANDROID_DEPS_BEGIN);
+    body.push('\n');
+    for coordinate in maven {
+        body.push_str("        ");
+        body.push_str(scope.gradle_keyword());
+        body.push_str("(\"");
+        body.push_str(coordinate);
+        body.push_str("\")\n");
+    }
+    body.push_str(ANDROID_DEPS_END);
+    body.push_str(&existing[span.1..]);
+
+    super::templates::write_file_if_changed(&build_file, body.as_bytes())
+        .await
+        .map_err(Into::into)
 }
 
 /// Rewrites the managed keep block in `module_dir/proguard-rules.pro`: one
@@ -750,17 +782,17 @@ async fn write_android_keeps(module_dir: &Path, packages: &BTreeSet<String>) -> 
         Err(error) => return Err(error.into()),
     };
 
-    let mut body = match (
-        existing.find(ANDROID_KEEPS_BEGIN),
-        existing.find(ANDROID_KEEPS_END),
-    ) {
-        (Some(begin), Some(end)) if begin < end => {
-            let end = end + ANDROID_KEEPS_END.len();
-            let mut body = existing[..begin].to_owned();
-            body.push_str(existing[end..].trim_start_matches('\n'));
-            body
-        }
-        _ => existing,
+    let mut body = if let Some((begin, end)) = managed_block_span(
+        &existing,
+        &rules_path,
+        ANDROID_KEEPS_BEGIN,
+        ANDROID_KEEPS_END,
+    )? {
+        let mut body = existing[..begin].to_owned();
+        body.push_str(existing[end..].trim_start_matches('\n'));
+        body
+    } else {
+        existing
     };
     while body.ends_with("\n\n") {
         body.pop();
@@ -2619,16 +2651,12 @@ pub async fn scan_required_permissions(
         let Some(waterui) = package.metadata.get("waterui") else {
             continue;
         };
-        let parsed: WaterUIMetadata = match serde_json::from_value(waterui.clone()) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                warn!(
-                    "Failed to parse waterui metadata for {}: {error}",
-                    package.name
-                );
-                continue;
-            }
-        };
+        let parsed: WaterUIMetadata = serde_json::from_value(waterui.clone()).map_err(|error| {
+            eyre::eyre!(
+                "crate {} declares malformed `[package.metadata.waterui]`: {error}",
+                package.name
+            )
+        })?;
         let features = enabled_features
             .get(&package.id)
             .cloned()
@@ -2982,25 +3010,25 @@ mod permission_audit_tests {
         assert!(crate::winui::backend::WinUiBackend::in_scope(None));
     }
 
-    /// Writes a real jar so `jar_packages` reads genuine zip entries.
-    fn write_jar(path: &Path, entries: &[&str]) {
-        let file = std::fs::File::create(path).expect("jar file");
-        let mut archive = zip::ZipWriter::new(file);
-        for entry in entries {
-            archive
-                .start_file(*entry, zip::write::SimpleFileOptions::default())
-                .expect("jar entry");
-            std::io::Write::write_all(&mut archive, b"class bytes").expect("jar entry contents");
-        }
-        archive.finish().expect("jar archive");
+    /// The Gradle `dependencies` block markers a generated module ships.
+    const DEPS_MARKERS: &str = "dependencies {\n    // --- begin waterui android classpath dependencies ---\n    // --- end waterui android classpath dependencies ---\n}\n";
+
+    /// Writes a module dir scaffold carrying the managed dependencies block
+    /// the generated modules ship.
+    fn module_dir_with_deps_block(root: &Path) -> PathBuf {
+        let module_dir = root.join("app");
+        std::fs::create_dir_all(&module_dir).expect("module dir");
+        std::fs::write(module_dir.join("build.gradle.kts"), DEPS_MARKERS)
+            .expect("module build script");
+        module_dir
     }
 
     /// A staged classpath lands its Kotlin sources under `src/main/java/waterui/`,
-    /// its jars under `libs/`, and emits an R8 keep per package the staged
-    /// classes live in — the only thing standing between `loadClass` and the
-    /// release build's shrinker.
+    /// its Maven coordinates inside the managed dependencies block, and emits
+    /// an R8 keep per package a staged source lives in — the only thing
+    /// standing between `loadClass` and the release build's shrinker.
     #[test]
-    fn staging_places_sources_jars_and_keep_rules() {
+    fn staging_places_sources_maven_deps_and_keep_rules() {
         let root = tempdir().expect("temp root");
         let crate_dir = root.path().join("crate");
         std::fs::create_dir_all(&crate_dir).expect("crate dir");
@@ -3010,23 +3038,15 @@ mod permission_audit_tests {
             "package waterkit.dialog\n\nobject DialogHelper {}\n",
         )
         .expect("kotlin source");
-        let jar = crate_dir.join("health_connect.jar");
-        write_jar(
-            &jar,
-            &[
-                "androidx/health/connect/client/HealthConnectClient.class",
-                "META-INF/MANIFEST.MF",
-            ],
-        );
-        let module_dir = root.path().join("app");
-        std::fs::create_dir_all(&module_dir).expect("module dir");
+        let module_dir = module_dir_with_deps_block(root.path());
 
         smol::block_on(stage_classpath_files(
             &AndroidClasspath {
                 kotlin_sources: vec![source],
-                jars: vec![jar],
+                maven: BTreeSet::from(["androidx.health.connect:connect-client:1.1.0".to_string()]),
             },
             &module_dir,
+            AndroidDependencyScope::Implementation,
         ))
         .expect("stage classpath");
 
@@ -3035,21 +3055,48 @@ mod permission_audit_tests {
                 .join("src/main/java/waterui/DialogHelper.kt")
                 .is_file()
         );
-        assert!(module_dir.join("libs/health_connect.jar").is_file());
+        let build =
+            std::fs::read_to_string(module_dir.join("build.gradle.kts")).expect("build script");
+        assert!(
+            build.contains("implementation(\"androidx.health.connect:connect-client:1.1.0\")"),
+            "{build}"
+        );
         let rules =
             std::fs::read_to_string(module_dir.join("proguard-rules.pro")).expect("keep rules");
         assert!(
             rules.contains("-keep class waterkit.dialog.** { *; }"),
             "{rules}"
         );
+    }
+
+    /// The embedded AAR module exports its classpath dependencies as `api`
+    /// so consumers resolve them through the published POM.
+    #[test]
+    fn embedded_scope_stages_maven_dependencies_as_api() {
+        let root = tempdir().expect("temp root");
+        let module_dir = module_dir_with_deps_block(root.path());
+
+        smol::block_on(stage_classpath_files(
+            &AndroidClasspath {
+                kotlin_sources: Vec::new(),
+                maven: BTreeSet::from(["androidx.health.connect:connect-client:1.1.0".to_string()]),
+            },
+            &module_dir,
+            AndroidDependencyScope::Api,
+        ))
+        .expect("stage classpath");
+
+        let build =
+            std::fs::read_to_string(module_dir.join("build.gradle.kts")).expect("build script");
         assert!(
-            rules.contains("-keep class androidx.health.connect.client.** { *; }"),
-            "{rules}"
+            build.contains("api(\"androidx.health.connect:connect-client:1.1.0\")"),
+            "{build}"
         );
     }
 
     /// Restaging an empty classpath removes everything an earlier stage left:
-    /// sources, jars, and the managed keep block — never stale classes.
+    /// sources, Maven coordinates, and the managed keep block — never stale
+    /// classes.
     #[test]
     fn restaging_an_empty_classpath_removes_stale_entries() {
         let root = tempdir().expect("temp root");
@@ -3057,20 +3104,21 @@ mod permission_audit_tests {
         std::fs::create_dir_all(&crate_dir).expect("crate dir");
         let source = crate_dir.join("PermissionHelper.kt");
         std::fs::write(&source, "package waterkit.permission\n").expect("kotlin source");
-        let module_dir = root.path().join("app");
-        std::fs::create_dir_all(&module_dir).expect("module dir");
+        let module_dir = module_dir_with_deps_block(root.path());
 
         smol::block_on(stage_classpath_files(
             &AndroidClasspath {
                 kotlin_sources: vec![source],
-                jars: Vec::new(),
+                maven: BTreeSet::from(["androidx.health.connect:connect-client:1.1.0".to_string()]),
             },
             &module_dir,
+            AndroidDependencyScope::Implementation,
         ))
         .expect("stage classpath");
         smol::block_on(stage_classpath_files(
             &AndroidClasspath::default(),
             &module_dir,
+            AndroidDependencyScope::Implementation,
         ))
         .expect("restage empty");
 
@@ -3082,6 +3130,10 @@ mod permission_audit_tests {
             "{rules}"
         );
         assert!(!rules.contains(ANDROID_KEEPS_BEGIN), "{rules}");
+        let build =
+            std::fs::read_to_string(module_dir.join("build.gradle.kts")).expect("build script");
+        assert!(!build.contains("connect-client"), "{build}");
+        assert!(build.contains(ANDROID_DEPS_BEGIN), "{build}");
     }
 
     /// A declared Kotlin source without a `package` directive cannot be kept
@@ -3092,17 +3144,80 @@ mod permission_audit_tests {
         let root = tempdir().expect("temp root");
         let source = root.path().join("NoPackage.kt");
         std::fs::write(&source, "object NoPackage {}\n").expect("kotlin source");
-        let module_dir = root.path().join("app");
-        std::fs::create_dir_all(&module_dir).expect("module dir");
+        let module_dir = module_dir_with_deps_block(root.path());
 
         let error = smol::block_on(stage_classpath_files(
             &AndroidClasspath {
                 kotlin_sources: vec![source],
-                jars: Vec::new(),
+                maven: BTreeSet::new(),
             },
             &module_dir,
+            AndroidDependencyScope::Implementation,
         ))
         .expect_err("a package-less Kotlin source must fail the stage");
         assert!(error.to_string().contains("package"), "{error}");
+    }
+
+    /// A module build script without the managed markers was hand-edited or
+    /// predates the mechanism — error rather than silently skipping the deps.
+    #[test]
+    fn a_module_build_script_without_the_deps_markers_fails() {
+        let root = tempdir().expect("temp root");
+        let module_dir = root.path().join("app");
+        std::fs::create_dir_all(&module_dir).expect("module dir");
+        std::fs::write(module_dir.join("build.gradle.kts"), "dependencies {\n}\n")
+            .expect("module build script");
+
+        let error = smol::block_on(stage_classpath_files(
+            &AndroidClasspath {
+                kotlin_sources: Vec::new(),
+                maven: BTreeSet::from(["androidx.health.connect:connect-client:1.1.0".to_string()]),
+            },
+            &module_dir,
+            AndroidDependencyScope::Implementation,
+        ))
+        .expect_err("a build script without the managed block must fail");
+        assert!(error.to_string().contains("managed"), "{error}");
+    }
+
+    /// A keep file carrying two managed blocks or a dangling begin marker is
+    /// corrupt — error rather than appending a third block.
+    #[test]
+    fn a_malformed_keep_block_fails() {
+        let root = tempdir().expect("temp root");
+        let module_dir = module_dir_with_deps_block(root.path());
+        let rules = module_dir.join("proguard-rules.pro");
+        std::fs::write(
+            &rules,
+            format!("{ANDROID_KEEPS_BEGIN}\n{ANDROID_KEEPS_BEGIN}\n"),
+        )
+        .expect("duplicate keep markers");
+
+        let error = smol::block_on(stage_classpath_files(
+            &AndroidClasspath {
+                kotlin_sources: Vec::new(),
+                maven: BTreeSet::new(),
+            },
+            &module_dir,
+            AndroidDependencyScope::Implementation,
+        ))
+        .expect_err("duplicated keep markers must fail");
+        assert!(error.to_string().contains("more than one"), "{error}");
+
+        std::fs::write(
+            &rules,
+            format!("{ANDROID_KEEPS_BEGIN}\n-keep class x.** {{*;}}\n"),
+        )
+        .expect("unterminated keep marker");
+        let error = smol::block_on(stage_classpath_files(
+            &AndroidClasspath {
+                kotlin_sources: Vec::new(),
+                maven: BTreeSet::new(),
+            },
+            &module_dir,
+            AndroidDependencyScope::Implementation,
+        ))
+        .expect_err("a begin marker without its end must fail");
+        assert!(error.to_string().contains("malformed"), "{error}");
     }
 }

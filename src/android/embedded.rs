@@ -97,12 +97,14 @@ pub async fn build_aar(
     // Assets and fonts ship inside the AAR exactly as they ship inside an APK.
     stage_embedded_assets(project, &module_dir, &built.app_symbols()?).await?;
 
-    // Kotlin helpers and vendored jars likewise belong on the classpath the
-    // host app resolves classes from; the AAR ships the compiled classes.
+    // Kotlin helpers and Maven dependencies likewise belong on the classpath
+    // the host app resolves classes from; `api` exports them through the
+    // published POM so a consumer's build sees them too.
     crate::assets::stage_android_classpath(
         project,
         &project.ffi_crate_path().join("Cargo.toml"),
         &module_dir,
+        crate::assets::AndroidDependencyScope::Api,
     )
     .await?;
 
