@@ -3,6 +3,7 @@
 use std::convert::Infallible;
 use std::ffi::OsString;
 
+#[cfg(target_os = "macos")]
 use eyre::Context as _;
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +99,7 @@ pub async fn development_team_id(host: &Host) -> eyre::Result<String> {
     if let Some(team) = xcode_account_team(host).await {
         return Ok(team);
     }
+    #[cfg(target_os = "macos")]
     for certificate in development_certificates(host).await? {
         if let Some(team) = team_id_in_certificate(&certificate) {
             return Ok(team);
@@ -123,13 +125,6 @@ async fn development_certificates(host: &Host) -> eyre::Result<Vec<Vec<u8>>> {
         .wrap_err("failed to run `security find-certificate`")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(pem_certificate_der(&stdout))
-}
-
-/// Device signing is impossible on a non-Apple host; there is no keychain
-/// to read.
-#[cfg(not(target_os = "macos"))]
-async fn development_certificates(_host: &Host) -> eyre::Result<Vec<Vec<u8>>> {
-    Ok(Vec::new())
 }
 
 /// Every PEM certificate block in `text` decoded to DER.
@@ -165,6 +160,7 @@ fn team_id_in_certificate(der: &[u8]) -> Option<String> {
 }
 
 /// The common-name prefixes Apple's development certificates carry.
+#[cfg(target_os = "macos")]
 pub(crate) fn is_development_certificate_name(common_name: &str) -> bool {
     common_name.contains("Apple Development:")
         || common_name.contains("iPhone Developer:")

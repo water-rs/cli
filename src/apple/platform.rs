@@ -6,7 +6,9 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use eyre::{Context, bail, eyre};
+#[cfg(target_os = "macos")]
+use eyre::eyre;
+use eyre::{Context, bail};
 use smol::fs;
 use tracing::info;
 
@@ -14,6 +16,8 @@ use tracing::info;
 use crate::browser_runtime;
 #[cfg(target_os = "macos")]
 use crate::macos_bundle::{package_cef_helper_app, remove_cef_helper_apps};
+#[cfg(target_os = "macos")]
+use crate::utils::run_command_os;
 use crate::{
     apple::app_bundle,
     apple::backend::AppleBackend,
@@ -24,7 +28,7 @@ use crate::{
     device::Artifact,
     platform::{PackageOptions, TargetBackend, TargetPlatform},
     project::{BrowserRuntimePlan, Project, ResolvedWebViewBackend},
-    utils::{copy_file, run_command_os},
+    utils::copy_file,
 };
 
 /// The generated FFI crate's application binary — the `[[bin]]` target
@@ -287,11 +291,12 @@ pub async fn build_rust_lib(
             "debug"
         })
         .join("deps");
-    let ffi_rlib = deps_dir.join(format!(
-        "lib{}.rlib",
-        project.ffi_crate_name().as_str().replace('-', "_")
-    ));
+    #[cfg(target_os = "macos")]
     if host_library == AppleHostLibrary::Dynamic {
+        let ffi_rlib = deps_dir.join(format!(
+            "lib{}.rlib",
+            project.ffi_crate_name().as_str().replace('-', "_")
+        ));
         // The rlib's codegen units also export `rust_eh_personality`. The
         // copy lives in the build dir and is only consumed by this link, so
         // localize it in place.
@@ -326,6 +331,7 @@ pub async fn build_rust_lib(
     // builtins (`__isPlatformVersionAtLeast` & friends) that resolve
     // against the toolchain's clang runtime — thread the one platform
     // archive, the same supplier Xcode's own link line picks.
+    #[cfg(target_os = "macos")]
     if let Some(suffix) = clang_rt_suffix(platform) {
         let rt_dir = clang_rt_lib_dir(platform).await?;
         executable = executable
@@ -396,6 +402,7 @@ fn link_search_flag(dir: &OsStr) -> String {
 
 /// The platform suffix of the `libclang_rt.<suffix>.a` archive inside the
 /// Xcode toolchain — `None` for non-Apple targets.
+#[cfg(target_os = "macos")]
 const fn clang_rt_suffix(platform: TargetPlatform) -> Option<&'static str> {
     match platform {
         TargetPlatform::MacOS => Some("osx"),
@@ -747,6 +754,7 @@ pub async fn package_apple(
     let backend = project
         .apple_backend()
         .ok_or_else(|| eyre::eyre!("Apple backend must be configured"))?;
+    #[cfg(target_os = "macos")]
     let browser_runtime_plan = project
         .browser_runtime_plan(platform, TargetBackend::Apple)
         .await?;
