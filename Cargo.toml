@@ -107,11 +107,11 @@ remove_dir_all = "1.0"
 # shared types across two sources. The `version` fields are what
 # `cargo publish` keeps after stripping `git`; a release therefore cannot ship
 # until versions carrying those APIs publish.
-waterui-assets-core = { git = "https://github.com/water-rs/waterui", rev = "5dd9dd073bf8b1dcc6484ed42e089125f889fac8", version = "0.5.1", features = ["remote"] }
-waterui-assets-planner = { git = "https://github.com/water-rs/waterui", rev = "5dd9dd073bf8b1dcc6484ed42e089125f889fac8", version = "0.5.1" }
-waterui-preview-protocol = { git = "https://github.com/water-rs/waterui", rev = "5dd9dd073bf8b1dcc6484ed42e089125f889fac8", version = "0.5.1" }
-waterui-inspector-protocol = { git = "https://github.com/water-rs/waterui", rev = "5dd9dd073bf8b1dcc6484ed42e089125f889fac8", version = "0.5.1" }
-waterui-mcp-protocol = { git = "https://github.com/water-rs/waterui", rev = "5dd9dd073bf8b1dcc6484ed42e089125f889fac8", version = "0.5.1" }
+waterui-assets-core = { git = "https://github.com/water-rs/waterui", rev = "ccf9bae741b90929682f1b1d8e41b4df9a131ff5", version = "0.5.1", features = ["remote"] }
+waterui-assets-planner = { git = "https://github.com/water-rs/waterui", rev = "ccf9bae741b90929682f1b1d8e41b4df9a131ff5", version = "0.5.1" }
+waterui-preview-protocol = { git = "https://github.com/water-rs/waterui", rev = "ccf9bae741b90929682f1b1d8e41b4df9a131ff5", version = "0.5.1" }
+waterui-inspector-protocol = { git = "https://github.com/water-rs/waterui", rev = "ccf9bae741b90929682f1b1d8e41b4df9a131ff5", version = "0.5.1" }
+waterui-mcp-protocol = { git = "https://github.com/water-rs/waterui", rev = "ccf9bae741b90929682f1b1d8e41b4df9a131ff5", version = "0.5.1" }
 aither-core = "0.4"
 aither-mcp = { version = "0.4", default-features = false, features = ["server"] }
 # Decodes the base64 image payloads a `tools/call` response carries back from
@@ -176,6 +176,12 @@ nix = { version = "0.31", features = ["process", "signal", "user"] }
 # default would pull a whole JPEG 2000 decoder (hayro-jpeg2000) for entries we
 # never read or emit.
 icns = { version = "0.4", default-features = false, features = ["pngio"] }
+# Device provisioning pairs a provisioning profile with the development
+# certificate it names: `security find-certificate` PEMs are parsed for the
+# subject organizational unit (the team ID) and the profile's
+# `DeveloperCertificates` are matched against `find-identity` SHA-1s.
+x509-parser = "0.18"
+sha1 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -1115,8 +1115,9 @@ impl CreateOptions {
 
 impl Project {
     /// `apple_selected` is whether this invocation selected the Apple backend —
-    /// the companion's `waterui-apple` dependency and entry-owning bin exist
-    /// only then, so an Android build never resolves the Apple backend crate.
+    /// one that did not emits a companion with no `waterui-apple` dependency,
+    /// entry-owning bin, or entry file, and removes a stale entry file a
+    /// previous apple-selected render left behind.
     pub(crate) async fn scaffold_ffi_companion(
         &self,
         apple_selected: bool,
@@ -1152,11 +1153,10 @@ impl Project {
         )
         .with_backend_project_path(self.ffi_crate_path())
         .with_project_root_path(self.root.clone())
+        .with_apple_backend_selected(apple_selected)
         .with_webview_enabled(webview_enabled)
         .with_chromium_enabled(chromium_enabled)
-        .with_browser_engine(browser_engine)
-        .with_ffi_crate_name(self.ffi_crate_name())
-        .with_apple_backend_selected(apple_selected);
+        .with_browser_engine(browser_engine);
 
         templates::ffi::scaffold(&self.ffi_crate_path(), &ctx, &self.ffi_crate_name())
             .await
@@ -2859,12 +2859,28 @@ mod scaffold_tests {
         }
     }
 
-    /// The ffi companion is rendered for this invocation's selection before
-    /// any backend init reads it: a project that declares `[backends.apple]`
-    /// but opens for Android must not see a companion still carrying
-    /// `waterui-apple` from an earlier apple-selected open — the Android
-    /// backend runs `cargo metadata` on that manifest and a stale path
-    /// dependency wedges it.
+    /// Write a stub crate at `dir` whose manifest declares `features` — cargo
+    /// validates every `dep/feature` a manifest forwards, so the stubs cover
+    /// the feature sets the generated manifests name.
+    fn write_vendor_stub(dir: &Path, name: &str, features: &[&str]) {
+        std::fs::create_dir_all(dir.join("src")).expect("stub crate dir");
+        let mut stub_manifest = toml_edit::DocumentMut::new();
+        stub_manifest["package"]["name"] = toml_edit::value(name);
+        stub_manifest["package"]["version"] = toml_edit::value("0.4.1");
+        stub_manifest["package"]["edition"] = toml_edit::value("2021");
+        for feature in features {
+            stub_manifest["features"][feature] = toml_edit::value(toml_edit::Array::new());
+        }
+        std::fs::write(dir.join("Cargo.toml"), stub_manifest.to_string()).expect("stub manifest");
+        std::fs::write(dir.join("src/lib.rs"), "").expect("stub lib");
+    }
+
+    /// An ffi companion a previous apple-selected render left behind — a
+    /// manifest naming `waterui-apple` plus the entry-owning bin file — is
+    /// re-rendered for THIS invocation's selection before the backend reads
+    /// it: an android open must produce a companion with no `waterui-apple`
+    /// pieces, or the backend's `cargo metadata` audit either resolves the
+    /// Apple backend for a build that never uses it or fails on its source.
     #[test]
     fn android_open_re_renders_a_stale_apple_ffi_manifest_before_backend_init() {
         use crate::platform::TargetPlatform;
@@ -2884,13 +2900,19 @@ mod scaffold_tests {
             toml_edit::value(missing_apple.to_string_lossy().as_ref());
         std::fs::write(&water_toml, document.to_string()).expect("declare the apple backend");
 
-        // The stale companion an earlier apple-selected open left behind: a
-        // manifest carrying a `waterui-apple` path dependency that no longer
-        // resolves, so `cargo metadata` on it fails.
-        let ffi_dir = smol::block_on(crate::water_dir::project_build_cache_dir(&root))
+        // Shape the build cache before seeding: `ensure_project_build_cache`
+        // records the project root and this CLI's commit in its metadata and
+        // wipes any cache directory whose metadata does not match, so only a
+        // companion left inside a shaped cache survives to the
+        // `ffi_companion_preexisting` check that arms the backend's audit.
+        let ffi_dir = smol::block_on(crate::water_dir::ensure_project_build_cache(&root))
             .expect("build cache dir")
             .join("ffi");
-        std::fs::create_dir_all(ffi_dir.join("src")).expect("stale ffi dir");
+
+        // The stale companion an earlier apple-selected open left behind: a
+        // manifest carrying a `waterui-apple` path dependency that no longer
+        // resolves plus the entry file, so `cargo metadata` on it fails.
+        std::fs::create_dir_all(ffi_dir.join("src/bin")).expect("stale ffi dir");
         let mut stale_ffi = toml_edit::DocumentMut::new();
         stale_ffi["package"]["name"] = toml_edit::value("water-example-ffi");
         stale_ffi["package"]["version"] = toml_edit::value("0.1.0");
@@ -2900,29 +2922,58 @@ mod scaffold_tests {
         std::fs::write(ffi_dir.join("Cargo.toml"), stale_ffi.to_string())
             .expect("seed the stale ffi manifest");
         std::fs::write(ffi_dir.join("src/lib.rs"), "").expect("seed the stale ffi lib");
+        std::fs::write(ffi_dir.join("src/bin/waterui-apple-main.rs"), "")
+            .expect("seed the stale apple entry file");
 
         // The backend audits the re-rendered manifest with `cargo metadata`,
         // and the fixture's registry pins resolve to local stubs so the test
-        // runs without a crates.io index.
-        for (name, dir_name) in [("waterui-ffi", "waterui-ffi"), ("waterui", "waterui")] {
-            let stub = ffi_dir.join("vendor").join(dir_name);
-            std::fs::create_dir_all(stub.join("src")).expect("stub crate dir");
-            let mut stub_manifest = toml_edit::DocumentMut::new();
-            stub_manifest["package"]["name"] = toml_edit::value(name);
-            stub_manifest["package"]["version"] = toml_edit::value("0.4.1");
-            stub_manifest["package"]["edition"] = toml_edit::value("2021");
-            std::fs::write(stub.join("Cargo.toml"), stub_manifest.to_string())
-                .expect("stub manifest");
-            std::fs::write(stub.join("src/lib.rs"), "").expect("stub lib");
+        // runs without a crates.io index. `[patch]` only applies at the
+        // resolution's workspace root, so the generated manifest carries it
+        // via the same propagation the render applies to a real project's
+        // `[patch.crates-io]` table.
+        for (name, features) in [
+            ("waterui", &["dynamic_linking", "media"][..]),
+            (
+                "waterui-ffi",
+                &[
+                    "android-jni",
+                    "c-api",
+                    "chromium",
+                    "gpu",
+                    "map",
+                    "media",
+                    "video",
+                    "webview",
+                    "webview-cef",
+                ][..],
+            ),
+        ] {
+            write_vendor_stub(&dir.path().join("vendor").join(name), name, features);
         }
-        std::fs::create_dir_all(ffi_dir.join(".cargo")).expect("cargo config dir");
-        let mut patch_config = toml_edit::DocumentMut::new();
-        patch_config["patch"]["crates-io"]["waterui-ffi"]["path"] =
-            toml_edit::value("../vendor/waterui-ffi");
-        patch_config["patch"]["crates-io"]["waterui"]["path"] =
-            toml_edit::value("../vendor/waterui");
-        std::fs::write(ffi_dir.join(".cargo/config.toml"), patch_config.to_string())
-            .expect("patch config");
+        let manifest_path = root.join("Cargo.toml");
+        let mut document: toml_edit::DocumentMut = std::fs::read_to_string(&manifest_path)
+            .expect("project Cargo.toml exists")
+            .parse()
+            .expect("project Cargo.toml parses");
+        for name in ["waterui", "waterui-ffi"] {
+            document["patch"]["crates-io"][name]["path"] = toml_edit::value(
+                dir.path()
+                    .join("vendor")
+                    .join(name)
+                    .to_string_lossy()
+                    .as_ref(),
+            );
+        }
+        std::fs::write(&manifest_path, document.to_string()).expect("write the patch table");
+
+        // `Project::open` resolves the project's layout with `cargo metadata
+        // --locked`, which refuses a lock that no longer matches the manifest;
+        // a plain offline resolve records the patched sources in the lock.
+        cargo_metadata::MetadataCommand::new()
+            .manifest_path(&manifest_path)
+            .other_options(vec!["--offline".to_string()])
+            .exec()
+            .expect("offline metadata resolves the patched project");
 
         let project = smol::block_on(Project::open(
             &root,

@@ -6,6 +6,8 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use eyre::eyre;
 use eyre::{Context, bail};
 use smol::fs;
 use tracing::info;
@@ -13,7 +15,9 @@ use tracing::info;
 #[cfg(target_os = "macos")]
 use crate::browser_runtime;
 #[cfg(target_os = "macos")]
-use crate::macos_bundle::package_cef_helper_app;
+use crate::macos_bundle::{package_cef_helper_app, remove_cef_helper_apps};
+#[cfg(target_os = "macos")]
+use crate::utils::run_command_os;
 use crate::{
     apple::app_bundle,
     apple::backend::AppleBackend,
@@ -38,7 +42,7 @@ pub const APPLE_ENTRY_BINARY_NAME: &str = "waterui-apple-main";
 // Build Utilities
 // ============================================================================
 
-/// The library shape an Apple build hands to the final link.
+/// The library shape an Apple build hands to Xcode.
 ///
 /// A packaged app links the runtime into itself and needs a self-contained archive. A
 /// development build resolves the runtime from `libwaterui_dylib.dylib` at load time, so
@@ -71,7 +75,7 @@ impl AppleHostLibrary {
         }
     }
 
-    /// File name the built library is staged under for the host image.
+    /// Name Xcode links against, via `-lwaterui_app` in `OTHER_LDFLAGS`.
     const fn linked_file_name(self) -> &'static str {
         match self {
             Self::Archive => "libwaterui_app.a",
@@ -157,129 +161,11 @@ async fn apple_ffi_build_features(
     Ok(features)
 }
 
-/// Stage the built host library (and, for the shared runtime, the runtime
-/// itself) into `output_dir` before the executable links: it resolves the
-/// Swift seam's callbacks into the app (`_waterui_init`, `_waterui_app`)
-/// and into `libwaterui_dylib` against these very files, and a `DT_NEEDED`
-/// entry records the install name it found — so the staged copy must
-/// already carry its final one.
-///
-/// # Errors
-/// Returns an error if copying or install-name surgery fails.
-async fn stage_apple_host_library(
-    project: &Project,
-    options: &BuildOptions,
-    built_target: &BuiltTarget,
-    triple: &target_lexicon::Triple,
-    host_library: AppleHostLibrary,
-) -> eyre::Result<()> {
-    let Some(output_dir) = options.output_dir() else {
-        return Ok(());
-    };
-    fs::create_dir_all(output_dir).await?;
-    let dest_lib = output_dir.join(host_library.linked_file_name());
-    copy_file(&built_target.artifact, &dest_lib).await?;
-    remove_superseded_host_library(output_dir, host_library).await?;
-    if options.linkage() == RustLinkage::SharedRuntime {
-        let libraries = RustDynamicLibraries::resolve(built_target, triple, project).await?;
-        libraries.stage(output_dir).await?;
-        let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
-        if host_library == AppleHostLibrary::Dynamic {
-            // The app library records the runtime's cargo-written install
-            // name; retarget while the canonical copy still carries it.
-            dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
-            // The executable binds the app dylib by its install name.
-            dynamic_runtime::canonicalize_install_name(&dest_lib).await?;
-        }
-        dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
-    }
-    Ok(())
-}
-
-/// The `-Clink-arg`s the entry-owning executable links with.
-///
-/// The Swift seam's callbacks into the app (`_waterui_init`, `_waterui_app`)
-/// resolve inside the one image: the bin's own source delegates to the
-/// library's `app`, so its `rlib` is a live `--extern` in the normal
-/// left-to-right archive scan, and `-Wl,-u` marks both callbacks undefined
-/// so their members are extracted there — every dependency they pull then
-/// resolves in the same pass. What must never join the line is
-/// `libwaterui_app.a`: an archive that bundles the whole dependency graph,
-/// so its `__objc_classlist` entries register every `ObjC` class a second
-/// time. The dynamic mode additionally re-asks for the same `rlib` behind
-/// the seam — its dependencies are dylibs then, immune to scan order.
-fn apple_entry_link_args(
-    seam_library_dir: &OsStr,
-    host_library: AppleHostLibrary,
-    ffi_rlib: &Path,
-    runtime_dir: &OsStr,
-) -> Vec<String> {
-    let mut args = vec![
-        "-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks".to_string(),
-        "-Clink-arg=-Wl,-rpath,@executable_path/Frameworks".to_string(),
-        "-Clink-arg=-lc++".to_string(),
-        "-Clink-arg=-framework".to_string(),
-        "-Clink-arg=VideoToolbox".to_string(),
-    ];
-    // `-u` keeps each callback's archive member in the image so the seam
-    // archive resolves them during the left-to-right pass; it must precede
-    // `-lWaterUISwift` on the line.
-    for symbol in swift_seam::APP_SEAM_CALLBACK_SYMBOLS {
-        args.push(format!("-Clink-arg=-Wl,-u,_{symbol}"));
-    }
-    args.extend([
-        link_search_flag(seam_library_dir),
-        "-Clink-arg=-lWaterUISwift".to_string(),
-    ]);
-    if host_library == AppleHostLibrary::Dynamic {
-        args.push(link_file_arg(ffi_rlib));
-        args.push(link_search_flag(runtime_dir));
-        args.push("-Clink-arg=-lwaterui_dylib".to_string());
-    }
-    args
-}
-
-/// Build the entry-owning executable and, when the manifest declared it,
-/// the CEF subprocess helper.
-///
-/// # Errors
-/// Returns an error if either `cargo` invocation fails.
-async fn build_entry_binaries(
-    project: &Project,
-    build: &RustBuild,
-    link_args: Vec<String>,
-    release: bool,
-) -> eyre::Result<()> {
-    let mut executable = build.clone();
-    for arg in link_args {
-        executable = executable.with_final_rustc_arg(arg);
-    }
-    executable
-        .build_binary(APPLE_ENTRY_BINARY_NAME, release)
-        .await?;
-
-    // The helper `[[bin]]` exists only when the manifest declared it — the
-    // application's linked engine, not chromium alone — so the build gates
-    // on the manifest's own predicate or Cargo reports `no bin target`.
-    if project.declares_cef_helper().await? {
-        build
-            .clone()
-            .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
-            .build_binary(
-                &crate::project_model::project_types::cef_helper_binary_name(
-                    project.ffi_crate_name().as_str(),
-                ),
-                release,
-            )
-            .await?;
-    }
-    Ok(())
-}
-
 /// Build Rust library for an Apple platform.
 ///
 /// # Errors
 /// Returns an error if the Rust build fails or the expected Apple archive cannot be copied.
+#[allow(clippy::too_many_lines)]
 pub async fn build_rust_lib(
     project: &Project,
     platform: TargetPlatform,
@@ -306,7 +192,6 @@ pub async fn build_rust_lib(
         .with_features(
             apple_ffi_build_features(project, browser_runtime_plan, options.linkage()).await?,
         )
-        .with_crate_type_override(host_library.crate_type())
         .with_envs(options.cargo_envs().iter().cloned());
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
@@ -322,11 +207,20 @@ pub async fn build_rust_lib(
         apple_deployment_target(project, platform).await?;
     build = build.with_env(deployment_environment, deployment_target.clone());
     if options.linkage() == RustLinkage::SharedRuntime {
-        build = build.with_preferred_dynamic_linking();
+        build = build
+            .with_preferred_dynamic_linking()
+            // The seam between `waterui-apple` and the app target is
+            // circular by design: the dylib calls `waterui_swift_*` entry
+            // points the Swift package implements inside the application
+            // binary, resolved at load time — the same callback shape the
+            // ObjC runtime uses everywhere else. Without dynamic lookup the
+            // dylib's own link step demands the symbols up front and fails.
+            .with_final_rustc_arg("-Clink-arg=-Wl,-undefined,dynamic_lookup");
     }
 
-    // The backend's Swift seam (`Sources/WaterUI`) compiles into a static
-    // archive the application executable links. A `cdylib`
+    // The backend's Swift seam (`Sources/WaterUI`) was compiled by the
+    // generated Xcode project; entry-owning packaging compiles it into a
+    // static archive the application executable links instead. A `cdylib`
     // keeps the host-provides-the-seam contract: the ffi crate's own build
     // script leaves its `waterui_swift_*` references explicitly undefined,
     // and they resolve against the image that loaded it.
@@ -335,9 +229,60 @@ pub async fn build_rust_lib(
 
     let target_dir = project.water_target_dir(options.linkage()).await?;
     let build = build.with_target_dir(target_dir.clone());
-    let built_target = build.build_lib(options.is_release()).await?;
-    stage_apple_host_library(project, &options, &built_target, &triple, host_library).await?;
+    let built_target = match host_library {
+        // The shared runtime's lib build emits every crate type the
+        // manifest declares — not a `--crate-type` selection, which
+        // writes only the chosen artifact — because this build feeds
+        // two consumers: the staged cdylib and the unhashed
+        // `deps/lib<ffi>.rlib` that `localize_archive_symbols` edits
+        // below and the entry binary's `--extern` resolves. Selecting
+        // `cdylib` alone leaves the rlib unwritten on a clean target
+        // dir; the dylib is picked out of Cargo's report by extension.
+        AppleHostLibrary::Dynamic => build.build_dylib(options.is_release()).await?,
+        AppleHostLibrary::Archive => {
+            build
+                .clone()
+                .with_crate_type_override(host_library.crate_type())
+                .build_lib(options.is_release())
+                .await?
+        }
+    };
 
+    // Stage the host library (and, for the shared runtime, the runtime itself)
+    // before the executable links: it resolves the Swift seam's callbacks into
+    // the app (`_waterui_init`, `_waterui_app`) and into `libwaterui_dylib`
+    // against these very files, and a `DT_NEEDED` entry records the install
+    // name it found — so the staged copy must already carry its final one.
+    if let Some(output_dir) = options.output_dir() {
+        fs::create_dir_all(output_dir).await?;
+        let dest_lib = output_dir.join(host_library.linked_file_name());
+        copy_file(&built_target.artifact, &dest_lib).await?;
+        remove_superseded_host_library(output_dir, host_library).await?;
+        if options.linkage() == RustLinkage::SharedRuntime {
+            let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
+            libraries.stage(output_dir).await?;
+            let staged_runtime = libraries.stage_apple_canonical(output_dir).await?;
+            if host_library == AppleHostLibrary::Dynamic {
+                // The app library records the runtime's cargo-written install
+                // name; retarget while the canonical copy still carries it.
+                dynamic_runtime::retarget_module(&dest_lib, &staged_runtime).await?;
+                // The executable binds the app dylib by its install name.
+                dynamic_runtime::canonicalize_install_name(&dest_lib).await?;
+            }
+            dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
+        }
+    }
+
+    // The Swift seam's callbacks into the app (`_waterui_init`,
+    // `_waterui_app`) and every `waterui_*` export resolve inside the one
+    // image through the entry binary's own lib dependency: the bin uses the
+    // companion crate, so Cargo threads its rlib into this link as crate
+    // metadata — which also carries the `#[link]` native dependencies the
+    // graph declares (frameworks like MapKit that a bare archive input
+    // would silently drop). A second `libwaterui_app.dylib` would register
+    // every ObjC class twice, so the shared-runtime build takes the crate's
+    // objects from that same rlib rather than a dylib of its own.
+    let staged_dir = options.output_dir().map(PathBuf::from);
     let deps_dir = target_dir
         .join(&target)
         .join(if options.is_release() {
@@ -346,25 +291,79 @@ pub async fn build_rust_lib(
             "debug"
         })
         .join("deps");
-    let ffi_rlib = deps_dir.join(format!(
-        "lib{}.rlib",
-        project.ffi_crate_name().as_str().replace('-', "_")
-    ));
-    let runtime_dir = options
-        .output_dir()
-        .map_or_else(|| deps_dir.clone(), PathBuf::from);
-    build_entry_binaries(
+    #[cfg(target_os = "macos")]
+    if host_library == AppleHostLibrary::Dynamic {
+        let ffi_rlib = deps_dir.join(format!(
+            "lib{}.rlib",
+            project.ffi_crate_name().as_str().replace('-', "_")
+        ));
+        // The rlib's codegen units also export `rust_eh_personality`. The
+        // copy lives in the build dir and is only consumed by this link, so
+        // localize it in place.
+        localize_archive_symbols(&ffi_rlib, &["rust_eh_personality"]).await?;
+    }
+
+    let mut executable = build
+        .clone()
+        .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
+        .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/Frameworks")
+        .with_final_rustc_arg("-Clink-arg=-lc++")
+        .with_final_rustc_arg(link_search_flag(&seam_library_dir))
+        .with_final_rustc_arg("-Clink-arg=-lWaterUISwift");
+
+    // VideoToolbox serves the media codec chain (`waterkit-codec`'s hardware
+    // decode); an app without the media capability never loads it, so it
+    // joins the link line only when the resolved graph says so — the same
+    // predicate that selects the `media` FFI surface.
+    if crate::project_model::assets::capability_enabled(
         project,
-        &build,
-        apple_entry_link_args(
-            &seam_library_dir,
-            host_library,
-            &ffi_rlib,
-            runtime_dir.as_os_str(),
-        ),
-        options.is_release(),
+        &project.ffi_crate_path().join("Cargo.toml"),
+        "media",
     )
-    .await?;
+    .await?
+    {
+        executable = executable
+            .with_final_rustc_arg("-Clink-arg=-framework")
+            .with_final_rustc_arg("-Clink-arg=VideoToolbox");
+    }
+
+    // The companion archive's Swift-compiled objects reference clang
+    // builtins (`__isPlatformVersionAtLeast` & friends) that resolve
+    // against the toolchain's clang runtime — thread the one platform
+    // archive, the same supplier Xcode's own link line picks.
+    #[cfg(target_os = "macos")]
+    if let Some(suffix) = clang_rt_suffix(platform) {
+        let rt_dir = clang_rt_lib_dir(platform).await?;
+        executable = executable
+            .with_final_rustc_arg(link_search_flag(rt_dir.as_os_str()))
+            .with_final_rustc_arg(format!("-Clink-arg=-lclang_rt.{suffix}"));
+    }
+
+    if host_library == AppleHostLibrary::Dynamic {
+        let runtime_dir = staged_dir.clone().unwrap_or(deps_dir);
+        executable = executable
+            .with_final_rustc_arg(link_search_flag(runtime_dir.as_os_str()))
+            .with_final_rustc_arg("-Clink-arg=-lwaterui_dylib");
+    }
+    executable
+        .build_binary(APPLE_ENTRY_BINARY_NAME, options.is_release())
+        .await?;
+
+    // The helper `[[bin]]` exists only when the manifest declared it — the
+    // application's linked engine, not chromium alone — so the build gates
+    // on the manifest's own predicate or Cargo reports `no bin target`.
+    if project.declares_cef_helper().await? {
+        build
+            .clone()
+            .with_final_rustc_arg("-Clink-arg=-Wl,-rpath,@executable_path/../Frameworks")
+            .build_binary(
+                &crate::project_model::project_types::cef_helper_binary_name(
+                    project.ffi_crate_name().as_str(),
+                ),
+                options.is_release(),
+            )
+            .await?;
+    }
 
     Ok(built_target)
 }
@@ -401,10 +400,135 @@ fn link_search_flag(dir: &OsStr) -> String {
     flag.to_string_lossy().into_owned()
 }
 
-fn link_file_arg(path: &Path) -> String {
-    let mut flag = OsString::from("-Clink-arg=");
-    flag.push(path.as_os_str());
-    flag.to_string_lossy().into_owned()
+/// The platform suffix of the `libclang_rt.<suffix>.a` archive inside the
+/// Xcode toolchain — `None` for non-Apple targets.
+#[cfg(target_os = "macos")]
+const fn clang_rt_suffix(platform: TargetPlatform) -> Option<&'static str> {
+    match platform {
+        TargetPlatform::MacOS => Some("osx"),
+        TargetPlatform::IOS => Some("ios"),
+        TargetPlatform::IOSSimulator => Some("iossim"),
+        TargetPlatform::TvOS => Some("tvos"),
+        TargetPlatform::TvOSSimulator => Some("tvossim"),
+        TargetPlatform::WatchOS => Some("watchos"),
+        TargetPlatform::WatchOSSimulator => Some("watchossim"),
+        TargetPlatform::VisionOS => Some("xros"),
+        TargetPlatform::VisionOSSimulator => Some("xrossim"),
+        TargetPlatform::Android
+        | TargetPlatform::Linux
+        | TargetPlatform::Windows
+        | TargetPlatform::Web
+        | TargetPlatform::Esp32S3
+        | TargetPlatform::Esp32C3
+        | TargetPlatform::Esp32P4 => None,
+    }
+}
+
+/// Turns `symbols` (C names without the Mach-O underscore) into local
+/// symbols inside every archive member that defines them as global text.
+/// The archive keeps every member — only the symbol's visibility changes —
+/// so the symbols still resolve for the member's own internal references
+/// while stopping `ld`'s duplicate-symbol diagnostics.
+#[cfg(target_os = "macos")]
+async fn localize_archive_symbols(archive: &Path, symbols: &[&str]) -> eyre::Result<()> {
+    let scratch = archive.with_extension("localize-work");
+    fs::create_dir_all(&scratch).await?;
+    let members = run_command_os(
+        "ar",
+        ["t".into(), archive.as_os_str().to_owned()].map(OsString::from),
+    )
+    .await?;
+    for member in members
+        .lines()
+        .map(str::trim)
+        .filter(|member| !member.is_empty() && *member != "__.SYMDEF")
+    {
+        let member_path = scratch.join(member);
+        run_command_os(
+            "sh",
+            [
+                OsString::from("-c"),
+                OsString::from(format!(
+                    "ar p '{}' '{}' > '{}'",
+                    archive.display(),
+                    member,
+                    member_path.display()
+                )),
+            ],
+        )
+        .await?;
+        let nm = run_command_os("nm", [member_path.as_os_str().to_owned()])
+            .await
+            .unwrap_or_default();
+        let mut args = vec![member_path.as_os_str().to_owned()];
+        let mut changed = false;
+        for symbol in symbols {
+            if nm
+                .lines()
+                .any(|line| line.contains(&format!(" T _{symbol}")))
+            {
+                args.push("-unexported_symbol".into());
+                args.push(format!("_{symbol}").into());
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        args.push("-o".into());
+        args.push(member_path.as_os_str().to_owned());
+        run_command_os("ld", std::iter::once(OsString::from("-r")).chain(args)).await?;
+        run_command_os(
+            "ar",
+            [
+                "r".into(),
+                archive.as_os_str().to_owned(),
+                member_path.as_os_str().to_owned(),
+            ]
+            .map(OsString::from),
+        )
+        .await?;
+    }
+    let _ = fs::remove_dir_all(&scratch).await;
+    Ok(())
+}
+
+/// `<toolchain>/usr/lib/clang/<ver>/lib/darwin` — resolved from the clang
+/// the platform's SDK picks (`xcrun --find clang` → `usr/bin/clang`), so a
+/// toolchain upgrade moves the versioned directory with it.
+#[cfg(target_os = "macos")]
+async fn clang_rt_lib_dir(platform: TargetPlatform) -> eyre::Result<PathBuf> {
+    use smol::stream::StreamExt as _;
+    let sdk_name = platform
+        .sdk_name()
+        .ok_or_else(|| eyre!("Platform {platform:?} is not an Apple platform"))?;
+    let clang = run_command_os(
+        "xcrun",
+        ["--sdk", sdk_name, "--find", "clang"].map(OsString::from),
+    )
+    .await
+    .map(|stdout| PathBuf::from(stdout.trim()))
+    .wrap_err("xcrun could not resolve clang")?;
+    let usr_dir = clang.parent().and_then(Path::parent).ok_or_else(|| {
+        eyre!(
+            "xcrun resolved clang outside a toolchain: {}",
+            clang.display()
+        )
+    })?;
+    // `usr/lib/clang/<version>/lib/darwin` — the toolchain carries exactly
+    // one versioned directory.
+    let clang_lib = usr_dir.join("lib/clang");
+    let mut entries = fs::read_dir(&clang_lib).await?;
+    while let Some(entry) = entries.next().await {
+        let darwin = entry?.path().join("lib/darwin");
+        if darwin.is_dir() {
+            return Ok(darwin);
+        }
+    }
+    bail!(
+        "Xcode toolchain at {} has no lib/clang/<ver>/lib/darwin",
+        clang_lib.display()
+    )
 }
 
 /// Compile the backend's Swift seam into `DerivedData/SwiftSeam` and return
@@ -440,9 +564,10 @@ async fn apple_swift_seam_dir(
 
 /// The deployment targets the Apple backend supports, as `SEMVER` strings.
 ///
-/// Entry-owning packaging has no project file, so they are declared here
-/// next to the backend that owns them — the same values `Package.swift` in
-/// `apple-backend` publishes.
+/// These were `*_DEPLOYMENT_TARGET` build settings in the generated Xcode
+/// project; entry-owning packaging has no project file, so they are declared
+/// here next to the backend that owns them — the same values `Package.swift`
+/// in `apple-backend` publishes.
 const fn apple_deployment_target_for(platform: TargetPlatform) -> Option<&'static str> {
     match platform {
         TargetPlatform::MacOS
@@ -660,8 +785,9 @@ pub async fn package_apple(
     )
     .await?;
 
-    // "Debug-iphonesimulator"-style product configuration names keep
-    // `simctl`/`devicectl` installs pointed at a stable location.
+    // Xcode used "Debug-iphonesimulator"-style product configuration names;
+    // the same layout keeps `simctl`/`devicectl` installs pointed at a stable
+    // location.
     let products_config = if sdk_name == "macosx" {
         configuration.to_string()
     } else {
@@ -673,6 +799,12 @@ pub async fn package_apple(
         .join(&products_config);
     let product_name = crate::apple::backend::apple_product_name(project)?.to_string();
     let app_path = products_dir.join(format!("{product_name}.app"));
+
+    #[cfg(target_os = "macos")]
+    if platform == TargetPlatform::MacOS {
+        browser_runtime::remove_macos_app(&app_path.join("Contents")).await?;
+        remove_cef_helper_apps(&app_path, &product_name).await?;
+    }
 
     let ctx = AppleBackend::template_context(project).await?;
     let layout = app_bundle::AppleAppLayout::for_app(&app_path, sdk_name);
@@ -821,32 +953,4 @@ pub const fn is_apple_platform(platform: TargetPlatform) -> bool {
             | TargetPlatform::VisionOS
             | TargetPlatform::VisionOSSimulator
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-    use std::path::Path;
-
-    #[test]
-    fn entry_link_args_mark_every_seam_callback_undefined_before_the_archive() {
-        let args = super::apple_entry_link_args(
-            OsStr::new("/seam"),
-            super::AppleHostLibrary::Archive,
-            Path::new("/deps/libffi.rlib"),
-            OsStr::new("/runtime"),
-        );
-        let seam = args
-            .iter()
-            .position(|arg| arg == "-Clink-arg=-lWaterUISwift")
-            .expect("the seam archive is linked");
-        for symbol in crate::apple::swift_seam::APP_SEAM_CALLBACK_SYMBOLS {
-            let flag = format!("-Clink-arg=-Wl,-u,_{symbol}");
-            let position = args
-                .iter()
-                .position(|arg| arg == &flag)
-                .unwrap_or_else(|| panic!("missing {flag}"));
-            assert!(position < seam, "{flag} must precede -lWaterUISwift");
-        }
-    }
 }

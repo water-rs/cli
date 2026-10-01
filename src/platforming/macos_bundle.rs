@@ -127,16 +127,20 @@ pub async fn package_binary_as_app(
     Ok(app_dir)
 }
 
-/// Signs a local macOS app bundle with an installed development identity.
+/// Signs a local macOS app bundle, preferring an installed development
+/// identity and falling back to ad-hoc signing when none exists.
 ///
-/// Apps declaring protected-resource usage descriptions require a stable
-/// identity so macOS can persist privacy grants across local rebuilds. Apps
-/// without protected resources use ad-hoc signing when no identity is installed.
+/// TCC records privacy grants against the code signature: an installed
+/// identity keeps grants valid across rebuilds, while an ad-hoc signature
+/// changes with every build and re-prompts. Apps declaring protected-resource
+/// usage descriptions therefore use the first installed identity when one is
+/// available; without one they are still signed ad hoc — the OS accepts it,
+/// only grant persistence is lost.
 ///
 /// # Errors
 ///
-/// Returns an error when a protected-resource app has no development identity,
-/// or when `security`/`codesign` cannot inspect or sign the assembled bundle.
+/// Returns an error when `security`/`codesign` cannot inspect or sign the
+/// assembled bundle.
 #[cfg(target_os = "macos")]
 pub async fn sign_macos_app(
     app_path: &Path,
@@ -154,11 +158,16 @@ pub async fn sign_macos_app(
     )
     .await?;
     let identity = if requires_stable_identity {
-        first_codesigning_identity(&identities).ok_or_else(|| {
-            eyre::eyre!(
-                "macOS apps using protected resources require an installed code-signing identity"
-            )
-        })?
+        first_codesigning_identity(&identities).map_or_else(
+            || {
+                tracing::warn!(
+                    "no code-signing identity installed; signing ad hoc — \
+                     privacy grants will be requested again after every rebuild"
+                );
+                "-"
+            },
+            |identity| identity,
+        )
     } else {
         "-"
     };
@@ -359,6 +368,24 @@ pub async fn package_cef_helper_app(
     Ok(helper_dirs)
 }
 
+/// Removes CEF helper applications added after a previous macOS build.
+///
+/// # Errors
+///
+/// Returns an error when an existing helper application cannot be removed.
+#[cfg(target_os = "macos")]
+pub async fn remove_cef_helper_apps(app_dir: &Path, executable_name: &str) -> eyre::Result<()> {
+    let frameworks_dir = app_dir.join("Contents/Frameworks");
+    for (name_suffix, _) in CEF_HELPER_VARIANTS {
+        let helper_name = format!("{executable_name} Helper{name_suffix}.app");
+        let helper_dir = frameworks_dir.join(helper_name);
+        if helper_dir.exists() {
+            fs::remove_dir_all(helper_dir).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn copy_dir(from: &Path, to: &Path) -> eyre::Result<()> {
     let source = from.to_path_buf();
     let destination = to.to_path_buf();
@@ -383,7 +410,7 @@ async fn copy_dir(from: &Path, to: &Path) -> eyre::Result<()> {
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 
-    use super::{first_codesigning_identity, package_cef_helper_app};
+    use super::{first_codesigning_identity, package_cef_helper_app, remove_cef_helper_apps};
 
     #[test]
     fn parses_first_valid_codesigning_identity() {
@@ -485,6 +512,13 @@ mod tests {
                 .expect("renderer helper plist must be readable");
             assert!(renderer_plist.contains("browser Helper (Renderer)"));
             assert!(renderer_plist.contains("dev.waterui.browser.helper.renderer"));
+
+            remove_cef_helper_apps(&app, "browser")
+                .await
+                .expect("CEF helpers must be removable before an incremental build");
+            for helper in helpers {
+                assert!(!helper.exists());
+            }
         });
     }
 }

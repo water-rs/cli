@@ -266,7 +266,7 @@ fn apply_mobile_plist_entries(
     let mut scene_manifest = plist::Dictionary::new();
     scene_manifest.insert(
         "UIApplicationSupportsMultipleScenes".to_string(),
-        plist::Value::Boolean(false),
+        plist::Value::Boolean(true),
     );
     scene_manifest.insert(
         "UISceneConfigurations".to_string(),
@@ -590,12 +590,13 @@ async fn sign_device_app(
     let host = Host::current();
     let bundle_id = project.bundle_identifier();
     let team = crate::apple::toolchain::development_team_id(&host).await?;
-    let identity = development_identity(&host, &team).await?;
     let profile = find_development_profile(&host, &team, bundle_id).await?;
+    let profile_data = decode_profile(&host, &profile).await?;
+    let identity = development_identity(&host, &team, &profile, &profile_data).await?;
 
     copy_file(&profile, layout.app_path.join("embedded.mobileprovision")).await?;
 
-    let mut entitlements = profile_entitlements(&profile).await?;
+    let mut entitlements = profile_entitlements(&profile, &profile_data)?;
     if entitlements_path.is_file()
         && let plist::Value::Dictionary(project_entitlements) =
             plist::Value::from_file(entitlements_path).wrap_err_with(|| {
@@ -650,41 +651,91 @@ async fn sign_device_app(
     bail!("Apple device signing requires macOS (codesign and the provisioning profiles live there)")
 }
 
-/// The `Apple Development` certificate sha-1 in the keychain for `team`, from
+/// The keychain development identity `profile` was issued for, from
 /// `security find-identity -v -p codesigning`.
+///
+/// Xcode pairs a provisioning profile with the `Apple Development`
+/// certificate listed in its `DeveloperCertificates`; `find-identity`
+/// reports the same certificate SHA-1 for each keychain identity, so the
+/// identity whose hash the profile names is the one `codesign` should
+/// use.
 #[cfg(target_os = "macos")]
-async fn development_identity(host: &Host, team: &str) -> eyre::Result<String> {
+async fn development_identity(
+    host: &Host,
+    team: &str,
+    profile: &Path,
+    profile_data: &plist::Dictionary,
+) -> eyre::Result<String> {
     let output = host
         .output("security", ["find-identity", "-v", "-p", "codesigning"])
         .await
         .wrap_err("failed to run `security find-identity`")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let is_development = line.contains("Apple Development:")
-            || line.contains("iPhone Developer:")
-            || line.contains("iOS Development:");
-        if !is_development || !line.contains(&format!("({team})")) {
-            continue;
-        }
-        if let Some((_, rest)) = line.split_once(')')
-            && let Some(hash) = rest.split_whitespace().next()
-        {
-            return Ok(hash.to_string());
-        }
-    }
-    bail!(
-        "No `Apple Development` signing identity for team {team} in the keychain. \
-         Open Xcode → Settings → Accounts → Manage Certificates and add one, \
-         then re-run `water package`."
-    )
+    pick_profile_identity(&stdout, profile_data).ok_or_else(|| {
+        eyre::eyre!(
+            "The keychain holds no `Apple Development` certificate the \
+             provisioning profile {} was issued for (team {team}). Open \
+             Xcode → Settings → Accounts → Manage Certificates and add the \
+             development certificate this profile lists, then re-run \
+             `water package`.",
+            profile.display()
+        )
+    })
 }
 
-/// Decode a `.mobileprovision` file with `security cms` and return its
-/// `Entitlements` dictionary.
+/// SHA-1 of a DER certificate as uppercase hex — the hash `find-identity`
+/// prints for each identity.
 #[cfg(target_os = "macos")]
-async fn profile_entitlements(profile: &Path) -> eyre::Result<plist::Dictionary> {
-    // `security cms -D -i` writes the embedded plist to stdout.
-    let output = Host::current()
+fn certificate_sha1_hex(der: &[u8]) -> String {
+    use sha1::Digest as _;
+    hex::encode_upper(sha1::Sha1::digest(der))
+}
+
+/// SHA-1 hashes of every certificate in a decoded profile's
+/// `DeveloperCertificates` array.
+#[cfg(target_os = "macos")]
+fn profile_certificate_hashes(data: &plist::Dictionary) -> std::collections::HashSet<String> {
+    data.get("DeveloperCertificates")
+        .and_then(plist::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_data().map(certificate_sha1_hex))
+        .collect()
+}
+
+/// `(sha-1, display name)` pairs `security find-identity -v -p
+/// codesigning` lists, for development identities only — each entry looks
+/// like `  1) 40HEXDIGITS "Apple Development: name (id)"`.
+#[cfg(target_os = "macos")]
+fn development_identities(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let entry = line.split_once(')')?.1.trim();
+            let (hash, name) = entry.split_once(' ')?;
+            let name = name.trim().trim_matches('"');
+            crate::apple::toolchain::is_development_certificate_name(name)
+                .then(|| (hash.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// The identity hash the profile's `DeveloperCertificates` names, if the
+/// keychain holds it.
+#[cfg(target_os = "macos")]
+fn pick_profile_identity(find_identity: &str, data: &plist::Dictionary) -> Option<String> {
+    let accepted = profile_certificate_hashes(data);
+    development_identities(find_identity)
+        .into_iter()
+        .map(|(hash, _)| hash)
+        .find(|hash| accepted.contains(hash))
+}
+
+/// Decode a `.mobileprovision` file with `security cms` into its plist
+/// dictionary — `security cms -D -i` writes the embedded plist to stdout.
+#[cfg(target_os = "macos")]
+async fn decode_profile(host: &Host, profile: &Path) -> eyre::Result<plist::Dictionary> {
+    let output = host
         .output(
             "security",
             [
@@ -696,6 +747,13 @@ async fn profile_entitlements(profile: &Path) -> eyre::Result<plist::Dictionary>
         )
         .await
         .wrap_err_with(|| format!("failed to decode {}", profile.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`security cms` rejected {}: {}",
+            profile.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let value = plist::Value::from_reader(std::io::Cursor::new(&output.stdout))
         .wrap_err_with(|| format!("{} is not a provisioning profile", profile.display()))?;
     let plist::Value::Dictionary(root) = value else {
@@ -704,7 +762,16 @@ async fn profile_entitlements(profile: &Path) -> eyre::Result<plist::Dictionary>
             profile.display()
         );
     };
-    match root.get("Entitlements") {
+    Ok(root)
+}
+
+/// The `Entitlements` dictionary of a decoded provisioning profile.
+#[cfg(target_os = "macos")]
+fn profile_entitlements(
+    profile: &Path,
+    data: &plist::Dictionary,
+) -> eyre::Result<plist::Dictionary> {
+    match data.get("Entitlements") {
         Some(plist::Value::Dictionary(entitlements)) => Ok(entitlements.clone()),
         _ => bail!("{} carries no Entitlements dictionary", profile.display()),
     }
@@ -744,29 +811,11 @@ async fn find_development_profile(
     candidates.sort();
 
     for profile in candidates {
-        let output = host
-            .output(
-                "security",
-                [
-                    "cms".into(),
-                    "-D".into(),
-                    "-i".into(),
-                    profile.as_os_str().to_owned(),
-                ],
-            )
-            .await;
-        let Ok(output) = output else {
+        let Ok(data) = decode_profile(host, &profile).await else {
             continue;
         };
-        if !output.status.success() {
-            continue;
-        }
-        let Ok(value) = plist::Value::from_reader(std::io::Cursor::new(&output.stdout)) else {
-            continue;
-        };
-        let Some(identifier) = value
-            .as_dictionary()
-            .and_then(|root| root.get("Entitlements"))
+        let Some(identifier) = data
+            .get("Entitlements")
             .and_then(plist::Value::as_dictionary)
             .and_then(|entitlements| entitlements.get("application-identifier"))
             .and_then(plist::Value::as_string)
@@ -784,4 +833,105 @@ async fn find_development_profile(
          mint one; open the project in Xcode and build for a device once, or \
          install a profile from the Apple Developer portal."
     )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{
+        certificate_sha1_hex, development_identities, pick_profile_identity,
+        profile_certificate_hashes,
+    };
+
+    /// The self-signed `Apple Development`-shaped fixture certificate from
+    /// `toolchain/testdata`; `sha1sum` of its DER is
+    /// `5d03dd01b4f95d47874c9bfd9367a978d838a228`.
+    const DEV_CERT_PEM: &str = include_str!("../toolchain/testdata/apple_development.pem");
+    const DEV_CERT_SHA1: &str = "5D03DD01B4F95D47874C9BFD9367A978D838A228";
+    const OTHER_CERT_SHA1: &str = "AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDDEEEEEEEE";
+
+    fn dev_cert_der() -> Vec<u8> {
+        x509_parser::pem::Pem::iter_from_buffer(DEV_CERT_PEM.as_bytes())
+            .next()
+            .expect("the fixture holds one PEM block")
+            .expect("the fixture PEM decodes")
+            .contents
+    }
+
+    fn find_identity_output() -> String {
+        format!(
+            "     1) {DEV_CERT_SHA1} \"Apple Development: devin.test@example.com (TESTCERT42)\"\n     2) {OTHER_CERT_SHA1} \"Apple Development: devin.other@example.com (OTHERID9X)\"\n     2 valid identities found\n"
+        )
+    }
+
+    #[test]
+    fn certificate_sha1_matches_openssl() {
+        assert_eq!(certificate_sha1_hex(&dev_cert_der()), DEV_CERT_SHA1);
+    }
+
+    #[test]
+    fn identity_pairs_with_a_profile_certificate() {
+        let profile = plist::Dictionary::from_iter([(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![plist::Value::Data(dev_cert_der())]),
+        )]);
+        assert_eq!(
+            pick_profile_identity(&find_identity_output(), &profile).as_deref(),
+            Some(DEV_CERT_SHA1)
+        );
+    }
+
+    #[test]
+    fn identity_absent_when_profile_lists_another_certificate() {
+        let profile = plist::Dictionary::from_iter([(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![plist::Value::Data(vec![0xDE, 0xAD])]),
+        )]);
+        assert_eq!(
+            pick_profile_identity(&find_identity_output(), &profile),
+            None
+        );
+    }
+
+    #[test]
+    fn non_development_identities_are_skipped() {
+        let find_identity = format!(
+            "     1) {DEV_CERT_SHA1} \"Devin Signing Test\"\n     1 valid identities found\n"
+        );
+        let profile = plist::Dictionary::from_iter([(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![plist::Value::Data(dev_cert_der())]),
+        )]);
+        assert_eq!(pick_profile_identity(&find_identity, &profile), None);
+    }
+
+    #[test]
+    fn a_profile_without_certificates_matches_nothing() {
+        assert_eq!(
+            pick_profile_identity(&find_identity_output(), &plist::Dictionary::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn find_identity_parsing_keeps_development_names_only() {
+        let output = find_identity_output()
+            + "     3) DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF \"Apple Distribution: x\"\n";
+        let identities = development_identities(&output);
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].0, DEV_CERT_SHA1);
+    }
+
+    #[test]
+    fn profile_hash_set_covers_every_certificate() {
+        let profile = plist::Dictionary::from_iter([(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![
+                plist::Value::Data(dev_cert_der()),
+                plist::Value::Data(vec![0x01, 0x02]),
+            ]),
+        )]);
+        let hashes = profile_certificate_hashes(&profile);
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(DEV_CERT_SHA1));
+    }
 }

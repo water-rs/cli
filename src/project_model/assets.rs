@@ -330,9 +330,20 @@ pub async fn seed_managed_crate_lock(
             build_manifest.display()
         ));
     }
-    let canonical = match project.manifest().framework.as_ref() {
-        Some(framework) => framework.canonical_lock(project.root()).await?,
-        None => None,
+    // `resolved_framework`, not `manifest().framework`: a `waterui_path`
+    // project persists no framework record (the path is the record), but its
+    // checkout's own `Cargo.lock` is still the canonical pin for the
+    // transitive packages only the managed crate reaches.
+    let has_framework =
+        project.manifest().framework.is_some() || project.manifest().waterui_path.is_some();
+    let canonical = if has_framework {
+        project
+            .resolved_framework()
+            .await?
+            .canonical_lock(project.root())
+            .await?
+    } else {
+        None
     };
     crate::templates::seed_lockfile(dir, &project.lockfile_path().await?, canonical.as_ref())
         .await?;

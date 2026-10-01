@@ -1,26 +1,31 @@
 //! The entry-owning Apple entry point for {{ ctx.app_display_name }}.
 //!
-//! This is the same wiring `waterui_apple::export_app!` expands to in
-//! `lib.rs`; the library keeps that expansion for the embedding path while
-//! this binary owns the process entry itself — no Swift host involved.
+//! This binary calls `waterui_apple_main` — which `waterui_apple::export_app!`
+//! expanded inside the companion library — through the package's own lib
+//! dependency. Depending on the library keeps every `waterui_*` export and
+//! every `#[link]` declaration in its crate graph on this executable's link:
+//! the native dependencies the graph declares reach the link line through
+//! crate metadata, which a bare archive input would drop.
 
-use waterui::app::App;
-use waterui::env::Environment;
-
-// Delegating through the library keeps its rlib on the link line: rustc
-// drops an unused `--extern`, and the Swift seam resolves `waterui_init` /
-// `waterui_app` out of that archive during the normal left-to-right pass —
-// with no second, graph-bundling staticlib anywhere on the line.
-fn app(env: Environment) -> App {
-    {{ ctx.ffi_crate_ident() }}::app(env)
-}
+use {{ ctx.ffi_crate_ident() }}::waterui_apple_main;
+{% if ctx.cef_runtime_enabled() %}
+/// CEF installs its `NSApplication` subclass before AppKit creates the
+/// shared application, so this runs before `entry::run` touches
+/// `NSApplication.shared` — macOS only.
+#[cfg(target_os = "macos")]
+use {{ ctx.ffi_crate_ident() }}::waterui_cef_prepare_macos_application;
+{% endif %}
 
 fn main() -> ! {
-    let mut env = waterui::configure_environment!(waterui::Environment::new());
-    waterui_ffi::__configure_native_realizations(&mut env);
-    // SAFETY: this is the process's entry on the main thread, and `env`
-    // lives in this frame — `run` never returns.
+    {% if ctx.cef_runtime_enabled() %}
+    #[cfg(target_os = "macos")]
     unsafe {
-        waterui_apple::entry::run(app, &mut env, {{ ctx.accessory }});
+        waterui_cef_prepare_macos_application();
     }
+    {% endif %}
+    // SAFETY: this is the process's entry on the main thread.
+    unsafe {
+        waterui_apple_main({{ ctx.accessory }});
+    }
+    unreachable!("waterui_apple_main never returns");
 }
