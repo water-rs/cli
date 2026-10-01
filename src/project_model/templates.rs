@@ -4995,8 +4995,15 @@ const FORWARDED_FFI_FEATURES: &[&str] = &[
 
 /// Additional `dep/feature` forwards a selectable FFI feature emits: pairs of
 /// (feature name, dependency). `map` also turns on `waterui-apple/map` so the
-/// native `MKMapView` leaf compiles only when the app's graph opted in.
-const BACKEND_FEATURE_FORWARDS: &[(&str, &str)] = &[("map", "waterui-apple")];
+/// native `MKMapView` leaf compiles only when the app's graph opted in; the
+/// `media` and `webview` capabilities forward the same way, so the `AVKit` and
+/// `WebKit` leaves — and the framework links they carry through `cocoa-ui` —
+/// compile only for apps whose graph holds `waterui-video` / `waterui-webview`.
+const BACKEND_FEATURE_FORWARDS: &[(&str, &str)] = &[
+    ("map", "waterui-apple"),
+    ("media", "waterui-apple"),
+    ("webview", "waterui-apple"),
+];
 
 /// Native FFI companion crate templates.
 pub mod ffi {
