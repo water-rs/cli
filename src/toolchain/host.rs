@@ -567,7 +567,7 @@ mod tests {
             "declared hosts must not see ambient environment variables"
         );
         // PATH is exactly what was declared — here, nothing.
-        assert!(host.path_entries().is_empty());
+        assert_eq!(host.path_entries(), [] as [std::path::PathBuf; 0]);
     }
 
     #[test]
