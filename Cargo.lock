@@ -4523,6 +4523,7 @@ dependencies = [
  "resvg",
  "roxmltree 0.21.1",
  "rustc-demangle",
+ "same-file",
  "schemars",
  "semver",
  "serde",

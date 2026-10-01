@@ -15,6 +15,7 @@
 
 use std::{
     ffi::OsStr,
+    io::Write as _,
     path::{Component, Path, PathBuf, Prefix, PrefixComponent},
     process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
@@ -36,6 +37,7 @@ const SHARED_TARGET_DIR_NAME: &str = "target";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const METADATA_FILE_NAME: &str = "metadata.toml";
 const CLEANUP_LOCK_FILE_NAME: &str = ".cleanup.lock";
+const SHARED_TARGET_LEASE_FILE_NAME: &str = ".build-lease";
 const LEGACY_LOCAL_WATER_DIR_NAME: &str = ".water";
 const DEFAULT_BUILD_CACHE_CLEANUP_AFTER_UNUSED_DAYS: u64 = 30;
 
@@ -157,11 +159,14 @@ pub async fn build_cache_root() -> eyre::Result<PathBuf> {
 ///
 /// The directory is a first-class cache entry: it carries the same
 /// `metadata.toml` the per-project containers do, so the garbage collector
-/// reports it in usage surveys and reclaims it under the same unused-days
-/// policy once nothing has built for that long. One target also means one
-/// Cargo build-directory lock: builds of different projects serialize, and a
-/// waiting build prints `Blocking waiting for file lock on build directory` —
-/// visible through the piped progress render — for the holder's duration.
+/// reports it in usage surveys and reclaims it once it has been unused for
+/// the configured window — but only while holding the exclusive build
+/// lease, which stays out of reach for as long as any build compiling into
+/// the tree holds a shared one (see [`SharedTargetLease`]). One target also
+/// means one Cargo build-directory lock: builds of different projects
+/// serialize, and a waiting build prints `Blocking waiting for file lock on
+/// build directory` — visible through the piped progress render — for the
+/// holder's duration.
 ///
 /// # Errors
 /// Returns an error if the Water home cannot be determined, the global config
@@ -211,9 +216,10 @@ async fn ensure_shared_target_dir_in(cache_root: &Path) -> eyre::Result<PathBuf>
 /// The garbage collector only reclaims the directory once it has been unused
 /// for the configured window; this is the explicit drop, for when a user
 /// wants the space back now. Unlike `cargo clean`, it refuses while a Cargo
-/// build is in flight — detected by the `.cargo-lock` every build holds in
-/// its profile directory — since deleting a target mid-build leaves the
-/// survivor's own project with a half-written graph.
+/// build is in flight — it must first take the exclusive lease, which any
+/// build compiling into the tree keeps out of reach through its shared
+/// lease — since deleting a target mid-build leaves the survivor's own
+/// project with a half-written graph.
 ///
 /// # Errors
 /// Returns an error if the cache root cannot be resolved, a Cargo build is
@@ -229,7 +235,9 @@ async fn remove_shared_target_dir_in(cache_root: &Path) -> eyre::Result<Option<u
     if !target_dir.exists() {
         return Ok(None);
     }
-    shared_target_in_use(&target_dir).await?;
+    // Held until the tree is gone: the exclusive lease is what proves no
+    // build is compiling into it.
+    let _lease = require_exclusive_shared_target_lease(&target_dir).await?;
     let bytes = directory_disk_usage(target_dir.clone()).await?;
     fs::remove_dir_all(&target_dir).await.wrap_err_with(|| {
         format!(
@@ -275,7 +283,7 @@ async fn remove_project_units_in(
     if !target_dir.exists() || packages.is_empty() {
         return Ok(Vec::new());
     }
-    shared_target_in_use(target_dir).await?;
+    let _lease = require_exclusive_shared_target_lease(target_dir).await?;
     let target_dir = target_dir.to_path_buf();
     let packages = packages.to_vec();
     smol::unblock(move || -> eyre::Result<Vec<PathBuf>> {
@@ -368,59 +376,163 @@ fn unit_entry_belongs_to(entry_name: &str, package: &str) -> bool {
     })
 }
 
-/// Refuse while a Cargo build holds a build-directory lock anywhere under
-/// `target_dir`.
+/// The lease file every build compiling into the shared Cargo target locks.
 ///
-/// Cargo locks `<triple>/<profile>/.cargo-lock` for the duration of a build,
-/// and those profile dirs sit at most three levels under the shared root —
-/// `<variant>/<triple>/<profile>` — so probing directories only, never
-/// listing profile contents, keeps the check bounded no matter how large the
-/// tree grows.
-async fn shared_target_in_use(target_dir: &Path) -> eyre::Result<()> {
+/// One file at the target root covers the whole tree — variant and
+/// toolchain subdirectories alike — because a removal drops the root. Like
+/// `.cleanup.lock` it is never deleted deliberately: it is the thing being
+/// locked, not a signal, and a new lease file is simply created if the
+/// directory is rebuilt after a drop.
+fn shared_target_lease_path(target_dir: &Path) -> PathBuf {
+    target_dir.join(SHARED_TARGET_LEASE_FILE_NAME)
+}
+
+/// Whether `file` is the inode `path` names right now.
+///
+/// A lock is granted on the inode the open file addresses, not on the path:
+/// a remover can delete the tree — and the lease file with it — while a
+/// lock waits, and the granted lock then guards nothing. Only when the
+/// locked file and the path name the same inode does the lease cover the
+/// live tree.
+fn locked_file_is_live(file: &std::fs::File, path: &Path) -> eyre::Result<bool> {
+    let locked = same_file::Handle::from_file(file.try_clone()?)
+        .wrap_err_with(|| format!("Failed to stat the lease file {}", path.display()))?;
+    match same_file::Handle::from_path(path) {
+        Ok(named) => Ok(locked == named),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).wrap_err_with(|| format!("Failed to stat the lease file {}", path.display()))
+        }
+    }
+}
+
+fn open_shared_target_lease_file(target_dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(shared_target_lease_path(target_dir))
+}
+
+/// Take a shared lease on the shared Cargo target rooted at `target_dir`,
+/// waiting until the lock is granted.
+///
+/// `target_dir` is the directory [`shared_target_dir`] returns — never a
+/// variant subdirectory — so the lease covers the tree a removal would drop.
+/// Removers — the build-cache garbage collector and the explicit drop paths
+/// — must take the exclusive lease before deleting, and they can only take
+/// it when no build holds a share, so a live compile never loses the
+/// directory it writes into. Builds hold the returned file for as long as
+/// their Cargo invocation runs — dropping or crashing releases the lock —
+/// and that is what keeps the target out of a collector's reach, where a
+/// one-time probe would lose every build that starts after the check.
+///
+/// A remover can delete the tree while the lock waits; when the granted
+/// lock turns out to sit on a deleted inode — or the lease file was already
+/// gone at open — the target is re-ensured so the root and a fresh marker
+/// exist, and the lease is retaken on the live inode.
+///
+/// # Errors
+/// Returns an error if the lease file cannot be opened, locked or checked,
+/// or the target directory cannot be rebuilt after a removal.
+pub async fn lease_shared_target_dir(target_dir: &Path) -> eyre::Result<std::fs::File> {
+    loop {
+        let dir = target_dir.to_path_buf();
+        let leased = smol::unblock(move || -> eyre::Result<Option<std::fs::File>> {
+            let lease_path = shared_target_lease_path(&dir);
+            let file = match open_shared_target_lease_file(&dir) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).wrap_err_with(|| {
+                        format!(
+                            "Failed to open the shared target lease in {}",
+                            dir.display()
+                        )
+                    });
+                }
+            };
+            FileExt::lock_shared(&file)
+                .wrap_err_with(|| format!("Failed to take a shared lease on {}", dir.display()))?;
+            if locked_file_is_live(&file, &lease_path)? {
+                return Ok(Some(file));
+            }
+            Ok(None)
+        })
+        .await?;
+        if let Some(lease) = leased {
+            return Ok(lease);
+        }
+        // The tree was removed around the lock: rebuild the root and its
+        // fresh marker, then lease whatever the path names afterwards.
+        let cache_root = target_dir.parent().ok_or_else(|| {
+            eyre::eyre!(
+                "the shared Cargo target {} has no parent directory",
+                target_dir.display()
+            )
+        })?;
+        ensure_shared_target_dir_in(cache_root).await?;
+    }
+}
+
+/// Try to take the exclusive lease on the shared Cargo target rooted at
+/// `target_dir`, returning `None` while any build holds a shared lease.
+///
+/// The granted lock must sit on the inode the lease path still names: when
+/// another remover deleted and the path was re-created in between, the lock
+/// guards a dead inode and is dropped for a retry on the live file, so two
+/// removers never both believe they own the tree.
+async fn try_exclusive_shared_target_lease(
+    target_dir: &Path,
+) -> eyre::Result<Option<std::fs::File>> {
     let target_dir = target_dir.to_path_buf();
-    smol::unblock(move || -> eyre::Result<()> {
-        let mut profile_dirs = Vec::new();
-        let mut pending = vec![(target_dir.clone(), 0usize)];
-        while let Some((dir, depth)) = pending.pop() {
-            if depth == 3 {
-                continue;
-            }
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    let path = entry.path();
-                    if path.join(".cargo-lock").exists() {
-                        profile_dirs.push(path.clone());
-                    }
-                    pending.push((path, depth + 1));
-                }
-            }
-        }
-        for dir in &profile_dirs {
-            let lock_path = dir.join(".cargo-lock");
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&lock_path)
-                .wrap_err_with(|| format!("Failed to open {}", lock_path.display()))?;
+    smol::unblock(move || -> eyre::Result<Option<std::fs::File>> {
+        let lease_path = shared_target_lease_path(&target_dir);
+        loop {
+            let file = open_shared_target_lease_file(&target_dir).wrap_err_with(|| {
+                format!(
+                    "Failed to open the shared target lease in {}",
+                    target_dir.display()
+                )
+            })?;
             match FileExt::try_lock(&file) {
-                Ok(()) => {}
-                Err(TryLockError::WouldBlock) => {
-                    return Err(eyre::eyre!(
-                        "the shared Cargo target {} is in use by a running build \
-                         ({} is locked) — drop it once the build finishes",
-                        target_dir.display(),
-                        lock_path.display()
-                    ));
+                Ok(()) => {
+                    if locked_file_is_live(&file, &lease_path)? {
+                        return Ok(Some(file));
+                    }
+                    // The lock sits on a deleted inode and guards nothing —
+                    // drop it and take the file the path names now.
                 }
+                Err(TryLockError::WouldBlock) => return Ok(None),
                 Err(TryLockError::Error(error)) => {
-                    return Err(eyre::Report::from(error))
-                        .wrap_err_with(|| format!("Failed to lock {}", lock_path.display()));
+                    return Err(eyre::Report::from(error)).wrap_err_with(|| {
+                        format!(
+                            "Failed to lock the shared target lease in {}",
+                            target_dir.display()
+                        )
+                    });
                 }
             }
         }
-        Ok(())
     })
     .await
+}
+
+/// The exclusive lease a remover must hold before dropping any part of the
+/// shared Cargo target.
+///
+/// The error names the running build the way the explicit drops report it;
+/// the returned file keeps the lease — and every build out of the tree —
+/// until it is dropped.
+async fn require_exclusive_shared_target_lease(target_dir: &Path) -> eyre::Result<std::fs::File> {
+    try_exclusive_shared_target_lease(target_dir)
+        .await?
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "the shared Cargo target {} is in use by a running build — drop it once the build finishes",
+                target_dir.display()
+            )
+        })
 }
 
 /// Return the managed build-cache directory for a project.
@@ -729,9 +841,23 @@ async fn read_metadata(cache_dir: &Path) -> eyre::Result<CacheMetadata> {
 async fn write_metadata(cache_dir: &Path, metadata: &CacheMetadata) -> eyre::Result<()> {
     let metadata_path = metadata_path(cache_dir);
     let contents = toml::to_string(metadata).wrap_err("Failed to serialize cache metadata")?;
-    fs::write(&metadata_path, contents)
-        .await
-        .wrap_err_with(|| format!("Failed to write cache metadata {}", metadata_path.display()))
+    let cache_dir = cache_dir.to_path_buf();
+    smol::unblock(move || -> eyre::Result<()> {
+        // Stage the marker beside its name and persist it in one step: a
+        // reader never observes a truncated document, and a crash only
+        // leaves the unnamed staging file `NamedTempFile` cleans up on drop.
+        let mut staging = tempfile::NamedTempFile::new_in(&cache_dir).wrap_err_with(|| {
+            format!("Failed to stage cache metadata {}", metadata_path.display())
+        })?;
+        staging.write_all(contents.as_bytes()).wrap_err_with(|| {
+            format!("Failed to write cache metadata {}", metadata_path.display())
+        })?;
+        staging.persist(&metadata_path).wrap_err_with(|| {
+            format!("Failed to write cache metadata {}", metadata_path.display())
+        })?;
+        Ok(())
+    })
+    .await
 }
 
 async fn remove_legacy_local_water_dir(project_root: &Path) -> eyre::Result<()> {
@@ -800,8 +926,10 @@ pub async fn survey_build_cache_usage(
             |metadata| PathBuf::from(&metadata.project_root),
         );
         let active = cache_dir == current_cache_dir;
+        // An unreadable marker is not proof of staleness: the entry reports
+        // its size but is never counted as reclaimable.
         let stale = !active
-            && metadata.as_ref().is_none_or(|metadata| {
+            && metadata.as_ref().is_some_and(|metadata| {
                 !PathBuf::from(&metadata.project_root).exists()
                     || now.saturating_sub(metadata.last_used_unix_seconds) > max_unused_seconds
             });
@@ -892,6 +1020,7 @@ async fn cleanup_stale_caches(
         .saturating_mul(24 * 60 * 60);
     let now = now_unix_seconds()?;
 
+    let shared_target_dir = cache_root.join(SHARED_TARGET_DIR_NAME);
     let mut scanned_entries = 0usize;
     let mut removed_entries = 0usize;
 
@@ -902,38 +1031,91 @@ async fn cleanup_stale_caches(
 
         scanned_entries += 1;
 
+        // The shared Cargo target is not a project entry: no project-root
+        // liveness rule applies to it, only the unused-days policy — and even
+        // a proven-stale marker cannot overrule a running build, so removal
+        // needs the exclusive lease every build holds a share of.
+        let is_shared_target = cache_dir == shared_target_dir;
         let should_remove = match read_metadata(&cache_dir).await {
+            Ok(metadata) if is_shared_target => {
+                now.saturating_sub(metadata.last_used_unix_seconds) > max_unused_seconds
+            }
             Ok(metadata) => {
                 let project_root = PathBuf::from(&metadata.project_root);
                 !project_root.exists()
                     || now.saturating_sub(metadata.last_used_unix_seconds) > max_unused_seconds
             }
+            // A marker that cannot be read proves nothing: every project open
+            // rewrites it, so an unreadable file is as likely a build in
+            // flight as garbage. Removal requires proof of staleness.
             Err(error) => {
                 warn!(
-                    "Removing stale build cache with invalid metadata at {}: {error}",
+                    "Keeping build cache entry with unreadable metadata at {}: {error}",
                     cache_dir.display()
                 );
-                true
+                false
             }
         };
 
-        if should_remove {
-            if let Err(error) = fs::remove_dir_all(&cache_dir).await {
-                warn!(
-                    "Failed to remove stale build cache {}: {error}",
-                    cache_dir.display()
-                );
-                continue;
-            }
-            prune_empty_build_cache_ancestors(
-                cache_root,
-                cache_dir
-                    .parent()
-                    .expect("managed build cache dir should always have a parent"),
-            )
-            .await?;
-            removed_entries += 1;
+        if !should_remove {
+            continue;
         }
+
+        // Held through the removal below: releasing the file releases the
+        // exclusive lease only once the directory is gone.
+        let mut removal_lease = None;
+        if is_shared_target {
+            match try_exclusive_shared_target_lease(&cache_dir).await {
+                Ok(Some(lease)) => removal_lease = Some(lease),
+                Ok(None) => {
+                    warn!(
+                        "Keeping shared Cargo target {}: a running build holds its lease",
+                        cache_dir.display()
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    warn!(
+                        "Keeping shared Cargo target {}: {error}",
+                        cache_dir.display()
+                    );
+                    continue;
+                }
+            }
+            // A build that opened the target after the marker was read above
+            // has already refreshed it, so under the exclusive lease only a
+            // still-stale marker may be removed.
+            match read_metadata(&cache_dir).await {
+                Ok(metadata)
+                    if now.saturating_sub(metadata.last_used_unix_seconds) > max_unused_seconds => {
+                }
+                Ok(_) => continue,
+                Err(error) => {
+                    warn!(
+                        "Keeping shared Cargo target with unreadable metadata at {}: {error}",
+                        cache_dir.display()
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if let Err(error) = fs::remove_dir_all(&cache_dir).await {
+            warn!(
+                "Failed to remove stale build cache {}: {error}",
+                cache_dir.display()
+            );
+            continue;
+        }
+        drop(removal_lease);
+        prune_empty_build_cache_ancestors(
+            cache_root,
+            cache_dir
+                .parent()
+                .expect("managed build cache dir should always have a parent"),
+        )
+        .await?;
+        removed_entries += 1;
     }
 
     Ok(BuildCacheGcSummary {
@@ -1423,36 +1605,100 @@ mod tests {
         });
     }
 
-    /// Dropping the shared target while a Cargo build holds a profile
-    /// `.cargo-lock` refuses rather than deleting a live build's tree.
+    /// Dropping the shared target while a build holds a shared lease on it
+    /// refuses rather than deleting a live build's tree; once the lease is
+    /// released the drop goes through.
     #[test]
-    fn shared_target_dir_refuses_while_a_build_lock_is_held() {
+    fn shared_target_dir_refuses_while_a_build_holds_its_lease() {
         smol::block_on(async {
             let cache_root = tempdir().expect("cache root");
             let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
                 .await
                 .expect("ensure shared target dir");
-            let profile = target_dir.join("shared/aarch64-apple-darwin/debug");
-            smol::fs::create_dir_all(&profile)
-                .await
-                .expect("create profile dir");
-            let lock_file =
-                std::fs::File::create(profile.join(".cargo-lock")).expect("create cargo lock");
-            fs4::FileExt::lock(&lock_file).expect("hold the build lock");
+            let lease = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(super::shared_target_lease_path(&target_dir))
+                .expect("open the build lease");
+            fs4::FileExt::lock_shared(&lease).expect("hold a shared lease");
 
             let error = super::remove_shared_target_dir_in(cache_root.path())
                 .await
-                .expect_err("a held build lock must refuse the drop");
+                .expect_err("a held build lease must refuse the drop");
             assert!(
                 error.to_string().contains("in use"),
                 "the error says why: {error}"
             );
+            assert!(target_dir.exists());
 
-            fs4::FileExt::unlock(&lock_file).expect("release the build lock");
+            drop(lease);
             super::remove_shared_target_dir_in(cache_root.path())
                 .await
-                .expect("an unlocked target drops")
+                .expect("a released target drops")
                 .expect("the target existed");
+        });
+    }
+
+    /// A build whose `lock_shared` waits out an in-progress removal must not
+    /// come back holding a lock on a deleted inode: the granted lock is
+    /// verified against the path, the tree is re-ensured, and the returned
+    /// lease is the file the path names now.
+    ///
+    /// Unix only: the scenario needs a tree deleted while a lease file
+    /// inside it is still open, which Windows' delete sharing does not
+    /// allow a test to stage.
+    #[cfg(unix)]
+    #[test]
+    fn a_lease_waiting_out_a_removal_returns_the_live_lease_file() {
+        smol::block_on(async {
+            let cache_root = tempdir().expect("cache root");
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            let lease_path = super::shared_target_lease_path(&target_dir);
+
+            // A remover holds the exclusive lease the build will wait on.
+            let remover =
+                super::open_shared_target_lease_file(&target_dir).expect("open the lease file");
+            fs4::FileExt::lock(&remover).expect("hold the exclusive lease");
+
+            let waiting_dir = target_dir.clone();
+            let (entered, wait) = std::sync::mpsc::channel::<()>();
+            let build = std::thread::spawn(move || {
+                entered
+                    .send(())
+                    .expect("report the build entering its lease");
+                smol::block_on(super::lease_shared_target_dir(&waiting_dir))
+            });
+            // The build has entered the lease call by the time the removal
+            // runs; whether it is already parked in `lock_shared` or opens a
+            // path that just vanished, the outcome is the same.
+            wait.recv().expect("the build thread is running");
+
+            // Move the tree aside in one step, then delete it: an open in
+            // flight either lands inside the moved tree — which the removal
+            // then takes with it — or misses the path outright, so the walk
+            // can never race a re-created `.build-lease` into ENOTEMPTY.
+            let aside = cache_root.path().join("removing");
+            std::fs::rename(&target_dir, &aside).expect("move the tree aside");
+            std::fs::remove_dir_all(&aside).expect("remove the tree");
+            drop(remover);
+
+            let lease = build
+                .join()
+                .expect("join the build thread")
+                .expect("the waiting lease resolves");
+            let locked =
+                same_file::Handle::from_file(lease.try_clone().expect("clone the lease fd"))
+                    .expect("stat the held lease file");
+            let named =
+                same_file::Handle::from_path(&lease_path).expect("stat the path's lease file");
+            assert_eq!(locked, named, "the held lease is the file the path names");
+            assert!(
+                metadata_path(&target_dir).is_file(),
+                "the rebuilt target carries its marker"
+            );
         });
     }
 
@@ -1548,10 +1794,10 @@ mod tests {
         });
     }
 
-    /// A project clean of the shared target refuses while a build holds
-    /// a profile's `.cargo-lock`, like the full drop does.
+    /// A project clean of the shared target refuses while a build holds a
+    /// shared lease on it, like the full drop does.
     #[test]
-    fn project_clean_of_the_shared_target_refuses_while_a_build_lock_is_held() {
+    fn project_clean_of_the_shared_target_refuses_while_a_build_holds_its_lease() {
         smol::block_on(async {
             let cache_root = tempdir().expect("cache root");
             let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
@@ -1560,21 +1806,26 @@ mod tests {
             let profile = target_dir.join("shared/aarch64-apple-darwin/debug");
             std::fs::create_dir_all(&profile).expect("profile dir");
             std::fs::write(profile.join("demo_hydrolysis_0000abcd"), []).expect("unit");
-            let lock_file =
-                std::fs::File::create(profile.join(".cargo-lock")).expect("create cargo lock");
-            fs4::FileExt::lock(&lock_file).expect("hold the build lock");
+            std::fs::write(profile.join(".cargo-lock"), []).expect("cargo lock");
+            let lease = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(super::shared_target_lease_path(&target_dir))
+                .expect("open the build lease");
+            fs4::FileExt::lock_shared(&lease).expect("hold a shared lease");
 
             let packages = ["demo-hydrolysis-0000abcd".to_owned()];
             let error = super::remove_project_units_in(&target_dir, &packages)
                 .await
-                .expect_err("a held build lock must refuse the clean");
+                .expect_err("a held build lease must refuse the clean");
             assert!(error.to_string().contains("in use"), "{error}");
             assert!(profile.join("demo_hydrolysis_0000abcd").is_file());
 
-            fs4::FileExt::unlock(&lock_file).expect("release the build lock");
+            drop(lease);
             let removed = super::remove_project_units_in(&target_dir, &packages)
                 .await
-                .expect("an unlocked target cleans");
+                .expect("a released target cleans");
             assert_eq!(removed, [profile.join("demo_hydrolysis_0000abcd")]);
         });
     }
@@ -1704,6 +1955,144 @@ mod tests {
                 })
             );
             assert!(!target_dir.exists());
+        });
+    }
+
+    /// Staleness alone is not enough to drop the shared Cargo target: a
+    /// shared lease held by a running build keeps the exclusive lease — and
+    /// with it removal — out of the sweep's reach, and once the build lets
+    /// go the stale target is collected again.
+    #[test]
+    fn cleanup_keeps_the_shared_target_while_a_build_holds_its_lease() {
+        smol::block_on(async {
+            let project = tempdir().expect("project dir");
+            let config = WaterConfig::default();
+            let cache_root = tempdir().expect("cache root");
+
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            let lease = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(super::shared_target_lease_path(&target_dir))
+                .expect("open the build lease");
+            fs4::FileExt::lock_shared(&lease).expect("hold a shared lease");
+
+            // Stale enough that the unused-days policy would collect the
+            // target were no build holding it.
+            let stale_metadata = super::CacheMetadata {
+                project_root: target_dir.display().to_string(),
+                cli_commit: CLI_COMMIT.to_string(),
+                last_used_unix_seconds: 1,
+            };
+            smol::fs::write(
+                metadata_path(&target_dir),
+                toml::to_string(&stale_metadata).expect("serialize stale metadata"),
+            )
+            .await
+            .expect("write stale metadata");
+
+            let outcome =
+                super::cleanup_stale_caches_if_idle(cache_root.path(), project.path(), &config)
+                    .await
+                    .expect("cleanup caches");
+
+            assert_eq!(
+                outcome,
+                super::BuildCacheGcOutcome::Ran(super::BuildCacheGcSummary {
+                    scanned_entries: 1,
+                    removed_entries: 0,
+                })
+            );
+            assert!(target_dir.exists(), "a live build's target must survive");
+
+            drop(lease);
+            let outcome =
+                super::cleanup_stale_caches_if_idle(cache_root.path(), project.path(), &config)
+                    .await
+                    .expect("cleanup once the lease is released");
+            assert_eq!(
+                outcome,
+                super::BuildCacheGcOutcome::Ran(super::BuildCacheGcSummary {
+                    scanned_entries: 1,
+                    removed_entries: 1,
+                })
+            );
+            assert!(!target_dir.exists());
+        });
+    }
+
+    /// An entry whose marker cannot be read is not proven stale. The marker
+    /// is rewritten every time the owning project opens, so an unreadable
+    /// file is just as likely a build in flight as garbage — the sweep keeps
+    /// it either way.
+    #[test]
+    fn cleanup_keeps_an_entry_whose_metadata_cannot_be_read() {
+        smol::block_on(async {
+            let project = tempdir().expect("project dir");
+            let config = WaterConfig::default();
+            let cache_root = tempdir().expect("cache root");
+
+            let entry = cache_root.path().join("Users/lexo/demo/managed_backends");
+            smol::fs::create_dir_all(&entry)
+                .await
+                .expect("create cache entry");
+            smol::fs::write(entry.join("marker.bin"), [0u8; 16])
+                .await
+                .expect("write entry contents");
+            // The shape a concurrent read sees while another process rewrites
+            // the marker: the file exists, its contents are not a document.
+            smol::fs::write(metadata_path(&entry), "project_root = [")
+                .await
+                .expect("write partial metadata");
+
+            let outcome =
+                super::cleanup_stale_caches_if_idle(cache_root.path(), project.path(), &config)
+                    .await
+                    .expect("cleanup caches");
+
+            assert_eq!(
+                outcome,
+                super::BuildCacheGcOutcome::Ran(super::BuildCacheGcSummary {
+                    scanned_entries: 1,
+                    removed_entries: 0,
+                })
+            );
+            assert!(entry.join("marker.bin").exists());
+        });
+    }
+
+    /// The shared target gets the same benefit of the doubt a project entry
+    /// does: an unreadable marker is not proof it is stale.
+    #[test]
+    fn cleanup_keeps_the_shared_target_whose_metadata_cannot_be_read() {
+        smol::block_on(async {
+            let project = tempdir().expect("project dir");
+            let config = WaterConfig::default();
+            let cache_root = tempdir().expect("cache root");
+
+            let target_dir = super::ensure_shared_target_dir_in(cache_root.path())
+                .await
+                .expect("ensure shared target dir");
+            smol::fs::write(metadata_path(&target_dir), "project_root = [")
+                .await
+                .expect("write partial metadata");
+
+            let outcome =
+                super::cleanup_stale_caches_if_idle(cache_root.path(), project.path(), &config)
+                    .await
+                    .expect("cleanup caches");
+
+            assert_eq!(
+                outcome,
+                super::BuildCacheGcOutcome::Ran(super::BuildCacheGcSummary {
+                    scanned_entries: 1,
+                    removed_entries: 0,
+                })
+            );
+            assert!(target_dir.exists());
         });
     }
 }

@@ -119,6 +119,9 @@ aither-mcp = { version = "0.4", default-features = false, features = ["server"] 
 base64 = "0.23"
 tempfile = "3.27"
 walkdir = "2.5"
+# File identity (device + inode) checks for the shared-target lease, so a
+# lock granted on an inode a remover already deleted cannot pass for live.
+same-file = "1"
 pathdiff = "0.2"
 # `Info.plist` assembly/serialization for Apple app bundles. `app_bundle`
 # compiles on every host — its actool/codesign arms bail at run time off
