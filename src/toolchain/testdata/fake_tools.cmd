@@ -95,6 +95,7 @@ if /i "%tool%"=="kotlinc" goto :kotlinc
 if /i "%tool%"=="cmake" goto :simple_version
 if /i "%tool%"=="meson" goto :simple_version
 if /i "%tool%"=="sccache" goto :sccache
+if /i "%tool%"=="git" goto :git
 if /i "%tool%"=="wasm-pack" goto :simple_version
 if /i "%tool%"=="sh" goto :simple_version
 if /i "%tool%"=="bash" goto :simple_version
@@ -126,6 +127,31 @@ if "%~1"=="--version" echo openjdk version "%WATERUI_FAKE_JAVA_VERSION%" 2026-01
 goto :exit_ok
 
 :exit_ok
+exit /b 0
+
+rem The managed-checkout sequence `git -C <dir> init | remote add | fetch |
+rem checkout` produces: on `checkout`, copy every file the staged
+rem WATERUI_FAKE_GIT_CHECKOUT tree holds into the -C directory, like a
+rem clone's detached checkout. `for /r`, `mkdir` and `copy` are builtins, so
+rem the restricted PATH is still honored.
+:git
+set "git_dir="
+set "git_prev="
+for %%a in (%*) do (
+    if /i "!git_prev!"=="-C" set "git_dir=%%~a"
+    set "git_prev=%%~a"
+)
+if "%~1"=="--version" (echo git version 2.43.0 & exit /b 0)
+set "git_args=%*"
+call :contains git_args checkout
+if %errorlevel%==0 if defined WATERUI_FAKE_GIT_CHECKOUT if defined git_dir (
+    for /r "%WATERUI_FAKE_GIT_CHECKOUT%" %%f in (*) do (
+        set "git_abs=%%f"
+        set "git_rel=!git_abs:%WATERUI_FAKE_GIT_CHECKOUT%\=!"
+        for %%d in ("!git_dir!\!git_rel!") do if not exist "%%~dpd" mkdir "%%~dpd"
+        copy /y "!git_abs!" "!git_dir!\!git_rel!" >nul
+    )
+)
 exit /b 0
 
 :rustup

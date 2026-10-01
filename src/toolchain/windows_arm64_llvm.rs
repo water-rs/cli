@@ -334,7 +334,7 @@ mod host_tests {
             .expect("LLVM tooling is only required on Windows ARM64");
         let envs = smol::block_on(WindowsArm64LlvmToolchain.cargo_envs(&host))
             .expect("cargo envs off Windows ARM64 must not probe tools");
-        assert!(envs.is_empty());
+        assert_eq!(envs, [] as [(String, std::ffi::OsString); 0]);
     }
 
     #[test]

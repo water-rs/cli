@@ -682,7 +682,7 @@ mod tests {
         ]]);
         smol::block_on(run_with_diagnose(&test_shell(), true, false, diagnose))
             .expect("doctor run must succeed");
-        assert!(taken(&installs).is_empty());
+        assert_eq!(taken(&installs), [] as [&str; 0]);
         assert_eq!(diagnose_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -692,7 +692,7 @@ mod tests {
         let (diagnose, diagnose_calls) = scripted(vec![vec![fixable_item("a", &installs, Ok(()))]]);
         smol::block_on(run_with_diagnose(&test_shell(), false, false, diagnose))
             .expect("doctor run must succeed");
-        assert!(taken(&installs).is_empty());
+        assert_eq!(taken(&installs), [] as [&str; 0]);
         assert_eq!(diagnose_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -708,7 +708,7 @@ mod tests {
         ]);
         smol::block_on(run_with_diagnose(&test_shell(), true, false, diagnose))
             .expect("doctor run must succeed");
-        assert!(taken(&installs).is_empty());
+        assert_eq!(taken(&installs), [] as [&str; 0]);
         assert_eq!(
             diagnose_calls.load(Ordering::SeqCst),
             2,

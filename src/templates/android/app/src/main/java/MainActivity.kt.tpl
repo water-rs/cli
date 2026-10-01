@@ -8,7 +8,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import dev.waterui.android.runtime.WaterUiRootView
-import java.io.File
+import dev.waterui.android.runtime.installWaterUiProcessEnvironment
 import java.lang.Runtime
 
 class MainActivity : AppCompatActivity() {
@@ -109,45 +109,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        private fun syncBundledAssets(activity: AppCompatActivity): File {
-            val assetRoot = File(activity.filesDir, "waterui_assets")
-            val stampAsset = "waterui_assets/.waterui-sync-stamp"
-            val bundledStamp = try {
-                activity.assets.open(stampAsset).bufferedReader().use { it.readText() }
-            } catch (_: Exception) {
-                assetRoot.mkdirs()
-                return assetRoot
-            }
-
-            val localStamp = File(assetRoot, ".waterui-sync-stamp")
-                .takeIf { it.exists() }
-                ?.readText()
-            if (localStamp == bundledStamp) {
-                return assetRoot
-            }
-
-            assetRoot.deleteRecursively()
-            assetRoot.mkdirs()
-            copyAssetTree(activity, "waterui_assets", assetRoot)
-            File(assetRoot, ".waterui-sync-stamp").writeText(bundledStamp)
-            return assetRoot
-        }
-
-        private fun copyAssetTree(activity: AppCompatActivity, assetPath: String, dest: File) {
-            val children = activity.assets.list(assetPath)?.filter { it.isNotEmpty() }.orEmpty()
-            if (children.isEmpty()) {
-                dest.parentFile?.mkdirs()
-                activity.assets.open(assetPath).use { input ->
-                    dest.outputStream().use { output -> input.copyTo(output) }
-                }
-                return
-            }
-
-            dest.mkdirs()
-            for (child in children) {
-                copyAssetTree(activity, "$assetPath/$child", File(dest, child))
-            }
-        }
     }
 
     private lateinit var androidRuntimeLease: AndroidRuntimeLease
@@ -160,16 +121,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        // Register custom fonts from dependencies
-        WaterUIFonts.register(this)
-
-        val assetsRoot = syncBundledAssets(this)
-        Os.setenv("WATERUI_ASSETS_ROOT", assetsRoot.absolutePath, true)
-        // Rust code that wants a cache directory (preview registry, pushed
-        // dylibs) resolves WATER_CACHE_DIR first; the platform dirs crate has
-        // no usable location inside an app sandbox. The intent extras below
-        // still override this default.
-        Os.setenv("WATER_CACHE_DIR", cacheDir.absolutePath, true)
+        // Bundled asset sync + the runtime's env defaults; the intent/property
+        // overrides below still win by overwriting them.
+        installWaterUiProcessEnvironment(this)
 
         setupEnvironmentFromIntent(intent)
         setupEnvironmentFromProperties()

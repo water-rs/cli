@@ -625,6 +625,7 @@ mod tests {
             .expect("test bundle identifier must be valid"),
             assets_path: String::from("assets"),
             accessory: false,
+            embedded: false,
         });
         block_on(manifest.save(project_root)).expect("save manifest");
     }

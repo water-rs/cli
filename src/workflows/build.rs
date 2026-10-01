@@ -1623,6 +1623,9 @@ impl RustBuild {
         cargo_target: CargoTarget<'_>,
         artifact_extension: Option<&'static str>,
     ) -> Result<BuiltTarget, RustBuildError> {
+        // Held until `build_inner` returns: the shared lease keeps the build
+        // cache garbage collector from dropping the target mid-compile.
+        let _target_lease = self.shared_target_lease().await?;
         let mut output = self.cargo_build_output(release, cargo_target).await?;
 
         if !output.status.success() {
@@ -2293,6 +2296,36 @@ Automatic meson installation failed: {install_err}\n\n{}",
         })
         .await?;
         Ok(metadata.target_directory.as_std_path().to_path_buf())
+    }
+
+    /// Take a shared lease on the shared Cargo target when this build
+    /// compiles into it (`target/shared`, `target/toolchain-*` and the root
+    /// itself are all inside it), so the build-cache garbage collector
+    /// cannot drop the tree while Cargo runs. The returned file is the
+    /// guard: holding it holds the lease.
+    async fn shared_target_lease(&self) -> Result<Option<std::fs::File>, RustBuildError> {
+        let Some(target_dir) = &self.target_dir else {
+            return Ok(None);
+        };
+        let shared_root = crate::water_dir::shared_target_dir()
+            .await
+            .map_err(|error| {
+                RustBuildError::FailToBuildRustLibrary(std::io::Error::other(format!(
+                    "Could not resolve the shared Cargo target: {error}"
+                )))
+            })?;
+        if !target_dir.starts_with(&shared_root) {
+            return Ok(None);
+        }
+        crate::water_dir::lease_shared_target_dir(&shared_root)
+            .await
+            .map(Some)
+            .map_err(|error| {
+                RustBuildError::FailToBuildRustLibrary(std::io::Error::other(format!(
+                    "Could not lease the shared Cargo target {}: {error}",
+                    shared_root.display()
+                )))
+            })
     }
 
     /// The `deps/` filename suffix `-Cextra-filename` gives a `--bin` unit's
@@ -4667,10 +4700,14 @@ mod tests {
             let crate_dir = fixture.join("crate");
             rustflags_probe_crate(&crate_dir, "water_target_probe");
             let host_triple = Triple::host().to_string();
+            let mut config = toml_edit::DocumentMut::new();
+            config["target"][&host_triple]["rustflags"] = toml_edit::Item::Value(
+                toml_edit::Array::from_iter(["--cfg=water_target_probe"]).into(),
+            );
             std::fs::create_dir_all(fixture.join(".cargo")).expect("config dir");
             std::fs::write(
                 fixture.join(".cargo").join("config.toml"),
-                format!("[target.'{host_triple}']\nrustflags = [\"--cfg=water_target_probe\"]\n"),
+                config.to_string(),
             )
             .expect("config");
 

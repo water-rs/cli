@@ -89,6 +89,66 @@ impl TargetBackend {
         }
     }
 
+    /// Whether this host can build `platform` with this backend.
+    ///
+    /// Desktop backends only build for their own host OS; the Android
+    /// backends, the web frontend and the ESP32 firmware cross-compile from
+    /// any host, and so does the Hydrolysis Android path. Every `water`
+    /// command that builds gates on this one check so a forbidden
+    /// combination fails identically in `build`, `run` and `package`.
+    ///
+    /// # Errors
+    /// Returns an error naming the required host or `--platform`.
+    pub fn validate_host_support(&self, platform: TargetPlatform) -> eyre::Result<()> {
+        if platform == TargetPlatform::Web {
+            return Ok(());
+        }
+        match self {
+            Self::Gtk4 => {
+                #[cfg(target_os = "linux")]
+                if platform != TargetPlatform::Linux {
+                    bail!("GTK4 backend on Linux host requires --platform linux");
+                }
+                #[cfg(not(target_os = "linux"))]
+                bail!("GTK4 backend is only supported on Linux hosts");
+            }
+            Self::Hydrolysis => {
+                // The Hydrolysis Android path cross-compiles from any host.
+                if platform == TargetPlatform::Android {
+                    return Ok(());
+                }
+                #[cfg(target_os = "macos")]
+                if platform != TargetPlatform::MacOS {
+                    bail!("Hydrolysis backend on macOS host requires --platform macos");
+                }
+                #[cfg(target_os = "linux")]
+                if platform != TargetPlatform::Linux {
+                    bail!("Hydrolysis backend on Linux host requires --platform linux");
+                }
+                #[cfg(target_os = "windows")]
+                if platform != TargetPlatform::Windows {
+                    bail!("Hydrolysis backend on Windows host requires --platform windows");
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+                bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
+            }
+            Self::WinUi => {
+                #[cfg(target_os = "windows")]
+                if platform != TargetPlatform::Windows {
+                    bail!("WinUI backend on Windows host requires --platform windows");
+                }
+                #[cfg(not(target_os = "windows"))]
+                bail!("WinUI backend is only supported on Windows hosts");
+            }
+            Self::Apple => {
+                #[cfg(not(target_os = "macos"))]
+                bail!("Apple backend requires a macOS host");
+            }
+            Self::Android | Self::Dew => {}
+        }
+        Ok(())
+    }
+
     /// The [`BuildProfile`] a development `water build` or `water run` uses
     /// for this backend when the user passes no profile flag.
     ///
@@ -219,7 +279,7 @@ impl TargetPlatform {
             | Self::WatchOSSimulator
             | Self::VisionOS
             | Self::VisionOSSimulator => &[TargetBackend::Apple],
-            Self::Android => &[TargetBackend::Android],
+            Self::Android => &[TargetBackend::Android, TargetBackend::Hydrolysis],
             Self::Linux => &[TargetBackend::Gtk4, TargetBackend::Hydrolysis],
             Self::Windows => &[TargetBackend::Hydrolysis, TargetBackend::WinUi],
             Self::Web => &[TargetBackend::Hydrolysis],
@@ -502,6 +562,55 @@ impl PackageOptions {
     #[must_use]
     pub const fn progress(&self) -> Option<&BuildProgress> {
         self.progress.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod host_support_tests {
+    use super::{TargetBackend, TargetPlatform};
+
+    #[test]
+    fn cross_compiling_backends_accept_any_platform_pairing() {
+        // Android targets, the web frontend and the ESP32 firmware all
+        // cross-compile — every `water` command gates on this same check.
+        assert!(
+            TargetBackend::Hydrolysis
+                .validate_host_support(TargetPlatform::Android)
+                .is_ok()
+        );
+        assert!(
+            TargetBackend::Hydrolysis
+                .validate_host_support(TargetPlatform::Web)
+                .is_ok()
+        );
+        assert!(
+            TargetBackend::Android
+                .validate_host_support(TargetPlatform::Android)
+                .is_ok()
+        );
+        assert!(
+            TargetBackend::Dew
+                .validate_host_support(TargetPlatform::Esp32S3)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn hydrolysis_still_rejects_a_foreign_desktop_target() {
+        #[cfg(target_os = "linux")]
+        let foreign = TargetPlatform::MacOS;
+        #[cfg(target_os = "macos")]
+        let foreign = TargetPlatform::Linux;
+        #[cfg(target_os = "windows")]
+        let foreign = TargetPlatform::Linux;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let foreign = TargetPlatform::Linux;
+
+        assert!(
+            TargetBackend::Hydrolysis
+                .validate_host_support(foreign)
+                .is_err()
+        );
     }
 }
 

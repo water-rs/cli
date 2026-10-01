@@ -550,6 +550,33 @@ impl ResolvedFramework {
             .map(String::as_str)
     }
 
+    /// The Hydrolysis Android host the framework pins — the
+    /// `hydrolysis-android-host-{url,revision,subdirectory}` coordinates the
+    /// CLI materializes into a managed checkout and `includeBuild`s.
+    ///
+    /// # Errors
+    /// Returns an error naming the missing key when the resolved framework
+    /// predates the host coordinates.
+    pub(crate) fn hydrolysis_android_host(&self) -> Result<HydrolysisAndroidHost<'_>> {
+        const PREFIX: &str = "hydrolysis-android-host-";
+        let value = |suffix: &str| {
+            self.scaffold
+                .get(&format!("{PREFIX}{suffix}"))
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    eyre!(
+                        "resolved framework carries no `{PREFIX}{suffix}` scaffold metadata: \
+                     the hydrolysis Android host needs the URL, revision and subdirectory pins"
+                    )
+                })
+        };
+        Ok(HydrolysisAndroidHost {
+            url: value("url")?,
+            revision: value("revision")?,
+            subdirectory: value("subdirectory")?,
+        })
+    }
+
     /// The Android API floor the selected framework's native runtime
     /// supports — the `android-min-api-level` its
     /// `[package.metadata.waterui]` table declares. The backend's Gradle
@@ -682,7 +709,7 @@ impl ResolvedFramework {
         metadata: &cargo_metadata::Metadata,
         contents: &[u8],
     ) -> Result<()> {
-        let source = match &self.source {
+        let (repository, revision) = match &self.source {
             Source::Stable { .. } | Source::Local { .. } => return Ok(()),
             Source::Dev {
                 repository,
@@ -693,8 +720,9 @@ impl ResolvedFramework {
                 repository,
                 revision,
                 ..
-            } => format!("git+{repository}?rev={revision}#{revision}"),
+            } => (repository, revision),
         };
+        let source = format!("git+{repository}?rev={revision}#{revision}");
         let locked = self.cargo_lock(contents)?;
         let allowed = self.allowed_packages(&locked.packages);
         let packages: BTreeMap<_, _> = metadata
@@ -718,7 +746,7 @@ impl ResolvedFramework {
                 .is_some_and(|candidate| candidate.repr == source)
         };
         if !metadata.packages.iter().any(is_framework_source) {
-            bail!("the project does not resolve its selected framework revision");
+            return Err(self.unresolved_revision_error(metadata, repository, revision));
         }
         let mut pending: Vec<_> = metadata
             .packages
@@ -772,6 +800,46 @@ impl ResolvedFramework {
             );
         }
         Ok(())
+    }
+
+    /// The error a project resolving none of its selected framework source
+    /// hits: the resolution carried the framework repository at another
+    /// revision, or at no git revision at all. Name the selected revision,
+    /// what the resolved lock carries and the `water channel` command that
+    /// re-pins the project — the shape the lock-divergence errors above
+    /// take.
+    fn unresolved_revision_error(
+        &self,
+        metadata: &cargo_metadata::Metadata,
+        repository: &str,
+        revision: &str,
+    ) -> eyre::Report {
+        let revisions: Vec<String> = metadata
+            .packages
+            .iter()
+            .filter_map(|package| package.source.as_ref())
+            .filter_map(|source| source.repr.parse::<cargo_lock::SourceId>().ok())
+            .filter(|source| {
+                source.is_git()
+                    && canonical_git_url(source.url().as_str()) == canonical_git_url(repository)
+            })
+            .filter_map(|source| source.precise().map(str::to_owned))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let resolved = match revisions.as_slice() {
+            [] => "no framework revision".to_owned(),
+            [revision] => format!("framework revision {revision}"),
+            revisions => format!("framework revisions {}", revisions.join(", ")),
+        };
+        let channel = self
+            .channel()
+            .expect("stable and local selections return early");
+        eyre!(
+            "the project does not resolve its selected framework revision {revision}; \
+             the resolved lock carries {resolved} for the framework repository; \
+             run `water channel {channel}` to reconcile the project"
+        )
     }
 
     pub(crate) async fn prepare_build(
@@ -1089,22 +1157,35 @@ impl ResolvedFramework {
     /// compilation gate; `nightly` and `stable` resolve the newest eligible
     /// GitHub release carrying a `framework.json` — a published `nightly-*`
     /// prerelease, a published `v<semver>` release — and pin what it
-    /// certifies.
+    /// certifies. `rev` pins `dev` to an exact commit of the branch's own
+    /// history instead of its head; a certified channel is already exact and
+    /// rejects the pin.
     ///
     /// # Errors
     /// Returns an error when the channel has no eligible release, the manifest
     /// fails verification, or the certified revision cannot be fetched.
-    pub(crate) async fn resolve(channel: FrameworkChannel) -> Result<(Self, Option<Vec<u8>>)> {
+    pub(crate) async fn resolve(
+        channel: FrameworkChannel,
+        rev: Option<&str>,
+    ) -> Result<(Self, Option<Vec<u8>>)> {
         let repository = framework_repository();
         let slug = repository_slug(repository)?;
         match channel {
             FrameworkChannel::Stable | FrameworkChannel::Nightly => {
+                if rev.is_some() {
+                    bail!(
+                        "--rev pins a commit of the dev channel; a {channel} release is already an exact revision"
+                    );
+                }
                 let certification = latest_certification(repository, channel).await?;
                 let revision = certification.revision.clone();
                 Self::construct(repository, slug, &revision, Some(certification)).await
             }
             FrameworkChannel::Dev => {
-                let revision = resolve_dev(repository, slug).await?;
+                let revision = match rev {
+                    Some(rev) => resolve_dev_at(repository, slug, rev).await?,
+                    None => resolve_dev(repository, slug).await?,
+                };
                 Self::construct(repository, slug, &revision, None).await
             }
         }
@@ -1577,7 +1658,9 @@ fn framework_metadata(manifest: &toml::Value) -> Result<toml::Table> {
 /// pins a repository — and every backend coordinate — `{name}-backend-url`,
 /// plus the `{name}-backend-version` of a backend pinned by release or the
 /// `{name}-backend-revision` of one pinned by commit, rather than by
-/// gitlink — from `[package.metadata.waterui]`.
+/// gitlink — and every host coordinate — `{name}-host-url`,
+/// `{name}-host-revision` and `{name}-host-subdirectory` — from
+/// `[package.metadata.waterui]`.
 ///
 /// `framework_manifest.py` emits exactly this table into every `framework.json`
 /// it publishes; both must produce the same table for the same tree.
@@ -1626,15 +1709,22 @@ fn framework_scaffold(manifest: &toml::Value) -> Result<BTreeMap<String, String>
     for (key, value) in &metadata {
         if !(key.ends_with("-backend-url")
             || key.ends_with("-backend-version")
-            || key.ends_with("-backend-revision"))
+            || key.ends_with("-backend-revision")
+            || key.ends_with("-host-url")
+            || key.ends_with("-host-revision")
+            || key.ends_with("-host-subdirectory"))
         {
             continue;
         }
         let value = value
             .as_str()
             .ok_or_else(|| eyre!("package.metadata.waterui.{key} must be a string"))?;
-        if key.ends_with("-backend-revision") {
+        if key.ends_with("-backend-revision") || key.ends_with("-host-revision") {
             validate_revision(value).wrap_err_with(|| format!("package.metadata.waterui.{key}"))?;
+        }
+        if key.ends_with("-host-subdirectory") {
+            validate_host_subdirectory(value)
+                .wrap_err_with(|| format!("package.metadata.waterui.{key}"))?;
         }
         scaffold.insert(key.clone(), value.to_owned());
     }
@@ -2082,6 +2172,36 @@ fn validate_revision(revision: &str) -> Result<()> {
     Ok(())
 }
 
+/// The Hydrolysis Android host coordinates a resolved framework carries:
+/// where to fetch the host repository, the exact commit to check out, and
+/// the subdirectory inside that checkout that is the Gradle project the
+/// generated app `includeBuild`s.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HydrolysisAndroidHost<'a> {
+    /// Git URL the host checkout is fetched from.
+    pub url: &'a str,
+    /// Full commit hash the checkout pins.
+    pub revision: &'a str,
+    /// Gradle root inside the checkout (e.g. `android`).
+    pub subdirectory: &'a str,
+}
+
+/// A `{name}-host-subdirectory` names the Gradle root inside the host
+/// checkout the generated project `includeBuild`s — a plain relative path,
+/// never absolute and never escaping the checkout.
+fn validate_host_subdirectory(subdirectory: &str) -> Result<()> {
+    let path = Path::new(subdirectory);
+    if subdirectory.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("host subdirectory must be a relative path inside the checkout");
+    }
+    Ok(())
+}
+
 async fn fetch(url: &str) -> Result<Vec<u8>> {
     fetch_optional(url)
         .await?
@@ -2155,6 +2275,15 @@ pub(crate) mod test_fixtures {
                     "https://github.com/water-rs/android-backend.git".to_owned(),
                 ),
                 ("android-backend-revision".to_owned(), revision('c')),
+                (
+                    "hydrolysis-android-host-url".to_owned(),
+                    "https://github.com/water-rs/hydrolysis.git".to_owned(),
+                ),
+                ("hydrolysis-android-host-revision".to_owned(), revision('d')),
+                (
+                    "hydrolysis-android-host-subdirectory".to_owned(),
+                    "android".to_owned(),
+                ),
             ])
             .collect();
         ResolvedFramework {
@@ -2202,6 +2331,66 @@ pub(crate) mod test_fixtures {
                 experimental("0.1.0", "https://github.com/water-rs/waterui-winui", 'e'),
             ),
         ])
+    }
+
+    /// A stable-channel resolution whose `scaffold` comes from running the
+    /// real `framework_scaffold` emission over the checkout fixture manifest
+    /// — the path the published `framework.json` takes — rather than a
+    /// hand-assembled map. Tests that exercise the scaffold contract
+    /// end-to-end resolve this, so a dropped or renamed
+    /// `[package.metadata.waterui]` key fails them instead of only the
+    /// emitter's unit test. `stable` still withholds the git-pinned scaffold
+    /// packages under `experimental-packages`; the emitted `-git`/`-rev`
+    /// facts move there.
+    pub fn stable_checkout_framework() -> ResolvedFramework {
+        let revision = |seed: char| seed.to_string().repeat(40);
+        let manifest = toml::Value::Table(
+            local_checkout_manifest()
+                .parse::<toml::Table>()
+                .expect("the checkout fixture manifest parses"),
+        );
+        let mut emitted =
+            framework_scaffold(&manifest).expect("the checkout fixture emits its scaffold");
+        let mut experimental_packages = BTreeMap::new();
+        for name in ["waterui-dew", "waterui-gtk", "waterui-winui"] {
+            experimental_packages.insert(
+                name.to_owned(),
+                ExperimentalPackage {
+                    version: emitted
+                        .remove(&format!("{name}-version"))
+                        .expect("the fixture pins the package version"),
+                    git: emitted
+                        .remove(&format!("{name}-git"))
+                        .expect("the fixture pins the package git source"),
+                    rev: emitted
+                        .remove(&format!("{name}-rev"))
+                        .expect("the fixture pins the package revision"),
+                },
+            );
+        }
+        let scaffold = FRAMEWORK_PACKAGES
+            .iter()
+            .map(|name| (format!("{name}-version"), "0.4.1".to_owned()))
+            .chain(emitted)
+            .collect();
+        ResolvedFramework {
+            source: Source::Stable {
+                release: Some(FrameworkRelease {
+                    repository: framework_repository().to_owned(),
+                    revision: revision('a'),
+                    tag: "v0.4.1".to_owned(),
+                }),
+            },
+            minimum_cli_version: None,
+            rust_version: None,
+            metadata: toml::toml! {
+                android-min-api-level = 26
+            },
+            scaffold,
+            experimental_packages,
+            packages: BTreeMap::new(),
+            patches: PatchSet::default(),
+        }
     }
 
     /// A `dev`-channel resolution: the manifest's scaffold facts — including
@@ -2408,6 +2597,74 @@ async fn resolve_dev(repository: &str, slug: &str) -> Result<String> {
     gated_dev_head(repository, slug, "dev.yml", "framework").await
 }
 
+/// A `dev` selection pinned to an exact commit: `rev` names a commit of the
+/// integration branch's own history, verified against the branch's head
+/// through the same GitHub API the tip resolution already uses. Anything
+/// else — a fork commit, another branch's tip, a commit `dev` never merged —
+/// is not dev history and cannot stand in for the channel.
+async fn resolve_dev_at(repository: &str, slug: &str, rev: &str) -> Result<String> {
+    validate_rev(rev)?;
+    let head = remote_dev_head(repository, "framework").await?;
+    let revision = normalize_revision(slug, rev).await?;
+    let status = dev_ancestor_status(slug, &revision, &head).await?;
+    ensure_dev_ancestor(&status, &revision, &head)?;
+    if !gate_passed(slug, "dev.yml", &revision).await? {
+        bail!("no successful dev gate run exists for --rev {revision}");
+    }
+    Ok(revision)
+}
+
+/// The spelling `--rev` accepts: a commit hash — hex only, at least the four
+/// characters a unique abbreviation needs and at most the full forty.
+/// Anything else is a ref, which ancestry cannot pin.
+fn validate_rev(rev: &str) -> Result<()> {
+    if !(4..=40).contains(&rev.len()) || !rev.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("--rev must be a commit hash of 4-40 hex characters, got `{rev}`");
+    }
+    Ok(())
+}
+
+/// The full commit id `rev` names in `slug` — the object the commits API
+/// names back, so an abbreviation `225259c80` persists the same forty
+/// characters the tip resolution would.
+async fn normalize_revision(slug: &str, rev: &str) -> Result<String> {
+    let response = fetch(&format!(
+        "https://api.github.com/repos/{slug}/commits/{rev}"
+    ))
+    .await
+    .wrap_err_with(|| format!("--rev {rev} does not name a commit in {slug}"))?;
+    let commit: serde_json::Value = serde_json::from_slice(&response)?;
+    commit["sha"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| eyre!("--rev {rev} did not resolve to a commit in {slug}"))
+}
+
+/// The compare status of `revision...head` — the ancestry fact the compare
+/// API reports for the pin against the branch's own head.
+async fn dev_ancestor_status(slug: &str, revision: &str, head: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{slug}/compare/{revision}...{head}");
+    let response = fetch(&url).await?;
+    let compare: serde_json::Value = serde_json::from_slice(&response)?;
+    compare["status"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| eyre!("malformed compare response from {url}: `status` is missing"))
+}
+
+/// The compare statuses a pin is accepted under: `ahead` — `dev` moved past
+/// the pin — or `identical` — the pin is the head itself. `behind` and
+/// `diverged` name a commit carrying work `dev` never contained.
+fn ensure_dev_ancestor(status: &str, revision: &str, head: &str) -> Result<()> {
+    if matches!(status, "ahead" | "identical") {
+        return Ok(());
+    }
+    bail!(
+        "--rev {revision} is not an ancestor of the framework's dev head {head} \
+         (compare status: {status})"
+    );
+}
+
 /// The Apple backend's `dev` HEAD for a `dev` framework selection. The
 /// backend moved out of the framework tree, so nothing records the backend
 /// revision a `dev` framework was built against — `apple-backend-version`
@@ -2423,10 +2680,8 @@ async fn backend_dev_revision(url: &str) -> Result<String> {
     .await
 }
 
-/// The `dev` HEAD of `repository`, held to the channel's promise that the
-/// resolved commit passed `gate` — the workflow file gating `dev` in that
-/// repository: `dev.yml` for the framework, `ci.yml` for a backend.
-async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) -> Result<String> {
+/// The `dev` branch head of `repository` — the tip `git ls-remote` reports.
+async fn remote_dev_head(repository: &str, what: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["ls-remote", repository, "refs/heads/dev"])
         .output()
@@ -2443,14 +2698,34 @@ async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) ->
         .ok_or_else(|| eyre!("{what} repository has no dev branch"))?
         .to_owned();
     validate_revision(&revision)?;
+    Ok(revision)
+}
+
+/// Whether `revision` carries a successful `gate` run on `dev` — the query
+/// behind the channel's promise that a resolved commit passed its
+/// compilation gate. `event=push` scopes the run to the branch itself: a
+/// pull-request run on the same commit is not the gate.
+async fn gate_passed(slug: &str, gate: &str, revision: &str) -> Result<bool> {
     let response = fetch(&format!("https://api.github.com/repos/{slug}/actions/workflows/{gate}/runs?branch=dev&head_sha={revision}&status=success&event=push&per_page=1")).await?;
     let runs: serde_json::Value = serde_json::from_slice(&response)?;
-    let checked = runs["workflow_runs"].as_array().is_some_and(|runs| {
-        runs.iter().any(|run| {
-            run["head_sha"].as_str() == Some(&revision) && run["conclusion"] == "success"
-        })
-    });
-    if !checked {
+    Ok(gate_run_succeeded(&runs, revision))
+}
+
+/// The successful-run decision over a workflow-runs response: some listed
+/// run names the revision and concluded `success`.
+fn gate_run_succeeded(runs: &serde_json::Value, revision: &str) -> bool {
+    runs["workflow_runs"].as_array().is_some_and(|runs| {
+        runs.iter()
+            .any(|run| run["head_sha"].as_str() == Some(revision) && run["conclusion"] == "success")
+    })
+}
+
+/// The `dev` HEAD of `repository`, held to the channel's promise that the
+/// resolved commit passed `gate` — the workflow file gating `dev` in that
+/// repository: `dev.yml` for the framework, `ci.yml` for a backend.
+async fn gated_dev_head(repository: &str, slug: &str, gate: &str, what: &str) -> Result<String> {
+    let revision = remote_dev_head(repository, what).await?;
+    if !gate_passed(slug, gate, &revision).await? {
         bail!("{what} dev revision {revision} has not passed its compilation gate");
     }
     Ok(revision)
@@ -2958,6 +3233,80 @@ mod tests {
                 include_bytes!("../../tests/fixtures/dev_channel/Water.lock"),
             )
             .expect("a fresh dev-channel resolution replaces no locked package");
+    }
+
+    /// A project whose resolution carries none of the selected framework
+    /// source fails naming the selected revision, the revision the resolved
+    /// lock carries for the framework repository — or that it carries none —
+    /// and the `water channel` command that re-pins the project (#236).
+    #[test]
+    fn a_divergent_framework_resolution_names_the_revisions_and_the_command() {
+        let repository = framework_repository();
+        let selected = 'a'.to_string().repeat(40);
+        let resolved = 'b'.to_string().repeat(40);
+        let contents = test_lock().to_string();
+        let mut framework = dev_framework();
+        framework.source = Source::Dev {
+            repository: repository.to_owned(),
+            revision: selected.clone(),
+            lock_sha256: hex::encode(Sha256::digest(contents.as_bytes())),
+        };
+        let package = |name: &str, version: &str, source: &str| {
+            serde_json::json!({
+                "name": name,
+                "version": version,
+                "id": source,
+                "source": source,
+                "dependencies": [],
+                "targets": [],
+                "features": {},
+                "manifest_path": "/project/Cargo.toml",
+                "edition": "2024"
+            })
+        };
+        let metadata = |packages: serde_json::Value| {
+            serde_json::from_value::<cargo_metadata::Metadata>(serde_json::json!({
+                "version": 1,
+                "packages": packages,
+                "workspace_members": [],
+                "resolve": {"nodes": [], "root": null},
+                "workspace_root": "/project",
+                "target_directory": "/project/target",
+                "workspace_metadata": {}
+            }))
+            .unwrap()
+        };
+        // The resolved lock carries the framework repository at another
+        // revision than the selection records.
+        let error = framework
+            .validate_dependencies(
+                &metadata(serde_json::json!([package(
+                    "waterui",
+                    "0.5.2",
+                    &format!("git+{repository}?rev={resolved}#{resolved}")
+                )])),
+                contents.as_bytes(),
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&selected), "{message}");
+        assert!(message.contains(&resolved), "{message}");
+        assert!(message.contains("water channel dev"), "{message}");
+        // The resolved lock carries no framework revision at all.
+        let error = framework
+            .validate_dependencies(
+                &metadata(serde_json::json!([package(
+                    "serde",
+                    "1.0.0",
+                    "registry+https://github.com/rust-lang/crates.io-index"
+                )])),
+                contents.as_bytes(),
+            )
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&selected), "{message}");
+        assert!(message.contains("no framework revision"), "{message}");
+        assert!(message.contains("water channel dev"), "{message}");
     }
 
     /// `water create` seeds the generated crate's lock the way the build
@@ -4321,6 +4670,18 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
                     "https://github.com/water-rs/android-backend.git".to_owned()
                 ),
                 ("android-backend-revision".to_owned(), "c".repeat(40)),
+                (
+                    "hydrolysis-android-host-url".to_owned(),
+                    "https://github.com/water-rs/hydrolysis.git".to_owned()
+                ),
+                (
+                    "hydrolysis-android-host-revision".to_owned(),
+                    "d".repeat(40)
+                ),
+                (
+                    "hydrolysis-android-host-subdirectory".to_owned(),
+                    "android".to_owned()
+                ),
             ])
         );
     }
@@ -4352,6 +4713,41 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
         assert!(
             error.to_string().contains("android-backend-revision"),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn framework_scaffold_validates_the_hydrolysis_android_host_coordinates() {
+        for (key, value) in [
+            ("hydrolysis-android-host-revision", "dev"),
+            ("hydrolysis-android-host-subdirectory", "../outside"),
+            ("hydrolysis-android-host-subdirectory", "/absolute"),
+            ("hydrolysis-android-host-subdirectory", ""),
+        ] {
+            let mut root: toml::Value = toml::from_str(include_str!(
+                "../../tests/fixtures/framework_checkout_manifest.toml"
+            ))
+            .unwrap();
+            root["package"]["metadata"]["waterui"][key] = toml::Value::String(value.to_owned());
+            let error = framework_scaffold(&root).unwrap_err();
+            assert!(error.to_string().contains(key), "{key}={value}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn resolved_framework_carries_the_hydrolysis_android_host_pin() {
+        let framework = stable_framework();
+        let host = framework.hydrolysis_android_host().unwrap();
+        assert_eq!(host.url, "https://github.com/water-rs/hydrolysis.git");
+        assert_eq!(host.revision, "d".repeat(40));
+        assert_eq!(host.subdirectory, "android");
+
+        let mut missing = stable_framework();
+        missing.scaffold.remove("hydrolysis-android-host-revision");
+        let error = missing.hydrolysis_android_host().unwrap_err().to_string();
+        assert!(
+            error.contains("hydrolysis-android-host-revision"),
+            "{error}"
         );
     }
 
@@ -4406,5 +4802,74 @@ rev = "d68d9e9825bcd1ffee762323881c13a2e7a3f639""#,
             framework.scaffold_value("android-backend-revision"),
             "c".repeat(40)
         );
+    }
+
+    #[test]
+    fn rev_argument_accepts_only_a_commit_hash() {
+        assert!(validate_rev("225259c80").is_ok());
+        assert!(validate_rev(&"a".repeat(40)).is_ok());
+        for rev in ["abc", "main", "dev", "HEAD~1", "", &"a".repeat(41)] {
+            assert!(validate_rev(rev).is_err(), "`{rev}` must be rejected");
+        }
+    }
+
+    #[test]
+    fn dev_ancestry_accepts_only_dev_history() {
+        let head = "b".repeat(40);
+        let pin = "a".repeat(40);
+        assert!(ensure_dev_ancestor("ahead", &pin, &head).is_ok());
+        assert!(ensure_dev_ancestor("identical", &pin, &head).is_ok());
+        for status in ["behind", "diverged", "unknown"] {
+            let message = ensure_dev_ancestor(status, &pin, &head)
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(&pin), "{message} must name the commit");
+            assert!(message.contains(&head), "{message} must name the dev head");
+            assert!(
+                message.contains(status),
+                "{message} must name the compare status"
+            );
+        }
+    }
+
+    /// A pinned revision is held to the tip's own promise: the gate decision
+    /// accepts only a successful run that names the commit itself — a run on
+    /// another sha, a failed conclusion, or a response without runs all fail.
+    #[test]
+    fn the_gate_decision_requires_a_successful_run_on_the_commit() {
+        let pin = "a".repeat(40);
+        let other = "b".repeat(40);
+        let run = |sha: &str, conclusion: &str| serde_json::json!({"head_sha": sha, "conclusion": conclusion});
+        assert!(gate_run_succeeded(
+            &serde_json::json!({"workflow_runs": [run(&pin, "success")]}),
+            &pin
+        ));
+        assert!(gate_run_succeeded(
+            &serde_json::json!({"workflow_runs": [run(&other, "success"), run(&pin, "success")]}),
+            &pin
+        ));
+        for response in [
+            serde_json::json!({"workflow_runs": [run(&pin, "failure")]}),
+            serde_json::json!({"workflow_runs": [run(&other, "success")]}),
+            serde_json::json!({"workflow_runs": []}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                !gate_run_succeeded(&response, &pin),
+                "{response} must not pass the gate for {pin}"
+            );
+        }
+    }
+
+    /// A `--rev` pin beside a certified channel fails inside `resolve` —
+    /// before any release is listed — the same refusal the flag layer makes.
+    #[test]
+    fn a_certified_channel_rejects_a_rev_pin_before_resolving() {
+        for channel in [FrameworkChannel::Stable, FrameworkChannel::Nightly] {
+            let message = smol::block_on(ResolvedFramework::resolve(channel, Some("225259c80")))
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("dev"), "{message} must name dev");
+        }
     }
 }

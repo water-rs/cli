@@ -17,7 +17,10 @@ use waterui_cli::{
     build::{BuildOptions, BuildProfile, BuiltTarget},
     device::Artifact,
     gtk4::platform::{build_gtk4, package_gtk4},
-    hydrolysis::platform::{build_hydrolysis, package_hydrolysis},
+    hydrolysis::{
+        android::{self as hydrolysis_android, HydrolysisAndroidPainter},
+        platform::{build_hydrolysis, package_hydrolysis},
+    },
     package_output::place_in_project,
     platform::{DeviceSigning, PackageOptions, TargetPlatform as LibTargetPlatform},
     project::{ManagedBackends, Project},
@@ -115,6 +118,13 @@ pub struct Args {
     #[arg(short, long, value_enum)]
     backend: TargetBackend,
 
+    /// Android painter the Hydrolysis host draws with (gpu, hwui).
+    /// Only valid with `--platform android --backend hydrolysis`; the
+    /// `[backends.hydrolysis] painter` table in `Water.toml` is the project
+    /// default when omitted.
+    #[arg(long, value_enum)]
+    painter: Option<HydrolysisAndroidPainter>,
+
     #[command(flatten)]
     profile: ProfileArgs,
 
@@ -200,19 +210,42 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
         args.distribution,
     );
     check_packaging_toolchain(shell, args.platform, context.backend, &args.arch).await?;
+    // The per-backend artifact builds cross clippy's `large_futures` threshold
+    // (16 KiB) on Windows, so the future is pinned on the heap.
     let built = Box::pin(build_packaging_artifacts(shell, &args, &context)).await?;
     package_artifact(shell, &args, &context, built.as_ref()).await
 }
 
 async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<PackagingContext>> {
     let project_path = crate::project_path::canonicalize(&args.path)?;
-    let managed_backends = ManagedBackends::for_platform(lib_platform(args.platform));
-    let project = Project::open(&project_path, managed_backends).await?;
     let backend = resolve_backend(args.platform, args.backend)?;
+    // Hydrolysis on Android opens no managed backend — the old widget-FFI
+    // backend is not its runtime; the Hydrolysis launcher crate
+    // `ensure_generated_backend` produces is.
+    let managed_backends =
+        if (args.platform, backend) == (TargetPlatform::Android, TargetBackend::Hydrolysis) {
+            ManagedBackends::NONE
+        } else {
+            ManagedBackends::for_platform(lib_platform(args.platform))
+        };
+    let project = Project::open(&project_path, managed_backends).await?;
+    if project.manifest().package.embedded {
+        bail!(
+            "`water package` does not apply to embedded projects: `water build --platform android` already produces the host-consumable artifact"
+        );
+    }
 
-    validate_arch_args(backend, &args.arch)?;
+    validate_arch_args(args.platform, backend, &args.arch)?;
     validate_unsigned_args(args.platform, backend, args.unsigned)?;
-    validate_desktop_backend_platform_on_host(args.platform, backend)?;
+    backend
+        .cli_backend()
+        .lib_backend()
+        .validate_host_support(lib_platform(args.platform))?;
+    if args.painter.is_some()
+        && !(args.platform == TargetPlatform::Android && backend == TargetBackend::Hydrolysis)
+    {
+        bail!("--painter only applies to `--platform android --backend hydrolysis`");
+    }
 
     if backend.is_experimental()
         && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
@@ -289,12 +322,14 @@ async fn build_packaging_artifacts(
 ) -> Result<Option<BuiltTarget>> {
     match context.backend {
         TargetBackend::Android => {
-            build_android_packaging_artifacts(
+            // The per-backend artifact builds cross clippy's `large_futures`
+            // threshold (16 KiB) on Windows, so the future is pinned on the heap.
+            Box::pin(build_android_packaging_artifacts(
                 shell,
                 &context.project,
                 &args.arch,
                 context.build_options.clone(),
-            )
+            ))
             .await
         }
         TargetBackend::Apple => {
@@ -315,6 +350,7 @@ async fn build_packaging_artifacts(
                 shell,
                 &context.project,
                 args.platform,
+                &args.arch,
                 context.build_options.clone(),
             )
             .await
@@ -406,10 +442,34 @@ async fn build_hydrolysis_packaging_artifacts(
     shell: &Shell,
     project: &Project,
     platform: TargetPlatform,
+    arch: &[AndroidArch],
     build_options: BuildOptions,
 ) -> Result<Option<BuiltTarget>> {
     if platform == TargetPlatform::Web {
         return Ok(None);
+    }
+
+    if platform == TargetPlatform::Android {
+        let mut built = None;
+        hydrolysis_android::clean_jni_libs(project).await?;
+        for arch in arch {
+            let abi = arch.to_abi();
+            let spinner = shell.spinner(format!("Building Rust library ({})...", abi.as_str()));
+            let target = shell
+                .display_output(hydrolysis_android::build(
+                    project,
+                    &waterui_cli::toolchain::Host::current(),
+                    abi,
+                    build_options.clone(),
+                ))
+                .await?;
+            built = Some(target);
+            if let Some(pb) = spinner {
+                pb.finish_and_clear();
+            }
+            success!(shell, "Built for {}", abi.as_str());
+        }
+        return Ok(built);
     }
 
     let spinner = shell.spinner("Building hydrolysis app...");
@@ -501,13 +561,31 @@ async fn package_artifact_inner(
             .await
         }
         TargetBackend::Hydrolysis => {
-            package_hydrolysis(
-                &context.project,
-                hydrolysis_platform(args.platform),
-                package_options,
-                built,
-            )
-            .await
+            if args.platform == TargetPlatform::Android {
+                let abis: Vec<AndroidAbi> = args.arch.iter().map(|arch| arch.to_abi()).collect();
+                let painter = hydrolysis_android::resolve_painter(&context.project, args.painter);
+                hydrolysis_android::package_with_abis(
+                    &context.project,
+                    &waterui_cli::toolchain::Host::current(),
+                    painter,
+                    &package_options,
+                    &abis,
+                    built.ok_or_else(|| {
+                        eyre::eyre!(
+                            "Internal error: Hydrolysis Android packaging has no build result"
+                        )
+                    })?,
+                )
+                .await
+            } else {
+                package_hydrolysis(
+                    &context.project,
+                    hydrolysis_platform(args.platform),
+                    package_options,
+                    built,
+                )
+                .await
+            }
         }
     }
 }
@@ -521,16 +599,16 @@ fn resolve_backend(platform: TargetPlatform, backend: TargetBackend) -> Result<T
         ) | (
             TargetPlatform::Macos,
             TargetBackend::Apple | TargetBackend::Hydrolysis
-        ) | (TargetPlatform::Android, TargetBackend::Android)
-            | (
-                TargetPlatform::Linux,
-                TargetBackend::Gtk4 | TargetBackend::Hydrolysis
-            )
-            | (
-                TargetPlatform::Windows,
-                TargetBackend::Hydrolysis | TargetBackend::WinUi
-            )
-            | (TargetPlatform::Web, TargetBackend::Hydrolysis)
+        ) | (
+            TargetPlatform::Android,
+            TargetBackend::Android | TargetBackend::Hydrolysis
+        ) | (
+            TargetPlatform::Linux,
+            TargetBackend::Gtk4 | TargetBackend::Hydrolysis
+        ) | (
+            TargetPlatform::Windows,
+            TargetBackend::Hydrolysis | TargetBackend::WinUi
+        ) | (TargetPlatform::Web, TargetBackend::Hydrolysis)
     );
 
     if !supported {
@@ -538,7 +616,7 @@ fn resolve_backend(platform: TargetPlatform, backend: TargetBackend) -> Result<T
             "Backend {:?} does not support platform {:?}.\n\
              Valid combinations:\n  \
              - iOS/iOS Simulator: apple\n  \
-             - Android: android\n  \
+             - Android: android, hydrolysis\n  \
              - macOS: apple, hydrolysis\n  \
              - Linux: gtk4, hydrolysis\n  \
              - Windows: hydrolysis, winui\n  \
@@ -565,18 +643,26 @@ fn validate_unsigned_args(
     Ok(())
 }
 
-fn validate_arch_args(backend: TargetBackend, arch: &[AndroidArch]) -> Result<()> {
-    if backend == TargetBackend::Android && arch.is_empty() {
+fn validate_arch_args(
+    platform: TargetPlatform,
+    backend: TargetBackend,
+    arch: &[AndroidArch],
+) -> Result<()> {
+    let packages_android = backend == TargetBackend::Android
+        || (platform == TargetPlatform::Android && backend == TargetBackend::Hydrolysis);
+
+    if packages_android && arch.is_empty() {
+        let backend_arg = format!("{backend:?}").to_lowercase();
         bail!(
-            "Android backend requires --arch.\n\
+            "Packaging for Android requires --arch.\n\
              Examples:\n  \
-             water package --platform android --backend android --arch arm64\n  \
-             water package --platform android --backend android --arch arm64,x86-64"
+             water package --platform android --backend {backend_arg} --arch arm64\n  \
+             water package --platform android --backend {backend_arg} --arch arm64,x86-64"
         );
     }
 
-    if backend != TargetBackend::Android && !arch.is_empty() {
-        bail!("--arch is only valid when packaging Android backend");
+    if !packages_android && !arch.is_empty() {
+        bail!("--arch is only valid when packaging for Android");
     }
 
     Ok(())
@@ -621,10 +707,15 @@ async fn check_toolchain_for_backend(
                 && platform != TargetPlatform::Linux
                 && platform != TargetPlatform::Windows
                 && platform != TargetPlatform::Web
+                && platform != TargetPlatform::Android
             {
                 bail!("Internal error: hydrolysis backend is not supported on {platform:?}");
             }
-            if platform == TargetPlatform::Web {
+            if platform == TargetPlatform::Android {
+                let required_abis = arch.iter().map(|arch| arch.to_abi()).collect::<Vec<_>>();
+                toolchain_checks::check_android_build_or_package_for_abis(host, &required_abis)
+                    .await?;
+            } else if platform == TargetPlatform::Web {
                 toolchain_checks::check_web(host).await?;
             } else {
                 toolchain_checks::check_hydrolysis(host).await?;
@@ -637,66 +728,6 @@ async fn check_toolchain_for_backend(
             toolchain_checks::check_winui(host).await?;
         }
     }
-    Ok(())
-}
-
-fn validate_desktop_backend_platform_on_host(
-    platform: TargetPlatform,
-    backend: TargetBackend,
-) -> Result<()> {
-    if platform == TargetPlatform::Web {
-        return Ok(());
-    }
-
-    match backend {
-        TargetBackend::Gtk4 => {
-            #[cfg(target_os = "linux")]
-            {
-                if platform != TargetPlatform::Linux {
-                    bail!("GTK4 backend on Linux host requires --platform linux");
-                }
-            }
-
-            #[cfg(not(target_os = "linux"))]
-            {
-                bail!("GTK4 backend is only supported on Linux hosts");
-            }
-        }
-        TargetBackend::Hydrolysis => {
-            #[cfg(target_os = "macos")]
-            if platform != TargetPlatform::Macos {
-                bail!("Hydrolysis backend on macOS host requires --platform macos");
-            }
-
-            #[cfg(target_os = "linux")]
-            if platform != TargetPlatform::Linux {
-                bail!("Hydrolysis backend on Linux host requires --platform linux");
-            }
-
-            #[cfg(target_os = "windows")]
-            if platform != TargetPlatform::Windows {
-                bail!("Hydrolysis backend on Windows host requires --platform windows");
-            }
-
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-            bail!("Hydrolysis backend is only supported on macOS, Linux, or Windows hosts");
-        }
-        TargetBackend::WinUi => {
-            #[cfg(target_os = "windows")]
-            if platform != TargetPlatform::Windows {
-                bail!("WinUI backend on Windows host requires --platform windows");
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            bail!("WinUI backend is only supported on Windows hosts");
-        }
-        TargetBackend::Apple => {
-            #[cfg(not(target_os = "macos"))]
-            bail!("Apple backend requires a macOS host");
-        }
-        TargetBackend::Android => {}
-    }
-
     Ok(())
 }
 
@@ -764,19 +795,50 @@ mod tests {
 
     #[test]
     fn rejects_empty_arch_for_android_backend() {
-        assert!(validate_arch_args(TargetBackend::Android, &[]).is_err());
+        assert!(validate_arch_args(TargetPlatform::Android, TargetBackend::Android, &[]).is_err());
+        assert!(
+            validate_arch_args(TargetPlatform::Android, TargetBackend::Hydrolysis, &[]).is_err()
+        );
     }
 
     #[test]
     fn rejects_arch_for_non_android_backend() {
-        let err = validate_arch_args(TargetBackend::Apple, &[AndroidArch::Arm64])
-            .expect_err("non-android --arch should fail");
+        let err = validate_arch_args(
+            TargetPlatform::Macos,
+            TargetBackend::Apple,
+            &[AndroidArch::Arm64],
+        )
+        .expect_err("non-android --arch should fail");
         assert!(err.to_string().contains("--arch is only valid"));
+        // Hydrolysis carries --arch only on Android.
+        assert!(
+            validate_arch_args(
+                TargetPlatform::Linux,
+                TargetBackend::Hydrolysis,
+                &[AndroidArch::Arm64]
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn accepts_android_arch_values() {
-        assert!(validate_arch_args(TargetBackend::Android, &[AndroidArch::Arm64]).is_ok());
+        assert!(
+            validate_arch_args(
+                TargetPlatform::Android,
+                TargetBackend::Android,
+                &[AndroidArch::Arm64]
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arch_args(
+                TargetPlatform::Android,
+                TargetBackend::Hydrolysis,
+                &[AndroidArch::Arm64]
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -785,6 +847,11 @@ mod tests {
             resolve_backend(TargetPlatform::Android, TargetBackend::Android)
                 .expect("android backend"),
             TargetBackend::Android
+        );
+        assert_eq!(
+            resolve_backend(TargetPlatform::Android, TargetBackend::Hydrolysis)
+                .expect("hydrolysis on android backend"),
+            TargetBackend::Hydrolysis
         );
         assert_eq!(
             resolve_backend(TargetPlatform::Windows, TargetBackend::Hydrolysis)

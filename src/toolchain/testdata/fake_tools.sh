@@ -391,6 +391,29 @@ sccache)
     esac
     exit 0
     ;;
+git)
+    # The managed-checkout sequence `git -C <dir> init | remote add | fetch |
+    # checkout` produces: on `checkout`, copy the staged
+    # WATERUI_FAKE_GIT_CHECKOUT tree into the -C directory, like a clone's
+    # detached checkout. Every other subcommand succeeds silently.
+    git_dir=""
+    git_prev=""
+    for git_arg in "$@"; do
+        if [ "$git_prev" = "-C" ]; then git_dir=$git_arg; fi
+        git_prev=$git_arg
+    done
+    case "$*" in
+        "--version")
+            printf 'git version %s\n' "${WATERUI_FAKE_GIT_VERSION:-2.43.0}"
+            ;;
+        *checkout*)
+            if [ -n "${WATERUI_FAKE_GIT_CHECKOUT-}" ] && [ -n "$git_dir" ]; then
+                /bin/cp -R "${WATERUI_FAKE_GIT_CHECKOUT}/." "$git_dir/"
+            fi
+            ;;
+    esac
+    exit 0
+    ;;
 cmake | meson | wasm-pack | sh | bash)
     case "$*" in
         --version | -version | -v)

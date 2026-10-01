@@ -18,7 +18,7 @@ use smol::fs;
 
 use crate::project_types::{BundleIdentifier, CrateName, RustIdent};
 
-/// Normalize a path to use forward slashes for config files (Cargo.toml, Xcode projects, etc.)
+/// Normalize a path to use forward slashes for config files (Cargo.toml, package manifests, etc.)
 /// This is necessary because Windows uses backslashes but these config files expect forward slashes.
 fn normalize_path_for_config(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
@@ -88,9 +88,15 @@ pub mod embedded {
 
     pub static APPLE: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/apple");
     pub static ANDROID: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/android");
+    pub static ANDROID_EMBEDDED: Dir<'_> =
+        include_dir!("$CARGO_MANIFEST_DIR/src/templates/android_embedded");
+    pub static ANDROID_SHARED: Dir<'_> =
+        include_dir!("$CARGO_MANIFEST_DIR/src/templates/android_shared");
     pub static FFI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/ffi");
     pub static GTK4: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/gtk4");
     pub static HYDROLYSIS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/hydrolysis");
+    pub static HYDROLYSIS_ANDROID: Dir<'_> =
+        include_dir!("$CARGO_MANIFEST_DIR/src/templates/hydrolysis_android");
     pub static ESP32: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/esp32");
     pub static PREVIEW: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/preview");
     pub static PREVIEW_FFI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/templates/preview_ffi");
@@ -118,14 +124,8 @@ impl IosPermissionTemplateEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FontRegistrationTemplateEntry {
-    pub family_name: String,
-    pub file_name: String,
-}
-
 /// What the launch screen staged into the Apple asset catalog contains, so
-/// the generated Xcode project names only the assets that exist.
+/// the generated Apple scaffold names only the assets that exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LaunchTemplateEntry {
     /// A `LaunchBackground` color set was staged (a background is configured).
@@ -225,6 +225,40 @@ impl Default for Esp32TemplateEntry {
     }
 }
 
+/// The Hydrolysis Android app scaffold's parameters: the managed host
+/// checkout it `includeBuild`s, the painter module that checkout supplies,
+/// and the app's native library name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HydrolysisAndroidTemplateEntry {
+    /// The cdylib `System.loadLibrary` name (e.g. `waterui_hydrolysis_backend_lib`).
+    pub native_library_name: String,
+    /// The Gradle project inside the pinned host checkout, relative to the
+    /// generated `android/` directory (e.g. `../android-host/<rev>/android`).
+    pub host_project_dir: String,
+    /// The application project root, relative to the generated `android/`
+    /// directory — Gradle tasks that invoke `water` resolve the project
+    /// against it. The shared `project_root_relative_path` diffs against the
+    /// backend dir one level up, which only the launcher crate may use.
+    pub project_root: String,
+    /// The `dev.waterui.hydrolysis` painter artifact the app module links
+    /// (e.g. `dev.waterui.hydrolysis:gpu`).
+    pub painter_dependency: String,
+    /// The painter's Gradle project inside the host checkout (e.g. `gpu`) —
+    /// the `includeBuild` `dependencySubstitution` uses it for both the
+    /// `dev.waterui.hydrolysis` module name and the substituted project.
+    pub painter_module: String,
+    /// The generated app's `minSdk`: the higher of the framework's Android
+    /// API floor and the selected painter's.
+    pub min_api_level: u32,
+    /// Import path of the band `View` the painter mounts as child 0 of the
+    /// host view — `None` for a painter that draws through the host view
+    /// itself and ships no band.
+    pub painter_band_import: Option<String>,
+    /// The band class [`painter_band_import`](Self::painter_band_import)
+    /// supplies, when set.
+    pub painter_band_class: Option<String>,
+}
+
 /// What the application's own dependency graph says about browser components.
 ///
 /// Nothing here is configuration: the engine that draws a `WebView` is a crate
@@ -250,6 +284,9 @@ pub struct TemplateContext {
     pub app_name: String,
     /// The Rust crate name (e.g., "`my_app`")
     pub crate_name: CrateName,
+    /// The Rust crate version — the Maven coordinate version the embedded
+    /// Android AAR publishes under.
+    pub crate_version: String,
     /// The bundle identifier (e.g., "dev.waterui.myapp")
     pub bundle_identifier: BundleIdentifier,
     /// The author name
@@ -292,6 +329,9 @@ pub struct TemplateContext {
     pub esp32: Esp32TemplateEntry,
     /// The launch screen assets the Apple templates refer to.
     pub launch: LaunchTemplateEntry,
+    /// Hydrolysis Android scaffold parameters — set only while the
+    /// `hydrolysis_android` templates render.
+    pub hydrolysis_android: Option<HydrolysisAndroidTemplateEntry>,
 }
 
 impl TemplateContext {
@@ -313,6 +353,7 @@ impl TemplateContext {
             app_display_name: options.name.clone(),
             app_name: options.name.replace(' ', ""),
             crate_name,
+            crate_version: String::new(),
             bundle_identifier: options.bundle_identifier.clone(),
             author: options.author.clone(),
             android_backend_path: None,
@@ -331,6 +372,7 @@ impl TemplateContext {
             web_frontend_arg: options.web.as_ref().map(|web| web.include_arg.clone()),
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
+            hydrolysis_android: None,
         }
     }
 
@@ -347,6 +389,7 @@ impl TemplateContext {
             app_display_name: manifest.package.name.clone(),
             app_name: app_name.into(),
             crate_name,
+            crate_version: String::new(),
             bundle_identifier: manifest.package.bundle_identifier.clone(),
             author: String::new(),
             android_backend_path: manifest
@@ -370,6 +413,7 @@ impl TemplateContext {
             web_frontend_arg: manifest.web.as_ref().map(|_| "web".to_string()),
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
+            hydrolysis_android: None,
         }
     }
 
@@ -398,6 +442,7 @@ impl TemplateContext {
             app_name: app_display_name.replace(' ', ""),
             app_display_name,
             crate_name,
+            crate_version: String::new(),
             bundle_identifier,
             author: String::new(),
             android_backend_path: None,
@@ -416,7 +461,16 @@ impl TemplateContext {
             web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
+            hydrolysis_android: None,
         }
+    }
+
+    /// Set the crate version published as the embedded artifact's Maven
+    /// coordinate.
+    #[must_use]
+    pub fn with_crate_version(mut self, version: impl Into<String>) -> Self {
+        self.crate_version = version.into();
+        self
     }
 
     /// Set backend project path for template rendering.
@@ -432,6 +486,7 @@ impl TemplateContext {
         self.project_root_path = Some(path);
         self
     }
+
 
     /// Set whether the application runtime graph links `waterui-webview`.
     #[must_use]
@@ -517,6 +572,83 @@ impl TemplateContext {
         self
     }
 
+    /// Set the Hydrolysis Android scaffold parameters.
+    #[must_use]
+    pub fn with_hydrolysis_android(mut self, entry: HydrolysisAndroidTemplateEntry) -> Self {
+        self.hydrolysis_android = Some(entry);
+        self
+    }
+
+    const fn hydrolysis_android_entry(&self) -> &HydrolysisAndroidTemplateEntry {
+        self.hydrolysis_android
+            .as_ref()
+            .expect("TemplateContext missing the Hydrolysis Android entry")
+    }
+
+    /// The cdylib name the generated `MainActivity` loads.
+    #[must_use]
+    pub fn hydrolysis_android_native_library_name(&self) -> &str {
+        &self.hydrolysis_android_entry().native_library_name
+    }
+
+    /// The pinned host checkout's Gradle root, relative to the generated
+    /// `android/` directory, that `settings.gradle.kts` `includeBuild`s.
+    #[must_use]
+    pub fn hydrolysis_android_host_project_dir(&self) -> &str {
+        &self.hydrolysis_android_entry().host_project_dir
+    }
+
+    /// The application project root relative to the generated `android/`
+    /// directory.
+    #[must_use]
+    pub fn hydrolysis_android_project_root(&self) -> &str {
+        &self.hydrolysis_android_entry().project_root
+    }
+
+    /// The `dev.waterui.hydrolysis` painter artifact the app module links.
+    #[must_use]
+    pub fn hydrolysis_android_painter_dependency(&self) -> &str {
+        &self.hydrolysis_android_entry().painter_dependency
+    }
+
+    /// The painter's Gradle project inside the host checkout
+    /// ([`HydrolysisAndroidTemplateEntry::painter_module`]).
+    pub fn hydrolysis_android_painter_module(&self) -> &str {
+        &self.hydrolysis_android_entry().painter_module
+    }
+
+    /// The generated app's `minSdk`.
+    #[must_use]
+    pub const fn hydrolysis_android_min_api_level(&self) -> u32 {
+        self.hydrolysis_android_entry().min_api_level
+    }
+
+    /// Whether the selected painter mounts a band `View` under the host.
+    #[must_use]
+    pub const fn hydrolysis_android_has_painter_band(&self) -> bool {
+        self.hydrolysis_android_entry().painter_band_class.is_some()
+    }
+
+    /// The painter band `View`'s import path; only valid when
+    /// [`Self::hydrolysis_android_has_painter_band`].
+    #[must_use]
+    pub fn hydrolysis_android_painter_band_import(&self) -> &str {
+        self.hydrolysis_android_entry()
+            .painter_band_import
+            .as_deref()
+            .expect("Hydrolysis Android entry has no painter band")
+    }
+
+    /// The painter band `View`'s class name; only valid when
+    /// [`Self::hydrolysis_android_has_painter_band`].
+    #[must_use]
+    pub fn hydrolysis_android_painter_band_class(&self) -> &str {
+        self.hydrolysis_android_entry()
+            .painter_band_class
+            .as_deref()
+            .expect("Hydrolysis Android entry has no painter band")
+    }
+
     #[must_use]
     pub fn crate_name_ident(&self) -> RustIdent {
         self.crate_name.rust_ident()
@@ -573,6 +705,36 @@ impl TemplateContext {
     #[must_use]
     pub fn android_backend_path(&self) -> String {
         self.compute_android_backend_path().unwrap_or_default()
+    }
+
+    /// The runtime coordinate the embedded module's POM declares for
+    /// `dev.waterui.android:runtime`: remote mode names the `JitPack`
+    /// coordinate; a local checkout names the version `version.txt` pins,
+    /// which `water build` publishes to `mavenLocal`.
+    #[must_use]
+    pub fn android_runtime_dependency(&self) -> String {
+        self.android_runtime_checkout().map_or_else(
+            || self.android_remote_backend_dependency(),
+            |checkout| {
+                let version = std::fs::read_to_string(checkout.join("version.txt")).map_or_else(
+                    |_| "0.0.0".to_string(),
+                    |version| version.trim().to_string(),
+                );
+                format!("dev.waterui.android:runtime:{version}")
+            },
+        )
+    }
+
+    /// Absolute path of the local Android runtime checkout the generated
+    /// project consumes — the same directory `includeBuild` names — or `None`
+    /// when the remote coordinate is used.
+    #[must_use]
+    pub fn android_runtime_checkout(&self) -> Option<PathBuf> {
+        android_runtime_checkout(
+            self.android_backend_path.as_deref(),
+            self.waterui_workspace_root().as_deref(),
+            self.project_root_path.as_deref(),
+        )
     }
 
     #[must_use]
@@ -658,7 +820,7 @@ impl TemplateContext {
     }
 
     /// The path to the local Apple backend checkout `[backends.apple]`
-    /// `backend_path` names, resolved from the Xcode project's directory.
+    /// `backend_path` names, resolved from the generated project's directory.
     /// `None` consumes the remote Swift package instead.
     ///
     /// Without a manifest override, `waterui_path/backends/apple` is used when
@@ -798,9 +960,12 @@ impl TemplateContext {
 enum TemplateNamespace {
     Apple,
     Android,
+    AndroidEmbedded,
+    AndroidShared,
     Ffi,
     Gtk4,
     Hydrolysis,
+    HydrolysisAndroid,
     Esp32,
     Inspector,
     Preview,
@@ -815,9 +980,12 @@ impl TemplateNamespace {
         match self {
             Self::Apple => "src/templates/apple",
             Self::Android => "src/templates/android",
+            Self::AndroidEmbedded => "src/templates/android_embedded",
+            Self::AndroidShared => "src/templates/android_shared",
             Self::Ffi => "src/templates/ffi",
             Self::Gtk4 => "src/templates/gtk4",
             Self::Hydrolysis => "src/templates/hydrolysis",
+            Self::HydrolysisAndroid => "src/templates/hydrolysis_android",
             Self::Esp32 => "src/templates/esp32",
             Self::Inspector => "src/templates/inspector",
             Self::Preview => "src/templates/preview",
@@ -827,6 +995,33 @@ impl TemplateNamespace {
             Self::Root => "src/templates",
         }
     }
+}
+
+/// The local Android runtime checkout a project consumes, as an absolute
+/// path: `[backends.android] backend_path` when set, else
+/// `<waterui_path>/backends/android` when it is a Gradle project. `None`
+/// means the generated project resolves the remote coordinate. Relative
+/// inputs resolve against `project_root`.
+///
+/// Single source for the same resolution [`TemplateContext`] performs for
+/// template renders — the embedded build needs it again when it publishes
+/// the runtime to `mavenLocal`.
+pub fn android_runtime_checkout(
+    backend_path: Option<&Path>,
+    waterui_path: Option<&Path>,
+    project_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let resolve = |path: &Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            project_root.map_or_else(|| path.to_path_buf(), |root| root.join(path))
+        }
+    };
+    backend_path.map(resolve).or_else(|| {
+        let local = resolve(waterui_path?).join("backends/android");
+        local.join("settings.gradle.kts").is_file().then_some(local)
+    })
 }
 
 fn scaffold_template_dispatch_path(namespace: TemplateNamespace, relative_path: &Path) -> String {
@@ -1016,6 +1211,9 @@ define_scaffold_templates! {
     AndroidApplicationTemplate => (Android, "src/templates/android/app/src/main/java/WaterUiApplication.kt.tpl"),
     AndroidStringsTemplate => (Android, "src/templates/android/app/src/main/res/values/strings.xml.tpl"),
     AndroidSettingsTemplate => (Android, "src/templates/android/settings.gradle.kts.tpl"),
+    AndroidEmbeddedSettingsTemplate => (AndroidEmbedded, "src/templates/android_embedded/settings.gradle.kts.tpl"),
+    AndroidEmbeddedModuleTemplate => (AndroidEmbedded, "src/templates/android_embedded/waterui/build.gradle.kts.tpl"),
+    AndroidEmbeddedManifestTemplate => (AndroidEmbedded, "src/templates/android_embedded/waterui/src/main/AndroidManifest.xml.tpl"),
     FfiBuildScriptTemplate => (Ffi, "src/templates/ffi/build.rs.tpl"),
     FfiLibTemplate => (Ffi, "src/templates/ffi/src/lib.rs.tpl"),
     FfiAppleMainTemplate => (Ffi, "src/templates/ffi/src/bin/waterui-apple-main.rs.tpl"),
@@ -1023,6 +1221,11 @@ define_scaffold_templates! {
     Gtk4BuildScriptTemplate => (Gtk4, "src/templates/gtk4/build.rs.tpl"),
     Gtk4MainTemplate => (Gtk4, "src/templates/gtk4/src/main.rs.tpl"),
     HydrolysisBuildScriptTemplate => (Hydrolysis, "src/templates/hydrolysis/build.rs.tpl"),
+    HydrolysisAndroidSettingsTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/settings.gradle.kts.tpl"),
+    HydrolysisAndroidStringsTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/src/main/res/values/strings.xml.tpl"),
+    HydrolysisAndroidBuildGradleTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/build.gradle.kts.tpl"),
+    HydrolysisAndroidManifestTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/src/main/AndroidManifest.xml.tpl"),
+    HydrolysisAndroidMainActivityTemplate => (HydrolysisAndroid, "src/templates/hydrolysis_android/app/src/main/java/MainActivity.kt.tpl"),
     RootWebLibTemplate => (Root, "src/templates/web_lib.rs.tpl"),
     HydrolysisLibTemplate => (Hydrolysis, "src/templates/hydrolysis/src/lib.rs.tpl"),
     HydrolysisMainTemplate => (Hydrolysis, "src/templates/hydrolysis/src/main.rs.tpl"),
@@ -1045,10 +1248,10 @@ define_scaffold_templates! {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserTemplateContext, Esp32TemplateEntry, LaunchTemplateEntry, ResolvedFramework,
-        ResolvedWebViewBackend, TemplateContext, TemplateNamespace, embedded, gtk4,
-        jitpack_dependency_coordinate, normalize_path_for_config, preview_ffi,
-        render_scaffold_template,
+        AndroidPermissionTemplateEntry, BrowserTemplateContext, Esp32TemplateEntry,
+        LaunchTemplateEntry, ResolvedFramework, ResolvedWebViewBackend, TemplateContext,
+        TemplateNamespace, embedded, gtk4, jitpack_dependency_coordinate,
+        normalize_path_for_config, preview_ffi, render_scaffold_template,
     };
     use crate::framework::test_fixtures::{
         dev_framework, nightly_framework, stable_framework, write_apple_revision_checkout,
@@ -1067,6 +1270,7 @@ mod tests {
             app_display_name: String::new(),
             app_name: String::new(),
             crate_name: CrateName::try_from("waterui_test").expect("test crate name must be valid"),
+            crate_version: "0.0.0".to_string(),
             bundle_identifier: BundleIdentifier::try_from("com.example.test")
                 .expect("test bundle identifier must be valid"),
             author: String::new(),
@@ -1085,6 +1289,7 @@ mod tests {
             preview_app_dependency: None,
             web_frontend_arg: None,
             esp32: Esp32TemplateEntry::default(),
+            hydrolysis_android: None,
             launch: LaunchTemplateEntry::default(),
         }
     }
@@ -1195,6 +1400,123 @@ mod tests {
         let remote = render(&context(&remote_manifest));
         assert!(remote.contains("if (true) {"), "{remote}");
         assert!(remote.contains("if (!true) {"), "{remote}");
+    }
+
+    /// Embedded mode scaffolds a Gradle *library* project (`:waterui`, an
+    /// Android library publishing an AAR), never an application — the host
+    /// keeps its own application module (water-rs/cli#223).
+    #[test]
+    fn android_embedded_renders_a_publishing_library() {
+        let manifest: crate::project::Manifest = toml::from_str(
+            r#"
+                [package]
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+                embedded = true
+            "#,
+        )
+        .expect("manifest parses");
+
+        let ctx = TemplateContext::for_project_manifest(
+            &manifest,
+            CrateName::try_from("demo").expect("crate name"),
+            "Demo",
+            &stable_framework(),
+        )
+        .with_backend_project_path(PathBuf::from("/proj/android"))
+        .with_project_root_path(PathBuf::from("/proj"))
+        .with_crate_version("1.2.3");
+
+        let render = |relative: &str, ctx: &TemplateContext| {
+            let template = embedded::ANDROID_EMBEDDED
+                .get_file(relative)
+                .unwrap_or_else(|| panic!("embedded template {relative} must exist"))
+                .contents_utf8()
+                .expect("embedded template must be utf-8");
+            render_scaffold_template(
+                TemplateNamespace::AndroidEmbedded,
+                std::path::Path::new(relative),
+                template,
+                ctx,
+            )
+            .unwrap_or_else(|error| panic!("embedded template {relative} render: {error}"))
+        };
+
+        // A library module applying `com.android.library` and publishing a
+        // `release` AAR under the crate's Maven coordinate — group is the
+        // bundle identifier, artifact is the crate name, version is the
+        // crate's Cargo version.
+        let module = render("waterui/build.gradle.kts.tpl", &ctx);
+        assert!(module.contains("id(\"com.android.library\")"), "{module}");
+        assert!(
+            module.contains("namespace = \"dev.waterui.demo.waterui\""),
+            "{module}"
+        );
+        assert!(
+            module.contains("groupId = \"dev.waterui.demo\""),
+            "{module}"
+        );
+        assert!(module.contains("artifactId = \"demo\""), "{module}");
+        assert!(module.contains("version = \"1.2.3\""), "{module}");
+        assert!(module.contains("from(components[\"release\"])"), "{module}");
+        // `api`, not `implementation`: the runtime's `WaterUiRootView` must
+        // stay on the host app's compile classpath.
+        assert!(
+            module.contains(&format!(
+                "api(\"{}\")",
+                ctx.android_remote_backend_dependency()
+            )),
+            "{module}"
+        );
+
+        // Remote mode keeps JitPack on the repository list for the published
+        // runtime coordinate and the composite build stays guarded off.
+        let settings = render("settings.gradle.kts.tpl", &ctx);
+        assert!(settings.contains("include(\":waterui\")"), "{settings}");
+        assert!(settings.contains("if (true) {"), "{settings}");
+        assert!(settings.contains("if (!true) {"), "{settings}");
+
+        // A local runtime checkout swaps the module's dependency to the
+        // mavenLocal coordinate and draws the composite build in.
+        let checkout = tempfile::tempdir().expect("checkout dir");
+        std::fs::write(checkout.path().join("version.txt"), "7.8.9").expect("version.txt");
+        let mut local_ctx = ctx.clone();
+        local_ctx.android_backend_path = Some(checkout.path().to_path_buf());
+        let local_module = render("waterui/build.gradle.kts.tpl", &local_ctx);
+        assert!(
+            local_module.contains("api(\"dev.waterui.android:runtime:7.8.9\")"),
+            "{local_module}"
+        );
+        let local_settings = render("settings.gradle.kts.tpl", &local_ctx);
+        assert!(
+            local_settings.contains(&format!(
+                "includeBuild(\"{}\")",
+                local_ctx.android_backend_path()
+            )),
+            "{local_settings}"
+        );
+        assert!(
+            local_settings.contains("substitute(module(\"dev.waterui.android:runtime\"))"),
+            "{local_settings}"
+        );
+        assert!(local_settings.contains("if (false) {"), "{local_settings}");
+
+        // Declared permissions render into the library's manifest so the AAR
+        // merges them into the host's.
+        let mut permission_ctx = ctx;
+        permission_ctx.android_permissions = vec![
+            AndroidPermissionTemplateEntry { name: "INTERNET" },
+            AndroidPermissionTemplateEntry { name: "CAMERA" },
+        ];
+        let android_manifest = render("waterui/src/main/AndroidManifest.xml.tpl", &permission_ctx);
+        assert!(
+            android_manifest.contains("android:name=\"android.permission.INTERNET\""),
+            "{android_manifest}"
+        );
+        assert!(
+            android_manifest.contains("android:name=\"android.permission.CAMERA\""),
+            "{android_manifest}"
+        );
     }
 
     fn support_ctx() -> TemplateContext {
@@ -1811,7 +2133,7 @@ mod tests {
         assert!(application.contains("if (runtime.generation != generation) return false"));
         assert!(application.contains("return application.releaseRuntime(generation)"));
         assert!(application.contains("Application(), WaterUiRuntimeOwner"));
-        assert!(application.contains("processEnvironment = WuiEnvironment.create()"));
+        assert!(application.contains("processEnvironment = WuiEnvironment.create(waterUiFonts)"));
         assert!(application.contains("createWaterUiEnvironment(): WuiEnvironment"));
         assert!(application.contains("}.clone()"));
 
@@ -1962,8 +2284,8 @@ mod tests {
         let manifest = cargo_toml
             .parse::<toml::Table>()
             .expect("hydrolysis Cargo.toml should parse");
-        let native_dependencies =
-            &manifest["target"]["cfg(not(target_arch = \"wasm32\"))"]["dependencies"];
+        let native_dependencies = &manifest["target"]["cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))"]
+            ["dependencies"];
         assert_eq!(
             native_dependencies["waterui-preview"]["version"].as_str(),
             Some(pinned("waterui-preview-version").as_str()),
@@ -2123,7 +2445,8 @@ mod tests {
             .expect("hydrolysis Cargo.toml should parse");
 
         for cfg in [
-            "cfg(not(target_arch = \"wasm32\"))",
+            "cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))",
+            "cfg(target_os = \"android\")",
             "cfg(target_arch = \"wasm32\")",
         ] {
             let dependencies = &manifest["target"][cfg]["dependencies"];
@@ -2149,8 +2472,8 @@ mod tests {
         }
 
         // In-tree crates still resolve by path into the checkout.
-        let native_dependencies =
-            &manifest["target"]["cfg(not(target_arch = \"wasm32\"))"]["dependencies"];
+        let native_dependencies = &manifest["target"]["cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))"]
+            ["dependencies"];
         assert_eq!(
             native_dependencies["waterui-core"]["path"].as_str(),
             Some(normalize_path_for_config(&checkout.join("core")).as_str()),
@@ -2861,7 +3184,7 @@ fn render_dir_outputs(
     Ok(outputs)
 }
 
-async fn write_file_if_changed(path: &Path, contents: &[u8]) -> io::Result<()> {
+pub async fn write_file_if_changed(path: &Path, contents: &[u8]) -> io::Result<()> {
     match fs::read(path).await {
         Ok(existing) if existing == contents => return Ok(()),
         Ok(_) | Err(_) => {}
@@ -3523,6 +3846,13 @@ pub mod android {
             ctx,
         )
         .await?;
+        scaffold_dir(
+            TemplateNamespace::AndroidShared,
+            &embedded::ANDROID_SHARED,
+            base_dir,
+            ctx,
+        )
+        .await?;
 
         // Make gradlew executable
         #[cfg(unix)]
@@ -3539,6 +3869,68 @@ pub mod android {
         // Create jniLibs directories
         for abi in ["arm64-v8a", "x86_64", "armeabi-v7a", "x86"] {
             let jni_dir = base_dir.join(format!("app/src/main/jniLibs/{abi}"));
+            fs::create_dir_all(&jni_dir).await?;
+        }
+
+        // Generate local.properties with Android SDK path
+        if let Some(sdk_path) = AndroidSdk::detect_path(&crate::toolchain::Host::current()) {
+            let local_props = base_dir.join("local.properties");
+            let content = format!("sdk.dir={}\n", normalize_path_for_config(&sdk_path));
+            write_file_if_changed(&local_props, content.as_bytes()).await?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Embedded-mode Android templates: a Gradle *library* project whose
+/// `:waterui` module assembles the AAR a host application consumes. Unlike
+/// the app template it owns no Activity or manifest entry — the host mounts
+/// the root view through the runtime's `WaterUiRootView`.
+pub mod android_embedded {
+    use crate::android::toolchain::AndroidSdk;
+
+    use super::{
+        Path, TemplateContext, TemplateNamespace, embedded, fs, io, normalize_path_for_config,
+        scaffold_dir, write_file_if_changed,
+    };
+
+    /// Write all embedded Android templates to the given directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file operations fail.
+    pub async fn scaffold(base_dir: &Path, ctx: &TemplateContext) -> io::Result<()> {
+        scaffold_dir(
+            TemplateNamespace::AndroidEmbedded,
+            &embedded::ANDROID_EMBEDDED,
+            base_dir,
+            ctx,
+        )
+        .await?;
+        scaffold_dir(
+            TemplateNamespace::AndroidShared,
+            &embedded::ANDROID_SHARED,
+            base_dir,
+            ctx,
+        )
+        .await?;
+
+        // Make gradlew executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let gradlew_path = base_dir.join("gradlew");
+            if gradlew_path.exists() {
+                let mut perms = fs::metadata(&gradlew_path).await?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&gradlew_path, perms).await?;
+            }
+        }
+
+        // Create jniLibs directories under the library module
+        for abi in ["arm64-v8a", "x86_64", "armeabi-v7a", "x86"] {
+            let jni_dir = base_dir.join(format!("waterui/src/main/jniLibs/{abi}"));
             fs::create_dir_all(&jni_dir).await?;
         }
 
@@ -4052,9 +4444,15 @@ pub mod hydrolysis {
     ) -> io::Result<BTreeMap<String, GeneratedTargetSection<GeneratedDependencyValue>>> {
         Ok(BTreeMap::from([
             (
-                "cfg(not(target_arch = \"wasm32\"))".to_string(),
+                "cfg(all(not(target_arch = \"wasm32\"), not(target_os = \"android\")))".to_string(),
                 GeneratedTargetSection {
                     dependencies: native_target_dependencies(ctx)?,
+                },
+            ),
+            (
+                "cfg(target_os = \"android\")".to_string(),
+                GeneratedTargetSection {
+                    dependencies: android_target_dependencies(ctx)?,
                 },
             ),
             (
@@ -4062,6 +4460,78 @@ pub mod hydrolysis {
                 GeneratedTargetSection {
                     dependencies: wasm_target_dependencies(ctx)?,
                 },
+            ),
+        ]))
+    }
+
+    /// The dependencies only the Android launcher compiles: the Hydrolysis
+    /// runner's Android host, the JNI declarations `JNI_OnLoad` needs, and
+    /// the GPU-capable `waterui` the registered app builds with. The
+    /// desktop-only stack (winit, pollster, preview and MCP runtimes) stays
+    /// out — the Android launcher never binaries or previews.
+    fn android_target_dependencies(
+        ctx: &TemplateContext,
+    ) -> io::Result<BTreeMap<String, GeneratedDependencyValue>> {
+        Ok(BTreeMap::from([
+            (
+                "hydrolysis".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "hydrolysis",
+                            &["accessibility"],
+                            NativeBackendDependencySource::WorkspaceDependency,
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "waterui".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "waterui",
+                            &["gpu"],
+                            NativeBackendDependencySource::WateruiRoot,
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "waterui-core".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "waterui-core",
+                            &[],
+                            NativeBackendDependencySource::WorkspaceSubdir("core"),
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "hydrolysis-m3".to_string(),
+                GeneratedDependencyValue::detailed(
+                    super::generated_dependency_from_spec(
+                        ctx,
+                        NativeBackendDependencySpec::new(
+                            "hydrolysis-m3",
+                            &[],
+                            NativeBackendDependencySource::WorkspaceDependency,
+                        ),
+                    )?
+                    .with_default_features(false),
+                ),
+            ),
+            (
+                "jni".to_string(),
+                GeneratedDependencyValue::simple("0.21.1"),
             ),
         ]))
     }
@@ -4253,6 +4723,84 @@ pub mod hydrolysis {
                 ),
             ),
         ]))
+    }
+}
+
+/// The generated Gradle app that runs a `WaterUI` application through the
+/// Hydrolysis Android host: a Kotlin `HydrolysisActivity` subclass, the
+/// painter band, and the Rust cdylib wiring — rendered under
+/// `<backend>/android` beside the launcher crate `templates::hydrolysis`
+/// scaffolds.
+pub mod hydrolysis_android {
+    use crate::android::toolchain::AndroidSdk;
+
+    use super::{
+        Path, PathBuf, TemplateContext, TemplateNamespace, embedded, io, normalize_path_for_config,
+        scaffold_dir, write_file_if_changed,
+    };
+
+    /// Write all Hydrolysis Android app templates to the given directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if file operations fail.
+    pub async fn scaffold(base_dir: &Path, ctx: &TemplateContext) -> io::Result<()> {
+        scaffold_dir(
+            TemplateNamespace::HydrolysisAndroid,
+            &embedded::HYDROLYSIS_ANDROID,
+            base_dir,
+            ctx,
+        )
+        .await?;
+        scaffold_dir(
+            TemplateNamespace::AndroidShared,
+            &embedded::ANDROID_SHARED,
+            base_dir,
+            ctx,
+        )
+        .await?;
+
+        // Make gradlew executable
+        #[cfg(unix)]
+        {
+            use super::fs;
+            use std::os::unix::fs::PermissionsExt;
+            let gradlew_path = base_dir.join("gradlew");
+            if gradlew_path.exists() {
+                let mut perms = fs::metadata(&gradlew_path).await?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&gradlew_path, perms).await?;
+            }
+        }
+
+        // Generate local.properties with Android SDK path
+        if let Some(sdk_path) = AndroidSdk::detect_path(&crate::toolchain::Host::current()) {
+            let local_props = base_dir.join("local.properties");
+            let content = format!("sdk.dir={}\n", normalize_path_for_config(&sdk_path));
+            write_file_if_changed(&local_props, content.as_bytes()).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Every file `scaffold` would write, as backend-relative path and
+    /// content, without touching the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if template rendering fails.
+    pub fn rendered_outputs(ctx: &TemplateContext) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+        let mut outputs = super::render_dir_outputs(
+            TemplateNamespace::HydrolysisAndroid,
+            &embedded::HYDROLYSIS_ANDROID,
+            ctx,
+        )?;
+        outputs.extend(super::render_dir_outputs(
+            TemplateNamespace::AndroidShared,
+            &embedded::ANDROID_SHARED,
+            ctx,
+        )?);
+        Ok(outputs)
     }
 }
 
@@ -5026,7 +5574,8 @@ pub mod ffi {
         package_name: &str,
     ) -> io::Result<()> {
         generate_cargo_toml(base_dir, ctx, package_name).await?;
-        scaffold_dir(TemplateNamespace::Ffi, &embedded::FFI, base_dir, ctx).await
+        scaffold_dir(TemplateNamespace::Ffi, &embedded::FFI, base_dir, ctx).await?;
+        Ok(())
     }
 
     async fn generate_cargo_toml(

@@ -76,8 +76,9 @@ impl Default for AndroidBackend {
 impl Backend for AndroidBackend {
     const DEFAULT_PATH: &'static str = "android";
 
-    // Preserve Gradle build caches during re-scaffolding
-    const CACHE_PATHS: &'static [&'static str] = &[".gradle", "build", "app"];
+    // Preserve Gradle build caches during re-scaffolding: `app` is the
+    // entry-owning module, `waterui` the embedded-mode library module.
+    const CACHE_PATHS: &'static [&'static str] = &[".gradle", "build", "app", "waterui"];
 
     fn path(&self) -> &Path {
         &self.project_path
@@ -97,10 +98,12 @@ impl Backend for AndroidBackend {
         // Android is where a missing declaration actually breaks things, so
         // surface anything a dependency needs that the app has not enabled.
         // The audit resolves the FFI companion's graph — the crate the Android
-        // build compiles. On a first init the companion is not scaffolded yet,
-        // so there is nothing to seed or scan until the next reinit.
+        // build compiles. `Project::open` re-renders the companion for this
+        // invocation's selection before any backend runs; only a companion
+        // carried over from a prior open is audited here — the fresh render's
+        // graph is resolved by the build that follows anyway.
         let ffi_manifest = project.ffi_crate_path().join("Cargo.toml");
-        if ffi_manifest.exists() {
+        if project.ffi_companion_preexisting && ffi_manifest.exists() {
             crate::assets::seed_managed_crate_lock(project, &ffi_manifest)
                 .await
                 .map_err(crate::backend::FailToInitBackend::Config)?;
@@ -113,15 +116,7 @@ impl Backend for AndroidBackend {
         }
 
         // Extract enabled permissions from the manifest
-        let android_permissions = manifest
-            .permissions
-            .iter()
-            .filter(|(_, entry)| entry.is_enabled())
-            .filter_map(|(key, _)| {
-                key.android_permission_name()
-                    .map(|name| templates::AndroidPermissionTemplateEntry { name })
-            })
-            .collect();
+        let android_permissions = manifest_permissions(manifest);
 
         let ctx = TemplateContext::for_project_manifest(
             manifest,
@@ -136,9 +131,20 @@ impl Backend for AndroidBackend {
         .with_project_root_path(project.root().to_path_buf())
         .with_android_permissions(android_permissions);
 
-        templates::android::scaffold(&project.backend_path::<Self>(), &ctx)
-            .await
-            .map_err(crate::backend::FailToInitBackend::Io)?;
+        if manifest.package.embedded {
+            let ctx = ctx.with_crate_version(
+                crate::android::embedded::read_crate_version(project.root())
+                    .await
+                    .map_err(crate::backend::FailToInitBackend::Config)?,
+            );
+            templates::android_embedded::scaffold(&project.backend_path::<Self>(), &ctx)
+                .await
+                .map_err(crate::backend::FailToInitBackend::Io)?;
+        } else {
+            templates::android::scaffold(&project.backend_path::<Self>(), &ctx)
+                .await
+                .map_err(crate::backend::FailToInitBackend::Io)?;
+        }
 
         Ok(Self {
             project_path: default_android_project_path(),
@@ -184,4 +190,21 @@ impl Backend for AndroidBackend {
 
 fn default_android_project_path() -> PathBuf {
     PathBuf::from("android")
+}
+
+/// The `<uses-permission>` entries the project manifest enables, for any
+/// backend that scaffolds an `AndroidManifest.xml` — the View-based backend
+/// and the Hydrolysis host alike.
+pub(crate) fn manifest_permissions(
+    manifest: &crate::project::Manifest,
+) -> Vec<templates::AndroidPermissionTemplateEntry> {
+    manifest
+        .permissions
+        .iter()
+        .filter(|(_, entry)| entry.is_enabled())
+        .filter_map(|(key, _)| {
+            key.android_permission_name()
+                .map(|name| templates::AndroidPermissionTemplateEntry { name })
+        })
+        .collect()
 }

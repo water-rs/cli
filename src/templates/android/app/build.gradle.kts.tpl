@@ -157,6 +157,9 @@ android {
 }
 
 dependencies {
+    // --- begin waterui android classpath dependencies ---
+    // --- end waterui android classpath dependencies ---
+
     // Use the backend revision embedded into the CLI build in remote mode, local backend otherwise
     if ({{ ctx.use_remote_dev_backend() }}) {
         implementation("{{ ctx.android_remote_backend_dependency() }}")

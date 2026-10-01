@@ -7,3 +7,7 @@ dirs = ["templates", ".", "src/templates", "src"]
 [[escaper]]
 path = "askama::filters::Html"
 extensions = ["tpl"]
+
+[[escaper]]
+path = "crate::apple::swift_seam::ModuleMapEscape"
+extensions = ["modulemap"]
