@@ -21,7 +21,9 @@ use tracing::info;
 use crate::{
     android::{
         backend::AndroidBackend,
-        platform::{AndroidAbi, AndroidPlatform, run_gradle_tasks},
+        platform::{
+            AndroidAbi, AndroidPlatform, android_ffi_dependency_features, run_gradle_tasks,
+        },
     },
     assets,
     build::{BuildOptions, BuiltTarget},
@@ -99,12 +101,15 @@ pub async fn build_aar(
 
     // Kotlin helpers and Maven dependencies likewise belong on the classpath
     // the host app resolves classes from; `api` exports them through the
-    // published POM so a consumer's build sees them too.
+    // published POM so a consumer's build sees them too. The scan mirrors the
+    // Rust build's feature selection so helpers behind optional features are
+    // not missed.
     crate::assets::stage_android_classpath(
         project,
         &project.ffi_crate_path().join("Cargo.toml"),
         &module_dir,
         crate::assets::AndroidDependencyScope::Api,
+        &android_ffi_dependency_features(project).await?,
     )
     .await?;
 

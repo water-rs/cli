@@ -339,13 +339,23 @@ pub async fn seed_managed_crate_lock(
     Ok(true)
 }
 
-/// `cargo metadata` on a manifest, on the blocking pool.
-async fn crate_metadata(build_manifest: &Path) -> eyre::Result<cargo_metadata::Metadata> {
+/// `cargo metadata` on a manifest, on the blocking pool. `features` mirrors
+/// the feature selection the build invokes with — optional dependencies (and
+/// the metadata they declare) only enter the resolved graph under it; an
+/// empty slice resolves the manifest's default feature set.
+async fn crate_metadata(
+    build_manifest: &Path,
+    features: &[String],
+) -> eyre::Result<cargo_metadata::Metadata> {
     let manifest_path = build_manifest.to_path_buf();
+    let features = features.to_vec();
     smol::unblock(move || {
-        cargo_metadata::MetadataCommand::new()
-            .manifest_path(&manifest_path)
-            .exec()
+        let mut command = cargo_metadata::MetadataCommand::new();
+        command.manifest_path(&manifest_path);
+        if !features.is_empty() {
+            command.features(cargo_metadata::CargoOpt::SomeFeatures(features));
+        }
+        command.exec()
     })
     .await
     .map_err(Into::into)
@@ -373,7 +383,7 @@ async fn scan_crate_font_declarations(
 
     let managed = seed_managed_crate_lock(project, build_manifest).await?;
 
-    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
+    let metadata = crate_metadata(build_manifest, &[]).await.wrap_err_with(|| {
         let mut message = format!(
             "Failed to run cargo metadata on {}",
             build_manifest.display()
@@ -523,14 +533,17 @@ impl AndroidDependencyScope {
 pub async fn scan_android_sources(
     project: &Project,
     build_manifest: &Path,
+    features: &[String],
 ) -> eyre::Result<AndroidClasspath> {
     seed_managed_crate_lock(project, build_manifest).await?;
-    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
-        format!(
-            "Failed to run cargo metadata on {}",
-            build_manifest.display()
-        )
-    })?;
+    let metadata = crate_metadata(build_manifest, features)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "Failed to run cargo metadata on {}",
+                build_manifest.display()
+            )
+        })?;
 
     let enabled_features: HashMap<&PackageId, HashSet<&str>> = metadata
         .resolve
@@ -629,8 +642,9 @@ pub async fn stage_android_classpath(
     build_manifest: &Path,
     module_dir: &Path,
     scope: AndroidDependencyScope,
+    features: &[String],
 ) -> eyre::Result<()> {
-    let classpath = scan_android_sources(project, build_manifest).await?;
+    let classpath = scan_android_sources(project, build_manifest, features).await?;
     stage_classpath_files(&classpath, module_dir, scope).await
 }
 
@@ -1886,12 +1900,14 @@ pub async fn package_feature_enabled(
     package: &str,
     feature: &str,
 ) -> eyre::Result<bool> {
-    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
-        format!(
-            "Failed to run cargo metadata on {}",
-            build_manifest.display()
-        )
-    })?;
+    let metadata = crate_metadata(build_manifest, &[])
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "Failed to run cargo metadata on {}",
+                build_manifest.display()
+            )
+        })?;
 
     let Some(resolve) = metadata.resolve.as_ref() else {
         return Ok(false);
@@ -2627,12 +2643,14 @@ mod tests {
 pub async fn scan_required_permissions(
     build_manifest: &Path,
 ) -> eyre::Result<Vec<RequiredPermission>> {
-    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
-        format!(
-            "Failed to run cargo metadata on {}",
-            build_manifest.display()
-        )
-    })?;
+    let metadata = crate_metadata(build_manifest, &[])
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "Failed to run cargo metadata on {}",
+                build_manifest.display()
+            )
+        })?;
 
     let enabled_features: HashMap<&PackageId, HashSet<&str>> = metadata
         .resolve

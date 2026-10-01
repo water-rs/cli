@@ -22,8 +22,8 @@ use crate::{
         output_metadata::{OutputKind, packaged_artifact},
         platform::{
             ANDROID_MAX_PAGE_SIZE_LINK_ARG, AndroidAbi, AndroidBuildContext, AndroidPlatform,
-            android_cargo_envs, android_path_env, ndk_libcxx_path, resolve_android_build_context,
-            run_gradle_tasks, staged_libs_need_libcxx,
+            android_cargo_envs, android_ffi_dependency_features, android_path_env, ndk_libcxx_path,
+            resolve_android_build_context, run_gradle_tasks, staged_libs_need_libcxx,
         },
     },
     assets::{self, AndroidThemeParent},
@@ -528,12 +528,15 @@ pub async fn package_with_abis(
     let android_dir = android_dir(&project.backend_path::<HydrolysisBackend>());
 
     // Kotlin helpers and Maven coordinates declared by the dependency graph go
-    // on the app module's classpath so Gradle compiles them into the dex.
+    // on the app module's classpath so Gradle compiles them into the dex. The
+    // scan mirrors the Rust build's feature selection so helpers behind
+    // optional features are not missed.
     crate::assets::stage_android_classpath(
         project,
         &project.ffi_crate_path().join("Cargo.toml"),
         &android_dir.join("app"),
         crate::assets::AndroidDependencyScope::Implementation,
+        &android_ffi_dependency_features(project).await?,
     )
     .await?;
 
