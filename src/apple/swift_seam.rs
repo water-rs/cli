@@ -163,7 +163,10 @@ pub async fn compile_swift_seam(
 /// # Errors
 /// Always fails: the Swift toolchain exists only on macOS hosts.
 #[cfg(not(target_os = "macos"))]
-#[expect(clippy::unused_async, reason = "keeps the signature of the macOS implementation, which awaits")]
+#[expect(
+    clippy::unused_async,
+    reason = "keeps the signature of the macOS implementation, which awaits"
+)]
 pub async fn compile_swift_seam(
     _backend_root: &Path,
     _platform: TargetPlatform,
