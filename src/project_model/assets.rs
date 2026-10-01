@@ -1772,11 +1772,12 @@ mod tests {
     }
 
     fn manifest_with_fonts(toml_fonts: &str) -> crate::project::Manifest {
-        toml::from_str(&format!(
-            "[package]\nname = \"Demo\"\n\
-             bundle_identifier = \"dev.example.demo\"\n\n{toml_fonts}"
-        ))
-        .expect("manifest parses")
+        let mut document = toml_fonts
+            .parse::<toml_edit::DocumentMut>()
+            .expect("the font fixture parses as TOML");
+        document["package"]["name"] = toml_edit::value("Demo");
+        document["package"]["bundle_identifier"] = toml_edit::value("dev.example.demo");
+        toml::from_str(&document.to_string()).expect("manifest parses")
     }
 
     #[test]
