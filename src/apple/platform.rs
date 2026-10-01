@@ -220,11 +220,17 @@ fn apple_entry_link_args(
         "-Clink-arg=-lc++".to_string(),
         "-Clink-arg=-framework".to_string(),
         "-Clink-arg=VideoToolbox".to_string(),
-        "-Clink-arg=-Wl,-u,_waterui_init".to_string(),
-        "-Clink-arg=-Wl,-u,_waterui_app".to_string(),
+    ];
+    // `-u` keeps each callback's archive member in the image so the seam
+    // archive resolves them during the left-to-right pass; it must precede
+    // `-lWaterUISwift` on the line.
+    for symbol in swift_seam::APP_SEAM_CALLBACK_SYMBOLS {
+        args.push(format!("-Clink-arg=-Wl,-u,_{symbol}"));
+    }
+    args.extend([
         link_search_flag(seam_library_dir),
         "-Clink-arg=-lWaterUISwift".to_string(),
-    ];
+    ]);
     if host_library == AppleHostLibrary::Dynamic {
         args.push(link_file_arg(ffi_rlib));
         args.push(link_search_flag(runtime_dir));
@@ -814,4 +820,32 @@ pub const fn is_apple_platform(platform: TargetPlatform) -> bool {
             | TargetPlatform::VisionOS
             | TargetPlatform::VisionOSSimulator
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn entry_link_args_mark_every_seam_callback_undefined_before_the_archive() {
+        let args = super::apple_entry_link_args(
+            OsStr::new("/seam"),
+            super::AppleHostLibrary::Archive,
+            Path::new("/deps/libffi.rlib"),
+            OsStr::new("/runtime"),
+        );
+        let seam = args
+            .iter()
+            .position(|arg| arg == "-Clink-arg=-lWaterUISwift")
+            .expect("the seam archive is linked");
+        for symbol in crate::apple::swift_seam::APP_SEAM_CALLBACK_SYMBOLS {
+            let flag = format!("-Clink-arg=-Wl,-u,_{symbol}");
+            let position = args
+                .iter()
+                .position(|arg| arg == &flag)
+                .unwrap_or_else(|| panic!("missing {flag}"));
+            assert!(position < seam, "{flag} must precede -lWaterUISwift");
+        }
+    }
 }
