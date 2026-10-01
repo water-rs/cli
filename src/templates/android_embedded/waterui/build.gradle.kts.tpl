@@ -25,6 +25,10 @@ group = "{{ ctx.bundle_identifier }}"
 version = "{{ ctx.crate_version }}"
 
 dependencies {
+    // Vendored jars dependency crates stage here at package time (the CLI's
+    // android classpath staging writes into `libs/`).
+    api(fileTree("libs") { include("*.jar") })
+
     // Exported (`api`) so the host's compile classpath sees WaterUiRootView.
     api("{{ ctx.android_runtime_dependency() }}")
 }

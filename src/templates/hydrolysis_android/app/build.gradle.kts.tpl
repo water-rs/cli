@@ -155,6 +155,10 @@ android {
 }
 
 dependencies {
+    // Vendored jars dependency crates stage here at package time (the CLI's
+    // android classpath staging writes into `libs/`).
+    implementation(fileTree("libs") { include("*.jar") })
+
     // The host and painter come from the pinned checkout this project
     // `includeBuild`s; the substitutions are declared in settings.gradle.kts.
     implementation("dev.waterui.hydrolysis:host")

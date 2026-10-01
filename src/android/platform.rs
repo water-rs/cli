@@ -560,6 +560,15 @@ impl AndroidPlatform {
         )
         .await?;
 
+        // Stage dependency-declared Kotlin helpers and vendored jars onto the
+        // app module's classpath so Gradle compiles them into the dex.
+        crate::assets::stage_android_classpath(
+            project,
+            &project.ffi_crate_path().join("Cargo.toml"),
+            &backend_path.join("app"),
+        )
+        .await?;
+
         let (command_name, output_kind, variant) =
             match (options.is_distribution(), options.is_debug()) {
                 (true, false) => ("bundleRelease", OutputKind::Bundle, "release"),

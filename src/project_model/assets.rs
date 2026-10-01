@@ -149,6 +149,30 @@ struct WaterUIMetadata {
     /// Permissions this crate cannot work without, keyed by logical permission.
     #[serde(default)]
     permissions: BTreeMap<PermissionKey, PermissionRequirement>,
+    /// Kotlin sources and vendored jars to place on the Android application
+    /// classpath, from `[package.metadata.waterui.android]`.
+    #[serde(default)]
+    android: AndroidMetadata,
+}
+
+/// One crate's `[package.metadata.waterui.android]` table.
+///
+/// A crate whose Rust side resolves helper classes through the application
+/// class loader declares the `.kt` files (and any vendored jars they depend
+/// on) that must be compiled into the app dex. The generated Gradle module
+/// performs the compile — the crate's build script does not.
+#[derive(Debug, Default, Deserialize)]
+struct AndroidMetadata {
+    /// Crate-relative `.kt` files to stage into the generated module.
+    #[serde(default, rename = "kotlin-sources")]
+    kotlin_sources: Vec<PathBuf>,
+    /// Crate-relative entries naming vendored jars: a `.jar` file, or a
+    /// directory scanned recursively for `.jar` files.
+    #[serde(default)]
+    jars: Vec<PathBuf>,
+    /// Only required when this cargo feature is enabled on the declaring crate.
+    #[serde(default, rename = "required-feature")]
+    required_feature: Option<String>,
 }
 
 /// One crate's declaration that it needs a permission to function.
@@ -459,6 +483,195 @@ async fn scan_crate_font_declarations(
 
     info!("Found {} font declarations from dependencies", fonts.len());
     Ok(fonts)
+}
+
+/// Kotlin sources and vendored jars the dependency graph asks to place on the
+/// Android application classpath, after `required-feature` gating.
+#[derive(Debug, Default)]
+pub struct AndroidClasspath {
+    /// Absolute paths of `.kt` files to stage into the generated module.
+    pub kotlin_sources: Vec<PathBuf>,
+    /// Absolute paths of vendored `.jar` files to stage into `libs/`.
+    pub jars: Vec<PathBuf>,
+}
+
+/// Scans `build_manifest`'s dependency graph for
+/// `[package.metadata.waterui.android]` declarations via `cargo metadata` —
+/// the same channel the font and permission scans read.
+///
+/// A declared source that cannot be read is an error: it is a class the app
+/// would miss in its dex and fail to resolve at runtime.
+pub async fn scan_android_sources(
+    project: &Project,
+    build_manifest: &Path,
+) -> eyre::Result<AndroidClasspath> {
+    seed_managed_crate_lock(project, build_manifest).await?;
+    let metadata = crate_metadata(build_manifest).await.wrap_err_with(|| {
+        format!(
+            "Failed to run cargo metadata on {}",
+            build_manifest.display()
+        )
+    })?;
+
+    let enabled_features: HashMap<&PackageId, HashSet<&str>> = metadata
+        .resolve
+        .as_ref()
+        .map(|resolve| {
+            resolve
+                .nodes
+                .iter()
+                .map(|node| (&node.id, node.features.iter().map(|f| f.as_str()).collect()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut classpath = AndroidClasspath::default();
+    for package in &metadata.packages {
+        let Some(waterui) = package.metadata.get("waterui") else {
+            continue;
+        };
+        let parsed: WaterUIMetadata = match serde_json::from_value(waterui.clone()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn!(
+                    "Failed to parse waterui metadata for {}: {error}",
+                    package.name
+                );
+                continue;
+            }
+        };
+        let android = parsed.android;
+        if android.kotlin_sources.is_empty() && android.jars.is_empty() {
+            continue;
+        }
+        if let Some(gate) = &android.required_feature
+            && !enabled_features
+                .get(&package.id)
+                .is_some_and(|features| features.contains(gate.as_str()))
+        {
+            debug!(
+                "Skipping android classpath of {}: feature `{gate}` is not enabled",
+                package.name
+            );
+            continue;
+        }
+        let crate_root = package
+            .manifest_path
+            .parent()
+            .ok_or_eyre("Package has no parent directory")?
+            .as_std_path()
+            .to_path_buf();
+        for source in android.kotlin_sources {
+            let path = crate_root.join(&source);
+            if !path.is_file() {
+                eyre::bail!(
+                    "{} declares Kotlin source `{}`: no such file at {}",
+                    package.name,
+                    source.display(),
+                    path.display()
+                );
+            }
+            classpath.kotlin_sources.push(path);
+        }
+        for entry in android.jars {
+            let path = crate_root.join(&entry);
+            if path.is_dir() {
+                for jar in WalkDir::new(&path)
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()
+                    .wrap_err_with(|| {
+                        format!(
+                            "{} declares jar directory `{}` that could not be walked",
+                            package.name,
+                            entry.display()
+                        )
+                    })?
+                {
+                    let jar = jar.path();
+                    if jar.is_file() && jar.extension() == Some(std::ffi::OsStr::new("jar")) {
+                        classpath.jars.push(jar.to_path_buf());
+                    }
+                }
+            } else if path.is_file() && path.extension() == Some(std::ffi::OsStr::new("jar")) {
+                classpath.jars.push(path);
+            } else {
+                eyre::bail!(
+                    "{} declares jar entry `{}`: expected a `.jar` file or a directory containing them at {}",
+                    package.name,
+                    entry.display(),
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(classpath)
+}
+
+/// Stages a dependency graph's Android classpath declarations into a Gradle
+/// module: `.kt` files under `src/main/java/waterui/` — a directory the
+/// module's Kotlin compile picks up — and vendored jars under `libs/`, which
+/// the module's build script reads through `fileTree`.
+///
+/// Both destinations are managed: whatever an earlier stage left is removed
+/// first, so a dependency or feature that is no longer in the graph stops
+/// shipping its classes in the package.
+pub async fn stage_android_classpath(
+    project: &Project,
+    build_manifest: &Path,
+    module_dir: &Path,
+) -> eyre::Result<()> {
+    let classpath = scan_android_sources(project, build_manifest).await?;
+
+    let java_dir = module_dir.join("src/main/java/waterui");
+    if java_dir.exists() {
+        fs::remove_dir_all(&java_dir).await?;
+    }
+    if !classpath.kotlin_sources.is_empty() {
+        fs::create_dir_all(&java_dir).await?;
+        let mut staged = HashSet::new();
+        for source in &classpath.kotlin_sources {
+            let Some(name) = source.file_name() else {
+                eyre::bail!("Kotlin source {} has no file name", source.display());
+            };
+            eyre::ensure!(
+                staged.insert(name.to_owned()),
+                "two crates declare a Kotlin source named `{}`",
+                name.to_string_lossy()
+            );
+            fs::copy(source, java_dir.join(name)).await?;
+        }
+        info!(
+            "Staged {} Kotlin sources into {}",
+            classpath.kotlin_sources.len(),
+            module_dir.display()
+        );
+    }
+
+    let libs_dir = module_dir.join("libs");
+    if libs_dir.exists() {
+        fs::remove_dir_all(&libs_dir).await?;
+    }
+    if !classpath.jars.is_empty() {
+        fs::create_dir_all(&libs_dir).await?;
+        let mut staged = HashSet::new();
+        for jar in &classpath.jars {
+            let Some(name) = jar.file_name() else {
+                eyre::bail!("jar {} has no file name", jar.display());
+            };
+            eyre::ensure!(
+                staged.insert(name.to_owned()),
+                "two crates declare a jar named `{}`",
+                name.to_string_lossy()
+            );
+            fs::copy(jar, libs_dir.join(name)).await?;
+        }
+        info!(
+            "Staged {} vendored jars into {}",
+            classpath.jars.len(),
+            module_dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Resolves and satisfies font declarations for a build.

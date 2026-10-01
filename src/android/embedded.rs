@@ -97,6 +97,15 @@ pub async fn build_aar(
     // Assets and fonts ship inside the AAR exactly as they ship inside an APK.
     stage_embedded_assets(project, &module_dir, &built.app_symbols()?).await?;
 
+    // Kotlin helpers and vendored jars likewise belong on the classpath the
+    // host app resolves classes from; the AAR ships the compiled classes.
+    crate::assets::stage_android_classpath(
+        project,
+        &project.ffi_crate_path().join("Cargo.toml"),
+        &module_dir,
+    )
+    .await?;
+
     // A local runtime checkout must be published too: the embedded module's
     // POM names `dev.waterui.android:runtime:<version>`, which the host can
     // only resolve from mavenLocal since it has no composite include of the
