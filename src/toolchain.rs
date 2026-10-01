@@ -15,6 +15,7 @@ pub mod meson;
 pub mod msvc;
 pub mod rust;
 pub mod sccache;
+pub mod spirv_tools;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod web;

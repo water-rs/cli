@@ -414,7 +414,7 @@ git)
     esac
     exit 0
     ;;
-cmake | meson | wasm-pack | sh | bash)
+cmake | meson | wasm-pack | spirv-opt | sh | bash)
     case "$*" in
         --version | -version | -v)
             printf '%s 1.0.0 (waterui-test)\n' "$tool"

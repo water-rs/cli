@@ -45,6 +45,7 @@ use crate::{
         msvc::MsvcBuildTools,
         rust::{CLI_MINIMUM_RUST_VERSION, RustToolchain},
         sccache::Sccache,
+        spirv_tools::SpirvTools,
         web::{PackageManagerToolchain, WasmPack, wasm32_target},
         windows_arm64_llvm::WindowsArm64LlvmToolchain,
     },
@@ -191,6 +192,7 @@ impl DoctorGroup {
             ids::LINUX_SYSTEM_PACKAGES
             | ids::MSVC_BUILD_TOOLS
             | ids::DXC
+            | ids::SPIRV_OPT
             | ids::WINDOWS_ARM64_LLVM
             | ids::WASM32_TARGET
             | ids::WASM_PACK
@@ -493,6 +495,9 @@ pub mod ids {
     pub const MSVC_BUILD_TOOLS: &str = "msvc-build-tools";
     /// `dxc` (DirectX Shader Compiler) for Hydrolysis shader builds.
     pub const DXC: &str = "dxc";
+    /// `spirv-opt` (SPIRV-Tools) for `cherenkov-gpu` SPIR-V builds on
+    /// non-Apple native targets.
+    pub const SPIRV_OPT: &str = "spirv-opt";
     /// GTK4/pango pkg-config probes.
     pub const GTK4: &str = "gtk4";
     /// `WinUI` build prerequisites on Windows hosts.
@@ -521,6 +526,7 @@ pub mod ids {
         LINUX_SYSTEM_PACKAGES,
         MSVC_BUILD_TOOLS,
         DXC,
+        SPIRV_OPT,
         WINDOWS_ARM64_LLVM,
         WASM32_TARGET,
         WASM_PACK,
@@ -1031,13 +1037,27 @@ async fn hydrolysis_checks(host: &Host, project: &ProjectContext) -> Vec<DoctorI
             )
         }
     };
-    let ((msvc_build_tools, dxc), windows_arm64_llvm, (wasm32, wasm_pack), web_package_manager) = join!(
+    let (
+        (msvc_build_tools, dxc),
+        spirv_opt,
+        windows_arm64_llvm,
+        (wasm32, wasm_pack),
+        web_package_manager,
+    ) = join!(
         windows_checks(host),
+        spirv_opt_check(host, project),
         windows_arm64_llvm,
         web,
         web_package_manager_check(host, project)
     );
-    let mut items = vec![msvc_build_tools, dxc, windows_arm64_llvm, wasm32, wasm_pack];
+    let mut items = vec![
+        msvc_build_tools,
+        dxc,
+        spirv_opt,
+        windows_arm64_llvm,
+        wasm32,
+        wasm_pack,
+    ];
     items.extend(web_package_manager);
     items
 }
@@ -1076,6 +1096,52 @@ async fn windows_checks(host: &Host) -> (DoctorItem, DoctorItem) {
                 "Only required on Windows hosts.",
             ),
         )
+    }
+}
+
+/// Whether this run can produce a target `cherenkov-gpu` emits SPIR-V for.
+///
+/// The engine's build script invokes `spirv-opt` for every non-Apple native
+/// target — Linux, Windows and Android — while Apple targets compile to
+/// Metal instead. Outside a project the host decides: a Linux or Windows
+/// host always has such a target in scope (GTK4/`WinUI`, and Hydrolysis's
+/// own native desktop build); on macOS the only host-default targets are
+/// Apple, so `spirv-opt` only matters once a project selects the Android
+/// backend Hydrolysis cross-compiles to.
+fn spirv_opt_required(project: &ProjectContext) -> bool {
+    project.in_scope(TargetBackend::Android)
+        || project.in_scope(TargetBackend::Gtk4)
+        || project.in_scope(TargetBackend::WinUi)
+        || (project.in_scope(TargetBackend::Hydrolysis) && !cfg!(target_os = "macos"))
+}
+
+/// `spirv-opt` (SPIRV-Tools), scoped by [`spirv_opt_required`]. The item's
+/// `Ok` report carries the binary's own `--version` line.
+async fn spirv_opt_check(host: &Host, project: &ProjectContext) -> DoctorItem {
+    const NAME: &str = "SPIRV-Tools (spirv-opt)";
+    if !spirv_opt_required(project) {
+        return DoctorItem::skipped_with_message(
+            ids::SPIRV_OPT,
+            NAME,
+            "Only required for Linux, Windows, or Android targets — Apple targets compile to Metal.",
+        );
+    }
+    match SpirvTools.check(host).await {
+        Ok(()) => {
+            let mut item = DoctorItem::ok(ids::SPIRV_OPT, NAME);
+            item.message = SpirvTools.version(host).await;
+            item
+        }
+        Err(ToolchainError::Fixable(installation)) => DoctorItem::fixable(
+            ids::SPIRV_OPT,
+            NAME,
+            installation.describe(),
+            installation,
+            host,
+        ),
+        Err(ToolchainError::Unfixable(error)) => {
+            DoctorItem::missing(ids::SPIRV_OPT, NAME, unfixable_message(&error))
+        }
     }
 }
 
@@ -1629,6 +1695,51 @@ mod tests {
         let wasm_pack = item(&items, ids::WASM_PACK);
         assert_eq!(wasm_pack.status, CheckStatus::Missing);
         assert!(wasm_pack.is_fixable());
+    }
+
+    /// `spirv-opt` is probed wherever a non-Apple native target is in scope
+    /// — every Linux/Windows host and any project — and skipped only on a
+    /// project-less macOS host, where just Apple targets apply.
+    #[test]
+    fn doctor_spirv_opt_matches_the_target_scope() {
+        let machine = TestMachine::new();
+        let host = machine.host(Vec::<(String, String)>::new());
+        let items = smol::block_on(doctor(&host));
+        let spirv_opt = item(&items, ids::SPIRV_OPT);
+        if cfg!(target_os = "macos") {
+            assert_eq!(spirv_opt.status, CheckStatus::Skipped);
+        } else {
+            assert_eq!(spirv_opt.status, CheckStatus::Missing);
+            assert!(!spirv_opt.optional);
+        }
+
+        let project_machine = TestMachine::new();
+        project_machine.file("Water.toml", &manifest(""));
+        let host = project_machine.host(Vec::<(String, String)>::new());
+        let items = smol::block_on(doctor(&host));
+        let spirv_opt = item(&items, ids::SPIRV_OPT);
+        assert_eq!(
+            spirv_opt.status,
+            CheckStatus::Missing,
+            "a project can always build a SPIR-V target"
+        );
+    }
+
+    /// With `spirv-opt` staged on PATH the item is `Ok` and reports the
+    /// binary's own `--version` line.
+    #[test]
+    fn doctor_spirv_opt_reports_the_installed_version() {
+        let machine = TestMachine::new();
+        machine.install("spirv-opt");
+        machine.file("Water.toml", &manifest(""));
+        let host = machine.host(Vec::<(String, String)>::new());
+        let items = smol::block_on(doctor(&host));
+        let spirv_opt = item(&items, ids::SPIRV_OPT);
+        assert_eq!(spirv_opt.status, CheckStatus::Ok);
+        assert_eq!(
+            spirv_opt.message.as_deref(),
+            Some("spirv-opt 1.0.0 (waterui-test)")
+        );
     }
 
     /// Outside a project the host decides: Hydrolysis everywhere, Apple on
