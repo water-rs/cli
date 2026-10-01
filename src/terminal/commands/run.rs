@@ -817,7 +817,7 @@ async fn build_and_run(
     selection: DeviceSelection,
     config: BuildRunConfig,
 ) -> Result<(Running, Option<web::WebDevServer>)> {
-    let build_plan = resolve_build_plan(cli_platform, backend, &selection.device)?;
+    let build_plan = resolve_build_plan(cli_platform, &selection.device);
     let physical_ios = is_physical_ios(&selection.device);
     let launch_task =
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
@@ -931,11 +931,7 @@ fn apply_dev_url_handoff(
     Ok(())
 }
 
-fn resolve_build_plan(
-    cli_platform: TargetPlatform,
-    backend: TargetBackend,
-    device: &SelectedDevice,
-) -> Result<BuildPlan> {
+fn resolve_build_plan(cli_platform: TargetPlatform, device: &SelectedDevice) -> BuildPlan {
     let lib_platform = match cli_platform {
         // The device decides the iOS SDK: a physical device builds
         // `aarch64-apple-ios` (iphoneos), a simulator `*-apple-ios-sim`.
@@ -955,31 +951,26 @@ fn resolve_build_plan(
             panic!("esp32 run should not enter build_and_run")
         }
     };
-    let android_abi = resolve_android_abi(backend, device)?;
+    let android_abi = device_android_abi(device);
 
-    Ok(BuildPlan {
+    BuildPlan {
         lib_platform,
         android_abi,
-    })
+    }
 }
 
-fn resolve_android_abi(
-    backend: TargetBackend,
+/// The Android ABI the selected device builds and packages for, when it is
+/// one.
+///
+/// The ABI is a property of the device, not the backend: Hydrolysis on a
+/// desktop target selects the local machine, which has no ABI.
+const fn device_android_abi(
     device: &SelectedDevice,
-) -> Result<Option<waterui_cli::android::platform::AndroidAbi>> {
-    match (backend, device) {
-        (
-            TargetBackend::Android | TargetBackend::Hydrolysis,
-            SelectedDevice::AndroidDevice(dev),
-        ) => Ok(Some(dev.abi())),
-        (
-            TargetBackend::Android | TargetBackend::Hydrolysis,
-            SelectedDevice::AndroidEmulator(emu),
-        ) => Ok(Some(emu.expected_abi())),
-        (TargetBackend::Android | TargetBackend::Hydrolysis, _) => {
-            bail!("Internal error: an Android target requires an Android device");
-        }
-        _ => Ok(None),
+) -> Option<waterui_cli::android::platform::AndroidAbi> {
+    match device {
+        SelectedDevice::AndroidDevice(dev) => Some(dev.abi()),
+        SelectedDevice::AndroidEmulator(emu) => Some(emu.expected_abi()),
+        _ => None,
     }
 }
 
@@ -1798,10 +1789,13 @@ fn handle_device_event(
 mod tests {
     use super::{
         Args, DeviceCandidate, DeviceChoice, SelectedDevice, TargetBackend, TargetPlatform,
-        default_backend, device_choice, handle_device_event, lib_platform, parse_env_assignment,
-        prompt_for_device, resolve_backend, resolve_platform, run_profile, validate_device_arg,
+        default_backend, device_android_abi, device_choice, handle_device_event, lib_platform,
+        parse_env_assignment, prompt_for_device, resolve_backend, resolve_platform, run_profile,
+        validate_device_arg,
     };
     use clap::Parser as _;
+    use waterui_cli::android::device::AndroidDevice;
+    use waterui_cli::android::platform::AndroidAbi;
     use waterui_cli::build::BuildProfile;
     use waterui_cli::device::{ApplicationExit, DeviceEvent, Local};
 
@@ -1992,6 +1986,21 @@ mod tests {
         )
         .expect("clean device exit should not fail water run");
         assert!(should_stop);
+    }
+
+    #[test]
+    fn android_abi_follows_the_device() {
+        // The ABI is a property of the selected device: a desktop run
+        // selects the local machine and resolves no ABI, whatever backend
+        // the run uses — Hydrolysis included.
+        assert_eq!(
+            device_android_abi(&SelectedDevice::AndroidDevice(AndroidDevice::new(
+                String::from("serial-1"),
+                AndroidAbi::Arm64V8a,
+            ))),
+            Some(AndroidAbi::Arm64V8a)
+        );
+        assert_eq!(device_android_abi(&SelectedDevice::Local(Local)), None);
     }
 
     #[test]
