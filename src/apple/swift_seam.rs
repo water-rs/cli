@@ -17,6 +17,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
 use askama::Template as _;
 use color_eyre::eyre::bail;
 #[cfg(target_os = "macos")]
