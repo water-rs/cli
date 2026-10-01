@@ -17,6 +17,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use askama::Template as _;
 use color_eyre::eyre::bail;
 #[cfg(target_os = "macos")]
 use color_eyre::eyre::{Context, eyre};
@@ -28,6 +29,31 @@ use tracing::info;
 use crate::platform::TargetPlatform;
 #[cfg(target_os = "macos")]
 use crate::utils::run_command_os;
+
+/// Askama escaper for the quoted header paths in `CWaterUI.modulemap`: a
+/// module map string literal escapes `"` and `\` with a backslash.
+#[derive(Clone, Copy, Debug)]
+pub struct ModuleMapEscape;
+
+impl askama::filters::Escaper for ModuleMapEscape {
+    fn write_escaped_str<W: std::fmt::Write>(&self, mut dest: W, string: &str) -> std::fmt::Result {
+        for c in string.chars() {
+            if matches!(c, '"' | '\\') {
+                dest.write_char('\\')?;
+            }
+            dest.write_char(c)?;
+        }
+        Ok(())
+    }
+}
+
+/// The `CWaterUI` module map that hands the seam's C headers to `swiftc`
+/// (`-fmodule-map-file`) so they resolve without an SPM target.
+#[derive(askama::Template)]
+#[template(path = "apple/CWaterUI.modulemap")]
+struct CWaterUiModuleMap<'a> {
+    headers: &'a [String],
+}
 
 /// The `@_cdecl` symbols `Sources/WaterUI` exports across the Rust/Swift
 /// seam — the archive resolves them for the executable, a `cdylib` keeps
@@ -103,19 +129,23 @@ pub async fn compile_swift_seam(
     fs::create_dir_all(out_dir).await?;
     let include_dir = backend_root.join("Sources/CWaterUI/include");
     let modulemap = out_dir.join("CWaterUI.modulemap");
-    let mut modulemap_contents = String::from("module CWaterUI {\n");
-    for header in ["waterui.h", "waterui_seam.h", "waterkit_audio_apple.h"] {
-        let path = include_dir.join(header);
-        if !path.is_file() {
-            bail!(
-                "Apple backend is missing CWaterUI header {}",
-                path.display()
-            );
-        }
-        let line = format!("    header \"{}\"\n", path.display());
-        modulemap_contents.push_str(&line);
-    }
-    modulemap_contents.push_str("    export *\n}\n");
+    let headers = ["waterui.h", "waterui_seam.h", "waterkit_audio_apple.h"]
+        .iter()
+        .map(|header| {
+            let path = include_dir.join(header);
+            if !path.is_file() {
+                bail!(
+                    "Apple backend is missing CWaterUI header {}",
+                    path.display()
+                );
+            }
+            Ok(path.to_string_lossy().into_owned())
+        })
+        .collect::<eyre::Result<Vec<String>>>()?;
+    let mut modulemap_contents = CWaterUiModuleMap { headers: &headers }
+        .render()
+        .wrap_err("failed to render the CWaterUI module map")?;
+    modulemap_contents.push('\n');
     fs::write(&modulemap, modulemap_contents).await?;
 
     let archive = out_dir.join("libWaterUISwift.a");
@@ -230,6 +260,8 @@ async fn collect_swift_sources(dir: &Path, out: &mut Vec<PathBuf>) -> eyre::Resu
 
 #[cfg(test)]
 mod tests {
+    use askama::Template as _;
+
     #[test]
     fn app_seam_callback_symbols_are_the_export_app_contract() {
         assert_eq!(
@@ -259,6 +291,73 @@ mod tests {
             super::swift_arch(arch_of("armv7-unknown-linux-gnueabihf")).is_err(),
             "a non-Apple arch is an error, not a silent default"
         );
+    }
+
+    #[test]
+    fn modulemap_escapes_header_paths_as_string_literals() {
+        let headers = vec![
+            "/tmp/with space/quo\"te.h".to_string(),
+            "C:\\sdk\\include\\waterui.h".to_string(),
+        ];
+        let rendered = super::CWaterUiModuleMap { headers: &headers }
+            .render()
+            .expect("the module map renders");
+        assert!(
+            rendered.contains("    header \"/tmp/with space/quo\\\"te.h\"\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("    header \"C:\\\\sdk\\\\include\\\\waterui.h\"\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.starts_with("module CWaterUI {\n") && rendered.ends_with("    export *\n}"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn modulemap_parse_checks_with_clang_when_present() {
+        use std::ffi::OsString;
+
+        smol::block_on(async {
+            let host = crate::toolchain::Host::current();
+            let Ok(clang) = host.which("clang").await else {
+                return;
+            };
+            let dir = tempfile::tempdir().expect("a scratch dir");
+            let include = dir.path().join("with space");
+            std::fs::create_dir_all(&include).expect("the include dir");
+            let dummy = include.join("dummy.h");
+            std::fs::write(&dummy, "#pragma once\n").expect("the dummy header");
+            let headers = vec![dummy.to_string_lossy().into_owned()];
+            let rendered = super::CWaterUiModuleMap { headers: &headers }
+                .render()
+                .expect("the module map renders");
+            let modulemap = dir.path().join("CWaterUI.modulemap");
+            std::fs::write(&modulemap, &rendered).expect("the module map file");
+            let empty = dir.path().join("empty.c");
+            std::fs::write(&empty, "").expect("the empty source");
+            let output = host
+                .output(
+                    &clang,
+                    [
+                        OsString::from("-fsyntax-only"),
+                        OsString::from("-fmodules"),
+                        OsString::from(format!("-fmodule-map-file={}", modulemap.display())),
+                        OsString::from("-x"),
+                        OsString::from("c"),
+                        empty.as_os_str().to_os_string(),
+                    ],
+                )
+                .await
+                .expect("clang runs");
+            assert!(
+                output.status.success() && !output.stderr.windows(6).any(|w| w == b"error:"),
+                "clang rejected the rendered module map: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
     }
 
     #[cfg(target_os = "macos")]
