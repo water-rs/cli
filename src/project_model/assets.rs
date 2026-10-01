@@ -7,7 +7,7 @@
 //! - Resolve fonts from local paths, the font cache, or the built-in registry
 //! - Copy assets to platform-specific locations
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
@@ -607,6 +607,12 @@ pub async fn scan_android_sources(
     Ok(classpath)
 }
 
+/// Markers bracketing the R8 keep block [`stage_android_classpath`] maintains
+/// in a module's `proguard-rules.pro`. The block is rewritten wholesale on
+/// every stage so keeps track the dependency graph exactly.
+const ANDROID_KEEPS_BEGIN: &str = "# --- begin waterui android classpath keeps ---";
+const ANDROID_KEEPS_END: &str = "# --- end waterui android classpath keeps ---";
+
 /// Stages a dependency graph's Android classpath declarations into a Gradle
 /// module: `.kt` files under `src/main/java/waterui/` — a directory the
 /// module's Kotlin compile picks up — and vendored jars under `libs/`, which
@@ -615,12 +621,28 @@ pub async fn scan_android_sources(
 /// Both destinations are managed: whatever an earlier stage left is removed
 /// first, so a dependency or feature that is no longer in the graph stops
 /// shipping its classes in the package.
+///
+/// Staged classes only ever run through name-based lookups — JNI reaches them
+/// via `context.getClassLoader().loadClass` — which R8 cannot see, so release
+/// builds would shrink or rename them away. The stage therefore also rewrites
+/// a managed keep block in the module's `proguard-rules.pro`, one rule per
+/// package a staged source or jar carries.
 pub async fn stage_android_classpath(
     project: &Project,
     build_manifest: &Path,
     module_dir: &Path,
 ) -> eyre::Result<()> {
     let classpath = scan_android_sources(project, build_manifest).await?;
+    stage_classpath_files(&classpath, module_dir).await
+}
+
+/// The file half of [`stage_android_classpath`], split from the cargo-metadata
+/// scan so the staging itself is exercised without a project.
+async fn stage_classpath_files(
+    classpath: &AndroidClasspath,
+    module_dir: &Path,
+) -> eyre::Result<()> {
+    let mut keep_packages = BTreeSet::new();
 
     let java_dir = module_dir.join("src/main/java/waterui");
     if java_dir.exists() {
@@ -638,6 +660,18 @@ pub async fn stage_android_classpath(
                 "two crates declare a Kotlin source named `{}`",
                 name.to_string_lossy()
             );
+            let package = fs::read_to_string(source)
+                .await?
+                .lines()
+                .find_map(|line| line.strip_prefix("package "))
+                .map(|rest| rest.trim().trim_end_matches(';').to_owned())
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "Kotlin source {} has no `package` declaration; the staged-class keep rule cannot name it",
+                        source.display()
+                    )
+                })?;
+            keep_packages.insert(package);
             fs::copy(source, java_dir.join(name)).await?;
         }
         info!(
@@ -663,6 +697,9 @@ pub async fn stage_android_classpath(
                 "two crates declare a jar named `{}`",
                 name.to_string_lossy()
             );
+            for package in jar_packages(jar)? {
+                keep_packages.insert(package);
+            }
             fs::copy(jar, libs_dir.join(name)).await?;
         }
         info!(
@@ -671,7 +708,79 @@ pub async fn stage_android_classpath(
             module_dir.display()
         );
     }
+
+    write_android_keeps(module_dir, &keep_packages).await?;
     Ok(())
+}
+
+/// The package names a vendored jar's class entries live in, e.g.
+/// `androidx.health.connect.client` for
+/// `androidx/health/connect/client/HealthConnectClient.class`.
+fn jar_packages(jar: &Path) -> eyre::Result<BTreeSet<String>> {
+    let file = std::fs::File::open(jar)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut packages = BTreeSet::new();
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        let name = entry.name();
+        if !entry.is_file()
+            || !std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("class"))
+        {
+            continue;
+        }
+        if let Some(dir) = name.rsplit_once('/').map(|(dir, _)| dir) {
+            packages.insert(dir.replace('/', "."));
+        }
+    }
+    Ok(packages)
+}
+
+/// Rewrites the managed keep block in `module_dir/proguard-rules.pro`: one
+/// `-keep class <pkg>.** { *; }` per package the staged classpath carries, so
+/// R8's release shrink cannot remove or rename classes JNI loads by name.
+/// An empty set removes a block an earlier stage left; the file itself is
+/// only written when its contents change.
+async fn write_android_keeps(module_dir: &Path, packages: &BTreeSet<String>) -> eyre::Result<()> {
+    let rules_path = module_dir.join("proguard-rules.pro");
+    let existing = match fs::read_to_string(&rules_path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut body = match (
+        existing.find(ANDROID_KEEPS_BEGIN),
+        existing.find(ANDROID_KEEPS_END),
+    ) {
+        (Some(begin), Some(end)) if begin < end => {
+            let end = end + ANDROID_KEEPS_END.len();
+            let mut body = existing[..begin].to_owned();
+            body.push_str(existing[end..].trim_start_matches('\n'));
+            body
+        }
+        _ => existing,
+    };
+    while body.ends_with("\n\n") {
+        body.pop();
+    }
+
+    if !packages.is_empty() {
+        body.push_str(ANDROID_KEEPS_BEGIN);
+        body.push('\n');
+        for package in packages {
+            body.push_str("-keep class ");
+            body.push_str(package);
+            body.push_str(".** { *; }\n");
+        }
+        body.push_str(ANDROID_KEEPS_END);
+        body.push('\n');
+    }
+
+    super::templates::write_file_if_changed(&rules_path, body.as_bytes())
+        .await
+        .map_err(Into::into)
 }
 
 /// Resolves and satisfies font declarations for a build.
@@ -2871,5 +2980,129 @@ mod permission_audit_tests {
             None
         ));
         assert!(crate::winui::backend::WinUiBackend::in_scope(None));
+    }
+
+    /// Writes a real jar so `jar_packages` reads genuine zip entries.
+    fn write_jar(path: &Path, entries: &[&str]) {
+        let file = std::fs::File::create(path).expect("jar file");
+        let mut archive = zip::ZipWriter::new(file);
+        for entry in entries {
+            archive
+                .start_file(*entry, zip::write::SimpleFileOptions::default())
+                .expect("jar entry");
+            std::io::Write::write_all(&mut archive, b"class bytes").expect("jar entry contents");
+        }
+        archive.finish().expect("jar archive");
+    }
+
+    /// A staged classpath lands its Kotlin sources under `src/main/java/waterui/`,
+    /// its jars under `libs/`, and emits an R8 keep per package the staged
+    /// classes live in — the only thing standing between `loadClass` and the
+    /// release build's shrinker.
+    #[test]
+    fn staging_places_sources_jars_and_keep_rules() {
+        let root = tempdir().expect("temp root");
+        let crate_dir = root.path().join("crate");
+        std::fs::create_dir_all(&crate_dir).expect("crate dir");
+        let source = crate_dir.join("DialogHelper.kt");
+        std::fs::write(
+            &source,
+            "package waterkit.dialog\n\nobject DialogHelper {}\n",
+        )
+        .expect("kotlin source");
+        let jar = crate_dir.join("health_connect.jar");
+        write_jar(
+            &jar,
+            &[
+                "androidx/health/connect/client/HealthConnectClient.class",
+                "META-INF/MANIFEST.MF",
+            ],
+        );
+        let module_dir = root.path().join("app");
+        std::fs::create_dir_all(&module_dir).expect("module dir");
+
+        smol::block_on(stage_classpath_files(
+            &AndroidClasspath {
+                kotlin_sources: vec![source],
+                jars: vec![jar],
+            },
+            &module_dir,
+        ))
+        .expect("stage classpath");
+
+        assert!(
+            module_dir
+                .join("src/main/java/waterui/DialogHelper.kt")
+                .is_file()
+        );
+        assert!(module_dir.join("libs/health_connect.jar").is_file());
+        let rules =
+            std::fs::read_to_string(module_dir.join("proguard-rules.pro")).expect("keep rules");
+        assert!(
+            rules.contains("-keep class waterkit.dialog.** { *; }"),
+            "{rules}"
+        );
+        assert!(
+            rules.contains("-keep class androidx.health.connect.client.** { *; }"),
+            "{rules}"
+        );
+    }
+
+    /// Restaging an empty classpath removes everything an earlier stage left:
+    /// sources, jars, and the managed keep block — never stale classes.
+    #[test]
+    fn restaging_an_empty_classpath_removes_stale_entries() {
+        let root = tempdir().expect("temp root");
+        let crate_dir = root.path().join("crate");
+        std::fs::create_dir_all(&crate_dir).expect("crate dir");
+        let source = crate_dir.join("PermissionHelper.kt");
+        std::fs::write(&source, "package waterkit.permission\n").expect("kotlin source");
+        let module_dir = root.path().join("app");
+        std::fs::create_dir_all(&module_dir).expect("module dir");
+
+        smol::block_on(stage_classpath_files(
+            &AndroidClasspath {
+                kotlin_sources: vec![source],
+                jars: Vec::new(),
+            },
+            &module_dir,
+        ))
+        .expect("stage classpath");
+        smol::block_on(stage_classpath_files(
+            &AndroidClasspath::default(),
+            &module_dir,
+        ))
+        .expect("restage empty");
+
+        assert!(!module_dir.join("src/main/java/waterui").exists());
+        let rules =
+            std::fs::read_to_string(module_dir.join("proguard-rules.pro")).expect("keep rules");
+        assert!(
+            !rules.contains("-keep class waterkit.permission"),
+            "{rules}"
+        );
+        assert!(!rules.contains(ANDROID_KEEPS_BEGIN), "{rules}");
+    }
+
+    /// A declared Kotlin source without a `package` directive cannot be kept
+    /// by R8 — it fails the stage rather than silently shipping an
+    /// unresolvable class.
+    #[test]
+    fn a_kotlin_source_without_a_package_declaration_fails() {
+        let root = tempdir().expect("temp root");
+        let source = root.path().join("NoPackage.kt");
+        std::fs::write(&source, "object NoPackage {}\n").expect("kotlin source");
+        let module_dir = root.path().join("app");
+        std::fs::create_dir_all(&module_dir).expect("module dir");
+
+        let error = smol::block_on(stage_classpath_files(
+            &AndroidClasspath {
+                kotlin_sources: vec![source],
+                jars: Vec::new(),
+            },
+            &module_dir,
+        ))
+        .expect_err("a package-less Kotlin source must fail the stage");
+        assert!(error.to_string().contains("package"), "{error}");
     }
 }
