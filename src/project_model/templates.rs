@@ -124,12 +124,6 @@ impl IosPermissionTemplateEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FontRegistrationTemplateEntry {
-    pub family_name: String,
-    pub file_name: String,
-}
-
 /// What the launch screen staged into the Apple asset catalog contains, so
 /// the generated Apple scaffold names only the assets that exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
