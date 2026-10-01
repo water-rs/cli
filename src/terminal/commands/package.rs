@@ -373,9 +373,12 @@ async fn build_android_packaging_artifacts(
     for arch in arch {
         let abi = arch.to_abi();
         let spinner = shell.spinner(format!("Building Rust library ({})...", abi.as_str()));
-        let target = shell
-            .display_output(AndroidPlatform::new(abi).build(project, build_options.clone()))
-            .await?;
+        // The Android build future crosses clippy's `large_futures` threshold
+        // (16 KiB) on Windows, so it is pinned on the heap.
+        let target = Box::pin(
+            shell.display_output(AndroidPlatform::new(abi).build(project, build_options.clone())),
+        )
+        .await?;
         built = Some(target);
         if let Some(pb) = spinner {
             pb.finish_and_clear();
