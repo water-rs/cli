@@ -557,13 +557,14 @@ impl TemplateContext {
         self.crate_name.rust_ident()
     }
 
-    /// The ffi companion's crate identifier — falls back to the app crate
-    /// when the context never scoped one.
+    /// The ffi companion's crate identifier. Only the ffi scaffold renders
+    /// it, and its context always carries the companion's name — a missing
+    /// name is a scaffold bug, so there is no fallback.
     #[must_use]
     pub fn ffi_crate_ident(&self) -> RustIdent {
         self.ffi_crate_name
             .as_ref()
-            .unwrap_or(&self.crate_name)
+            .expect("the ffi scaffold context must carry the companion crate name")
             .rust_ident()
     }
 
@@ -1104,7 +1105,9 @@ mod tests {
             android_backend_path: None,
             apple_backend_path: None,
             apple_backend_selected: true,
-            ffi_crate_name: None,
+            ffi_crate_name: Some(
+                CrateName::try_from("waterui_test_ffi").expect("test ffi crate name must be valid"),
+            ),
             waterui_path,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
