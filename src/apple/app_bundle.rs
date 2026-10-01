@@ -429,6 +429,7 @@ async fn compile_asset_catalog(
 /// Non-macOS hosts cannot run `actool`; Apple packaging only ever ran on
 /// macOS (it drove `xcodebuild` before), so the check is a plain error.
 #[cfg(not(target_os = "macos"))]
+#[expect(clippy::unused_async, reason = "keeps the signature of the macOS implementation, which awaits")]
 async fn compile_asset_catalog(
     _layout: &AppleAppLayout,
     _xcassets: &Path,
@@ -634,6 +635,7 @@ async fn sign_device_app(
 
 /// A physical device cannot be provisioned from a non-macOS host.
 #[cfg(not(target_os = "macos"))]
+#[expect(clippy::unused_async, reason = "keeps the signature of the macOS implementation, which awaits")]
 async fn sign_device_app(
     _layout: &AppleAppLayout,
     _project: &Project,

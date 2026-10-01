@@ -322,12 +322,14 @@ async fn build_packaging_artifacts(
 ) -> Result<Option<BuiltTarget>> {
     match context.backend {
         TargetBackend::Android => {
-            build_android_packaging_artifacts(
+            // The per-backend artifact builds cross clippy's `large_futures`
+            // threshold (16 KiB) on Windows, so the future is pinned on the heap.
+            Box::pin(build_android_packaging_artifacts(
                 shell,
                 &context.project,
                 &args.arch,
                 context.build_options.clone(),
-            )
+            ))
             .await
         }
         TargetBackend::Apple => {

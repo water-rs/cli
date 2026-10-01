@@ -629,6 +629,7 @@ pub async fn package_apple(
     let backend = project
         .apple_backend()
         .ok_or_else(|| eyre::eyre!("Apple backend must be configured"))?;
+    #[cfg(target_os = "macos")]
     let browser_runtime_plan = project
         .browser_runtime_plan(platform, TargetBackend::Apple)
         .await?;
