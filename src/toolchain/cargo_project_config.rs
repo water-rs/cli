@@ -339,8 +339,14 @@ mod tests {
         // The managed crate living under the project keeps pure discovery.
         let nested = project.join("tools/backend");
         std::fs::create_dir_all(&nested).unwrap();
-        assert!(cargo_config_args(&project, &nested).unwrap().is_empty());
-        assert!(cargo_config_args(&project, &project).unwrap().is_empty());
+        assert_eq!(
+            cargo_config_args(&project, &nested).unwrap(),
+            [] as [std::ffi::OsString; 0]
+        );
+        assert_eq!(
+            cargo_config_args(&project, &project).unwrap(),
+            [] as [std::ffi::OsString; 0]
+        );
     }
 
     #[test]

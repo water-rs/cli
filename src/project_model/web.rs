@@ -1689,7 +1689,7 @@ mod tests {
 
         let report = apply_brand_overlay(&web, "App").unwrap();
         assert!(!report.branded);
-        assert!(!report.warnings.is_empty());
+        assert_ne!(report.warnings, [] as [String; 0]);
         assert!(
             report.warnings.iter().any(|w| w.contains("src/App.tsx")),
             "{:?}",
