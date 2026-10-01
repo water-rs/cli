@@ -2320,6 +2320,17 @@ mod tests {
             manifest["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
             Some(false)
         );
+        // The map capability reaches the Rust backend as well as the FFI
+        // surface: the `map` feature also enables `waterui-apple/map`, so the
+        // `MKMapView` leaf compiles only for apps whose graph holds
+        // `waterui-map`.
+        let map_forwards = manifest["features"]["map"]
+            .as_array()
+            .expect("map feature is declared")
+            .iter()
+            .map(|feature| feature.as_str().expect("feature name"))
+            .collect::<Vec<_>>();
+        assert_eq!(map_forwards, ["waterui-ffi/map", "waterui-apple/map"]);
         assert_eq!(manifest["package"]["autobins"].as_bool(), Some(false));
         let bins = manifest["bin"]
             .as_array()
@@ -4982,6 +4993,11 @@ const FORWARDED_FFI_FEATURES: &[&str] = &[
     "webview-cef",
 ];
 
+/// Additional `dep/feature` forwards a selectable FFI feature emits: pairs of
+/// (feature name, dependency). `map` also turns on `waterui-apple/map` so the
+/// native `MKMapView` leaf compiles only when the app's graph opted in.
+const BACKEND_FEATURE_FORWARDS: &[(&str, &str)] = &[("map", "waterui-apple")];
+
 /// Native FFI companion crate templates.
 pub mod ffi {
     use cargo_toml::{Dependency, DependencyDetail, Manifest, Package, Product, Workspace};
@@ -5068,11 +5084,21 @@ pub mod ffi {
 
         // `waterui-ffi` is a hard dependency here, so the forwards are the
         // plain `dep/feat` form; see `FORWARDED_FFI_FEATURES` for why they are
-        // manifest-declared.
+        // manifest-declared. Some capabilities also reach the Rust backend:
+        // the `map` feature enables `waterui-apple/map` too, so the
+        // `MKMapView` leaf — and the `MapKit` framework link it carries
+        // through `cocoa-ui` — is compiled only for apps whose graph holds
+        // `waterui-map`.
         for name in super::FORWARDED_FFI_FEATURES {
-            manifest
-                .features
-                .insert((*name).to_string(), vec![format!("waterui-ffi/{name}")]);
+            let mut forwards = vec![format!("waterui-ffi/{name}")];
+            for dep in super::BACKEND_FEATURE_FORWARDS
+                .iter()
+                .filter(|(feature, _)| feature == name)
+                .map(|(_, dep)| dep)
+            {
+                forwards.push(format!("{dep}/{name}"));
+            }
+            manifest.features.insert((*name).to_string(), forwards);
         }
 
         for (name, source) in [
