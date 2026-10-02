@@ -127,8 +127,25 @@ android {
         }
     }
 
+{% if let Some(signing) = ctx.android_signing() %}
+    // Release signing from `[signing.android]` in Water.toml. The passwords are
+    // read from the environment at build time and never written to the project.
+    signingConfigs {
+        create("release") {
+            storeFile = projectRoot.resolve("{{ signing.keystore }}")
+            keyAlias = "{{ signing.key_alias }}"
+            storePassword = System.getenv("{{ signing.store_password_env }}")
+            keyPassword = System.getenv("{{ signing.key_password_env }}")
+        }
+    }
+{% endif %}
     buildTypes {
         release {
+            {% if let Some(signing) = ctx.android_signing() %}
+            if (System.getenv("{{ signing.unsigned_env }}") != "1") {
+                signingConfig = signingConfigs.getByName("release")
+            }
+            {% endif %}
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

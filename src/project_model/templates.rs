@@ -275,6 +275,51 @@ pub struct BrowserTemplateContext {
     pub engine: Option<ResolvedWebViewBackend>,
 }
 
+/// `[signing.android]` rendered into the generated Gradle project: the
+/// keystore path and key alias from `Water.toml`, escaped for the Kotlin
+/// string literals they render into. Passwords never enter the context — the
+/// generated `signingConfig` reads them from the environment at build time.
+#[derive(Debug, Clone)]
+pub struct AndroidSigningTemplateEntry {
+    /// The keystore path as declared in `Water.toml` (project-root-relative),
+    /// escaped for the Kotlin literal it renders into.
+    pub keystore: String,
+    /// The alias of the signing key inside the keystore, escaped for the
+    /// Kotlin literal it renders into.
+    pub key_alias: String,
+    /// The environment variable the generated `signingConfig` reads the store
+    /// password from.
+    pub store_password_env: &'static str,
+    /// The environment variable the generated `signingConfig` reads the key
+    /// password from.
+    pub key_password_env: &'static str,
+    /// The environment variable `water package --unsigned` sets so the
+    /// generated release `signingConfig` stays unused.
+    pub unsigned_env: &'static str,
+}
+
+impl From<&crate::android::signing::AndroidSigningConfig> for AndroidSigningTemplateEntry {
+    fn from(config: &crate::android::signing::AndroidSigningConfig) -> Self {
+        Self {
+            keystore: kotlin_string_literal(&config.keystore().to_string_lossy()),
+            key_alias: kotlin_string_literal(config.key_alias()),
+            store_password_env: crate::android::signing::STORE_PASSWORD_ENV,
+            key_password_env: crate::android::signing::KEY_PASSWORD_ENV,
+            unsigned_env: crate::android::signing::UNSIGNED_ENV,
+        }
+    }
+}
+
+/// Escape a value for the `"..."` literal it renders into in a generated
+/// Kotlin source: a bare `$` would open a Kotlin string template that
+/// evaluates arbitrary build-script code.
+fn kotlin_string_literal(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+}
+
 /// Context for rendering templates with type-safe substitutions.
 #[derive(Debug, Clone)]
 pub struct TemplateContext {
@@ -330,6 +375,12 @@ pub struct TemplateContext {
     /// root for a frontend referenced in place. `None` renders the demo
     /// `lib.rs` instead.
     pub web_frontend_arg: Option<String>,
+    /// Android release signing rendered into the Gradle project, from
+    /// `[signing.android]` in `Water.toml`. `None` renders no
+    /// `signingConfig`, and release packaging then fails in
+    /// `crate::android::signing::PreparedSigning::resolve` unless the caller
+    /// asked for unsigned output.
+    pub android_signing: Option<AndroidSigningTemplateEntry>,
     /// ESP32 harness parameters used by the esp32 templates.
     pub esp32: Esp32TemplateEntry,
     /// The launch screen assets the Apple templates refer to.
@@ -376,6 +427,7 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             web_frontend_arg: options.web.as_ref().map(|web| web.include_arg.clone()),
+            android_signing: None,
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
             hydrolysis_android: None,
@@ -421,6 +473,11 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             web_frontend_arg: manifest.web.as_ref().map(|_| "web".to_string()),
+            android_signing: manifest
+                .signing
+                .android
+                .as_ref()
+                .map(AndroidSigningTemplateEntry::from),
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
             hydrolysis_android: None,
@@ -470,6 +527,7 @@ impl TemplateContext {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             web_frontend_arg: None,
+            android_signing: None,
             esp32: Esp32TemplateEntry::default(),
             launch: LaunchTemplateEntry::default(),
             hydrolysis_android: None,
@@ -558,6 +616,12 @@ impl TemplateContext {
     pub fn with_preview_app_dependency(mut self, crate_name: CrateName, path: PathBuf) -> Self {
         self.preview_app_dependency = Some((crate_name, path));
         self
+    }
+
+    /// The `[signing.android]` entry the Gradle templates render, if any.
+    #[must_use]
+    pub const fn android_signing(&self) -> Option<&AndroidSigningTemplateEntry> {
+        self.android_signing.as_ref()
     }
 
     /// Set Android permissions for template rendering.
@@ -1308,6 +1372,7 @@ mod tests {
             preview_runtime_features: Vec::new(),
             preview_app_dependency: None,
             web_frontend_arg: None,
+            android_signing: None,
             esp32: Esp32TemplateEntry::default(),
             hydrolysis_android: None,
             launch: LaunchTemplateEntry::default(),
@@ -2158,6 +2223,114 @@ mod tests {
             ctx.framework.scaffold_value("android-backend-url"),
             ctx.framework.scaffold_value("android-backend-revision"),
         )));
+    }
+
+    #[test]
+    fn kotlin_string_literal_escapes_quotes_backslashes_and_dollars() {
+        // A `$` is a Kotlin string-template opening — `${...}` evaluates
+        // arbitrary build-script code — so it must be escaped like `"` and `\`.
+        let escaped = super::kotlin_string_literal("a\"b\\c${d}");
+        assert_eq!(escaped, "a\\\"b\\\\c\\${d}");
+        let entry = super::AndroidSigningTemplateEntry::from(
+            &crate::android::signing::AndroidSigningConfig::new("keys/$store.jks", "up${evil}")
+                .expect("a config without control characters"),
+        );
+        assert_eq!(entry.keystore, "keys/\\$store.jks");
+        assert_eq!(entry.key_alias, "up\\${evil}");
+    }
+
+    #[test]
+    fn android_build_gradle_renders_release_signing_config() {
+        let template = embedded::ANDROID
+            .get_file("app/build.gradle.kts.tpl")
+            .expect("android build.gradle template must exist")
+            .contents_utf8()
+            .expect("android build.gradle template must be utf-8");
+
+        let render = |ctx: &TemplateContext| {
+            render_scaffold_template(
+                TemplateNamespace::Android,
+                std::path::Path::new("app/build.gradle.kts.tpl"),
+                template,
+                ctx,
+            )
+            .expect("android build.gradle render")
+        };
+
+        // No [signing.android] entry: the release build type stays unsigned
+        // (Gradle's own unsigned output), and packaging fails earlier unless
+        // the caller asked for it.
+        let mut ctx = project_ctx();
+        let unsigned = render(&ctx);
+        assert!(!unsigned.contains("signingConfigs"));
+        assert!(!unsigned.contains("signingConfig ="));
+
+        ctx.android_signing = Some(super::AndroidSigningTemplateEntry::from(
+            &crate::android::signing::AndroidSigningConfig::new("release.jks", "upload")
+                .expect("a config without control characters"),
+        ));
+        let signed = render(&ctx);
+        assert!(signed.contains(r#"storeFile = projectRoot.resolve("release.jks")"#));
+        assert!(signed.contains(r#"keyAlias = "upload""#));
+        // Passwords are env reads, never literals.
+        assert!(
+            signed.contains(r#"storePassword = System.getenv("WATERUI_ANDROID_STORE_PASSWORD")"#)
+        );
+        assert!(signed.contains(r#"keyPassword = System.getenv("WATERUI_ANDROID_KEY_PASSWORD")"#));
+        // `--unsigned` suppresses the config through the environment.
+        assert!(signed.contains(r#"System.getenv("WATERUI_ANDROID_UNSIGNED") != "1""#));
+        assert!(signed.contains(r#"signingConfig = signingConfigs.getByName("release")"#));
+    }
+
+    #[test]
+    fn hydrolysis_android_build_gradle_renders_release_signing_config() {
+        // `[signing.android]` is an Android platform contract: the Hydrolysis
+        // host's generated app signs its release variant the same way the
+        // Android backend's does.
+        let template = embedded::HYDROLYSIS_ANDROID
+            .get_file("app/build.gradle.kts.tpl")
+            .expect("hydrolysis android build.gradle template must exist")
+            .contents_utf8()
+            .expect("hydrolysis android build.gradle template must be utf-8");
+
+        let render = |ctx: &TemplateContext| {
+            render_scaffold_template(
+                TemplateNamespace::HydrolysisAndroid,
+                std::path::Path::new("app/build.gradle.kts.tpl"),
+                template,
+                ctx,
+            )
+            .expect("hydrolysis android build.gradle render")
+        };
+
+        let mut ctx =
+            project_ctx().with_hydrolysis_android(super::HydrolysisAndroidTemplateEntry {
+                native_library_name: "waterui_test_hydrolysis".to_string(),
+                host_project_dir: "../android-host/rev/android".to_string(),
+                project_root: "..".to_string(),
+                painter_dependency: "dev.waterui.hydrolysis:gpu".to_string(),
+                painter_module: "gpu".to_string(),
+                min_api_level: 26,
+                painter_band_import: None,
+                painter_band_class: None,
+            });
+        let unsigned = render(&ctx);
+        assert!(!unsigned.contains("signingConfigs"));
+        assert!(!unsigned.contains("signingConfig ="));
+
+        ctx.android_signing = Some(super::AndroidSigningTemplateEntry::from(
+            &crate::android::signing::AndroidSigningConfig::new("release.jks", "upload")
+                .expect("a config without control characters"),
+        ));
+        let signed = render(&ctx);
+        assert!(signed.contains(r#"storeFile = projectRoot.resolve("release.jks")"#));
+        assert!(signed.contains(r#"keyAlias = "upload""#));
+        assert!(
+            signed.contains(r#"storePassword = System.getenv("WATERUI_ANDROID_STORE_PASSWORD")"#)
+        );
+        assert!(signed.contains(r#"keyPassword = System.getenv("WATERUI_ANDROID_KEY_PASSWORD")"#));
+        assert!(signed.contains(r#"System.getenv("WATERUI_ANDROID_UNSIGNED") != "1""#));
+        assert!(signed.contains(r#"signingConfig = signingConfigs.getByName("release")"#));
     }
 
     #[test]
