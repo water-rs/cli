@@ -186,6 +186,7 @@ impl Backend for HydrolysisBackend {
         built: &crate::build::BuiltTarget,
     ) -> eyre::Result<Artifact> {
         if platform == TargetPlatform::Android {
+            let prepared = crate::android::signing::PreparedSigning::resolve(project, &options)?;
             return crate::hydrolysis::android::package_with_abis(
                 project,
                 &Host::current(),
@@ -193,6 +194,7 @@ impl Backend for HydrolysisBackend {
                 &options,
                 &[AndroidAbi::Arm64V8a],
                 built,
+                &prepared,
             )
             .await;
         }

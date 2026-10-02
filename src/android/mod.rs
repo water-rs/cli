@@ -14,6 +14,8 @@ pub mod ndk_version;
 pub(crate) mod output_metadata;
 /// Android platform configuration.
 pub mod platform;
+/// Android release signing (`[signing.android]`).
+pub mod signing;
 pub(crate) mod toolchain;
 
 pub use self::toolchain::{

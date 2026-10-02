@@ -829,6 +829,18 @@ async fn build_and_run(
     let launch_task =
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
+    // The package options and the release-signing plan are resolved before
+    // the Rust build: a release run without a valid `[signing.android]`
+    // fails here instead of after compiling. The plan binds to this project
+    // and these options; the Gradle step re-proves the binding rather than
+    // resolving again. `[signing.android]` is an Android platform contract —
+    // both Android backends prepare it.
+    let package_options =
+        package_options(&config, shell.build_progress()).with_device_udid(device_udid);
+    let prepared_signing = (build_plan.lib_platform == LibTargetPlatform::Android)
+        .then(|| waterui_cli::android::signing::PreparedSigning::resolve(project, &package_options))
+        .transpose()?;
+
     let _ = shell.status(">", "Building...");
     let built = build_for_backend(
         project,
@@ -854,9 +866,9 @@ async fn build_and_run(
         backend,
         &build_plan,
         &built,
-        &config,
-        Some(shell.build_progress()),
-        device_udid,
+        package_options,
+        prepared_signing.as_ref(),
+        config.painter,
     )
     .await?;
 
@@ -1054,22 +1066,22 @@ async fn build_for_backend(
     }
 }
 
+fn package_options(config: &BuildRunConfig, progress: BuildProgress) -> PackageOptions {
+    PackageOptions::development()
+        .with_debug(!config.profile.is_release())
+        .with_dev_server(config.dev_server)
+        .with_progress(progress)
+}
+
 async fn package_for_backend(
     project: &Project,
     backend: TargetBackend,
     plan: &BuildPlan,
     built: &waterui_cli::build::BuiltTarget,
-    config: &BuildRunConfig,
-    progress: Option<BuildProgress>,
-    device_udid: Option<String>,
+    package_options: PackageOptions,
+    prepared_signing: Option<&waterui_cli::android::signing::PreparedSigning>,
+    painter: HydrolysisAndroidPainter,
 ) -> Result<Artifact> {
-    let mut package_options = PackageOptions::development()
-        .with_debug(!config.profile.is_release())
-        .with_dev_server(config.dev_server)
-        .with_device_udid(device_udid);
-    if let Some(progress) = progress {
-        package_options = package_options.with_progress(progress);
-    }
     match backend {
         TargetBackend::Apple => {
             package_apple(project, plan.lib_platform, package_options, built).await
@@ -1078,7 +1090,16 @@ async fn package_for_backend(
             let abi = plan
                 .android_abi
                 .ok_or_else(|| eyre::eyre!("Internal error: missing Android ABI for packaging"))?;
-            AndroidPlatform::package_with_abis(project, package_options, &[abi], built).await
+            AndroidPlatform::package_with_abis(
+                project,
+                package_options,
+                &[abi],
+                built,
+                prepared_signing.ok_or_else(|| {
+                    eyre::eyre!("Internal error: Android packaging has no signing plan")
+                })?,
+            )
+            .await
         }
         TargetBackend::Gtk4 => package_gtk4(project, package_options, built).await,
         TargetBackend::Hydrolysis => {
@@ -1089,10 +1110,13 @@ async fn package_for_backend(
                 hydrolysis_android::package_with_abis(
                     project,
                     &waterui_cli::toolchain::Host::current(),
-                    config.painter,
+                    painter,
                     &package_options,
                     &[abi],
                     built,
+                    prepared_signing.ok_or_else(|| {
+                        eyre::eyre!("Internal error: Android packaging has no signing plan")
+                    })?,
                 )
                 .await
             } else {

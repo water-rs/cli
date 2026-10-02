@@ -303,22 +303,29 @@ impl Project {
             .await
             .map_err(FailToRun::Build)?;
 
-        let mut build_options = build_options;
+        let mut package_options = PackageOptions::development();
         if let Some(progress) = &progress {
-            build_options = build_options.with_progress(progress.clone());
+            package_options = package_options.with_progress(progress.clone());
+        }
+        // Resolve release signing before the Rust build: a misconfigured
+        // release package fails here rather than after compilation. Debug
+        // runs resolve to a no-decision plan.
+        let prepared = crate::android::signing::PreparedSigning::resolve(self, &package_options)
+            .map_err(FailToRun::Package)?;
+
+        let mut build_options = build_options;
+        if let Some(progress) = progress {
+            build_options = build_options.with_progress(progress);
         }
         let built = AndroidPlatform::new(abi)
             .build(self, build_options)
             .await
             .map_err(FailToRun::Build)?;
 
-        let mut package_options = PackageOptions::development();
-        if let Some(progress) = progress {
-            package_options = package_options.with_progress(progress);
-        }
-        let artifact = AndroidPlatform::package_with_abis(self, package_options, &[abi], &built)
-            .await
-            .map_err(FailToRun::Package)?;
+        let artifact =
+            AndroidPlatform::package_with_abis(self, package_options, &[abi], &built, &prepared)
+                .await
+                .map_err(FailToRun::Package)?;
 
         Self::run_packaged(device, artifact, run_options).await
     }
@@ -1341,8 +1348,8 @@ impl Project {
             web: options.web.as_ref().map(|scaffold| web::WebConfig {
                 package_manager: scaffold.package_manager,
             }),
-            assets: None,
             signing: SigningConfig::default(),
+            assets: None,
         };
 
         // Save Water.toml
@@ -1882,7 +1889,10 @@ use smol::{fs::read_to_string, process::Command, unblock};
 use waterui_assets_planner::{LaunchConfig, ThemeConfig};
 
 use crate::{
-    android::{backend::AndroidBackend, device::AndroidAbiProvider, platform::AndroidPlatform},
+    android::{
+        backend::AndroidBackend, device::AndroidAbiProvider, platform::AndroidPlatform,
+        signing::AndroidSigningConfig,
+    },
     apple::backend::AppleBackend,
     backend::{Backend, Backends},
     build::{BuildOptions, BuildProfile},
@@ -1938,19 +1948,25 @@ pub struct Manifest {
 ///
 /// Each platform's distribution packaging reads its own subsection; a
 /// project that never packages for distribution leaves the table out.
+/// Development builds keep each platform's own signing (the Android debug
+/// keystore); these entries apply to release packaging only, and carry no
+/// secrets — passwords are read from the environment at package time.
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct SigningConfig {
     /// macOS Developer ID distribution signing (`[signing.macos]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub macos: Option<MacosSigningConfig>,
+    /// Android release signing (`[signing.android]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub android: Option<AndroidSigningConfig>,
 }
 
 impl SigningConfig {
     /// Whether no platform carries signing configuration.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.macos.is_none()
+        self.macos.is_none() && self.android.is_none()
     }
 }
 
