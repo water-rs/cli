@@ -37,9 +37,23 @@ struct PackageTemplate<'a> {
     links: &'a [PlatformLinks],
 }
 
+impl PackageTemplate<'_> {
+    fn needs_clang_runtime(&self) -> bool {
+        self.links.iter().any(PlatformLinks::needs_clang_runtime)
+    }
+}
+
 struct PlatformLinks {
     platform: &'static str,
     links: Vec<NativeLink>,
+}
+
+impl PlatformLinks {
+    fn needs_clang_runtime(&self) -> bool {
+        self.links
+            .iter()
+            .any(|link| !link.framework && link.name.starts_with("clang_rt."))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -379,6 +393,76 @@ mod tests {
         assert!(
             rendered.contains(".linkedFramework(\"CoreFoundation\", .when(platforms: [.macOS]))")
         );
+        assert!(!rendered.contains("Process()"));
+        assert!(!rendered.contains("clangRuntimeLibraryDirectory"));
+    }
+
+    #[test]
+    fn package_resolves_clang_runtime_on_consumer_and_preserves_native_links() {
+        let links = [
+            PlatformLinks {
+                platform: "macOS",
+                links: ["System", "clang_rt.osx", "c++", "System"]
+                    .map(|name| NativeLink {
+                        name: name.to_owned(),
+                        framework: false,
+                    })
+                    .to_vec(),
+            },
+            PlatformLinks {
+                platform: "iOS",
+                links: vec![NativeLink {
+                    name: "clang_rt.ios".to_owned(),
+                    framework: false,
+                }],
+            },
+        ];
+        let rendered = PackageTemplate {
+            name: "fixture",
+            macos: "26.0",
+            ios: "26.0",
+            links: &links,
+        }
+        .render()
+        .unwrap();
+        assert_eq!(
+            rendered
+                .matches("let clangRuntimeLibraryDirectory:")
+                .count(),
+            1
+        );
+        assert!(rendered.contains("clang.arguments = [\"clang\", \"-print-resource-dir\"]"));
+        assert!(rendered.contains(".appendingPathComponent(\"lib/darwin\")"));
+        assert!(rendered.contains("clang.terminationStatus == 0"));
+        for platform in &links {
+            let search = format!(
+                ".unsafeFlags([\"-L\", clangRuntimeLibraryDirectory], .when(platforms: [.{}]))",
+                platform.platform
+            );
+            let mut offset = rendered.find(&search).unwrap();
+            for link in &platform.links {
+                let setting = format!(
+                    ".linkedLibrary(\"{}\", .when(platforms: [.{}]))",
+                    link.name, platform.platform
+                );
+                offset += rendered[offset..]
+                    .find(&setting)
+                    .expect("each native library retains its order and platform")
+                    + setting.len();
+            }
+        }
+    }
+
+    #[test]
+    fn framework_names_do_not_require_clang_runtime_search() {
+        let platform = PlatformLinks {
+            platform: "macOS",
+            links: vec![NativeLink {
+                name: "clang_rt.osx".to_owned(),
+                framework: true,
+            }],
+        };
+        assert!(!platform.needs_clang_runtime());
     }
 
     fn resource_manifest(name: &str) -> waterui_assets_planner::BundleManifest {
