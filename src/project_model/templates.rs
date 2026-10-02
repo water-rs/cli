@@ -3046,14 +3046,18 @@ mod tests {
 
     #[test]
     fn apple_scaffold_contains_no_swift_runtime_or_embedded_package() {
-        let outputs = super::apple::rendered_outputs(&project_ctx()).unwrap();
-        assert!(!outputs.is_empty());
-        for (path, _) in outputs {
-            assert_eq!(
-                path.extension().and_then(|value| value.to_str()),
-                Some("entitlements")
-            );
-        }
+        let mut ctx = project_ctx();
+        ctx.app_name = "WaterUIApp".to_string();
+        let outputs = super::apple::rendered_outputs(&ctx).unwrap();
+        let expected_path = PathBuf::from("WaterUIApp/WaterUIApp.entitlements");
+        let expected = include_bytes!("../templates/apple/AppName/AppName.entitlements.tpl");
+        assert_eq!(outputs, vec![(expected_path.clone(), expected.to_vec())]);
+        let directory = tempdir().unwrap();
+        smol::block_on(super::apple::scaffold(directory.path(), &ctx)).unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join(expected_path)).unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -5827,6 +5831,46 @@ pub mod ffi {
             .features
             .insert("dev".to_string(), vec![format!("{}/dev", ctx.crate_name)]);
 
+        configure_native_features(&mut manifest, ctx);
+        configure_native_dependencies(&mut manifest, ctx)?;
+
+        manifest.patch = match ctx.waterui_workspace_root() {
+            Some(root) => {
+                smol::unblock(move || super::collect_framework_checkout_patches(&root)).await?
+            }
+            None => ctx.framework.patches(),
+        };
+
+        // This crate roots the workspace that also holds preview modules. A preview
+        // module is loaded into the support application and resolves its `WaterUI`
+        // symbols against the runtime that application already has open, so the two
+        // must come out of one Cargo resolution: Cargo derives `-C metadata` — which
+        // it mangles into every symbol — per workspace, and two workspaces produce
+        // runtimes whose symbols cannot resolve against each other even when their
+        // dependency graphs are byte-for-byte identical.
+        //
+        // The members are whichever modules are on disk, listed by name rather than
+        // by a `modules/*` glob: Cargo reads a glob that matches nothing as a
+        // literal path and fails on it, and an ordinary application has no modules
+        // at all.
+        manifest.workspace = Some(Workspace {
+            members: super::preview_module_members(base_dir).await?,
+            ..Workspace::default()
+        });
+
+        if let Some(project_root) = &ctx.project_root_path {
+            super::propagate_workspace_patches(&mut manifest, project_root).await?;
+        }
+
+        let toml_string = toml::to_string_pretty(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        fs::create_dir_all(base_dir).await?;
+        write_file_if_changed(&base_dir.join("Cargo.toml"), toml_string.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Declare capability forwarding for the target-specific native dependencies.
+    fn configure_native_features(manifest: &mut Manifest<()>, ctx: &TemplateContext) {
         // `waterui-ffi` is a non-Apple target dependency, so the forwards are the
         // plain `dep/feat` form; see `FORWARDED_FFI_FEATURES` for why they are
         // manifest-declared. Some capabilities also reach the Rust backend:
@@ -5859,7 +5903,13 @@ pub mod ffi {
             }
             manifest.features.insert((*name).to_string(), forwards);
         }
+    }
 
+    /// Resolve framework, Apple backend and CEF sources into their target tables.
+    fn configure_native_dependencies(
+        manifest: &mut Manifest<()>,
+        ctx: &TemplateContext,
+    ) -> io::Result<()> {
         for (name, source) in [
             ("waterui", NativeBackendDependencySource::WateruiRoot),
             (
@@ -5925,38 +5975,6 @@ pub mod ffi {
                     Dependency::Detailed(Box::new(browser)),
                 );
         }
-        manifest.patch = match ctx.waterui_workspace_root() {
-            Some(root) => {
-                smol::unblock(move || super::collect_framework_checkout_patches(&root)).await?
-            }
-            None => ctx.framework.patches(),
-        };
-
-        // This crate roots the workspace that also holds preview modules. A preview
-        // module is loaded into the support application and resolves its `WaterUI`
-        // symbols against the runtime that application already has open, so the two
-        // must come out of one Cargo resolution: Cargo derives `-C metadata` — which
-        // it mangles into every symbol — per workspace, and two workspaces produce
-        // runtimes whose symbols cannot resolve against each other even when their
-        // dependency graphs are byte-for-byte identical.
-        //
-        // The members are whichever modules are on disk, listed by name rather than
-        // by a `modules/*` glob: Cargo reads a glob that matches nothing as a
-        // literal path and fails on it, and an ordinary application has no modules
-        // at all.
-        manifest.workspace = Some(Workspace {
-            members: super::preview_module_members(base_dir).await?,
-            ..Workspace::default()
-        });
-
-        if let Some(project_root) = &ctx.project_root_path {
-            super::propagate_workspace_patches(&mut manifest, project_root).await?;
-        }
-
-        let toml_string = toml::to_string_pretty(&manifest)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        fs::create_dir_all(base_dir).await?;
-        write_file_if_changed(&base_dir.join("Cargo.toml"), toml_string.as_bytes()).await?;
         Ok(())
     }
 

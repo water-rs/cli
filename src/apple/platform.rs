@@ -6,8 +6,6 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-#[cfg(target_os = "macos")]
-use eyre::eyre;
 use eyre::{Context, bail};
 use smol::fs;
 use tracing::info;
