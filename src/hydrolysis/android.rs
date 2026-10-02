@@ -332,6 +332,14 @@ async fn android_template_context(
 
 /// Render the generated Gradle app into `<backend>/android` for `painter`.
 ///
+/// The ffi companion is rendered for this invocation first: it is not a
+/// managed native backend, so `Project::open` never produces one for a
+/// hydrolysis selection, yet `package_with_abis` reads its manifest to
+/// mirror the app's feature selection onto the Gradle classpath. A
+/// companion left over from a different selection must not be the one it
+/// sees, so this renders it unconditionally — never an Apple one, this
+/// backend has no Apple entry.
+///
 /// # Errors
 ///
 /// Returns an error when template rendering or file writing fails.
@@ -341,6 +349,7 @@ pub async fn scaffold_android_project(
     host_project_dir: &Path,
 ) -> eyre::Result<()> {
     let backend_path = project.backend_path::<HydrolysisBackend>();
+    project.scaffold_ffi_companion(false).await?;
     let ctx = android_template_context(project, painter, host_project_dir).await?;
     templates::hydrolysis_android::scaffold(&android_dir(&backend_path), &ctx).await?;
     Ok(())
@@ -881,6 +890,35 @@ mod tests {
             assert!(
                 gradle.contains(&format!("resolve(\"{}\")", entry.project_root)),
                 "the rendered projectRoot uses the android-dir-relative path: {gradle}"
+            );
+        });
+    }
+
+    /// A cold managed-backend cache: opening with `ManagedBackends::NONE`
+    /// leaves no ffi companion, and the Gradle packaging step reads its
+    /// manifest for the classpath staging. The Android scaffold step must
+    /// render it rather than rely on a prior native-Android open.
+    #[test]
+    fn the_android_scaffold_renders_the_ffi_companion_on_a_cold_cache() {
+        smol::block_on(async {
+            let (_temporary, project) = fixture_project("").await;
+            assert!(
+                !project.ffi_crate_path().join("Cargo.toml").exists(),
+                "fixture opened with no managed backends: no companion scaffolded"
+            );
+            let (_machine, host) = machine_with_staged_host(Path::new("staged"), &["gpu"]);
+            let host_project_dir =
+                require_painter_module(&host, &project, HydrolysisAndroidPainter::Gpu)
+                    .await
+                    .expect("host project dir");
+
+            scaffold_android_project(&project, HydrolysisAndroidPainter::Gpu, &host_project_dir)
+                .await
+                .expect("android scaffold renders");
+
+            assert!(
+                project.ffi_crate_path().join("Cargo.toml").exists(),
+                "the packaging path rendered the companion manifest it reads"
             );
         });
     }
