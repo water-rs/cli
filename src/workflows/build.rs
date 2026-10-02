@@ -88,7 +88,7 @@ pub async fn rust_target_libdir(triple: &Triple, toolchain: &str) -> eyre::Resul
 /// The Cargo target a build selects.
 ///
 /// A crate-type override only has meaning for the library target, so carrying the
-/// target kind in the type keeps `cargo rustc -- --crate-type` from ever reaching a
+/// target kind in the type keeps `cargo rustc --crate-type` from ever reaching a
 /// binary build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CargoTarget<'a> {
@@ -98,12 +98,22 @@ pub(crate) enum CargoTarget<'a> {
     Binary(&'a str),
 }
 
-impl<'a> CargoTarget<'a> {
-    fn cargo_args(self) -> Vec<&'a str> {
-        match self {
-            Self::Lib => vec!["--lib"],
-            Self::Binary(name) => vec!["--bin", name],
+impl CargoTarget<'_> {
+    /// The cargo-level args selecting this target, plus the `--crate-type`
+    /// unit selector when a lib override is set. The flag must reach cargo
+    /// itself — passed after `--` it would land on rustc, where
+    /// `--crate-type` accumulates and the manifest's other crate types would
+    /// still emit and link.
+    fn cargo_args(self, crate_type_override: Option<&str>) -> Vec<String> {
+        let mut args: Vec<String> = match self {
+            Self::Lib => vec!["--lib".to_owned()],
+            Self::Binary(name) => vec!["--bin".to_owned(), name.to_owned()],
+        };
+        if let Some(crate_type) = crate_type_override {
+            args.push("--crate-type".to_owned());
+            args.push(crate_type.to_owned());
         }
+        args
     }
 
     const fn accepts_crate_type_override(self) -> bool {
@@ -2041,7 +2051,7 @@ Automatic meson installation failed: {install_err}\n\n{}",
         }
         let mut cmd = cmd
             .arg("--message-format=json-render-diagnostics")
-            .args(cargo_target.cargo_args())
+            .args(cargo_target.cargo_args(crate_type_override))
             .args(["--target", self.triple.to_string().as_str()])
             .args(framework.is_some().then_some("--locked"))
             .current_dir(&self.path);
@@ -2160,12 +2170,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
         })
     }
 
-    /// The arguments after `cargo rustc --`: the `--crate-type` override,
-    /// this build's trailing rustc arguments, and — for a `--bin` unit —
-    /// `-Cextra-filename=-<marker>`, which scopes the unit's `deps/` output
-    /// name to this build so its artifact is never resolved through the
-    /// unhashed `<profile>/<name>` uplift that aliases whatever build wrote
-    /// there last.
+    /// The arguments after `cargo rustc --`: this build's trailing rustc
+    /// arguments, and — for a `--bin` unit — `-Cextra-filename=-<marker>`,
+    /// which scopes the unit's `deps/` output name to this build so its
+    /// artifact is never resolved through the unhashed `<profile>/<name>`
+    /// uplift that aliases whatever build wrote there last.
     fn trailing_rustc_args(
         &self,
         release: bool,
@@ -3434,9 +3443,13 @@ mod tests {
     fn crate_type_override_applies_only_to_library_targets() {
         assert!(CargoTarget::Lib.accepts_crate_type_override());
         assert!(!CargoTarget::Binary("waterui-cef-helper").accepts_crate_type_override());
-        assert_eq!(CargoTarget::Lib.cargo_args(), ["--lib"]);
+        assert_eq!(CargoTarget::Lib.cargo_args(None), ["--lib"]);
         assert_eq!(
-            CargoTarget::Binary("waterui-cef-helper").cargo_args(),
+            CargoTarget::Lib.cargo_args(Some("cdylib")),
+            ["--lib", "--crate-type", "cdylib"]
+        );
+        assert_eq!(
+            CargoTarget::Binary("waterui-cef-helper").cargo_args(None),
             ["--bin", "waterui-cef-helper"]
         );
     }

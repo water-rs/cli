@@ -296,10 +296,6 @@ pub struct TemplateContext {
     /// `[backends.apple] backend_path` — a local Apple backend checkout that
     /// replaces the remote Swift package reference.
     pub apple_backend_path: Option<PathBuf>,
-    /// The generated ffi companion's package name as a crate identifier —
-    /// the entry-owning bin references it so rustc keeps the library's rlib
-    /// on the link line for the Swift seam's callbacks.
-    pub ffi_crate_name: Option<CrateName>,
     /// Whether the project selected the Apple backend for this invocation —
     /// the ffi companion only depends on `waterui-apple` and declares its
     /// entry-owning bin when this is set, so an Android-only build never
@@ -367,7 +363,6 @@ impl TemplateContext {
             author: options.author.clone(),
             android_backend_path: None,
             apple_backend_path: None,
-            ffi_crate_name: None,
             apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
@@ -410,7 +405,6 @@ impl TemplateContext {
             apple_backend_path: apple
                 .and_then(|backend| backend.backend_path.as_deref())
                 .map(PathBuf::from),
-            ffi_crate_name: None,
             // Selected at invocation, never from declared config: a project
             // that declares `[backends.apple]` but builds for Android must
             // still emit no `waterui-apple` pieces.
@@ -463,7 +457,6 @@ impl TemplateContext {
             author: String::new(),
             android_backend_path: None,
             apple_backend_path: None,
-            ffi_crate_name: None,
             apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
@@ -502,14 +495,6 @@ impl TemplateContext {
     #[must_use]
     pub fn with_project_root_path(mut self, path: PathBuf) -> Self {
         self.project_root_path = Some(path);
-        self
-    }
-
-    /// Set the ffi companion's package name — the entry-owning bin names
-    /// the library through it so rustc keeps its rlib on the link line.
-    #[must_use]
-    pub fn with_ffi_crate_name(mut self, name: CrateName) -> Self {
-        self.ffi_crate_name = Some(name);
         self
     }
 
@@ -688,15 +673,18 @@ impl TemplateContext {
         self.crate_name.rust_ident()
     }
 
-    /// The ffi companion's crate identifier. Only the ffi scaffold renders
-    /// it, and its context always carries the companion's name — a missing
-    /// name is a scaffold bug, so there is no fallback.
+    /// The generated ffi companion crate's Rust identifier — the crate the
+    /// Apple entry binary imports `waterui_apple_main` from.
     #[must_use]
     pub fn ffi_crate_ident(&self) -> RustIdent {
-        self.ffi_crate_name
-            .as_ref()
-            .expect("the ffi scaffold context must carry the companion crate name")
-            .rust_ident()
+        crate::project_model::project_types::generated_crate_name(
+            &self.crate_name,
+            "ffi",
+            self.project_root_path
+                .as_deref()
+                .expect("ffi crate ident is rendered for a project"),
+        )
+        .rust_ident()
     }
 
     #[must_use]
@@ -1308,9 +1296,6 @@ mod tests {
             android_backend_path: None,
             apple_backend_path: None,
             apple_backend_selected: true,
-            ffi_crate_name: Some(
-                CrateName::try_from("waterui_test_ffi").expect("test ffi crate name must be valid"),
-            ),
             waterui_path,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
@@ -1976,6 +1961,16 @@ mod tests {
         );
 
         assert!(ctx.compute_apple_backend_path().is_none());
+    }
+
+    #[test]
+    fn waterui_apple_dependency_prefers_a_local_checkout() {
+        let mut ctx = ctx(None, Some(PathBuf::from("managed_backends/apple")), None);
+        ctx.apple_backend_path = Some(PathBuf::from("../apple-backend"));
+
+        let detail = ctx.waterui_apple_dependency();
+        assert_eq!(detail.path.as_deref(), Some("../../../apple-backend"));
+        assert!(detail.git.is_none() && detail.rev.is_none() && detail.tag.is_none());
     }
 
     #[test]
@@ -2668,6 +2663,17 @@ mod tests {
             manifest["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
             Some(false)
         );
+        // The map capability reaches the Rust backend as well as the FFI
+        // surface: the `map` feature also enables `waterui-apple/map`, so the
+        // `MKMapView` leaf compiles only for apps whose graph holds
+        // `waterui-map`.
+        let map_forwards = manifest["features"]["map"]
+            .as_array()
+            .expect("map feature is declared")
+            .iter()
+            .map(|feature| feature.as_str().expect("feature name"))
+            .collect::<Vec<_>>();
+        assert_eq!(map_forwards, ["waterui-ffi/map", "waterui-apple/map"]);
         assert_eq!(manifest["package"]["autobins"].as_bool(), Some(false));
         let bins = manifest["bin"]
             .as_array()
@@ -2681,6 +2687,9 @@ mod tests {
             bins[0]["path"].as_str(),
             Some("src/bin/waterui-apple-main.rs")
         );
+        let main_bin = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-apple-main.rs"))
+            .expect("apple main source should be written");
+        assert!(!main_bin.contains("waterui_cef_prepare_macos_application"));
     }
 
     #[test]
@@ -2721,6 +2730,10 @@ mod tests {
         let helper = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-cef-helper.rs"))
             .expect("CEF helper source should be written");
         assert!(helper.contains("waterui_cef_run_packaged_subprocess"));
+
+        let main_bin = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-apple-main.rs"))
+            .expect("apple main source should be written");
+        assert!(main_bin.contains("waterui_cef_prepare_macos_application"));
     }
 
     #[test]
@@ -2944,9 +2957,10 @@ mod tests {
             .map(|value| value.as_str().expect("crate type should be a string"))
             .collect::<Vec<_>>();
 
-        // Apple links the staticlib, Android loads the cdylib, and the
-        // entry-owning `waterui-apple-main` bin consumes the rlib so its own
-        // crate dependency stays static inside the executable image.
+        // Apple embedders link the staticlib, Android loads the cdylib, and
+        // the entry-owning `waterui-apple-main` bin imports the companion
+        // crate through the rlib — the dependency that carries both its
+        // exports and its `#[link]` native declarations into the executable.
         assert_eq!(crate_types, ["staticlib", "cdylib", "rlib"]);
     }
 
@@ -5603,6 +5617,18 @@ const FORWARDED_FFI_FEATURES: &[&str] = &[
     "webview-cef",
 ];
 
+/// Additional `dep/feature` forwards a selectable FFI feature emits: pairs of
+/// (feature name, dependency). `map` also turns on `waterui-apple/map` so the
+/// native `MKMapView` leaf compiles only when the app's graph opted in; the
+/// `media` and `webview` capabilities forward the same way, so the `AVKit` and
+/// `WebKit` leaves — and the framework links they carry through `cocoa-ui` —
+/// compile only for apps whose graph holds `waterui-video` / `waterui-webview`.
+const BACKEND_FEATURE_FORWARDS: &[(&str, &str)] = &[
+    ("map", "waterui-apple"),
+    ("media", "waterui-apple"),
+    ("webview", "waterui-apple"),
+];
+
 /// Native FFI companion crate templates.
 pub mod ffi {
     use cargo_toml::{Dependency, DependencyDetail, Manifest, Package, Product, Workspace};
@@ -5668,11 +5694,12 @@ pub mod ffi {
             ..Default::default()
         });
         // Entry-owning Apple packaging installs this binary as the
-        // application executable: it calls `waterui_apple::entry::run` the
-        // same way `waterui_apple::export_app!` does in the library, which
-        // keeps its own expansion for the embedding path. The companion is
-        // scaffolded for Android projects too, so the bin only exists when
-        // the Apple backend was actually selected.
+        // application executable: it calls the `waterui_apple_main` export
+        // `waterui_apple::export_app!` placed in the companion library, so
+        // every `waterui_*` symbol reaches the image from that one artifact
+        // rather than from both the staticlib and the bin's own codegen.
+        // The companion is scaffolded for Android projects too, so the bin
+        // only exists when the Apple backend was actually selected.
         if ctx.apple_backend_selected {
             manifest.bin.push(Product {
                 name: Some(crate::apple::platform::APPLE_ENTRY_BINARY_NAME.to_string()),
@@ -5704,11 +5731,24 @@ pub mod ffi {
 
         // `waterui-ffi` is a hard dependency here, so the forwards are the
         // plain `dep/feat` form; see `FORWARDED_FFI_FEATURES` for why they are
-        // manifest-declared.
+        // manifest-declared. Some capabilities also reach the Rust backend:
+        // the `map` feature enables `waterui-apple/map` too, so the
+        // `MKMapView` leaf — and the `MapKit` framework link it carries
+        // through `cocoa-ui` — is compiled only for apps whose graph holds
+        // `waterui-map`. A backend forward references the backend crate, so
+        // it is only declared when that backend was selected.
         for name in super::FORWARDED_FFI_FEATURES {
-            manifest
-                .features
-                .insert((*name).to_string(), vec![format!("waterui-ffi/{name}")]);
+            let mut forwards = vec![format!("waterui-ffi/{name}")];
+            for dep in super::BACKEND_FEATURE_FORWARDS
+                .iter()
+                .filter(|(feature, dep)| {
+                    feature == name && (*dep != "waterui-apple" || ctx.apple_backend_selected)
+                })
+                .map(|(_, dep)| dep)
+            {
+                forwards.push(format!("{dep}/{name}"));
+            }
+            manifest.features.insert((*name).to_string(), forwards);
         }
 
         for (name, source) in [
