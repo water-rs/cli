@@ -11,6 +11,8 @@ use target_lexicon::Triple;
 
 use crate::{build::NativeLink, platform::TargetPlatform, toolchain::Host};
 
+mod destination;
+
 pub(super) struct RuntimeClosure {
     archives: Vec<String>,
     pub(super) remaining: Vec<NativeLink>,
@@ -80,11 +82,12 @@ impl RuntimeClosure {
         &self,
         host: &Host,
         platform: TargetPlatform,
-        triple: &str,
+        project: &crate::project::Project,
         archive: &Path,
         output: &Path,
         notices: &Path,
     ) -> Result<PathBuf> {
+        let triple = platform.triple().to_string();
         if self.archives.is_empty() {
             return Ok(archive.to_path_buf());
         }
@@ -114,7 +117,15 @@ impl RuntimeClosure {
                 runtimes.push(path);
             }
         }
-        let args = composition_arguments(sdk, triple, archive, output, &runtimes)?;
+        let inputs = if platform == TargetPlatform::MacOS {
+            let (_, deployment) =
+                crate::apple::platform::apple_deployment_target(project, platform).await?;
+            let directory = output.with_extension("runtime-objects");
+            destination::macos_objects(host, &runtimes, &directory, &deployment).await?
+        } else {
+            runtimes
+        };
+        let args = composition_arguments(sdk, &triple, archive, output, &inputs)?;
         host.run("xcrun", args).await?;
         copy_notices(&resource, notices).await?;
         Ok(output.to_path_buf())

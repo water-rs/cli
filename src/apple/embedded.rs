@@ -217,7 +217,7 @@ async fn assemble_slices(
             .compose(
                 host,
                 slice.platform,
-                triple,
+                project,
                 &archive,
                 &directory.join(format!("{triple}-closed.a")),
                 &staging.join("package/Sources/WaterUI/Resources/Notices"),
