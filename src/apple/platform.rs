@@ -308,7 +308,7 @@ pub(crate) async fn build_rust_lib_with_links(
     }
 
     // The Rust entry links the companion rlib, carrying backend native links
-    // and app exports into one image without a Swift rendering seam.
+    // and app exports into one image.
     let staged_dir = options.output_dir().map(PathBuf::from);
     let deps_dir = target_dir
         .join(&target)
@@ -740,8 +740,7 @@ pub async fn package_apple(
             .stage_apple_canonical(&layout.frameworks_dir)
             .await?;
         // Redirect the executable's recorded runtime dependency to the
-        // canonical `@rpath` name, the way the Swift host library was
-        // retargeted before.
+        // canonical `@rpath` name of the staged Rust runtime.
         dynamic_runtime::retarget_module(&layout.executable_file(&product_name), &staged_runtime)
             .await?;
         dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;

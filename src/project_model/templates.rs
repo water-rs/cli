@@ -294,7 +294,7 @@ pub struct TemplateContext {
     /// Path to the Android backend (relative or absolute)
     pub android_backend_path: Option<PathBuf>,
     /// `[backends.apple] backend_path` — a local Apple backend checkout that
-    /// replaces the remote Swift package reference.
+    /// replaces the remote Rust backend dependency.
     pub apple_backend_path: Option<PathBuf>,
     /// Whether the project selected the Apple backend for this invocation —
     /// the ffi companion only depends on `waterui-apple` and declares its
@@ -840,10 +840,10 @@ impl TemplateContext {
 
     /// The path to the local Apple backend checkout `[backends.apple]`
     /// `backend_path` names, resolved from the generated project's directory.
-    /// `None` consumes the remote Swift package instead.
+    /// `None` consumes the pinned remote Rust backend instead.
     ///
     /// Without a manifest override, `waterui_path/backends/apple` is used when
-    /// it is a real Swift package: dropping this silently retargeted every
+    /// it contains a Rust manifest: dropping this silently retargeted every
     /// local-checkout build — including the backend's own e2e suite — onto the
     /// pinned remote release.
     fn compute_apple_backend_path(&self) -> Option<String> {
@@ -853,7 +853,7 @@ impl TemplateContext {
             .or_else(|| {
                 let local = self.waterui_workspace_root()?.join("backends/apple");
                 local
-                    .join("Package.swift")
+                    .join("Cargo.toml")
                     .is_file()
                     .then(|| self.backend_relative_path(&local))
             })
@@ -1928,10 +1928,10 @@ mod tests {
         let backend_dir = waterui_root.path().join("backends/apple");
         std::fs::create_dir_all(&backend_dir).expect("backend dir");
         std::fs::write(
-            backend_dir.join("Package.swift"),
-            "// swift-tools-version:5.9\n",
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\nversion = \"0.1.0\"\n",
         )
-        .expect("Package.swift");
+        .expect("backend Cargo.toml");
         let project_root = tempdir().expect("tempdir");
 
         let ctx = ctx(
@@ -2748,6 +2748,11 @@ mod tests {
         let helper = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-cef-helper.rs"))
             .expect("CEF helper source should be written");
         assert!(helper.contains("waterui_browser_cef::run_packaged_subprocess"));
+        assert!(!helper.contains("waterui_ffi"));
+        assert!(helper.contains("#[cfg(target_os = \"macos\")]"));
+        assert!(helper.contains(
+            "compile_error!(\"The Apple CEF subprocess helper requires a macOS target\")"
+        ));
 
         let main_bin = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-apple-main.rs"))
             .expect("apple main source should be written");
@@ -2957,6 +2962,10 @@ mod tests {
             manifest["target"]["cfg(not(target_vendor = \"apple\"))"]["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
             Some(false)
         );
+        assert!(manifest["dependencies"].get("waterui-ffi").is_none());
+        let targets = manifest["target"].as_table().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains_key("cfg(not(target_vendor = \"apple\"))"));
         // The module is a member of the support runtime's workspace, never a
         // workspace of its own: one Cargo resolution is what makes the module and
         // the runtime it is loaded into agree on the `-C metadata` hash that ends
@@ -6549,6 +6558,9 @@ pub mod preview_ffi {
             Dependency::Detailed(Box::new(preview_dependency)),
         );
 
+        // The portable non-Apple preview loader also selects APPLE_ABI_FEATURE.
+        // Its c-api forward only activates the non-Apple target dependency;
+        // Apple targets compile no waterui-ffi dependency through this feature.
         for (feature, ffi_feature) in [
             (APPLE_ABI_FEATURE, "waterui-ffi/c-api"),
             (ANDROID_ABI_FEATURE, "waterui-ffi/android-jni"),
