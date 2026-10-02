@@ -184,6 +184,10 @@ async fn apple_ffi_build_features(
     let mut features = apple_ffi_dependency_features(project, browser_runtime).await?;
     if linkage == RustLinkage::SharedRuntime {
         features.push("dev".to_string());
+        // The inspector is devtooling: development sessions get it through the
+        // shared-runtime linkage while a packaged build leaves its server
+        // stack out.
+        features.push("inspector".to_string());
     }
     Ok(features)
 }

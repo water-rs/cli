@@ -5610,6 +5610,7 @@ const FORWARDED_FFI_FEATURES: &[&str] = &[
     "c-api",
     "chromium",
     "gpu",
+    "inspector",
     "map",
     "media",
     "video",

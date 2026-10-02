@@ -795,6 +795,10 @@ async fn configure_android_rust_build(
         let nightly = crate::toolchain::rust::nightly_toolchain_with_rust_src(host).await?;
         build = build
             .with_feature("dev")
+            // The inspector is devtooling: development sessions get it through
+            // the shared-runtime linkage while a packaged build leaves its
+            // server stack out.
+            .with_feature("inspector")
             .with_preferred_dynamic_linking()
             .with_build_std(nightly)
             .with_env(
