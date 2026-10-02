@@ -286,6 +286,25 @@ pub async fn build_rust_lib(
         }
     };
 
+    // The Swift seam's callbacks into the app (`_waterui_init`,
+    // `_waterui_app`) and every `waterui_*` export resolve inside the one
+    // image through the entry binary's own lib dependency: the bin uses the
+    // companion crate, so Cargo threads its rlib into this link as crate
+    // metadata — which also carries the `#[link]` native dependencies the
+    // graph declares (frameworks like MapKit that a bare archive input
+    // would silently drop). A second `libwaterui_app.dylib` would register
+    // every ObjC class twice, so the shared-runtime build takes the crate's
+    // objects from that same rlib rather than a dylib of its own.
+    let staged_dir = options.output_dir().map(PathBuf::from);
+    let deps_dir = target_dir
+        .join(&target)
+        .join(if options.is_release() {
+            "release"
+        } else {
+            "debug"
+        })
+        .join("deps");
+
     // Stage the host library (and, for the shared runtime, the runtime itself)
     // before the executable links: it resolves the Swift seam's callbacks into
     // the app (`_waterui_init`, `_waterui_app`) and into `libwaterui_dylib`
@@ -309,26 +328,17 @@ pub async fn build_rust_lib(
             }
             dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
         }
+    } else if host_library == AppleHostLibrary::Dynamic {
+        // Without an output directory the link's runtime search dir is the
+        // deps dir below, which Cargo fills only with the hashed
+        // `libwaterui_dylib-<metadata>.dylib` — so `-lwaterui_dylib` cannot
+        // resolve. Stage the canonical install-name copy there first, with
+        // the same `@rpath` handling the packaged staging path performs
+        // (cli#272).
+        let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
+        let staged_runtime = libraries.stage_apple_canonical(&deps_dir).await?;
+        dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
     }
-
-    // The Swift seam's callbacks into the app (`_waterui_init`,
-    // `_waterui_app`) and every `waterui_*` export resolve inside the one
-    // image through the entry binary's own lib dependency: the bin uses the
-    // companion crate, so Cargo threads its rlib into this link as crate
-    // metadata — which also carries the `#[link]` native dependencies the
-    // graph declares (frameworks like MapKit that a bare archive input
-    // would silently drop). A second `libwaterui_app.dylib` would register
-    // every ObjC class twice, so the shared-runtime build takes the crate's
-    // objects from that same rlib rather than a dylib of its own.
-    let staged_dir = options.output_dir().map(PathBuf::from);
-    let deps_dir = target_dir
-        .join(&target)
-        .join(if options.is_release() {
-            "release"
-        } else {
-            "debug"
-        })
-        .join("deps");
     #[cfg(target_os = "macos")]
     if host_library == AppleHostLibrary::Dynamic {
         let ffi_rlib = deps_dir.join(format!(
