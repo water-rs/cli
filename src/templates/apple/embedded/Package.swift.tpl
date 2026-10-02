@@ -12,6 +12,7 @@ let package = Package(
             dependencies: ["CWaterUI"],
             resources: [.copy("Resources/waterui_assets"), .copy("Resources/fonts")],
             swiftSettings: [
+                .define("WATERUI_EMBEDDED_RESOURCES"),
 {% for define in defines %}
                 .define("{{ define }}"),
 {% endfor %}

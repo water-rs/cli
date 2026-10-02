@@ -1,15 +1,19 @@
 import Foundation
 
 /// Resources shipped with the generated WaterUI package.
-public enum WaterUIResources {
-    public static var assets: URL {
+extension WaterUIResourceContext {
+    public static var module: Self {
+        Self(assets: assetsURL, fonts: fontsURL)
+    }
+
+    private static var assetsURL: URL {
         guard let url = Bundle.module.url(forResource: "waterui_assets", withExtension: nil) else {
             fatalError("The WaterUI package is missing its asset bundle")
         }
         return url
     }
 
-    public static var fonts: URL {
+    private static var fontsURL: URL {
         guard let url = Bundle.module.url(forResource: "fonts", withExtension: nil) else {
             fatalError("The WaterUI package is missing its font bundle")
         }

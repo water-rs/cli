@@ -373,6 +373,7 @@ mod tests {
         assert!(rendered.contains(".binaryTarget(name: \"CWaterUI\""));
         assert!(rendered.contains(".copy(\"Resources/waterui_assets\")"));
         assert!(rendered.contains(".define(\"WATERUI_NO_GPU\")"));
+        assert!(rendered.contains(".define(\"WATERUI_EMBEDDED_RESOURCES\")"));
         assert!(!rendered.contains("VideoToolbox"));
         assert!(
             rendered.contains(".linkedFramework(\"CoreFoundation\", .when(platforms: [.macOS]))")
