@@ -10,6 +10,10 @@ use eyre::{Result, bail};
 use smol::fs;
 use target_lexicon::{Aarch64Architecture, Architecture};
 
+mod runtime;
+
+use runtime::RuntimeClosure;
+
 use crate::{
     apple::platform,
     assets,
@@ -37,23 +41,9 @@ struct PackageTemplate<'a> {
     links: &'a [PlatformLinks],
 }
 
-impl PackageTemplate<'_> {
-    fn needs_clang_runtime(&self) -> bool {
-        self.links.iter().any(PlatformLinks::needs_clang_runtime)
-    }
-}
-
 struct PlatformLinks {
     platform: &'static str,
     links: Vec<NativeLink>,
-}
-
-impl PlatformLinks {
-    fn needs_clang_runtime(&self) -> bool {
-        self.links
-            .iter()
-            .any(|link| !link.framework && link.name.starts_with("clang_rt."))
-    }
 }
 
 /// SwiftPM platform conditions cannot distinguish device, simulator or architecture.
@@ -160,7 +150,7 @@ pub async fn build_xcframework(
     let package = temporary.path().join("package");
     let source = package.join("Sources/WaterUI");
     let backend = platform::apple_backend_source_root(project).await?;
-    fs::create_dir_all(&source).await?;
+    fs::create_dir_all(source.join("Resources/Notices")).await?;
     fs::copy(
         backend.join("Sources/WaterUI/Embedding.swift"),
         source.join("Embedding.swift"),
@@ -238,7 +228,21 @@ async fn assemble_slices(
             } else {
                 "iOS"
             };
-            collect_platform_links(&mut links, swift_platform, triple, native_links)?;
+            let mut closure = RuntimeClosure::new(native_links);
+            closure
+                .normalize_sdk_frameworks(host, slice.platform)
+                .await?;
+            let archive = closure
+                .compose(
+                    host,
+                    slice.platform,
+                    triple,
+                    &archive,
+                    &directory.join(format!("{triple}-closed.a")),
+                    &staging.join("package/Sources/WaterUI/Resources/Notices"),
+                )
+                .await?;
+            collect_platform_links(&mut links, swift_platform, triple, closure.remaining)?;
             archives.push(archive);
         }
         let library = directory.join("libWaterUINative.a");
@@ -414,6 +418,7 @@ mod tests {
         );
         assert!(!rendered.contains("Process()"));
         assert!(!rendered.contains("clangRuntimeLibraryDirectory"));
+        assert!(rendered.contains(".copy(\"Resources/Notices\")"));
     }
 
     #[test]
@@ -475,74 +480,6 @@ mod tests {
             );
         }
         assert_eq!(links[0].links, contract);
-    }
-
-    #[test]
-    fn package_resolves_clang_runtime_on_consumer_and_preserves_native_links() {
-        let links = [
-            PlatformLinks {
-                platform: "macOS",
-                links: ["System", "clang_rt.osx", "c++", "System"]
-                    .map(|name| NativeLink {
-                        name: name.to_owned(),
-                        framework: false,
-                    })
-                    .to_vec(),
-            },
-            PlatformLinks {
-                platform: "iOS",
-                links: vec![NativeLink {
-                    name: "clang_rt.ios".to_owned(),
-                    framework: false,
-                }],
-            },
-        ];
-        let rendered = PackageTemplate {
-            name: "fixture",
-            macos: "26.0",
-            ios: "26.0",
-            links: &links,
-        }
-        .render()
-        .unwrap();
-        assert_eq!(
-            rendered
-                .matches("let clangRuntimeLibraryDirectory:")
-                .count(),
-            1
-        );
-        assert!(rendered.contains("clang.arguments = [\"clang\", \"-print-resource-dir\"]"));
-        assert!(rendered.contains(".appendingPathComponent(\"lib/darwin\")"));
-        assert!(rendered.contains("clang.terminationStatus == 0"));
-        for platform in &links {
-            let search = format!(
-                ".unsafeFlags([\"-L\", clangRuntimeLibraryDirectory], .when(platforms: [.{}]))",
-                platform.platform
-            );
-            let mut offset = rendered.find(&search).unwrap();
-            for link in &platform.links {
-                let setting = format!(
-                    ".linkedLibrary(\"{}\", .when(platforms: [.{}]))",
-                    link.name, platform.platform
-                );
-                offset += rendered[offset..]
-                    .find(&setting)
-                    .expect("each native library retains its order and platform")
-                    + setting.len();
-            }
-        }
-    }
-
-    #[test]
-    fn framework_names_do_not_require_clang_runtime_search() {
-        let platform = PlatformLinks {
-            platform: "macOS",
-            links: vec![NativeLink {
-                name: "clang_rt.osx".to_owned(),
-                framework: true,
-            }],
-        };
-        assert!(!platform.needs_clang_runtime());
     }
 
     fn resource_manifest(name: &str) -> waterui_assets_planner::BundleManifest {
