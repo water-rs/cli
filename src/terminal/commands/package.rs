@@ -11,7 +11,7 @@ use waterui_cli::toolchain_checks;
 use waterui_cli::{
     android::platform::{AndroidAbi, AndroidPlatform},
     apple::{
-        platform::{build_rust_lib, package_apple},
+        platform::{build_rust_lib, package_apple, stage_packaged_host_library},
         toolchain::AppleSdk,
     },
     build::{BuildOptions, BuildProfile, BuiltTarget},
@@ -501,6 +501,14 @@ async fn package_artifact(
         .display_output(package_artifact_inner(shell, args, context, built))
         .await?;
     let artifact = place_in_project(&context.project, artifact).await?;
+    // Consumers read the host library beside the `.app` this command reports,
+    // so it stages against the placed path, which only exists after the move.
+    if context.backend == TargetBackend::Apple
+        && let Some(built) = built
+        && let Some(dir) = artifact.path().parent()
+    {
+        stage_packaged_host_library(built, dir).await?;
+    }
     if let Some(pb) = spinner {
         pb.finish_and_clear();
     }

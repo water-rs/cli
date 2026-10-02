@@ -116,6 +116,33 @@ async fn remove_superseded_host_library(
     }
 }
 
+/// Stage the packaged app's static host library beside the `.app` `water
+/// package` reports.
+///
+/// A packaged app's consumers — the device-test job links
+/// `dirname(<Packaged at>)/libwaterui_app.a` into its test bundle — read the
+/// library from the directory the report names, so this runs once the
+/// artifact has landed there, not inside [`package_apple`] where the bundle
+/// still sits in the build cache. `water package` always links the app
+/// statically, so the archive shape is the only one this staging contract
+/// covers; a `SharedRuntime` packaging build would need a different
+/// destination contract, not this copy.
+///
+/// # Errors
+/// Returns an error if the copy or the superseded-shape removal fails.
+pub async fn stage_packaged_host_library(
+    built: &BuiltTarget,
+    packaged_dir: &Path,
+) -> eyre::Result<()> {
+    const HOST_LIBRARY: AppleHostLibrary = AppleHostLibrary::Archive;
+    copy_file(
+        &built.artifact,
+        &packaged_dir.join(HOST_LIBRARY.linked_file_name()),
+    )
+    .await?;
+    remove_superseded_host_library(packaged_dir, HOST_LIBRARY).await
+}
+
 /// The features an Apple runtime's generated FFI crate is compiled with.
 ///
 /// Each name is a feature the generated manifest forwards to `waterui-ffi`
