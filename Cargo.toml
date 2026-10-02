@@ -219,6 +219,7 @@ multiple_crate_versions = { level = "allow", priority = 1 }
 
 [dev-dependencies]
 fontcull-skrifa = "0.39.2"
+syn = { version = "2", features = ["full"] }
 
 [package.metadata.cargo-machete]
 ignored = ["roxmltree", "waterui-inspector-protocol"]

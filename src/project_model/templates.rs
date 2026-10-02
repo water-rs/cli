@@ -2770,9 +2770,55 @@ mod tests {
 
         let lib = std::fs::read_to_string(ffi_dir.join("src/lib.rs"))
             .expect("ffi lib.rs should be written");
+        // Parse the generated Rust and inspect its items structurally:
+        // comments name these macros legitimately, so a text search cannot
+        // tell an invocation from prose.
+        let file = syn::parse_file(&lib).expect("the generated ffi lib.rs must parse");
+        let invoked = |wanted: &[&str]| {
+            file.items.iter().any(|item| {
+                matches!(item, syn::Item::Macro(item_macro)
+                    if item_macro.mac.path.segments.len() == wanted.len()
+                        && item_macro
+                            .mac
+                            .path
+                            .segments
+                            .iter()
+                            .zip(wanted)
+                            .all(|(segment, name)| segment.ident == *name))
+            })
+        };
         assert!(
-            !lib.contains("export_app"),
-            "an Android-only ffi companion must not call waterui_apple::export_app!"
+            !invoked(&["waterui_apple", "export_app"]),
+            "an Android-only ffi companion must not invoke waterui_apple::export_app!"
+        );
+        assert!(
+            invoked(&["waterui_ffi", "export"]),
+            "the companion always emits the waterui_ffi::export!() invocation"
+        );
+        let app_shim = file.items.iter().any(|item| {
+            let syn::Item::Fn(item_fn) = item else {
+                return false;
+            };
+            let syn::ReturnType::Type(_, output) = &item_fn.sig.output else {
+                return false;
+            };
+            item_fn.sig.ident == "app"
+                && item_fn.sig.inputs.len() == 1
+                && matches!(
+                    item_fn.sig.inputs.first(),
+                    Some(syn::FnArg::Typed(arg)) if matches!(
+                        arg.ty.as_ref(),
+                        syn::Type::Path(path) if path.path.is_ident("Environment")
+                    )
+                )
+                && matches!(
+                    output.as_ref(),
+                    syn::Type::Path(path) if path.path.is_ident("App")
+                )
+        });
+        assert!(
+            app_shim,
+            "the app(env) -> App shim every backend's export!() expansion calls must exist"
         );
     }
 
