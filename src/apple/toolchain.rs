@@ -1,11 +1,8 @@
 //! Apple toolchain module
 
-use std::convert::Infallible;
-use std::ffi::OsString;
-
-#[cfg(target_os = "macos")]
 use eyre::Context as _;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 
 use crate::toolchain::{Host, Toolchain, ToolchainError};
 
@@ -96,7 +93,7 @@ impl AppleSdk {
 /// Fails when neither an Xcode account team nor a development certificate
 /// exists — the error tells the user where to add an account.
 pub async fn development_team_id(host: &Host) -> eyre::Result<String> {
-    if let Some(team) = xcode_account_team(host).await {
+    if let Some(team) = xcode_account_team(host).await? {
         return Ok(team);
     }
     #[cfg(target_os = "macos")]
@@ -221,52 +218,78 @@ pub(crate) fn identity_for_profile(
         .cloned()
 }
 
-/// A team Xcode can provision for: the account's last-selected team, or any
-/// team its accounts advertise. Reads Xcode's account registry from
-/// `~/Library/Preferences/com.apple.dt.Xcode.plist`; a missing Xcode install
-/// or unsigned-in state yields `None`.
-async fn xcode_account_team(host: &Host) -> Option<String> {
-    let plist = host
-        .home_dir()?
-        .join("Library/Preferences/com.apple.dt.Xcode.plist");
+/// A team record under `IDEProvisioningTeamByIdentifier` in Xcode's
+/// preferences — the map key is the *account* UUID, so the usable team ID
+/// only ever comes from the record.
+#[derive(Deserialize)]
+struct XcodeTeamRecord {
+    /// The Apple Developer team this account may provision under.
+    #[serde(rename = "teamID")]
+    team_id: String,
+}
 
-    let extract = |key: &str, format: &str| {
-        let plist = plist.clone();
-        let key = key.to_string();
-        let format = format.to_string();
-        async move {
-            host.output(
-                "plutil",
-                [
-                    OsString::from("-extract"),
-                    OsString::from(key),
-                    OsString::from(format),
-                    OsString::from("-o"),
-                    OsString::from("-"),
-                    plist.into_os_string(),
-                ],
-            )
-            .await
+/// Xcode's account registry — only the keys the signing path reads.
+#[derive(Deserialize)]
+struct XcodePreferences {
+    /// `IDEProvisioningTeamManagerLastSelectedTeamID` — the team Xcode last
+    /// provisioned with, when it recorded one.
+    #[serde(rename = "IDEProvisioningTeamManagerLastSelectedTeamID", default)]
+    last_selected_team_id: Option<String>,
+    /// `IDEProvisioningTeamByIdentifier` — account UUID → team records.
+    #[serde(rename = "IDEProvisioningTeamByIdentifier", default)]
+    teams_by_identifier: std::collections::BTreeMap<String, Vec<XcodeTeamRecord>>,
+}
+
+/// Pick the development team out of the parsed registry.
+///
+/// Selection order: `last_selected` when a signed-in account still
+/// advertises that team — a stale key from a removed account is never
+/// used — then the first team the accounts advertise (accounts sort by
+/// UUID), then `None` so the certificate path runs.
+fn select_xcode_account_team(preferences: &XcodePreferences) -> Option<String> {
+    let mut teams: Vec<&str> = Vec::new();
+    for records in preferences.teams_by_identifier.values() {
+        for record in records {
+            if !teams.contains(&record.team_id.as_str()) {
+                teams.push(&record.team_id);
+            }
+        }
+    }
+    if let Some(selected) = preferences
+        .last_selected_team_id
+        .as_deref()
+        .filter(|team| !team.is_empty())
+        && teams.contains(&selected)
+    {
+        return Some(selected.to_string());
+    }
+    teams.first().map(|team| (*team).to_string())
+}
+
+/// A team Xcode can provision for: the account's last-selected team, or any
+/// team its accounts advertise. Reads Xcode's account registry once from
+/// `~/Library/Preferences/com.apple.dt.Xcode.plist`; a missing Xcode install
+/// or unsigned-in state yields `None` while a corrupt or unreadable file is
+/// an error, never a silent fall-through.
+///
+/// `IDEProvisioningTeamByIdentifier` maps *account* UUIDs to lists of team
+/// records — the usable team lives in each record's `teamID`, never in the
+/// key itself.
+async fn xcode_account_team(host: &Host) -> eyre::Result<Option<String>> {
+    let Some(home) = host.home_dir() else {
+        return Ok(None);
+    };
+    let plist = home.join("Library/Preferences/com.apple.dt.Xcode.plist");
+    let bytes = match smol::fs::read(&plist).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| format!("failed to read {}", plist.display()));
         }
     };
-
-    if let Ok(output) = extract("IDEProvisioningTeamManagerLastSelectedTeamID", "raw").await
-        && output.status.success()
-    {
-        let team = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !team.is_empty() {
-            return Some(team);
-        }
-    }
-
-    let output = extract("IDEProvisioningTeamByIdentifier", "json")
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let teams: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    teams.as_object()?.keys().next().cloned()
+    let preferences: XcodePreferences = plist::from_bytes(&bytes)
+        .wrap_err_with(|| format!("failed to parse {}", plist.display()))?;
+    Ok(select_xcode_account_team(&preferences))
 }
 
 impl std::fmt::Display for AppleSdk {
@@ -310,7 +333,10 @@ impl Toolchain for AppleSdk {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppleSdk, Xcode};
+    use super::{
+        AppleSdk, Xcode, XcodePreferences, XcodeTeamRecord, select_xcode_account_team,
+        xcode_account_team,
+    };
     use crate::toolchain::testing::TestMachine;
     use crate::toolchain::{Toolchain, ToolchainError};
 
@@ -354,6 +380,218 @@ mod tests {
             matches!(result, Err(ToolchainError::Unfixable(_))),
             "xcrun without an SDK path must be unfixable: {result:?}"
         );
+    }
+
+    /// A registry the way the parser sees it: account UUIDs → team records,
+    /// plus an optional last-selected team.
+    fn preferences(last_selected: Option<&str>, accounts: &[(&str, &[&str])]) -> XcodePreferences {
+        XcodePreferences {
+            last_selected_team_id: last_selected.map(str::to_string),
+            teams_by_identifier: accounts
+                .iter()
+                .map(|(account, teams)| {
+                    (
+                        (*account).to_string(),
+                        teams
+                            .iter()
+                            .map(|team| XcodeTeamRecord {
+                                team_id: (*team).to_string(),
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Serialize a preferences fixture as a real XML property list at
+    /// `~/Library/Preferences/com.apple.dt.Xcode.plist` in the fake home.
+    fn write_xcode_plist(machine: &TestMachine, value: &serde_json::Value) {
+        let preferences_dir = machine.home().join("Library/Preferences");
+        std::fs::create_dir_all(&preferences_dir).expect("create preferences directory");
+        let mut bytes = Vec::new();
+        plist::to_writer_xml(&mut bytes, value).expect("fixture serializes as a plist");
+        std::fs::write(preferences_dir.join("com.apple.dt.Xcode.plist"), bytes)
+            .expect("write preferences fixture");
+    }
+
+    /// The shape a real Xcode writes: the account UUID keys the map, the
+    /// usable team ID lives in each record's `teamID`.
+    #[test]
+    fn account_team_comes_from_the_record_not_the_key() {
+        let prefs = preferences(
+            None,
+            &[("DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C", &["4AZ53N9R83"])],
+        );
+        assert_eq!(
+            select_xcode_account_team(&prefs),
+            Some("4AZ53N9R83".to_string()),
+            "the account UUID must never be returned as the team"
+        );
+    }
+
+    #[test]
+    fn account_team_prefers_an_eligible_last_selected_team() {
+        let prefs = preferences(
+            Some("4AZ53N9R83"),
+            &[(
+                "DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C",
+                &["4AZ53N9R83", "PAIDTEAM99"],
+            )],
+        );
+        assert_eq!(
+            select_xcode_account_team(&prefs),
+            Some("4AZ53N9R83".to_string())
+        );
+    }
+
+    #[test]
+    fn a_stale_last_selected_team_is_never_returned() {
+        let prefs = preferences(
+            Some("REMOVED42"),
+            &[("DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C", &["4AZ53N9R83"])],
+        );
+        assert_eq!(
+            select_xcode_account_team(&prefs),
+            Some("4AZ53N9R83".to_string()),
+            "a last-selected team no account advertises falls back to records"
+        );
+        assert_eq!(
+            select_xcode_account_team(&preferences(Some("REMOVED42"), &[])),
+            None,
+            "without team records the stale key cannot be verified"
+        );
+    }
+
+    #[test]
+    fn account_team_absent_without_registry_data() {
+        assert_eq!(select_xcode_account_team(&preferences(None, &[])), None);
+        assert_eq!(
+            select_xcode_account_team(&preferences(
+                None,
+                &[("DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C", &[])],
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn without_a_last_selected_team_the_first_account_team_wins() {
+        let prefs = preferences(
+            None,
+            &[
+                ("DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C", &["4AZ53N9R83"]),
+                ("A1B2C3D4-E5F6-7890-ABCD-EF1234567890", &["OTHERTEAM1"]),
+            ],
+        );
+        // Account UUIDs sort deterministically: A1B2… precedes DE0D….
+        assert_eq!(
+            select_xcode_account_team(&prefs),
+            Some("OTHERTEAM1".to_string())
+        );
+    }
+
+    #[test]
+    fn the_same_team_across_accounts_counts_once() {
+        let prefs = preferences(
+            None,
+            &[
+                ("DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C", &["4AZ53N9R83"]),
+                ("A1B2C3D4-E5F6-7890-ABCD-EF1234567890", &["4AZ53N9R83"]),
+            ],
+        );
+        assert_eq!(
+            select_xcode_account_team(&prefs),
+            Some("4AZ53N9R83".to_string())
+        );
+    }
+
+    #[test]
+    fn account_team_reads_a_real_preferences_file() {
+        let machine = TestMachine::new();
+        write_xcode_plist(
+            &machine,
+            &serde_json::json!({
+                "IDEProvisioningTeamByIdentifier": {
+                    "DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C": [{
+                        "teamID": "4AZ53N9R83",
+                        "teamName": "Personal Team",
+                        "isFreeProvisioningTeam": true,
+                        "teamType": "Personal Team"
+                    }]
+                }
+            }),
+        );
+        let host = machine.host(Vec::<(String, String)>::new());
+        assert_eq!(
+            smol::block_on(xcode_account_team(&host)).unwrap(),
+            Some("4AZ53N9R83".to_string())
+        );
+    }
+
+    #[test]
+    fn a_real_stale_last_selected_falls_back_to_records() {
+        let machine = TestMachine::new();
+        write_xcode_plist(
+            &machine,
+            &serde_json::json!({
+                "IDEProvisioningTeamManagerLastSelectedTeamID": "REMOVED42",
+                "IDEProvisioningTeamByIdentifier": {
+                    "DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C": [{"teamID": "4AZ53N9R83"}]
+                }
+            }),
+        );
+        let host = machine.host(Vec::<(String, String)>::new());
+        assert_eq!(
+            smol::block_on(xcode_account_team(&host)).unwrap(),
+            Some("4AZ53N9R83".to_string())
+        );
+    }
+
+    #[test]
+    fn a_missing_preferences_file_is_not_a_team() {
+        let machine = TestMachine::new();
+        let host = machine.host(Vec::<(String, String)>::new());
+        assert_eq!(smol::block_on(xcode_account_team(&host)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_corrupt_preferences_file_is_an_error() {
+        let machine = TestMachine::new();
+        let dir = machine.home().join("Library/Preferences");
+        std::fs::create_dir_all(&dir).expect("create preferences directory");
+        std::fs::write(dir.join("com.apple.dt.Xcode.plist"), b"not a plist")
+            .expect("write corrupt fixture");
+        let host = machine.host(Vec::<(String, String)>::new());
+        assert!(smol::block_on(xcode_account_team(&host)).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_preferences_path_is_an_error() {
+        let machine = TestMachine::new();
+        std::fs::create_dir_all(
+            machine
+                .home()
+                .join("Library/Preferences/com.apple.dt.Xcode.plist"),
+        )
+        .expect("create directory in place of the plist");
+        let host = machine.host(Vec::<(String, String)>::new());
+        assert!(smol::block_on(xcode_account_team(&host)).is_err());
+    }
+
+    #[test]
+    fn a_team_record_without_team_id_is_an_error() {
+        let machine = TestMachine::new();
+        write_xcode_plist(
+            &machine,
+            &serde_json::json!({
+                "IDEProvisioningTeamByIdentifier": {
+                    "DE0DE8B1-3DBB-4F70-B15D-B16BF1872F1C": [{"teamName": "Personal Team"}]
+                }
+            }),
+        );
+        let host = machine.host(Vec::<(String, String)>::new());
+        assert!(smol::block_on(xcode_account_team(&host)).is_err());
     }
 }
 
