@@ -15,7 +15,10 @@ impl RustBuild {
     /// replays the compiler diagnostic on a fresh unit as well as a rebuilt one.
     pub(crate) async fn native_static_libraries(&self, release: bool) -> Result<Vec<NativeLink>> {
         let _lease = self.shared_target_lease().await?;
-        let output = self.cargo_build_output(release, CargoTarget::Lib).await?;
+        let profile_dir = self.lib_output_dir(release).await?;
+        let output = self
+            .cargo_build_output(release, CargoTarget::Lib, &profile_dir)
+            .await?;
         if !output.status.success() {
             bail!(
                 "Failed to obtain static library link requirements: {}",
