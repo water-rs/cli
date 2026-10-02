@@ -139,7 +139,7 @@ mod tests {
                 assert_eq!(subsections(&original), subsections(&selected));
                 let symbols = |file: &object::File<'_>| {
                     file.symbols()
-                        .filter(|symbol| symbol.is_global())
+                        .filter(ObjectSymbol::is_global)
                         .map(|symbol| {
                             (
                                 symbol.name().unwrap().to_owned(),
