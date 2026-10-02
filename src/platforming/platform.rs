@@ -394,25 +394,42 @@ pub fn ensure_desktop_platform_is_host(
 // Package Options
 // ============================================================================
 
+/// Who a packaged application is for.
+///
+/// The audience decides how the artifact is sealed for delivery: a
+/// distribution package must survive delivery to a machine that never saw
+/// the developer's keychain, while a development package only has to run
+/// where it was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackageAudience {
+    /// A package for the developer's own machine: ad hoc signature on macOS,
+    /// a direct-install artifact on Android.
+    #[default]
+    Development,
+    /// A package for users elsewhere: Developer ID signature, hardened
+    /// runtime and notarization on macOS; a store-upload artifact on Android.
+    Distribution,
+}
+
 /// Configuration options for packaging the application.
 ///
 /// This struct contains settings that control how the application
 /// is packaged for distribution across different platforms.
 #[derive(Debug, Clone)]
 pub struct PackageOptions {
-    /// Whether to prepare the package for store distribution.
+    /// Who the package is for.
     ///
-    /// When `true`, the package will be configured for submission to
-    /// official app stores (App Store for iOS/macOS or Play Store for Android).
-    ///
-    /// When `false`, the package will be prepared for direct distribution
-    /// or development purposes.
+    /// A distribution package is configured for delivery outside the
+    /// developer's machine (notarized Developer ID signature on macOS, an
+    /// upload artifact for the App Store or Play Store); a development
+    /// package is for direct use on the machine that built it.
     ///
     /// # Warning
     ///
-    /// Enable this option only change your packaging format, it does not change your build configuration.
-    /// For a real world distribution build, you may also want to disable `debug` in `BuildOptions`.
-    distribution: bool,
+    /// The audience only changes the packaging format, not the build
+    /// configuration. For a real world distribution build, you may also want
+    /// to disable `debug` in `BuildOptions`.
+    audience: PackageAudience,
 
     /// Whether to enable debug mode in the packaged application.
     ///
@@ -473,7 +490,7 @@ impl PackageOptions {
     #[must_use]
     pub const fn development() -> Self {
         Self {
-            distribution: false,
+            audience: PackageAudience::Development,
             debug: true,
             device_signing: DeviceSigning::Automatic,
             shared_rust_runtime: true,
@@ -484,9 +501,9 @@ impl PackageOptions {
 
     /// Create options for a self-contained package artifact.
     #[must_use]
-    pub const fn packaging(distribution: bool, debug: bool) -> Self {
+    pub const fn packaging(audience: PackageAudience, debug: bool) -> Self {
         Self {
-            distribution,
+            audience,
             debug,
             device_signing: DeviceSigning::Automatic,
             shared_rust_runtime: false,
@@ -526,10 +543,16 @@ impl PackageOptions {
         self
     }
 
+    /// Who the package is for.
+    #[must_use]
+    pub const fn audience(&self) -> PackageAudience {
+        self.audience
+    }
+
     /// Whether to package in distribution mode
     #[must_use]
     pub const fn is_distribution(&self) -> bool {
-        self.distribution
+        matches!(self.audience, PackageAudience::Distribution)
     }
 
     /// Whether to package in debug mode
@@ -626,8 +649,8 @@ mod package_options_tests {
         assert!(development.uses_shared_rust_runtime());
 
         for options in [
-            PackageOptions::packaging(false, true),
-            PackageOptions::packaging(true, false),
+            PackageOptions::packaging(super::PackageAudience::Development, true),
+            PackageOptions::packaging(super::PackageAudience::Distribution, false),
         ] {
             assert!(!options.uses_shared_rust_runtime());
         }

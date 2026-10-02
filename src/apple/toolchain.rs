@@ -100,7 +100,7 @@ pub async fn development_team_id(host: &Host) -> eyre::Result<String> {
         return Ok(team);
     }
     #[cfg(target_os = "macos")]
-    for certificate in development_certificates(host).await? {
+    for certificate in keychain_certificates(host).await? {
         if let Some(team) = team_id_in_certificate(&certificate) {
             return Ok(team);
         }
@@ -112,13 +112,13 @@ pub async fn development_team_id(host: &Host) -> eyre::Result<String> {
     ))
 }
 
-/// The login keychain's development certificates as DER bytes.
+/// Every certificate the keychain lists, as DER bytes.
 ///
 /// `security find-certificate -a -Z -p` prints every keychain certificate
 /// as a PEM block preceded by its `SHA-256 hash:` line; the PEM reader
 /// keeps only the certificate blocks.
 #[cfg(target_os = "macos")]
-async fn development_certificates(host: &Host) -> eyre::Result<Vec<Vec<u8>>> {
+pub(crate) async fn keychain_certificates(host: &Host) -> eyre::Result<Vec<Vec<u8>>> {
     let output = host
         .output("security", ["find-certificate", "-a", "-Z", "-p"])
         .await
@@ -129,7 +129,7 @@ async fn development_certificates(host: &Host) -> eyre::Result<Vec<Vec<u8>>> {
 
 /// Every PEM certificate block in `text` decoded to DER.
 #[cfg(target_os = "macos")]
-fn pem_certificate_der(text: &str) -> Vec<Vec<u8>> {
+pub(crate) fn pem_certificate_der(text: &str) -> Vec<Vec<u8>> {
     x509_parser::pem::Pem::iter_from_buffer(text.as_bytes())
         .filter_map(std::result::Result::ok)
         .filter(|pem| pem.label == "CERTIFICATE")

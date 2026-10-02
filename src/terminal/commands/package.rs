@@ -22,7 +22,9 @@ use waterui_cli::{
         platform::{build_hydrolysis, package_hydrolysis},
     },
     package_output::place_in_project,
-    platform::{DeviceSigning, PackageOptions, TargetPlatform as LibTargetPlatform},
+    platform::{
+        DeviceSigning, PackageAudience, PackageOptions, TargetPlatform as LibTargetPlatform,
+    },
     project::{ManagedBackends, Project},
     winui::platform::{build_winui, package_winui},
 };
@@ -522,14 +524,20 @@ async fn package_artifact_inner(
     context: &PackagingContext,
     built: Option<&BuiltTarget>,
 ) -> Result<Artifact> {
-    let package_options =
-        PackageOptions::packaging(args.distribution, args.profile().is_development())
-            .with_device_signing(if args.unsigned {
-                DeviceSigning::Unsigned
-            } else {
-                DeviceSigning::Automatic
-            })
-            .with_progress(shell.build_progress());
+    let package_options = PackageOptions::packaging(
+        if args.distribution {
+            PackageAudience::Distribution
+        } else {
+            PackageAudience::Development
+        },
+        args.profile().is_development(),
+    )
+    .with_device_signing(if args.unsigned {
+        DeviceSigning::Unsigned
+    } else {
+        DeviceSigning::Automatic
+    })
+    .with_progress(shell.build_progress());
     match context.backend {
         TargetBackend::Android => {
             let abis: Vec<AndroidAbi> = args.arch.iter().map(|arch| arch.to_abi()).collect();
