@@ -2660,7 +2660,7 @@ mod tests {
             .parse::<toml::Table>()
             .expect("ffi Cargo.toml should parse");
         assert_eq!(
-            manifest["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
+            manifest["target"]["cfg(not(target_vendor = \"apple\"))"]["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
             Some(false)
         );
         // The map capability reaches the Rust backend as well as the FFI
@@ -2674,6 +2674,24 @@ mod tests {
             .map(|feature| feature.as_str().expect("feature name"))
             .collect::<Vec<_>>();
         assert_eq!(map_forwards, ["waterui-ffi/map", "waterui-apple/map"]);
+        assert!(manifest["dependencies"].get("waterui-ffi").is_none());
+        assert!(manifest["dependencies"].get("waterui-apple").is_none());
+        assert!(
+            manifest["target"]["cfg(target_vendor = \"apple\")"]["dependencies"]
+                .get("waterui-apple")
+                .is_some()
+        );
+        assert!(
+            manifest["target"]["cfg(target_vendor = \"apple\")"]["dependencies"]
+                .get("waterui-ffi")
+                .is_none()
+        );
+        let lib = std::fs::read_to_string(ffi_dir.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("#[cfg(not(target_vendor = \"apple\"))]\nwaterui_ffi::export!();"));
+        assert!(
+            lib.contains("#[cfg(target_vendor = \"apple\")]\nwaterui_apple::export_app!(app);")
+        );
+        syn::parse_file(&lib).expect("mixed-target native companion parses");
         assert_eq!(manifest["package"]["autobins"].as_bool(), Some(false));
         let bins = manifest["bin"]
             .as_array()
@@ -2729,11 +2747,18 @@ mod tests {
 
         let helper = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-cef-helper.rs"))
             .expect("CEF helper source should be written");
-        assert!(helper.contains("waterui_cef_run_packaged_subprocess"));
+        assert!(helper.contains("waterui_browser_cef::run_packaged_subprocess"));
 
         let main_bin = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-apple-main.rs"))
             .expect("apple main source should be written");
-        assert!(main_bin.contains("waterui_cef_prepare_macos_application"));
+        assert!(main_bin.contains("waterui_browser_cef::initialize_macos_application"));
+        assert!(main_bin.contains("waterui_browser_cef::initialize_sandbox_early"));
+        assert!(
+            manifest["target"]["cfg(target_os = \"macos\")"]["dependencies"]
+                .get("waterui-browser-cef")
+                .is_some()
+        );
+        assert!(!main_bin.contains("waterui_ffi"));
     }
 
     #[test]
@@ -2925,11 +2950,11 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest["dependencies"]["waterui-ffi"]["optional"].as_bool(),
+            manifest["target"]["cfg(not(target_vendor = \"apple\"))"]["dependencies"]["waterui-ffi"]["optional"].as_bool(),
             Some(true)
         );
         assert_eq!(
-            manifest["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
+            manifest["target"]["cfg(not(target_vendor = \"apple\"))"]["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
             Some(false)
         );
         // The module is a member of the support runtime's workspace, never a
@@ -3011,7 +3036,19 @@ mod tests {
     }
 
     #[test]
-    fn generated_ffi_build_script_undefs_every_swift_seam_symbol() {
+    fn apple_scaffold_contains_no_swift_runtime_or_embedded_package() {
+        let outputs = super::apple::rendered_outputs(&project_ctx()).unwrap();
+        assert!(!outputs.is_empty());
+        for (path, _) in outputs {
+            assert_eq!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("entitlements")
+            );
+        }
+    }
+
+    #[test]
+    fn generated_native_build_script_has_no_swift_link_contract() {
         let temp = tempfile::tempdir().expect("temp dir");
         let ffi_dir = temp.path().join("managed_backends").join("ffi");
         let ctx = ctx(
@@ -3025,15 +3062,8 @@ mod tests {
 
         let build_script = std::fs::read_to_string(ffi_dir.join("build.rs"))
             .expect("ffi build.rs should be written");
-        // Cargo emits the ffi `cdylib` also as a dependency artifact of
-        // `cargo rustc --bin`, where this build's trailing rustc args never
-        // reach — the crate's own link-arg is the only route that covers both.
-        for symbol in crate::apple::swift_seam::SEAM_SYMBOL_NAMES {
-            assert!(
-                build_script.contains(&format!("\"{symbol}\"")),
-                "ffi build.rs must undef `_waterui_swift_*` seam symbol {symbol}"
-            );
-        }
+        assert!(!build_script.contains("waterui_swift_"));
+        assert!(!build_script.contains("rustc-link-arg-cdylib"));
     }
 
     #[test]
@@ -3323,6 +3353,8 @@ struct SupportCargoManifest {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     features: std::collections::BTreeMap<String, Vec<String>>,
     dependencies: std::collections::BTreeMap<String, SupportDependencyValue>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    target: std::collections::BTreeMap<String, GeneratedTargetSection<SupportDependencyValue>>,
     workspace: SupportWorkspaceSection,
     /// `[patch]` inherited from the runtime's own workspace.
     ///
@@ -3466,6 +3498,16 @@ async fn write_support_cargo_toml(
         }
         None => framework.patches(),
     };
+    let mut dependencies = dependencies;
+    let mut target = std::collections::BTreeMap::new();
+    if let Some(ffi) = dependencies.remove("waterui-ffi") {
+        target.insert(
+            "cfg(not(target_vendor = \"apple\"))".to_string(),
+            GeneratedTargetSection {
+                dependencies: std::collections::BTreeMap::from([("waterui-ffi".to_string(), ffi)]),
+            },
+        );
+    }
     let manifest = SupportCargoManifest {
         package: SupportPackageSection {
             name: crate_name.to_string(),
@@ -3483,6 +3525,7 @@ async fn write_support_cargo_toml(
         features,
         dependencies,
         workspace: SupportWorkspaceSection {},
+        target,
         patch,
     };
 
@@ -5775,7 +5818,7 @@ pub mod ffi {
             .features
             .insert("dev".to_string(), vec![format!("{}/dev", ctx.crate_name)]);
 
-        // `waterui-ffi` is a hard dependency here, so the forwards are the
+        // `waterui-ffi` is a non-Apple target dependency, so the forwards are the
         // plain `dep/feat` form; see `FORWARDED_FFI_FEATURES` for why they are
         // manifest-declared. Some capabilities also reach the Rust backend:
         // the `map` feature enables `waterui-apple/map` too, so the
@@ -5785,6 +5828,17 @@ pub mod ffi {
         // it is only declared when that backend was selected.
         for name in super::FORWARDED_FFI_FEATURES {
             let mut forwards = vec![format!("waterui-ffi/{name}")];
+            if ctx.apple_backend_selected && matches!(*name, "gpu" | "media" | "video" | "webview")
+            {
+                forwards.push(format!("waterui/{name}"));
+            }
+            if ctx.cef_runtime_enabled() {
+                match *name {
+                    "chromium" => forwards.push("waterui-browser-cef/chromium".to_string()),
+                    "webview-cef" => forwards.push("waterui-browser-cef/webview".to_string()),
+                    _ => {}
+                }
+            }
             for dep in super::BACKEND_FEATURE_FORWARDS
                 .iter()
                 .filter(|(feature, dep)| {
@@ -5810,9 +5864,16 @@ pub mod ffi {
             )?
             .with_default_features(false)
             .into_cargo();
-            manifest
-                .dependencies
-                .insert(name.to_owned(), Dependency::Detailed(Box::new(dependency)));
+            let dependencies = if name == "waterui-ffi" {
+                &mut manifest
+                    .target
+                    .entry("cfg(not(target_vendor = \"apple\"))".to_string())
+                    .or_default()
+                    .dependencies
+            } else {
+                &mut manifest.dependencies
+            };
+            dependencies.insert(name.to_owned(), Dependency::Detailed(Box::new(dependency)));
         }
 
         // The Rust backend owns the app's whole startup through
@@ -5824,10 +5885,36 @@ pub mod ffi {
         // fetches, or compiles `waterui-apple`.
         if ctx.apple_backend_selected {
             let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
-            manifest.dependencies.insert(
-                "waterui-apple".to_string(),
-                Dependency::Detailed(Box::new(waterui_apple)),
-            );
+            manifest
+                .target
+                .entry("cfg(target_vendor = \"apple\")".to_string())
+                .or_default()
+                .dependencies
+                .insert(
+                    "waterui-apple".to_string(),
+                    Dependency::Detailed(Box::new(waterui_apple)),
+                );
+        }
+        if ctx.cef_runtime_enabled() {
+            let browser = generated_dependency_from_spec(
+                ctx,
+                NativeBackendDependencySpec::new(
+                    "waterui-browser-cef",
+                    &[],
+                    NativeBackendDependencySource::WorkspaceDependency,
+                ),
+            )?
+            .with_default_features(false)
+            .into_cargo();
+            manifest
+                .target
+                .entry("cfg(target_os = \"macos\")".to_string())
+                .or_default()
+                .dependencies
+                .insert(
+                    "waterui-browser-cef".to_string(),
+                    Dependency::Detailed(Box::new(browser)),
+                );
         }
         manifest.patch = match ctx.waterui_workspace_root() {
             Some(root) => {
@@ -6422,10 +6509,15 @@ pub mod preview_ffi {
                 ..Default::default()
             },
         );
-        manifest.dependencies.insert(
-            "waterui-ffi".to_string(),
-            Dependency::Detailed(Box::new(ffi_dependency)),
-        );
+        manifest
+            .target
+            .entry("cfg(not(target_vendor = \"apple\"))".to_string())
+            .or_default()
+            .dependencies
+            .insert(
+                "waterui-ffi".to_string(),
+                Dependency::Detailed(Box::new(ffi_dependency)),
+            );
 
         let preview_dependency = if let Some(waterui_path) = &ctx.waterui_path {
             let waterui_root = Path::new(&compute_native_backend_dependency_path(

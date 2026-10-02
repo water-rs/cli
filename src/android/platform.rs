@@ -749,7 +749,7 @@ async fn resolve_android_sdk_paths(host: &Host) -> eyre::Result<(PathBuf, PathBu
 /// The features an Android runtime's generated FFI crate is compiled with,
 /// each forwarded to `waterui-ffi` by the generated manifest.
 ///
-/// See [`crate::apple::platform::apple_ffi_dependency_features`] for why anything
+/// See [`crate::apple::platform::apple_dependency_features`] for why anything
 /// loaded into that runtime must be compiled with the same set.
 ///
 /// # Errors

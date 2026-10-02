@@ -259,7 +259,11 @@ async fn run_embedded_apple_build(
     );
     line!(
         shell,
-        "Mount WaterUI.App(), WaterUIView, or WaterUIViewController."
+        "Create one shared runtime on the main actor: let runtime = await WaterUIRuntime.create()"
+    );
+    line!(
+        shell,
+        "Mount WaterUIHost(runtime: runtime, resources: .module) or WaterUIHostController(runtime: runtime, resources: .module)."
     );
     Ok(())
 }

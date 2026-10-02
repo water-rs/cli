@@ -315,7 +315,7 @@ async fn configure_preview_module_build(
                 .wrap_err("Failed to resolve the preview support deployment target")?;
         Ok((
             rust_build.with_env(key, value).with_features(
-                crate::apple::platform::apple_ffi_dependency_features(
+                crate::apple::platform::apple_dependency_features(
                     &support_project,
                     browser_runtime,
                 )

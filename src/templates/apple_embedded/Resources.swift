@@ -1,6 +1,6 @@
 import Foundation
 
-/// Resources shipped with the generated WaterUI package.
+/// Pass `.module` to the host's `resources` argument for this package's assets and fonts.
 extension WaterUIResourceContext {
     public static var module: Self {
         Self(assets: assetsURL, fonts: fontsURL)

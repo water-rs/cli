@@ -1,6 +1,0 @@
-module CWaterUI {
-{%- for header in headers %}
-    header "{{ header }}"
-{%- endfor %}
-    export *
-}

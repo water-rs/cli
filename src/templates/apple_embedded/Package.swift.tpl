@@ -6,18 +6,21 @@ let package = Package(
     platforms: [.macOS("{{ macos }}"), .iOS("{{ ios }}")],
     products: [.library(name: "WaterUI", targets: ["WaterUI"])],
     targets: [
-        .binaryTarget(name: "CWaterUI", path: "CWaterUI.xcframework"),
+        .binaryTarget(name: "WaterUINative", path: "WaterUINative.xcframework"),
         .target(
             name: "WaterUI",
-            dependencies: ["CWaterUI"],
+            dependencies: ["WaterUINative"],
             resources: [.copy("Resources/waterui_assets"), .copy("Resources/fonts")],
             swiftSettings: [
-                .define("WATERUI_EMBEDDED_RESOURCES"),
-{% for define in defines %}
-                .define("{{ define }}"),
-{% endfor %}
+                .enableExperimentalFeature("Extern"),
             ],
             linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-u", "-Xlinker", "_waterui_apple_runtime_create",
+                    "-Xlinker", "-u", "-Xlinker", "_waterui_apple_runtime_drop",
+                    "-Xlinker", "-u", "-Xlinker", "_waterui_apple_mount",
+                    "-Xlinker", "-u", "-Xlinker", "_waterui_apple_mount_drop",
+                ]),
 {% for platform in links %}
 {% for link in platform.links %}
 {% if link.framework %}

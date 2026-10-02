@@ -11,7 +11,7 @@ use smol::fs;
 use target_lexicon::{Aarch64Architecture, Architecture};
 
 use crate::{
-    apple::{app_bundle::copy_dir_contents, platform},
+    apple::platform,
     assets,
     build::{BuildOptions, NativeLink},
     platform::TargetPlatform,
@@ -24,17 +24,16 @@ use crate::{
 pub struct EmbeddedArtifact {
     /// Add this directory as a local package dependency in the native host.
     pub package_path: PathBuf,
-    /// Binary C module containing the application's Rust archive.
+    /// Header-free binary containing the application's native Rust archive.
     pub xcframework_path: PathBuf,
 }
 
 #[derive(Template)]
-#[template(path = "apple/embedded/Package.swift.tpl", escape = "none")]
+#[template(path = "apple_embedded/Package.swift.tpl", escape = "none")]
 struct PackageTemplate<'a> {
     name: &'a str,
     macos: &'a str,
     ios: &'a str,
-    defines: &'a [String],
     links: &'a [PlatformLinks],
 }
 
@@ -120,23 +119,21 @@ pub async fn build_xcframework(
     let package = temporary.path().join("package");
     let source = package.join("Sources/WaterUI");
     let backend = platform::apple_backend_source_root(project).await?;
-    copy_dir_contents(&backend.join("Sources/WaterUI"), &source).await?;
-    let headers = temporary.path().join("headers");
-    copy_dir_contents(&backend.join("Sources/CWaterUI/include"), &headers).await?;
-    fs::write(
-        headers.join("module.modulemap"),
-        include_str!("../templates/apple/embedded/module.modulemap"),
+    fs::create_dir_all(&source).await?;
+    fs::copy(
+        backend.join("Sources/WaterUI/Embedding.swift"),
+        source.join("Embedding.swift"),
     )
     .await?;
     let (links, manifests) =
         assemble_slices(project, options, &host, &selected, temporary.path()).await?;
     stage_resources(project, &source.join("Resources"), manifests).await?;
-    write_package(project, options, &package, &links).await?;
+    write_package(project, &package, &links).await?;
     let destination = package_parent.join(format!("{}-apple", project.crate_name()));
     replace_package(&package, &destination).await?;
     smol::unblock(move || temporary.close()).await?;
     Ok(EmbeddedArtifact {
-        xcframework_path: destination.join("CWaterUI.xcframework"),
+        xcframework_path: destination.join("WaterUINative.xcframework"),
         package_path: destination,
     })
 }
@@ -211,52 +208,37 @@ async fn assemble_slices(
             }
             archives.push(archive);
         }
-        let library = directory.join("libCWaterUI.a");
+        let library = directory.join("libWaterUINative.a");
         let mut lipo = vec![OsString::from("lipo"), OsString::from("-create")];
         lipo.extend(archives.into_iter().map(PathBuf::into_os_string));
         lipo.extend([OsString::from("-output"), library.clone().into_os_string()]);
         host.run("xcrun", lipo).await?;
-        arguments.extend([
-            OsString::from("-library"),
-            library.into_os_string(),
-            OsString::from("-headers"),
-            staging.join("headers").into_os_string(),
-        ]);
+        arguments.extend([OsString::from("-library"), library.into_os_string()]);
     }
     arguments.extend([
         OsString::from("-output"),
         staging
-            .join("package/CWaterUI.xcframework")
+            .join("package/WaterUINative.xcframework")
             .into_os_string(),
     ]);
     host.run("xcodebuild", arguments).await?;
     Ok((links, manifests))
 }
 
-async fn write_package(
-    project: &Project,
-    options: &BuildOptions,
-    package: &Path,
-    links: &[PlatformLinks],
-) -> Result<()> {
+async fn write_package(project: &Project, package: &Path, links: &[PlatformLinks]) -> Result<()> {
     let (_, macos) = platform::apple_deployment_target(project, TargetPlatform::MacOS).await?;
     let (_, ios) = platform::apple_deployment_target(project, TargetPlatform::IOS).await?;
-    let mut defines = platform::apple_swift_defines(project).await?;
-    if !options.is_release() {
-        defines.push("DEBUG".to_owned());
-    }
     let manifest = PackageTemplate {
         name: project.crate_name().as_str(),
         macos: &macos,
         ios: &ios,
-        defines: &defines,
         links,
     }
     .render()?;
     fs::write(package.join("Package.swift"), manifest).await?;
     fs::write(
         package.join("Sources/WaterUI/WaterUIResources.swift"),
-        include_str!("../templates/apple/embedded/Resources.swift"),
+        include_str!("../templates/apple_embedded/Resources.swift"),
     )
     .await?;
     Ok(())
@@ -371,7 +353,6 @@ mod tests {
 
     #[test]
     fn package_uses_binary_module_and_preserves_resource_directories() {
-        let defines = vec!["WATERUI_NO_GPU".to_owned()];
         let links = vec![PlatformLinks {
             platform: "macOS",
             links: vec![NativeLink {
@@ -383,15 +364,17 @@ mod tests {
             name: "fixture",
             macos: "26.0",
             ios: "26.0",
-            defines: &defines,
             links: &links,
         }
         .render()
         .unwrap();
-        assert!(rendered.contains(".binaryTarget(name: \"CWaterUI\""));
+        assert!(rendered.contains(".binaryTarget(name: \"WaterUINative\""));
         assert!(rendered.contains(".copy(\"Resources/waterui_assets\")"));
-        assert!(rendered.contains(".define(\"WATERUI_NO_GPU\")"));
-        assert!(rendered.contains(".define(\"WATERUI_EMBEDDED_RESOURCES\")"));
+        assert!(rendered.contains(".enableExperimentalFeature(\"Extern\")"));
+        assert!(!rendered.contains("CWaterUI"));
+        for symbol in ["runtime_create", "runtime_drop", "mount", "mount_drop"] {
+            assert!(rendered.contains(&format!("\"_waterui_apple_{symbol}\"")));
+        }
         assert!(!rendered.contains("VideoToolbox"));
         assert!(
             rendered.contains(".linkedFramework(\"CoreFoundation\", .when(platforms: [.macOS]))")
