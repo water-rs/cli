@@ -186,8 +186,15 @@ async fn apple_ffi_build_features(
         features.push("dev".to_string());
         // The inspector is devtooling: development sessions get it through the
         // shared-runtime linkage while a packaged build leaves its server
-        // stack out.
-        features.push("inspector".to_string());
+        // stack out. The generated manifest forwards `inspector` only when
+        // the resolved `waterui-ffi` declares it, so the build can only name
+        // it when the scaffold declared it.
+        if crate::templates::generated_ffi_manifest_declares(
+            &project.ffi_crate_path().join("Cargo.toml"),
+            "inspector",
+        )? {
+            features.push("inspector".to_string());
+        }
     }
     Ok(features)
 }

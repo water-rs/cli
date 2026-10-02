@@ -795,16 +795,23 @@ async fn configure_android_rust_build(
         let nightly = crate::toolchain::rust::nightly_toolchain_with_rust_src(host).await?;
         build = build
             .with_feature("dev")
-            // The inspector is devtooling: development sessions get it through
-            // the shared-runtime linkage while a packaged build leaves its
-            // server stack out.
-            .with_feature("inspector")
             .with_preferred_dynamic_linking()
             .with_build_std(nightly)
             .with_env(
                 "LLVM_COMPILER_RT_LIB",
                 ndk_builtins_lib(&context.ndk_path, context.abi)?,
             );
+        // The inspector is devtooling: development sessions get it through
+        // the shared-runtime linkage while a packaged build leaves its
+        // server stack out. The generated manifest forwards `inspector` only
+        // when the resolved `waterui-ffi` declares it, so the build can only
+        // name it when the scaffold declared it.
+        if crate::templates::generated_ffi_manifest_declares(
+            &project.ffi_crate_path().join("Cargo.toml"),
+            "inspector",
+        )? {
+            build = build.with_feature("inspector");
+        }
     }
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());
