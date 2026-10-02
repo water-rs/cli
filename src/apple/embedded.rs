@@ -56,6 +56,33 @@ impl PlatformLinks {
     }
 }
 
+/// SwiftPM platform conditions cannot distinguish device, simulator or architecture.
+/// Share a list only when its complete ordered link contract is identical.
+fn collect_platform_links(
+    links: &mut Vec<PlatformLinks>,
+    platform: &'static str,
+    triple: &str,
+    native_links: Vec<NativeLink>,
+) -> Result<()> {
+    if let Some(existing) = links.iter().find(|entry| entry.platform == platform) {
+        if existing.links != native_links {
+            bail!(
+                "Cannot package static Apple libraries: {triple} requires {native_links:?}, \
+                 but another {platform} slice requires {:?}. SwiftPM linker settings cannot \
+                 select device/simulator or architecture-specific libraries. A single static \
+                 package requires identical ordered native link requirements across those slices.",
+                existing.links
+            );
+        }
+    } else {
+        links.push(PlatformLinks {
+            platform,
+            links: native_links,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Slice {
     platform: TargetPlatform,
@@ -211,15 +238,7 @@ async fn assemble_slices(
             } else {
                 "iOS"
             };
-            if !links
-                .iter()
-                .any(|entry| entry.platform == swift_platform && entry.links == native_links)
-            {
-                links.push(PlatformLinks {
-                    platform: swift_platform,
-                    links: native_links,
-                });
-            }
+            collect_platform_links(&mut links, swift_platform, triple, native_links)?;
             archives.push(archive);
         }
         let library = directory.join("libWaterUINative.a");
@@ -395,6 +414,67 @@ mod tests {
         );
         assert!(!rendered.contains("Process()"));
         assert!(!rendered.contains("clangRuntimeLibraryDirectory"));
+    }
+
+    #[test]
+    fn conflicting_ios_device_and_simulator_links_fail_without_merging() {
+        let native = |runtime: &str| {
+            ["System", runtime, runtime, "c++"]
+                .map(|name| NativeLink {
+                    name: name.to_owned(),
+                    framework: false,
+                })
+                .to_vec()
+        };
+        let device = native("clang_rt.ios");
+        let mut links = Vec::new();
+        collect_platform_links(&mut links, "iOS", "aarch64-apple-ios", device.clone()).unwrap();
+        let error = collect_platform_links(
+            &mut links,
+            "iOS",
+            "aarch64-apple-ios-sim",
+            native("clang_rt.iossim"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("aarch64-apple-ios-sim"));
+        assert!(error.to_string().contains("clang_rt.iossim"));
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].links, device);
+    }
+
+    #[test]
+    fn shared_link_contract_requires_exact_order_and_repetition() {
+        let contract = ["System", "c++", "System"]
+            .map(|name| NativeLink {
+                name: name.to_owned(),
+                framework: false,
+            })
+            .to_vec();
+        let mut links = Vec::new();
+        collect_platform_links(
+            &mut links,
+            "macOS",
+            "aarch64-apple-darwin",
+            contract.clone(),
+        )
+        .unwrap();
+        collect_platform_links(&mut links, "macOS", "x86_64-apple-darwin", contract.clone())
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        for changed in [
+            vec![
+                contract[1].clone(),
+                contract[0].clone(),
+                contract[2].clone(),
+            ],
+            contract[..2].to_vec(),
+        ] {
+            assert!(
+                collect_platform_links(&mut links, "macOS", "x86_64-apple-darwin", changed)
+                    .is_err()
+            );
+        }
+        assert_eq!(links[0].links, contract);
     }
 
     #[test]
