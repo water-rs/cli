@@ -110,6 +110,9 @@ pub mod local {
 /// Apple platform configuration.
 pub mod physical;
 pub mod platform;
+/// Development provisioning profiles: validation and `xcodebuild` acquisition.
+#[cfg(target_os = "macos")]
+pub mod provisioning;
 /// Compiling the backend's Swift seam without `xcodebuild`.
 pub mod swift_seam;
 /// Apple toolchain management.

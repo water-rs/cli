@@ -182,6 +182,11 @@ icns = { version = "0.4", default-features = false, features = ["pngio"] }
 # `DeveloperCertificates` are matched against `find-identity` SHA-1s.
 x509-parser = "0.18"
 sha1 = "0.10"
+# A `.mobileprovision` is a CMS SignedData envelope around a plist; decoding
+# it in-process keeps the device-signing path off `security cms -D` output
+# parsing.
+cms = "0.2.3"
+der = "0.7"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 rcgen = "=0.14.8"

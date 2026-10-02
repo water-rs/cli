@@ -819,6 +819,13 @@ async fn build_and_run(
 ) -> Result<(Running, Option<web::WebDevServer>)> {
     let build_plan = resolve_build_plan(cli_platform, &selection.device);
     let physical_ios = is_physical_ios(&selection.device);
+    // The provisioning profile for a physical-device run must name the
+    // destination's hardware UDID — capture it before the selection is
+    // consumed by the launch task.
+    let device_udid = match &selection.device {
+        SelectedDevice::ApplePhysical(device) => Some(device.udid.clone()),
+        _ => None,
+    };
     let launch_task =
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
@@ -828,7 +835,8 @@ async fn build_and_run(
     // and these options; the Gradle step re-proves the binding rather than
     // resolving again. `[signing.android]` is an Android platform contract —
     // both Android backends prepare it.
-    let package_options = package_options(&config, shell.build_progress());
+    let package_options =
+        package_options(&config, shell.build_progress()).with_device_udid(device_udid);
     let prepared_signing = (build_plan.lib_platform == LibTargetPlatform::Android)
         .then(|| waterui_cli::android::signing::PreparedSigning::resolve(project, &package_options))
         .transpose()?;

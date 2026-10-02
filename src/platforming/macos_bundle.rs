@@ -799,7 +799,7 @@ fn developer_id_certificate_sha1(der: &[u8], team_id: &str) -> Option<String> {
     let team = subject
         .iter_organizational_unit()
         .any(|unit| unit.as_str().is_ok_and(|unit| unit == team_id));
-    (developer_id_application && team).then(|| crate::apple::app_bundle::certificate_sha1_hex(der))
+    (developer_id_application && team).then(|| crate::apple::toolchain::certificate_sha1_hex(der))
 }
 
 /// The Developer ID identity to sign with: the certificate matching
@@ -1173,7 +1173,7 @@ mod tests {
 
     /// The SHA-1 `codesign` names a certificate by.
     fn sha1(der: &[u8]) -> String {
-        crate::apple::app_bundle::certificate_sha1_hex(der)
+        crate::apple::toolchain::certificate_sha1_hex(der)
     }
 
     #[test]

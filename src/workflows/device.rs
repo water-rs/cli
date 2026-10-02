@@ -302,6 +302,15 @@ pub trait Device: Sized + Send {
     /// - `AppleSimulator::scan()` → uses `simctl list`
     /// - `AndroidDevice::scan()` → uses `adb devices`
     fn scan(host: &Host) -> impl Future<Output = eyre::Result<Vec<Self>>> + Send;
+
+    /// The hardware UDID a package built for this device must be
+    /// provisioned for — a physical Apple device returns its UDID so the
+    /// development provisioning profile can be bound to it; simulators,
+    /// emulators and local targets need no device-bound profile and return
+    /// `None`.
+    fn device_udid(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Represents a running application on a device.

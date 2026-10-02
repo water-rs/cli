@@ -479,6 +479,10 @@ impl Device for ApplePhysicalDevice {
         &self.name
     }
 
+    fn device_udid(&self) -> Option<&str> {
+        Some(&self.udid)
+    }
+
     fn launch(&self, _host: &Host) -> impl Future<Output = eyre::Result<()>> + Send {
         // A physical device needs no boot step — but surface a clear error
         // for the states that would make `run` fail anyway.
