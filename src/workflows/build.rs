@@ -2378,7 +2378,11 @@ Automatic meson installation failed: {install_err}\n\n{}",
         let Some(target_dir) = &self.target_dir else {
             return Ok(None);
         };
-        let shared_root = crate::water_dir::shared_target_dir()
+        // A pure path lookup decides containment: a build whose target lives
+        // outside the shared root must not touch `~/.water` at all — the
+        // ensure would stamp the shared target's metadata for a build that
+        // never enters it, and that write races other processes on Windows.
+        let shared_root = crate::water_dir::shared_target_dir_path()
             .await
             .map_err(|error| {
                 RustBuildError::FailToBuildRustLibrary(std::io::Error::other(format!(
@@ -2388,6 +2392,13 @@ Automatic meson installation failed: {install_err}\n\n{}",
         if !target_dir.starts_with(&shared_root) {
             return Ok(None);
         }
+        let shared_root = crate::water_dir::shared_target_dir()
+            .await
+            .map_err(|error| {
+                RustBuildError::FailToBuildRustLibrary(std::io::Error::other(format!(
+                    "Could not resolve the shared Cargo target: {error}"
+                )))
+            })?;
         crate::water_dir::lease_shared_target_dir(&shared_root)
             .await
             .map(Some)

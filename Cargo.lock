@@ -4703,6 +4703,7 @@ dependencies = [
  "sha1",
  "sha2",
  "smol",
+ "syn 2.0.119",
  "sysinfo",
  "tar",
  "target-lexicon",

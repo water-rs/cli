@@ -36,6 +36,7 @@ const MANAGED_BACKENDS_DIR_NAME: &str = "managed_backends";
 const SHARED_TARGET_DIR_NAME: &str = "target";
 const CONFIG_FILE_NAME: &str = "config.toml";
 const METADATA_FILE_NAME: &str = "metadata.toml";
+const METADATA_LOCK_FILE_NAME: &str = ".metadata.lock";
 const CLEANUP_LOCK_FILE_NAME: &str = ".cleanup.lock";
 const SHARED_TARGET_LEASE_FILE_NAME: &str = ".build-lease";
 const LEGACY_LOCAL_WATER_DIR_NAME: &str = ".water";
@@ -189,24 +190,79 @@ pub async fn shared_target_dir_path() -> eyre::Result<PathBuf> {
 
 async fn ensure_shared_target_dir_in(cache_root: &Path) -> eyre::Result<PathBuf> {
     let target_dir = cache_root.join(SHARED_TARGET_DIR_NAME);
-    fs::create_dir_all(&target_dir).await.wrap_err_with(|| {
-        format!(
-            "Failed to create shared target dir {}",
-            target_dir.display()
+    loop {
+        fs::create_dir_all(&target_dir).await.wrap_err_with(|| {
+            format!(
+                "Failed to create shared target dir {}",
+                target_dir.display()
+            )
+        })?;
+        // Stamp under a shared build lease: the marker inside the tree is
+        // the lease's own record of use, so a remover — which needs the
+        // exclusive lease — cannot drop the directory between the create
+        // and the write. The lease is released when this returns; a build
+        // that then compiles into the tree takes its own share, and the
+        // lease loop rebuilds the root if it was removed in between.
+        let stamped = {
+            let dir = target_dir.clone();
+            smol::unblock(move || -> eyre::Result<Option<std::fs::File>> {
+                let lease_path = shared_target_lease_path(&dir);
+                let file = match open_shared_target_lease_file(&dir) {
+                    Ok(file) => file,
+                    // The tree was removed between the create and the open —
+                    // rebuild and lease it again.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        return Err(error).wrap_err_with(|| {
+                            format!(
+                                "Failed to open the shared target lease in {}",
+                                dir.display()
+                            )
+                        });
+                    }
+                };
+                FileExt::lock_shared(&file).wrap_err_with(|| {
+                    format!("Failed to take a shared lease on {}", dir.display())
+                })?;
+                if locked_file_is_live(&file, &lease_path)? {
+                    Ok(Some(file))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?
+        };
+        let Some(_lease) = stamped else {
+            continue;
+        };
+        // `project_root` is the entry itself: it exists exactly as long as
+        // the cache does, so only the unused-days policy can collect it.
+        write_metadata(
+            &target_dir,
+            &CacheMetadata {
+                project_root: target_dir.display().to_string(),
+                cli_commit: CLI_COMMIT.to_string(),
+                last_used_unix_seconds: now_unix_seconds()?,
+            },
         )
-    })?;
-    // `project_root` is the entry itself: it exists exactly as long as the
-    // cache does, so only the unused-days policy can collect it.
-    write_metadata(
-        &target_dir,
-        &CacheMetadata {
-            project_root: target_dir.display().to_string(),
-            cli_commit: CLI_COMMIT.to_string(),
-            last_used_unix_seconds: now_unix_seconds()?,
-        },
-    )
-    .await?;
-    Ok(target_dir)
+        .await?;
+        return Ok(target_dir);
+    }
+}
+
+/// The lock file serializing `metadata.toml` writes inside a cache dir.
+///
+/// Independent `water` processes may stamp the same cache entry
+/// concurrently — a build resolves the shared target while another package
+/// runs — and two overlapping writers can fail the persist step on
+/// platforms that replace files less permissively (Windows cannot replace
+/// a path another process has open for writing). Locking the sibling file
+/// for the write's duration gives every writer a completed `metadata.toml`
+/// regardless of overlap; like `.build-lease` it is never deleted.
+fn metadata_lock_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(METADATA_LOCK_FILE_NAME)
 }
 
 /// Remove the shared Cargo target directory every project's builds write
@@ -840,9 +896,22 @@ async fn read_metadata(cache_dir: &Path) -> eyre::Result<CacheMetadata> {
 
 async fn write_metadata(cache_dir: &Path, metadata: &CacheMetadata) -> eyre::Result<()> {
     let metadata_path = metadata_path(cache_dir);
+    let lock_path = metadata_lock_path(cache_dir);
     let contents = toml::to_string(metadata).wrap_err("Failed to serialize cache metadata")?;
     let cache_dir = cache_dir.to_path_buf();
     smol::unblock(move || -> eyre::Result<()> {
+        // Hold the cache dir's metadata lock across stage+rename so
+        // concurrent processes stamp the marker one at a time.
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .wrap_err_with(|| {
+                format!("Failed to open cache metadata lock {}", lock_path.display())
+            })?;
+        FileExt::lock(&lock)
+            .wrap_err_with(|| format!("Failed to lock cache metadata {}", lock_path.display()))?;
         // Stage the marker beside its name and persist it in one step: a
         // reader never observes a truncated document, and a crash only
         // leaves the unnamed staging file `NamedTempFile` cleans up on drop.
@@ -1562,6 +1631,35 @@ mod tests {
             assert_eq!(outcome, super::BuildCacheGcOutcome::SkippedAlreadyRunning);
 
             drop(held);
+        });
+    }
+
+    /// Every `water` process stamps the shared target's marker, so callers
+    /// on different projects routinely overlap the write. The stamp is
+    /// serialized on a lock file: overlapping ensures all succeed and the
+    /// surviving marker parses — no writer may be left with a failed
+    /// rename or a torn document.
+    #[test]
+    fn concurrent_shared_target_stamps_serialize() {
+        smol::block_on(async {
+            let cache_root = tempdir().expect("cache root");
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let root = cache_root.path().to_path_buf();
+                    smol::spawn(async move { super::ensure_shared_target_dir_in(&root).await })
+                })
+                .collect();
+            for task in tasks {
+                task.await.expect("ensure shared target dir");
+            }
+
+            let metadata =
+                smol::fs::read_to_string(metadata_path(&cache_root.path().join("target")))
+                    .await
+                    .expect("read metadata");
+            let metadata: super::CacheMetadata =
+                toml::from_str(&metadata).expect("marker parses after concurrent writes");
+            assert_eq!(metadata.cli_commit, CLI_COMMIT);
         });
     }
 
