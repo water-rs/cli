@@ -519,7 +519,14 @@ pub async fn package_with_abis(
     options: &PackageOptions,
     abis: &[AndroidAbi],
     built: &BuiltTarget,
+    prepared: &crate::android::signing::PreparedSigning,
 ) -> eyre::Result<Artifact> {
+    // Prove the release-signing plan belongs to this project and these
+    // options before any work — the same bound the Android platform backend
+    // enforces; `[signing.android]` is an Android platform contract, not a
+    // per-backend feature.
+    let release_signing = prepared.release_signing_for(project.root(), options)?;
+
     let host_project_dir = require_painter_module(host, project, painter).await?;
     scaffold_android_project(project, painter, &host_project_dir).await?;
 
@@ -556,15 +563,18 @@ pub async fn package_with_abis(
 
     // The Rust cdylib is already staged under jniLibs; Gradle must not
     // rebuild it, and its ABI filters narrow to the requested set.
-    run_gradle_tasks(
-        &android_dir,
-        &[command_name],
-        &[
-            ("WATERUI_SKIP_RUST_BUILD", "1".to_owned()),
-            ("WATERUI_ANDROID_ABIS", abis_str),
-        ],
-    )
-    .await?;
+    // Release variants sign with the manifest's `[signing.android]` unless
+    // the decision was `--unsigned`, which suppresses the generated
+    // signingConfig through the environment; debug variants keep the Gradle
+    // debug keystore.
+    let mut envs = vec![
+        ("WATERUI_SKIP_RUST_BUILD", "1".to_owned()),
+        ("WATERUI_ANDROID_ABIS", abis_str),
+    ];
+    if release_signing == Some(crate::android::signing::ReleaseSigning::Suppressed) {
+        envs.push((crate::android::signing::UNSIGNED_ENV, "1".to_owned()));
+    }
+    run_gradle_tasks(&android_dir, &[command_name], &envs).await?;
 
     let path = packaged_artifact(&android_dir, output_kind, variant).await?;
     Ok(Artifact::new(project.bundle_identifier(), path))
