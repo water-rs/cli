@@ -167,6 +167,60 @@ pub(crate) fn is_development_certificate_name(common_name: &str) -> bool {
         || common_name.contains("iOS Development:")
 }
 
+/// SHA-1 of a DER certificate as uppercase hex — the hash `find-identity`
+/// prints for each identity.
+#[cfg(target_os = "macos")]
+pub(crate) fn certificate_sha1_hex(der: &[u8]) -> String {
+    use sha1::Digest as _;
+    hex::encode_upper(sha1::Sha1::digest(der))
+}
+
+/// SHA-1 hashes of every certificate in a decoded profile's
+/// `DeveloperCertificates` array.
+#[cfg(target_os = "macos")]
+pub(crate) fn profile_certificate_hashes(
+    data: &plist::Dictionary,
+) -> std::collections::HashSet<String> {
+    data.get("DeveloperCertificates")
+        .and_then(plist::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_data().map(certificate_sha1_hex))
+        .collect()
+}
+
+/// `(sha-1, display name)` pairs `security find-identity -v -p
+/// codesigning` lists, for development identities only — each entry looks
+/// like `  1) 40HEXDIGITS "Apple Development: name (id)"`.
+#[cfg(target_os = "macos")]
+pub(crate) fn development_identities(output: &str) -> Vec<(String, String)> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let entry = line.split_once(')')?.1.trim();
+            let (hash, name) = entry.split_once(' ')?;
+            let name = name.trim().trim_matches('"');
+            is_development_certificate_name(name).then(|| (hash.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// The identity hash the profile's `DeveloperCertificates` names, if the
+/// keychain holds it — pairing a profile with the `codesign --sign`
+/// identity that can actually use it.
+#[cfg(target_os = "macos")]
+pub(crate) fn identity_for_profile(
+    identities: &[(String, String)],
+    data: &plist::Dictionary,
+) -> Option<String> {
+    let accepted = profile_certificate_hashes(data);
+    identities
+        .iter()
+        .map(|(hash, _)| hash)
+        .find(|hash| accepted.contains(*hash))
+        .cloned()
+}
+
 /// A team Xcode can provision for: the account's last-selected team, or any
 /// team its accounts advertise. Reads Xcode's account registry from
 /// `~/Library/Preferences/com.apple.dt.Xcode.plist`; a missing Xcode install
@@ -305,7 +359,11 @@ mod tests {
 
 #[cfg(all(test, target_os = "macos"))]
 mod signing_tests {
-    use super::{is_development_certificate_name, pem_certificate_der, team_id_in_certificate};
+    use super::{
+        certificate_sha1_hex, development_identities, identity_for_profile,
+        is_development_certificate_name, pem_certificate_der, profile_certificate_hashes,
+        team_id_in_certificate,
+    };
 
     /// A self-signed certificate shaped like an `Apple Development` one:
     /// `CN=Apple Development: <email> (<certificate-id>)`, `OU=<team>`.
@@ -314,6 +372,82 @@ mod signing_tests {
     /// A self-signed certificate whose common name is not an Apple
     /// development name.
     const OTHER_CERT: &str = include_str!("../toolchain/testdata/other_signing.pem");
+    /// `sha1sum` of the development fixture's DER.
+    const DEV_CERT_SHA1: &str = "5D03DD01B4F95D47874C9BFD9367A978D838A228";
+    const OTHER_CERT_SHA1: &str = "AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDDEEEEEEEE";
+
+    fn dev_cert_der() -> Vec<u8> {
+        x509_parser::pem::Pem::iter_from_buffer(DEVELOPMENT_CERT.as_bytes())
+            .next()
+            .expect("the fixture holds one PEM block")
+            .expect("the fixture PEM decodes")
+            .contents
+    }
+
+    fn find_identity_output() -> String {
+        format!(
+            "     1) {DEV_CERT_SHA1} \"Apple Development: devin.test@example.com (TESTCERT42)\"\n     2) {OTHER_CERT_SHA1} \"Apple Development: devin.other@example.com (OTHERID9X)\"\n     2 valid identities found\n"
+        )
+    }
+
+    #[test]
+    fn certificate_sha1_matches_openssl() {
+        assert_eq!(certificate_sha1_hex(&dev_cert_der()), DEV_CERT_SHA1);
+    }
+
+    #[test]
+    fn identity_pairs_with_a_profile_certificate() {
+        let profile = plist::Dictionary::from_iter([(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![plist::Value::Data(dev_cert_der())]),
+        )]);
+        let identities = development_identities(&find_identity_output());
+        assert_eq!(
+            identity_for_profile(&identities, &profile).as_deref(),
+            Some(DEV_CERT_SHA1)
+        );
+    }
+
+    #[test]
+    fn identity_absent_when_profile_lists_another_certificate() {
+        let profile = plist::Dictionary::from_iter([(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![plist::Value::Data(vec![0xDE, 0xAD])]),
+        )]);
+        let identities = development_identities(&find_identity_output());
+        assert_eq!(identity_for_profile(&identities, &profile), None);
+    }
+
+    #[test]
+    fn non_development_identities_are_skipped() {
+        let identities = development_identities(&format!(
+            "     1) {DEV_CERT_SHA1} \"Devin Signing Test\"\n     1 valid identities found\n"
+        ));
+        assert_eq!(identities, []);
+    }
+
+    #[test]
+    fn find_identity_parsing_keeps_development_names_only() {
+        let output = find_identity_output()
+            + "     3) DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF \"Apple Distribution: x\"\n";
+        let identities = development_identities(&output);
+        assert_eq!(identities.len(), 2);
+        assert_eq!(identities[0].0, DEV_CERT_SHA1);
+    }
+
+    #[test]
+    fn profile_hash_set_covers_every_certificate() {
+        let profile = plist::Dictionary::from_iter([(
+            "DeveloperCertificates".to_string(),
+            plist::Value::Array(vec![
+                plist::Value::Data(dev_cert_der()),
+                plist::Value::Data(vec![0x01, 0x02]),
+            ]),
+        )]);
+        let hashes = profile_certificate_hashes(&profile);
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(DEV_CERT_SHA1));
+    }
 
     #[test]
     fn team_id_comes_from_subject_organizational_unit() {

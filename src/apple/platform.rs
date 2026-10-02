@@ -629,16 +629,9 @@ pub async fn apple_deployment_target(
     _project: &Project,
     platform: TargetPlatform,
 ) -> eyre::Result<(&'static str, String)> {
-    let environment = match platform {
-        TargetPlatform::MacOS => "MACOSX_DEPLOYMENT_TARGET",
-        TargetPlatform::IOS | TargetPlatform::IOSSimulator => "IPHONEOS_DEPLOYMENT_TARGET",
-        TargetPlatform::TvOS | TargetPlatform::TvOSSimulator => "TVOS_DEPLOYMENT_TARGET",
-        TargetPlatform::WatchOS | TargetPlatform::WatchOSSimulator => "WATCHOS_DEPLOYMENT_TARGET",
-        TargetPlatform::VisionOS | TargetPlatform::VisionOSSimulator => "XROS_DEPLOYMENT_TARGET",
-        other => {
-            bail!("Platform {other:?} does not have an Apple deployment target");
-        }
-    };
+    let environment = platform.deployment_target_setting().ok_or_else(|| {
+        eyre::eyre!("Platform {platform:?} does not have an Apple deployment target")
+    })?;
     let target = apple_deployment_target_for(platform).ok_or_else(|| {
         eyre::eyre!("Platform {platform:?} does not have an Apple deployment target")
     })?;
@@ -931,6 +924,7 @@ pub async fn package_apple(
         backend,
         project_path.as_path(),
         project,
+        &deployment_target,
     )
     .await?;
 

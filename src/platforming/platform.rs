@@ -342,6 +342,67 @@ impl TargetPlatform {
         }
     }
 
+    /// The platform name an xcodebuild `-destination` specifier uses
+    /// (`platform=iOS,id=…`, `generic/platform=tvOS`) for this platform's
+    /// device family.
+    #[must_use]
+    pub const fn xcode_destination_name(&self) -> Option<&'static str> {
+        match self {
+            Self::MacOS => Some("macOS"),
+            Self::IOS | Self::IOSSimulator => Some("iOS"),
+            Self::TvOS | Self::TvOSSimulator => Some("tvOS"),
+            Self::WatchOS | Self::WatchOSSimulator => Some("watchOS"),
+            Self::VisionOS | Self::VisionOSSimulator => Some("visionOS"),
+            Self::Android
+            | Self::Linux
+            | Self::Windows
+            | Self::Web
+            | Self::Esp32S3
+            | Self::Esp32C3
+            | Self::Esp32P4 => None,
+        }
+    }
+
+    /// The `TARGETED_DEVICE_FAMILY` value Xcode projects for this platform
+    /// declare (`1,2` = iPhone+iPad, `3` = Apple TV, `4` = Apple Watch,
+    /// `7` = Apple Vision).
+    #[must_use]
+    pub const fn targeted_device_family(&self) -> Option<&'static str> {
+        match self {
+            Self::IOS | Self::IOSSimulator => Some("1,2"),
+            Self::TvOS | Self::TvOSSimulator => Some("3"),
+            Self::WatchOS | Self::WatchOSSimulator => Some("4"),
+            Self::VisionOS | Self::VisionOSSimulator => Some("7"),
+            Self::MacOS
+            | Self::Android
+            | Self::Linux
+            | Self::Windows
+            | Self::Web
+            | Self::Esp32S3
+            | Self::Esp32C3
+            | Self::Esp32P4 => None,
+        }
+    }
+
+    /// The `*_DEPLOYMENT_TARGET` Xcode build setting this platform uses.
+    #[must_use]
+    pub const fn deployment_target_setting(&self) -> Option<&'static str> {
+        match self {
+            Self::MacOS => Some("MACOSX_DEPLOYMENT_TARGET"),
+            Self::IOS | Self::IOSSimulator => Some("IPHONEOS_DEPLOYMENT_TARGET"),
+            Self::TvOS | Self::TvOSSimulator => Some("TVOS_DEPLOYMENT_TARGET"),
+            Self::WatchOS | Self::WatchOSSimulator => Some("WATCHOS_DEPLOYMENT_TARGET"),
+            Self::VisionOS | Self::VisionOSSimulator => Some("XROS_DEPLOYMENT_TARGET"),
+            Self::Android
+            | Self::Linux
+            | Self::Windows
+            | Self::Web
+            | Self::Esp32S3
+            | Self::Esp32C3
+            | Self::Esp32P4 => None,
+        }
+    }
+
     /// Get the architecture for this platform.
     #[must_use]
     pub fn arch(&self) -> Architecture {
@@ -429,6 +490,12 @@ pub struct PackageOptions {
     /// How a build for a physical device is code-signed.
     device_signing: DeviceSigning,
 
+    /// Hardware UDID of the physical Apple device the package targets, when
+    /// packaging for one (`water run`); `None` for a device-agnostic
+    /// `water package`, which skips the profile's `ProvisionedDevices`
+    /// check and provisions with a generic iOS destination.
+    device_udid: Option<String>,
+
     /// Whether the package embeds the shared `WaterUI` Rust runtime.
     shared_rust_runtime: bool,
 
@@ -476,6 +543,7 @@ impl PackageOptions {
             distribution: false,
             debug: true,
             device_signing: DeviceSigning::Automatic,
+            device_udid: None,
             shared_rust_runtime: true,
             web_frontend: WebFrontendMode::Stage,
             progress: None,
@@ -489,6 +557,7 @@ impl PackageOptions {
             distribution,
             debug,
             device_signing: DeviceSigning::Automatic,
+            device_udid: None,
             shared_rust_runtime: false,
             web_frontend: WebFrontendMode::Stage,
             progress: None,
@@ -506,6 +575,21 @@ impl PackageOptions {
     #[must_use]
     pub const fn device_signing(&self) -> DeviceSigning {
         self.device_signing
+    }
+
+    /// Bind the package to a physical Apple device by hardware UDID, so
+    /// provisioning registers the device and the selected profile must list
+    /// it. `None` keeps the package device-agnostic.
+    #[must_use]
+    pub fn with_device_udid(mut self, device_udid: Option<String>) -> Self {
+        self.device_udid = device_udid;
+        self
+    }
+
+    /// The hardware UDID of the device the package targets, if any.
+    #[must_use]
+    pub fn device_udid(&self) -> Option<&str> {
+        self.device_udid.as_deref()
     }
 
     /// Override the debug flag without changing the runtime linkage.

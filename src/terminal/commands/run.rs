@@ -819,6 +819,13 @@ async fn build_and_run(
 ) -> Result<(Running, Option<web::WebDevServer>)> {
     let build_plan = resolve_build_plan(cli_platform, &selection.device);
     let physical_ios = is_physical_ios(&selection.device);
+    // The provisioning profile for a physical-device run must name the
+    // destination's hardware UDID — capture it before the selection is
+    // consumed by the launch task.
+    let device_udid = match &selection.device {
+        SelectedDevice::ApplePhysical(device) => Some(device.udid.clone()),
+        _ => None,
+    };
     let launch_task =
         spawn_device_launch_task(host.clone(), selection.device, selection.needs_launch);
 
@@ -849,6 +856,7 @@ async fn build_and_run(
         &built,
         &config,
         Some(shell.build_progress()),
+        device_udid,
     )
     .await?;
 
@@ -1053,10 +1061,12 @@ async fn package_for_backend(
     built: &waterui_cli::build::BuiltTarget,
     config: &BuildRunConfig,
     progress: Option<BuildProgress>,
+    device_udid: Option<String>,
 ) -> Result<Artifact> {
     let mut package_options = PackageOptions::development()
         .with_debug(!config.profile.is_release())
-        .with_dev_server(config.dev_server);
+        .with_dev_server(config.dev_server)
+        .with_device_udid(device_udid);
     if let Some(progress) = progress {
         package_options = package_options.with_progress(progress);
     }

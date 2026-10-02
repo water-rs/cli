@@ -259,6 +259,11 @@ impl Project {
         if let Some(progress) = progress {
             package_options = package_options.with_progress(progress);
         }
+        // A physical-device package must be provisioned for the exact
+        // device it will install on — the device reports its UDID.
+        if let Some(udid) = device.device_udid() {
+            package_options = package_options.with_device_udid(Some(udid.to_string()));
+        }
         // Package the build artifacts for the target platform
         let artifact = backend
             .package(self, platform, package_options, &built)

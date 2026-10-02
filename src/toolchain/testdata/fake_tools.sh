@@ -293,6 +293,19 @@ xcode-select)
     esac
     exit 0
     ;;
+security)
+    case "$*" in
+        "find-identity -v -p codesigning")
+            respond_or_empty SECURITY_FIND_IDENTITY
+            ;;
+        "find-certificate -a -Z -p"*)
+            respond_or_empty SECURITY_FIND_CERTIFICATE
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+    ;;
 xcrun)
     case "$*" in
         *--show-sdk-path)
