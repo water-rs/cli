@@ -2791,8 +2791,14 @@ mod tests {
             vec!["waterui-apple/map".to_string()]
         );
         // No destination declares `inspector` or `chromium`.
-        assert!(super::ffi_feature_forwards("inspector", &manifest, &tables).is_empty());
-        assert!(super::ffi_feature_forwards("chromium", &manifest, &tables).is_empty());
+        assert_eq!(
+            super::ffi_feature_forwards("inspector", &manifest, &tables),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            super::ffi_feature_forwards("chromium", &manifest, &tables),
+            Vec::<String>::new()
+        );
     }
 
     /// A local checkout answers the forward filter itself: the scaffolded
