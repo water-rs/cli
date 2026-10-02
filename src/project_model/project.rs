@@ -1115,13 +1115,18 @@ impl CreateOptions {
 
 impl Project {
     /// `apple_selected` is whether this invocation selected the Apple backend —
-    /// one that did not emits a companion with no `waterui-apple` dependency,
+    /// one that does not emit a companion with no `waterui-apple` dependency,
     /// entry-owning bin, or entry file, and removes a stale entry file a
-    /// previous apple-selected render left behind.
+    /// previous apple-selected render left behind. Apple pieces are also
+    /// omitted on hosts that cannot run an Apple build.
     pub(crate) async fn scaffold_ffi_companion(
         &self,
         apple_selected: bool,
     ) -> Result<(), crate::backend::FailToInitBackend> {
+        // The companion's Apple pieces exist only where an Apple build runs.
+        // A host that cannot produce an Apple build must not resolve the
+        // Apple backend crate merely because the project selected it.
+        let apple_selected = apple_selected && cfg!(target_os = "macos");
         let manifest = self.manifest();
         let app_name = manifest
             .package
@@ -3000,6 +3005,32 @@ mod scaffold_tests {
                 .join("src/bin/waterui-apple-main.rs")
                 .exists(),
             "an android-selected companion renders no apple entry file"
+        );
+    }
+
+    /// The companion's Apple pieces exist only where an Apple build can
+    /// run: an apple-selected render on a host that cannot produce one
+    /// emits no `waterui-apple` — the manifest it writes must resolve on
+    /// the host that rendered it.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn apple_selected_companion_carries_no_apple_pieces_off_macos() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("water-example");
+        let project = create_project(&root);
+
+        smol::block_on(project.scaffold_ffi_companion(true))
+            .expect("an apple-selected scaffold must succeed");
+
+        let rendered = std::fs::read_to_string(project.ffi_crate_path().join("Cargo.toml"))
+            .expect("the rendered ffi manifest");
+        assert!(!rendered.contains("waterui-apple"), "{rendered}");
+        assert!(
+            !project
+                .ffi_crate_path()
+                .join("src/bin/waterui-apple-main.rs")
+                .exists(),
+            "a companion rendered off macOS renders no apple entry file"
         );
     }
 
