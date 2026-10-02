@@ -5,7 +5,7 @@ use eyre::{Result, bail};
 use super::{CargoTarget, RustBuild, combined_build_output};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NativeLink {
+pub struct NativeLink {
     pub name: String,
     pub framework: bool,
 }
@@ -13,7 +13,11 @@ pub(crate) struct NativeLink {
 impl RustBuild {
     /// Ask the same Cargo invocation for rustc's native link contract. Cargo
     /// replays the compiler diagnostic on a fresh unit as well as a rebuilt one.
-    pub(crate) async fn native_static_libraries(&self, release: bool) -> Result<Vec<NativeLink>> {
+    ///
+    /// # Errors
+    /// Returns an error if the build fails, Cargo's output cannot be read,
+    /// or rustc never reports the `native-static-libs` flags.
+    pub async fn native_static_libraries(&self, release: bool) -> Result<Vec<NativeLink>> {
         let _lease = self.shared_target_lease().await?;
         let profile_dir = self.lib_output_dir(release).await?;
         let output = self

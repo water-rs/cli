@@ -179,7 +179,11 @@ async fn assemble_slices(
                 options
                     .clone()
                     .with_static_runtime()
-                    .with_target_triple(triple.parse()?)
+                    .with_target_triple(
+                        triple
+                            .parse()
+                            .map_err(|_| eyre::eyre!("unsupported Apple architecture {triple}"))?,
+                    )
                     .with_output_dir(directory.join(triple)),
             ))
             .await?;

@@ -99,7 +99,7 @@ pub async fn stage_for_apple(
 }
 
 /// Stage compiler-discovered resources without an application's icon or launch catalog.
-pub(crate) async fn stage_library_resources(
+pub async fn stage_library_resources(
     project: &Project,
     dest_dir: &Path,
     symbols: &ArtifactSymbols,
@@ -111,7 +111,7 @@ pub(crate) async fn stage_library_resources(
 }
 
 /// Write one complete resource plan, including the content stamp.
-pub(crate) async fn write_library_resources(
+pub async fn write_library_resources(
     manifest: &BundleManifest,
     dest_dir: &Path,
 ) -> eyre::Result<()> {
@@ -399,7 +399,7 @@ fn plan_main_assets(project: &Project) -> eyre::Result<Vec<PlannedAsset>> {
 /// statics. `symbols` is the library artifact the target build produced for
 /// the project crate — planning runs after the build, so nothing here spawns
 /// a compile of its own.
-pub(crate) async fn build_manifest(
+pub async fn build_manifest(
     project: &Project,
     symbols: &ArtifactSymbols,
     dev_server: bool,
