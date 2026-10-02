@@ -46,7 +46,7 @@ struct PlatformLinks {
     links: Vec<NativeLink>,
 }
 
-/// SwiftPM platform conditions cannot distinguish device, simulator or architecture.
+/// `SwiftPM` platform conditions cannot distinguish device, simulator or architecture.
 /// Share a list only when its complete ordered link contract is identical.
 fn collect_platform_links(
     links: &mut Vec<PlatformLinks>,
