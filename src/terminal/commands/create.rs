@@ -73,7 +73,7 @@ enum CreateTemplate {
     /// The standard Rust shell.
     #[default]
     App,
-    /// A Rust shell whose root view is `include_web!("web")` plus a `web/`
+    /// A Rust shell whose root view is `include_web!(resources, "web")` plus a `web/`
     /// Vite frontend.
     Web,
 }
@@ -378,7 +378,9 @@ mod tests {
             let lib_rs =
                 std::fs::read_to_string(project_path.join("src/lib.rs")).expect("src/lib.rs");
             assert!(
-                lib_rs.contains("include_web!(\"web\")"),
+                lib_rs.contains("include_web!(resources, \"web\")")
+                    && lib_rs.contains("use_env(|env: Environment|")
+                    && lib_rs.contains("ResourceContext::from_environment(&env)"),
                 "the root view mounts the frontend:\n{lib_rs}"
             );
             assert!(

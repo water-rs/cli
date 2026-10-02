@@ -268,7 +268,7 @@ async fn execute_plan(
     include_arg.ok_or_else(|| eyre!("the init plan produced no shell scaffold step"))
 }
 
-/// The Rust shell: the root view is `include_web!(<include_arg>)`.
+/// The Rust shell: the root view is `include_web!(resources, <include_arg>)`.
 async fn scaffold_shell(
     shell: &Shell,
     root: &std::path::Path,

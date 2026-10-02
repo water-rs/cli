@@ -341,6 +341,20 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_architectures_return_diagnostics() {
+        for architecture in [
+            Architecture::Arm(target_lexicon::ArmArchitecture::Armv7),
+            Architecture::X86_32(target_lexicon::X86_32Architecture::I686),
+        ] {
+            let error = slices(Some(architecture)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("Apple embedded artifacts do not support {architecture}")
+            );
+        }
+    }
+
+    #[test]
     fn intel_has_no_device_slice() {
         let selected = slices(Some(Architecture::X86_64)).unwrap();
         assert_eq!(selected.len(), 2);

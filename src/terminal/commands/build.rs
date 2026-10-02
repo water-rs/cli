@@ -232,7 +232,8 @@ async fn run_embedded_apple_build(
     let architecture = args.arch.map(|arch| match arch {
         TargetArch::Arm64 => Architecture::Aarch64(Aarch64Architecture::Aarch64),
         TargetArch::X86_64 => Architecture::X86_64,
-        TargetArch::Armv7 | TargetArch::X86 => unreachable!("Apple architectures were validated"),
+        TargetArch::Armv7 => Architecture::Arm(target_lexicon::ArmArchitecture::Armv7),
+        TargetArch::X86 => Architecture::X86_32(target_lexicon::X86_32Architecture::I686),
     });
     let spinner = shell.spinner("Building embedded Apple package...");
     let result = Box::pin(
