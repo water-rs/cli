@@ -354,7 +354,7 @@ pub async fn seed_managed_crate_lock(
 /// the feature selection the build invokes with — optional dependencies (and
 /// the metadata they declare) only enter the resolved graph under it; an
 /// empty slice resolves the manifest's default feature set.
-pub(crate) async fn crate_metadata(
+pub async fn crate_metadata(
     build_manifest: &Path,
     features: &[String],
 ) -> eyre::Result<cargo_metadata::Metadata> {

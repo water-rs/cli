@@ -1326,18 +1326,35 @@ mod tests {
     /// `Package.swift` marker makes `waterui_path` consume it as the local
     /// backend — declaring the backend forward destinations `map`, `media`
     /// and `webview`.
+    /// A minimal crate manifest: package header plus a `[features]` table.
+    fn fixture_manifest(name: &str, version: &str, features: &[&str]) -> String {
+        use std::fmt::Write as _;
+        let mut text =
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n");
+        if !features.is_empty() {
+            text.push_str("\n[features]\n");
+            for feature in features {
+                let _ = writeln!(text, "{feature} = []");
+            }
+        }
+        text
+    }
+
+    /// A minimal crate fixture — manifest plus an empty lib target — written
+    /// under `dir`.
+    fn write_fixture_crate(dir: &Path, name: &str, features: &[&str]) {
+        std::fs::create_dir_all(dir.join("src")).expect("fixture src dir");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            fixture_manifest(name, "0.0.0", features),
+        )
+        .expect("fixture manifest");
+        std::fs::write(dir.join("src/lib.rs"), "").expect("fixture lib");
+    }
+
     fn write_fake_framework_checkout(root: &Path, ffi_features: &[&str]) {
         fn manifest(name: &str, features: &[&str]) -> String {
-            let mut text = format!(
-                "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"
-            );
-            if !features.is_empty() {
-                text.push_str("\n[features]\n");
-                for feature in features {
-                    text.push_str(&format!("{feature} = []\n"));
-                }
-            }
-            text
+            fixture_manifest(name, "0.0.0", features)
         }
         std::fs::create_dir_all(root.join("ffi")).expect("ffi manifest dir");
         std::fs::write(
@@ -2852,18 +2869,13 @@ mod tests {
         // manifest pins on.
         let write_ffi = |dir_name: &str, version: &str, features: &[&str]| {
             let dir = tempdir.path().join(dir_name);
-            std::fs::create_dir_all(dir.join("src")).expect("fixture src dir");
-            let mut manifest = format!(
-                "[package]\nname = \"waterui-ffi\"\nversion = \"{version}\"\nedition = \"2021\"\n"
-            );
-            if !features.is_empty() {
-                manifest.push_str("\n[features]\n");
-                for feature in features {
-                    manifest.push_str(&format!("{feature} = []\n"));
-                }
-            }
-            std::fs::write(dir.join("Cargo.toml"), manifest).expect("fixture manifest");
-            std::fs::write(dir.join("src/lib.rs"), "").expect("fixture lib");
+            write_fixture_crate(&dir, "waterui-ffi", features);
+            // The pinned revision must carry the declared version.
+            let manifest_path = dir.join("Cargo.toml");
+            let manifest = std::fs::read_to_string(&manifest_path)
+                .expect("fixture manifest")
+                .replace("0.0.0", version);
+            std::fs::write(&manifest_path, manifest).expect("fixture manifest");
             git(&dir, &["init", "-b", "fixture"]);
             git(&dir, &["add", "-A"]);
             git(
@@ -2883,11 +2895,13 @@ mod tests {
         };
 
         let manifest_for = |git_url: &str, rev: &str| {
-            let mut manifest = cargo_toml::Manifest::<()>::default();
-            manifest.package = Some(cargo_toml::Package::new(
-                "probe-app".to_string(),
-                super::cargo_semver("0.1.0"),
-            ));
+            let mut manifest = cargo_toml::Manifest::<()> {
+                package: Some(cargo_toml::Package::new(
+                    "probe-app".to_string(),
+                    super::cargo_semver("0.1.0"),
+                )),
+                ..Default::default()
+            };
             manifest.dependencies.insert(
                 "waterui-ffi".to_string(),
                 cargo_toml::Dependency::Detailed(Box::new(cargo_toml::DependencyDetail {
@@ -2915,10 +2929,7 @@ mod tests {
             .expect("the probe resolves the pinned fixture");
             let table = &tables["waterui-ffi"];
             for feature in &features {
-                assert!(
-                    table.contains(*feature),
-                    "{version} must declare {feature}"
-                );
+                assert!(table.contains(*feature), "{version} must declare {feature}");
             }
             assert_eq!(
                 table.contains("inspector"),
@@ -3112,13 +3123,11 @@ mod tests {
         std::fs::write(workspace_root.join("preview/src/lib.rs"), "")
             .expect("fixture member source");
         // The forward filter reads the `waterui-ffi` table off the checkout.
-        std::fs::create_dir_all(workspace_root.join("ffi")).expect("fixture ffi dir");
-        std::fs::write(
-            workspace_root.join("ffi/Cargo.toml"),
-            "[package]\nname = \"waterui-ffi\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
-             [features]\nc-api = []\nandroid-jni = []\n",
-        )
-        .expect("write waterui-ffi manifest");
+        write_fixture_crate(
+            &workspace_root.join("ffi"),
+            "waterui-ffi",
+            &["c-api", "android-jni"],
+        );
         let ctx = ctx(
             Some(workspace_root),
             Some(preview_ffi_dir.clone()),
@@ -3205,10 +3214,7 @@ mod tests {
     #[test]
     fn generated_ffi_manifest_emits_only_linked_crate_types() {
         let temp = tempfile::tempdir().expect("temp dir");
-        write_fake_framework_checkout(
-            &temp.path().join("waterui"),
-            super::FORWARDED_FFI_FEATURES,
-        );
+        write_fake_framework_checkout(&temp.path().join("waterui"), super::FORWARDED_FFI_FEATURES);
         let project_root = temp.path().join("project");
         // The relative `waterui_path` resolves through the project root, so
         // it must exist for `project/../waterui` to land on the checkout.
@@ -3248,10 +3254,7 @@ mod tests {
     #[test]
     fn generated_ffi_build_script_undefs_every_swift_seam_symbol() {
         let temp = tempfile::tempdir().expect("temp dir");
-        write_fake_framework_checkout(
-            &temp.path().join("waterui"),
-            super::FORWARDED_FFI_FEATURES,
-        );
+        write_fake_framework_checkout(&temp.path().join("waterui"), super::FORWARDED_FFI_FEATURES);
         let ffi_dir = temp.path().join("managed_backends").join("ffi");
         let project_root = temp.path().join("project");
         // The relative `waterui_path` resolves through the project root, so
@@ -3282,10 +3285,7 @@ mod tests {
     #[test]
     fn generated_manifests_keep_debug_info_off_for_dependencies() {
         let temp = tempfile::tempdir().expect("temp dir");
-        write_fake_framework_checkout(
-            &temp.path().join("waterui"),
-            super::FORWARDED_FFI_FEATURES,
-        );
+        write_fake_framework_checkout(&temp.path().join("waterui"), super::FORWARDED_FFI_FEATURES);
         let project_root = temp.path().join("project");
         // The relative `waterui_path` resolves through the project root, so
         // it must exist for `project/../waterui` to land on the checkout.
@@ -3320,10 +3320,7 @@ mod tests {
     #[test]
     fn generated_manifests_carry_the_release_profile() {
         let temp = tempfile::tempdir().expect("temp dir");
-        write_fake_framework_checkout(
-            &temp.path().join("waterui"),
-            super::FORWARDED_FFI_FEATURES,
-        );
+        write_fake_framework_checkout(&temp.path().join("waterui"), super::FORWARDED_FFI_FEATURES);
         let project_root = temp.path().join("project");
         // The relative `waterui_path` resolves through the project root, so
         // it must exist for `project/../waterui` to land on the checkout.
@@ -6053,8 +6050,8 @@ async fn resolved_forward_tables(
             });
         match dep_path {
             Some(path) => {
-                let dep_manifest_path = collapse_dotdot(&manifest_dir.join(path))
-                    .join("Cargo.toml");
+                let dep_manifest_path =
+                    collapse_dotdot(&manifest_dir.join(path)).join("Cargo.toml");
                 let dep_manifest =
                     cargo_toml::Manifest::from_path(&dep_manifest_path).map_err(|error| {
                         io::Error::new(
@@ -6108,12 +6105,16 @@ async fn resolved_forward_tables(
 /// Fails when `cargo metadata` cannot resolve the probe, when the probe
 /// produces no resolution graph or no root, or when a target names no
 /// resolved package of the probe's root node.
-async fn probe_forward_tables(
-    manifest: &cargo_toml::Manifest<()>,
+/// `probe`'s own copy of `manifest`'s dependency declarations: every
+/// relative `path` absolutized against `manifest_dir` — the probe resolves
+/// from a temporary directory — and each `unresolved` target held
+/// non-optional, since an optional edge (the preview crate's `waterui-ffi`)
+/// only enters the resolved graph under a feature that enables it.
+fn absolutize_probe_paths(
+    probe: &mut cargo_toml::Manifest<()>,
     manifest_dir: &Path,
     unresolved: &[&str],
-) -> io::Result<FeatureTables> {
-    let generated_manifest = manifest_dir.join("Cargo.toml");
+) {
     let absolutize = |path: &mut Option<String>| {
         let Some(path_str) = path else { return };
         let dir = Path::new(path_str.as_str());
@@ -6123,17 +6124,6 @@ async fn probe_forward_tables(
                 .into_owned();
         }
     };
-    let mut probe = manifest.clone();
-    probe.features.clear();
-    probe.workspace = Some(cargo_toml::Workspace::default());
-    // The probe resolves before the template sources land, so it declares no
-    // products — their files are not on disk — and gets the single target
-    // Cargo insists on, a stub `src/lib.rs` written beside it below.
-    probe.lib = None;
-    probe.bin.clear();
-    probe.test.clear();
-    probe.bench.clear();
-    probe.example.clear();
     for (name, dependency) in &mut probe.dependencies {
         if let cargo_toml::Dependency::Detailed(detail) = dependency {
             absolutize(&mut detail.path);
@@ -6142,23 +6132,16 @@ async fn probe_forward_tables(
             }
         }
     }
-    for dependencies in [
-        &mut probe.dev_dependencies,
-        &mut probe.build_dependencies,
-    ]
-    .into_iter()
-    .chain(
-        probe
-            .target
-            .values_mut()
-            .flat_map(|target| {
-                [
-                    &mut target.dependencies,
-                    &mut target.dev_dependencies,
-                    &mut target.build_dependencies,
-                ]
-            }),
-    ) {
+    for dependencies in [&mut probe.dev_dependencies, &mut probe.build_dependencies]
+        .into_iter()
+        .chain(probe.target.values_mut().flat_map(|target| {
+            [
+                &mut target.dependencies,
+                &mut target.dev_dependencies,
+                &mut target.build_dependencies,
+            ]
+        }))
+    {
         for dependency in dependencies.values_mut() {
             if let cargo_toml::Dependency::Detailed(detail) = dependency {
                 absolutize(&mut detail.path);
@@ -6172,6 +6155,26 @@ async fn probe_forward_tables(
             }
         }
     }
+}
+
+async fn probe_forward_tables(
+    manifest: &cargo_toml::Manifest<()>,
+    manifest_dir: &Path,
+    unresolved: &[&str],
+) -> io::Result<FeatureTables> {
+    let generated_manifest = manifest_dir.join("Cargo.toml");
+    let mut probe = manifest.clone();
+    probe.features.clear();
+    probe.workspace = Some(cargo_toml::Workspace::default());
+    // The probe resolves before the template sources land, so it declares no
+    // products — their files are not on disk — and gets the single target
+    // Cargo insists on, a stub `src/lib.rs` written beside it below.
+    probe.lib = None;
+    probe.bin.clear();
+    probe.test.clear();
+    probe.bench.clear();
+    probe.example.clear();
+    absolutize_probe_paths(&mut probe, manifest_dir, unresolved);
 
     let probe_dir = tempfile::tempdir()?;
     let manifest_path = probe_dir.path().join("Cargo.toml");

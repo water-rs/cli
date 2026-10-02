@@ -2795,8 +2795,15 @@ mod scaffold_tests {
         }
     }
 
-    fn create_project(root: &Path) -> Project {
-        smol::block_on(Project::create(
+    /// A remote-channel project whose framework pins resolve without a
+    /// network: `waterui` and `waterui-ffi` ride `[patch.crates-io]` onto
+    /// vendor stubs (the only source `[patch]` can redirect offline), and
+    /// `waterui-apple` gets a `backend_path` stub — a path dependency — so
+    /// the ffi companion's feature-table probe resolves entirely locally.
+    /// `apple_backend` declares the vendored backend in `Water.toml` for the
+    /// opens that select it; a declared backend reports `apple_backend()`.
+    fn create_project(root: &Path, vendor_dir: &Path, apple_backend: bool) -> Project {
+        let project = smol::block_on(Project::create(
             root,
             CreateOptions {
                 name: "Water Example".to_string(),
@@ -2811,7 +2818,67 @@ mod scaffold_tests {
                 web: None,
             },
         ))
-        .expect("project creation must succeed")
+        .expect("project creation must succeed");
+
+        write_vendor_stub(
+            &vendor_dir.join("waterui"),
+            "waterui",
+            &["dynamic_linking", "media"],
+        );
+        write_vendor_stub(
+            &vendor_dir.join("waterui-ffi"),
+            "waterui-ffi",
+            &[
+                "android-jni",
+                "c-api",
+                "chromium",
+                "dev",
+                "gpu",
+                "inspector",
+                "map",
+                "media",
+                "video",
+                "webview",
+                "webview-cef",
+            ],
+        );
+        write_vendor_stub(
+            &vendor_dir.join("waterui-apple"),
+            "waterui-apple",
+            &["map", "media", "webview"],
+        );
+        let manifest_path = root.join("Cargo.toml");
+        let mut document: toml_edit::DocumentMut = std::fs::read_to_string(&manifest_path)
+            .expect("project Cargo.toml exists")
+            .parse()
+            .expect("project Cargo.toml parses");
+        for name in ["waterui", "waterui-ffi"] {
+            document["patch"]["crates-io"][name]["path"] =
+                toml_edit::value(vendor_dir.join(name).to_string_lossy().as_ref());
+        }
+        std::fs::write(&manifest_path, document.to_string()).expect("write the patch table");
+        if apple_backend {
+            let water_toml = root.join("Water.toml");
+            let mut water_document: toml_edit::DocumentMut = std::fs::read_to_string(&water_toml)
+                .expect("Water.toml exists")
+                .parse()
+                .expect("Water.toml parses");
+            water_document["backends"]["apple"]["backend_path"] =
+                toml_edit::value(vendor_dir.join("waterui-apple").to_string_lossy().as_ref());
+            std::fs::write(&water_toml, water_document.to_string())
+                .expect("declare the vendored apple backend");
+        }
+
+        // `Project::open` resolves the project's layout with `cargo metadata
+        // --locked`; a plain offline resolve records the patched sources in
+        // the lock first.
+        cargo_metadata::MetadataCommand::new()
+            .manifest_path(&manifest_path)
+            .other_options(vec!["--offline".to_string()])
+            .exec()
+            .expect("offline metadata resolves the patched project");
+
+        project
     }
 
     /// Opening a project for one platform scaffolds the managed backend
@@ -2829,7 +2896,7 @@ mod scaffold_tests {
         ] {
             let dir = tempfile::tempdir().expect("temp dir");
             let root = dir.path().join("water-example");
-            create_project(&root);
+            create_project(&root, dir.path(), apple_expected);
 
             let project = smol::block_on(Project::open(
                 &root,
@@ -2892,7 +2959,7 @@ mod scaffold_tests {
 
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("water-example");
-        create_project(&root);
+        create_project(&root, dir.path(), false);
 
         // The project declares an apple backend it is not building for.
         let missing_apple = dir.path().join("apple-backend");
@@ -2929,56 +2996,6 @@ mod scaffold_tests {
         std::fs::write(ffi_dir.join("src/lib.rs"), "").expect("seed the stale ffi lib");
         std::fs::write(ffi_dir.join("src/bin/waterui-apple-main.rs"), "")
             .expect("seed the stale apple entry file");
-
-        // The backend audits the re-rendered manifest with `cargo metadata`,
-        // and the fixture's registry pins resolve to local stubs so the test
-        // runs without a crates.io index. `[patch]` only applies at the
-        // resolution's workspace root, so the generated manifest carries it
-        // via the same propagation the render applies to a real project's
-        // `[patch.crates-io]` table.
-        for (name, features) in [
-            ("waterui", &["dynamic_linking", "media"][..]),
-            (
-                "waterui-ffi",
-                &[
-                    "android-jni",
-                    "c-api",
-                    "chromium",
-                    "gpu",
-                    "map",
-                    "media",
-                    "video",
-                    "webview",
-                    "webview-cef",
-                ][..],
-            ),
-        ] {
-            write_vendor_stub(&dir.path().join("vendor").join(name), name, features);
-        }
-        let manifest_path = root.join("Cargo.toml");
-        let mut document: toml_edit::DocumentMut = std::fs::read_to_string(&manifest_path)
-            .expect("project Cargo.toml exists")
-            .parse()
-            .expect("project Cargo.toml parses");
-        for name in ["waterui", "waterui-ffi"] {
-            document["patch"]["crates-io"][name]["path"] = toml_edit::value(
-                dir.path()
-                    .join("vendor")
-                    .join(name)
-                    .to_string_lossy()
-                    .as_ref(),
-            );
-        }
-        std::fs::write(&manifest_path, document.to_string()).expect("write the patch table");
-
-        // `Project::open` resolves the project's layout with `cargo metadata
-        // --locked`, which refuses a lock that no longer matches the manifest;
-        // a plain offline resolve records the patched sources in the lock.
-        cargo_metadata::MetadataCommand::new()
-            .manifest_path(&manifest_path)
-            .other_options(vec!["--offline".to_string()])
-            .exec()
-            .expect("offline metadata resolves the patched project");
 
         let project = smol::block_on(Project::open(
             &root,
@@ -3017,7 +3034,7 @@ mod scaffold_tests {
     fn apple_selected_companion_carries_no_apple_pieces_off_macos() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("water-example");
-        let project = create_project(&root);
+        let project = create_project(&root, dir.path(), true);
 
         smol::block_on(project.scaffold_ffi_companion(true))
             .expect("an apple-selected scaffold must succeed");
