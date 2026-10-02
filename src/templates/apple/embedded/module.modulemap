@@ -1,0 +1,4 @@
+module CWaterUI {
+    umbrella "."
+    export *
+}

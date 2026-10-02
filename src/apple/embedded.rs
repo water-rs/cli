@@ -1,0 +1,436 @@
+//! Embedded Apple artifacts assembled without a native host project.
+
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
+
+use askama::Template;
+use eyre::{Result, bail};
+use smol::fs;
+use target_lexicon::{Aarch64Architecture, Architecture};
+
+use crate::{
+    apple::{app_bundle::copy_dir_contents, platform},
+    assets,
+    build::{BuildOptions, NativeLink},
+    platform::TargetPlatform,
+    project::Project,
+    toolchain::Host,
+};
+
+/// Stable local Swift package location consumed by a native host.
+#[derive(Debug)]
+pub struct EmbeddedArtifact {
+    /// Add this directory as a local package dependency in the native host.
+    pub package_path: PathBuf,
+    /// Binary C module containing the application's Rust archive.
+    pub xcframework_path: PathBuf,
+}
+
+#[derive(Template)]
+#[template(path = "apple/embedded/Package.swift.tpl", escape = "none")]
+struct PackageTemplate<'a> {
+    name: &'a str,
+    macos: &'a str,
+    ios: &'a str,
+    defines: &'a [String],
+    links: &'a [PlatformLinks],
+}
+
+struct PlatformLinks {
+    platform: &'static str,
+    links: Vec<NativeLink>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Slice {
+    platform: TargetPlatform,
+    name: &'static str,
+    triples: Vec<&'static str>,
+}
+
+fn slices(architecture: Option<Architecture>) -> Result<Vec<Slice>> {
+    let arm = match architecture {
+        None | Some(Architecture::Aarch64(Aarch64Architecture::Aarch64)) => true,
+        Some(Architecture::X86_64) => false,
+        Some(other) => bail!("Apple embedded artifacts do not support {other}"),
+    };
+    let intel = architecture.is_none() || architecture == Some(Architecture::X86_64);
+    let mut result = Vec::new();
+    for (platform, name, arm_triple, intel_triple) in [
+        (
+            TargetPlatform::MacOS,
+            "macos",
+            "aarch64-apple-darwin",
+            Some("x86_64-apple-darwin"),
+        ),
+        (TargetPlatform::IOS, "ios", "aarch64-apple-ios", None),
+        (
+            TargetPlatform::IOSSimulator,
+            "ios-simulator",
+            "aarch64-apple-ios-sim",
+            Some("x86_64-apple-ios"),
+        ),
+    ] {
+        let mut triples = Vec::new();
+        if arm {
+            triples.push(arm_triple);
+        }
+        if intel && let Some(triple) = intel_triple {
+            triples.push(triple);
+        }
+        if !triples.is_empty() {
+            result.push(Slice {
+                platform,
+                name,
+                triples,
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Build static Rust slices, then export the resolved backend's Swift seam
+/// and compiler-discovered resources as a local Swift package.
+///
+/// Cargo caches stay outside the replaced package directory. Each invocation
+/// assembles a fresh package before replacing the previous successful output.
+/// No executable, native project, application entry, or signing identity is used.
+///
+/// # Errors
+/// Returns errors from target selection, compilation, resource staging or Xcode.
+pub async fn build_xcframework(
+    project: &Project,
+    options: &BuildOptions,
+    architecture: Option<Architecture>,
+) -> Result<EmbeddedArtifact> {
+    let selected = slices(architecture)?;
+    let host = Host::current();
+    check_toolchain(&host, &selected).await?;
+    let package_parent = project.root().join("target/package");
+    fs::create_dir_all(&package_parent).await?;
+    let temporary_parent = package_parent.clone();
+    let temporary = smol::unblock(move || {
+        tempfile::Builder::new()
+            .prefix(".apple-embedded-")
+            .tempdir_in(temporary_parent)
+    })
+    .await?;
+    let package = temporary.path().join("package");
+    let source = package.join("Sources/WaterUI");
+    let backend = platform::apple_backend_source_root(project).await?;
+    copy_dir_contents(&backend.join("Sources/WaterUI"), &source).await?;
+    let headers = temporary.path().join("headers");
+    copy_dir_contents(&backend.join("Sources/CWaterUI/include"), &headers).await?;
+    fs::write(
+        headers.join("module.modulemap"),
+        include_str!("../templates/apple/embedded/module.modulemap"),
+    )
+    .await?;
+    let (links, manifests) =
+        assemble_slices(project, options, &host, &selected, temporary.path()).await?;
+    stage_resources(project, &source.join("Resources"), manifests).await?;
+    write_package(project, options, &package, &links).await?;
+    let destination = package_parent.join(format!("{}-apple", project.crate_name()));
+    replace_package(&package, &destination).await?;
+    smol::unblock(move || temporary.close()).await?;
+    Ok(EmbeddedArtifact {
+        xcframework_path: destination.join("CWaterUI.xcframework"),
+        package_path: destination,
+    })
+}
+
+async fn check_toolchain(host: &Host, selected: &[Slice]) -> Result<()> {
+    futures_util::future::try_join_all(selected.iter().map(|slice| {
+        let sdk = match slice.platform {
+            TargetPlatform::MacOS => crate::apple::toolchain::AppleSdk::Macos,
+            TargetPlatform::IOS => crate::apple::toolchain::AppleSdk::Ios,
+            TargetPlatform::IOSSimulator => crate::apple::toolchain::AppleSdk::IosSimulator,
+            _ => unreachable!("slices only returns supported Apple platforms"),
+        };
+        crate::toolchain_checks::check_apple(host, sdk)
+    }))
+    .await?;
+    Ok(())
+}
+
+async fn assemble_slices(
+    project: &Project,
+    options: &BuildOptions,
+    host: &Host,
+    selected: &[Slice],
+    staging: &Path,
+) -> Result<(
+    Vec<PlatformLinks>,
+    Vec<waterui_assets_planner::BundleManifest>,
+)> {
+    let mut arguments = vec![OsString::from("-create-xcframework")];
+    let mut links: Vec<PlatformLinks> = Vec::new();
+    let mut manifests = Vec::new();
+    for slice in selected {
+        let directory = staging.join(slice.name);
+        fs::create_dir_all(&directory).await?;
+        let mut archives = Vec::new();
+        for triple in &slice.triples {
+            let (built, native_links) = Box::pin(platform::build_rust_lib_with_links(
+                project,
+                slice.platform,
+                options
+                    .clone()
+                    .with_static_runtime()
+                    .with_target_triple(triple.parse()?)
+                    .with_output_dir(directory.join(triple)),
+            ))
+            .await?;
+            // Stage each target's actual symbol set: platform-gated asset
+            // declarations must not disappear when a later slice is built.
+            let (archive, symbols) = smol::unblock(move || {
+                let symbols = built.app_symbols()?;
+                Ok::<_, eyre::Report>((built.artifact, symbols))
+            })
+            .await?;
+            manifests.push(assets::plan_library_resources(project, &symbols, false).await?);
+            let swift_platform = if slice.platform == TargetPlatform::MacOS {
+                "macOS"
+            } else {
+                "iOS"
+            };
+            if !links
+                .iter()
+                .any(|entry| entry.platform == swift_platform && entry.links == native_links)
+            {
+                links.push(PlatformLinks {
+                    platform: swift_platform,
+                    links: native_links,
+                });
+            }
+            archives.push(archive);
+        }
+        let library = directory.join("libCWaterUI.a");
+        let mut lipo = vec![OsString::from("lipo"), OsString::from("-create")];
+        lipo.extend(archives.into_iter().map(PathBuf::into_os_string));
+        lipo.extend([OsString::from("-output"), library.clone().into_os_string()]);
+        host.run("xcrun", lipo).await?;
+        arguments.extend([
+            OsString::from("-library"),
+            library.into_os_string(),
+            OsString::from("-headers"),
+            staging.join("headers").into_os_string(),
+        ]);
+    }
+    arguments.extend([
+        OsString::from("-output"),
+        staging
+            .join("package/CWaterUI.xcframework")
+            .into_os_string(),
+    ]);
+    host.run("xcodebuild", arguments).await?;
+    Ok((links, manifests))
+}
+
+async fn write_package(
+    project: &Project,
+    options: &BuildOptions,
+    package: &Path,
+    links: &[PlatformLinks],
+) -> Result<()> {
+    let (_, macos) = platform::apple_deployment_target(project, TargetPlatform::MacOS).await?;
+    let (_, ios) = platform::apple_deployment_target(project, TargetPlatform::IOS).await?;
+    let mut defines = platform::apple_swift_defines(project).await?;
+    if !options.is_release() {
+        defines.push("DEBUG".to_owned());
+    }
+    let manifest = PackageTemplate {
+        name: project.crate_name().as_str(),
+        macos: &macos,
+        ios: &ios,
+        defines: &defines,
+        links,
+    }
+    .render()?;
+    fs::write(package.join("Package.swift"), manifest).await?;
+    fs::write(
+        package.join("Sources/WaterUI/WaterUIResources.swift"),
+        include_str!("../templates/apple/embedded/Resources.swift"),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn stage_resources(
+    project: &Project,
+    destination: &std::path::Path,
+    manifests: Vec<waterui_assets_planner::BundleManifest>,
+) -> Result<()> {
+    let manifest = merge_manifests(manifests)?;
+    assets::write_library_resources(&manifest, destination).await?;
+    let declarations =
+        assets::scan_fonts(project, &project.ffi_crate_path().join("Cargo.toml")).await?;
+    let mut fonts = assets::resolve_fonts(declarations).await?;
+    fonts.extend(assets::scan_project_font_assets(&manifest)?);
+    let font_dir = destination.join("fonts");
+    fs::create_dir_all(&font_dir).await?;
+    assets::copy_fonts(&fonts, &font_dir).await?;
+    assets::write_font_manifest(&fonts, &font_dir, None).await?;
+    Ok(())
+}
+
+fn merge_manifests(
+    manifests: Vec<waterui_assets_planner::BundleManifest>,
+) -> Result<waterui_assets_planner::BundleManifest> {
+    let mut manifests = manifests.into_iter();
+    let mut merged = manifests
+        .next()
+        .ok_or_else(|| eyre::eyre!("No Apple resource manifests were built"))?;
+    for manifest in manifests {
+        for asset in manifest.assets {
+            if let Some(existing) = merged
+                .assets
+                .iter()
+                .find(|existing| existing.logical_path == asset.logical_path)
+            {
+                if existing != &asset {
+                    bail!(
+                        "Apple slices declare conflicting assets at {}",
+                        asset.logical_path.display()
+                    );
+                }
+            } else {
+                merged.assets.push(asset);
+            }
+        }
+        for mount in manifest.mounts {
+            if !merged.mounts.contains(&mount) {
+                merged.mounts.push(mount);
+            }
+        }
+    }
+    merged
+        .assets
+        .sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
+    Ok(merged)
+}
+
+async fn replace_package(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    match fs::remove_dir_all(destination).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    fs::rename(source, destination).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_artifact_has_device_and_universal_desktop_and_simulator() {
+        let selected = slices(None).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|slice| slice.triples.len())
+                .collect::<Vec<_>>(),
+            [2, 1, 2]
+        );
+        assert_eq!(selected[1].platform, TargetPlatform::IOS);
+        assert_eq!(selected[2].platform, TargetPlatform::IOSSimulator);
+    }
+
+    #[test]
+    fn intel_has_no_device_slice() {
+        let selected = slices(Some(Architecture::X86_64)).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert!(
+            selected
+                .iter()
+                .all(|slice| slice.platform != TargetPlatform::IOS)
+        );
+    }
+
+    #[test]
+    fn package_uses_binary_module_and_preserves_resource_directories() {
+        let defines = vec!["WATERUI_NO_GPU".to_owned()];
+        let links = vec![PlatformLinks {
+            platform: "macOS",
+            links: vec![NativeLink {
+                name: "CoreFoundation".to_owned(),
+                framework: true,
+            }],
+        }];
+        let rendered = PackageTemplate {
+            name: "fixture",
+            macos: "26.0",
+            ios: "26.0",
+            defines: &defines,
+            links: &links,
+        }
+        .render()
+        .unwrap();
+        assert!(rendered.contains(".binaryTarget(name: \"CWaterUI\""));
+        assert!(rendered.contains(".copy(\"Resources/waterui_assets\")"));
+        assert!(rendered.contains(".define(\"WATERUI_NO_GPU\")"));
+        assert!(!rendered.contains("VideoToolbox"));
+        assert!(
+            rendered.contains(".linkedFramework(\"CoreFoundation\", .when(platforms: [.macOS]))")
+        );
+    }
+
+    fn resource_manifest(name: &str) -> waterui_assets_planner::BundleManifest {
+        waterui_assets_planner::BundleManifest {
+            crate_root: PathBuf::from("/fixture"),
+            assets_root: PathBuf::from("/fixture/assets"),
+            mounts: Vec::new(),
+            assets: vec![waterui_assets_planner::PlannedAsset {
+                mount: String::new(),
+                source_path: PathBuf::from("/fixture/assets").join(name),
+                relative_path: PathBuf::from(name),
+                logical_path: PathBuf::from(name),
+                kind: waterui_assets_core::AssetKind::Data,
+                role: waterui_assets_planner::AssetRole::Regular,
+            }],
+        }
+    }
+
+    #[test]
+    fn resource_union_keeps_platform_specific_assets_and_deduplicates_shared_assets() {
+        let merged = merge_manifests(vec![
+            resource_manifest("desktop.json"),
+            resource_manifest("phone.json"),
+            resource_manifest("desktop.json"),
+        ])
+        .unwrap();
+        assert_eq!(merged.assets.len(), 2);
+        assert_eq!(merged.assets[0].logical_path, Path::new("desktop.json"));
+        assert_eq!(merged.assets[1].logical_path, Path::new("phone.json"));
+    }
+
+    #[test]
+    fn resource_union_rejects_conflicting_platform_definitions() {
+        let first = resource_manifest("shared.json");
+        let mut second = first.clone();
+        second.assets[0].source_path = PathBuf::from("/other/shared.json");
+        assert!(merge_manifests(vec![first, second]).is_err());
+    }
+
+    #[test]
+    fn replacement_removes_obsolete_slices_and_resources() {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let old = root.path().join("old");
+            let new = root.path().join("new");
+            fs::create_dir_all(old.join("stale-slice")).await.unwrap();
+            fs::create_dir_all(&new).await.unwrap();
+            fs::write(new.join("current"), "current").await.unwrap();
+            replace_package(&new, &old).await.unwrap();
+            assert!(!old.join("stale-slice").exists());
+            assert_eq!(
+                fs::read_to_string(old.join("current")).await.unwrap(),
+                "current"
+            );
+        });
+    }
+}

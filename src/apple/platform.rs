@@ -165,12 +165,28 @@ async fn apple_ffi_build_features(
 ///
 /// # Errors
 /// Returns an error if the Rust build fails or the expected Apple archive cannot be copied.
-#[allow(clippy::too_many_lines)]
 pub async fn build_rust_lib(
     project: &Project,
     platform: TargetPlatform,
     options: BuildOptions,
 ) -> eyre::Result<BuiltTarget> {
+    build_rust_lib_with_links(project, platform, options)
+        .await
+        .map(|(built, _)| built)
+}
+
+/// Compile the library and retain rustc's native dependency contract for embedding.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn build_rust_lib_with_links(
+    project: &Project,
+    platform: TargetPlatform,
+    options: BuildOptions,
+) -> eyre::Result<(BuiltTarget, Vec<crate::build::NativeLink>)> {
+    let options = if project.manifest().package.embedded {
+        options.with_static_runtime()
+    } else {
+        options
+    };
     // Resolve fonts BEFORE cargo build - this ensures icons.json is present
     // for crates like fontawesome7 that need it during build.rs
     let font_declarations =
@@ -199,6 +215,9 @@ pub async fn build_rust_lib(
     if let Some(progress) = options.progress() {
         build = build.with_progress(progress.clone());
     }
+    if project.manifest().package.embedded {
+        build = build.with_final_rustc_arg("--print=native-static-libs");
+    }
     build = build
         .with_env("PKG_CONFIG_ALLOW_CROSS", "1")
         .with_env(format!("PKG_CONFIG_ALLOW_CROSS_{target_underscore}"), "1")
@@ -224,9 +243,6 @@ pub async fn build_rust_lib(
     // keeps the host-provides-the-seam contract: the ffi crate's own build
     // script leaves its `waterui_swift_*` references explicitly undefined,
     // and they resolve against the image that loaded it.
-    let seam_library_dir =
-        apple_swift_seam_dir(project, platform, &deployment_target, !options.is_release()).await?;
-
     let target_dir = project.water_target_dir(options.linkage()).await?;
     let build = build.with_target_dir(target_dir.clone());
     let built_target = match host_library {
@@ -272,6 +288,18 @@ pub async fn build_rust_lib(
             dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
         }
     }
+
+    if project.manifest().package.embedded {
+        let links = build
+            .clone()
+            .with_crate_type_override("staticlib")
+            .native_static_libraries(options.is_release())
+            .await?;
+        return Ok((built_target, links));
+    }
+
+    let seam_library_dir =
+        apple_swift_seam_dir(project, platform, &deployment_target, !options.is_release()).await?;
 
     // The Swift seam's callbacks into the app (`_waterui_init`,
     // `_waterui_app`) and every `waterui_*` export resolve inside the one
@@ -365,7 +393,7 @@ pub async fn build_rust_lib(
             .await?;
     }
 
-    Ok(built_target)
+    Ok((built_target, Vec::new()))
 }
 
 /// The `-D` flags the Swift seam compiles with, read off the application's
@@ -374,7 +402,7 @@ pub async fn build_rust_lib(
 /// the matching bridge in, `WATERUI_NO_MEDIA`/`WATERUI_NO_GPU` opt the
 /// absent capability's C calls out so the archive never references symbols
 /// the dylib does not export.
-async fn apple_swift_defines(project: &Project) -> eyre::Result<Vec<String>> {
+pub(crate) async fn apple_swift_defines(project: &Project) -> eyre::Result<Vec<String>> {
     let build_manifest = project.ffi_crate_path().join("Cargo.toml");
     let mut defines = Vec::new();
     for (capability, define) in [("map", "WATERUI_MAP"), ("webview", "WATERUI_WEBVIEW")] {
@@ -654,7 +682,7 @@ fn validate_local_apple_backend(project: &Project) -> eyre::Result<()> {
 ///
 /// # Errors
 /// Returns an error when the backend source cannot be located.
-async fn apple_backend_source_root(project: &Project) -> eyre::Result<PathBuf> {
+pub(crate) async fn apple_backend_source_root(project: &Project) -> eyre::Result<PathBuf> {
     if let Some(backend_path) = project
         .manifest()
         .backends

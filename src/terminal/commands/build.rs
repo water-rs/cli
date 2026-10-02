@@ -148,7 +148,7 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
 }
 
 /// `water build` on an embedded project produces the artifact the host
-/// application consumes — the Android AAR — rather than a runnable binary.
+/// application consumes — an Android AAR or Apple Swift package.
 ///
 /// The AAR carries every ABI unless `--arch` narrows the set, lands at
 /// `target/package/` inside the project, and is published to `mavenLocal`
@@ -157,13 +157,14 @@ pub async fn run(shell: &Shell, args: Args) -> Result<()> {
 async fn run_embedded_build(shell: &Shell, args: &Args, context: &BuildContext) -> Result<()> {
     if args.output_dir.is_some() {
         bail!(
-            "--output-dir does not apply to embedded projects: the AAR lands at target/package/ and publishes to mavenLocal"
+            "--output-dir does not apply to embedded projects: artifacts land at target/package/"
         );
     }
+    if context.backend == TargetBackend::Apple {
+        return Box::pin(run_embedded_apple_build(shell, args, context)).await;
+    }
     if args.platform != TargetPlatform::Android {
-        bail!(
-            "embedded projects only support --platform android: the embedded artifact is an Android AAR"
-        );
+        bail!("embedded projects support the Apple and Android backends");
     }
 
     let abis: Vec<AndroidAbi> = args.arch.map_or_else(
@@ -221,6 +222,45 @@ async fn run_embedded_build(shell: &Shell, args: &Args, context: &BuildContext) 
             Err(err)
         }
     }
+}
+
+async fn run_embedded_apple_build(
+    shell: &Shell,
+    args: &Args,
+    context: &BuildContext,
+) -> Result<()> {
+    let architecture = args.arch.map(|arch| match arch {
+        TargetArch::Arm64 => Architecture::Aarch64(Aarch64Architecture::Aarch64),
+        TargetArch::X86_64 => Architecture::X86_64,
+        TargetArch::Armv7 | TargetArch::X86 => unreachable!("Apple architectures were validated"),
+    });
+    let spinner = shell.spinner("Building embedded Apple package...");
+    let result = Box::pin(
+        shell.display_output(waterui_cli::apple::embedded::build_xcframework(
+            &context.project,
+            &context.build_options,
+            architecture,
+        )),
+    )
+    .await;
+    if let Some(progress) = spinner {
+        progress.finish_and_clear();
+    }
+    let artifact = result?;
+    success!(
+        shell,
+        "Embedded Swift package at {}",
+        artifact.package_path.display()
+    );
+    line!(
+        shell,
+        "Add this local package to the native host and import WaterUI."
+    );
+    line!(
+        shell,
+        "Mount WaterUI.App(), WaterUIView, or WaterUIViewController."
+    );
+    Ok(())
 }
 
 async fn prepare_build_context(shell: &Shell, args: &Args) -> Result<Option<BuildContext>> {

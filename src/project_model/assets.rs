@@ -1704,6 +1704,8 @@ fn sha256_hex(s: &str) -> String {
     hex::encode(result)
 }
 
+pub(crate) use unified::{build_manifest as plan_library_resources, write_library_resources};
+
 /// Stage project assets for Apple packaging (Asset Catalog + raw resources).
 ///
 /// `symbols` is the library artifact the target build already produced
