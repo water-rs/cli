@@ -332,6 +332,14 @@ async fn android_template_context(
 
 /// Render the generated Gradle app into `<backend>/android` for `painter`.
 ///
+/// The ffi companion is rendered for this invocation first: it is not a
+/// managed native backend, so `Project::open` never produces one for a
+/// hydrolysis selection, yet `package_with_abis` reads its manifest to
+/// mirror the app's feature selection onto the Gradle classpath. A
+/// companion left over from a different selection must not be the one it
+/// sees, so this renders it unconditionally — never an Apple one, this
+/// backend has no Apple entry.
+///
 /// # Errors
 ///
 /// Returns an error when template rendering or file writing fails.
@@ -341,6 +349,7 @@ pub async fn scaffold_android_project(
     host_project_dir: &Path,
 ) -> eyre::Result<()> {
     let backend_path = project.backend_path::<HydrolysisBackend>();
+    project.scaffold_ffi_companion(false).await?;
     let ctx = android_template_context(project, painter, host_project_dir).await?;
     templates::hydrolysis_android::scaffold(&android_dir(&backend_path), &ctx).await?;
     Ok(())
@@ -634,6 +643,56 @@ mod tests {
         )
         .expect("Cargo.lock");
         std::fs::write(root.join("src/lib.rs"), "").expect("lib.rs");
+
+        // The ffi companion's feature-table probe resolves the generated
+        // manifest's registry pins through `cargo metadata`; the workspace
+        // `[patch.crates-io]` table the scaffold propagates redirects them to
+        // local stubs — the only source `[patch]` can redirect without a
+        // crates.io index — so the probe exercises the real generated
+        // manifest without a published `waterui-*` 0.4.1 to find.
+        let vendor_dir = temporary.path().join("vendor");
+        crate::framework::test_fixtures::write_vendor_stub(
+            &vendor_dir.join("waterui"),
+            "waterui",
+            &["dynamic_linking", "media"],
+        );
+        crate::framework::test_fixtures::write_vendor_stub(
+            &vendor_dir.join("waterui-ffi"),
+            "waterui-ffi",
+            &[
+                "android-jni",
+                "c-api",
+                "chromium",
+                "dev",
+                "gpu",
+                "inspector",
+                "map",
+                "media",
+                "video",
+                "webview",
+                "webview-cef",
+            ],
+        );
+        let manifest_path = root.join("Cargo.toml");
+        let mut document: toml_edit::DocumentMut = std::fs::read_to_string(&manifest_path)
+            .expect("project Cargo.toml exists")
+            .parse()
+            .expect("project Cargo.toml parses");
+        for name in ["waterui", "waterui-ffi"] {
+            document["patch"]["crates-io"][name]["path"] =
+                toml_edit::value(vendor_dir.join(name).to_string_lossy().as_ref());
+        }
+        std::fs::write(&manifest_path, document.to_string()).expect("write the patch table");
+
+        // `Project::open` resolves the project's layout with `cargo metadata
+        // --locked`; a plain offline resolve records the patched sources in
+        // the lock first.
+        cargo_metadata::MetadataCommand::new()
+            .manifest_path(&manifest_path)
+            .other_options(vec!["--offline".to_string()])
+            .exec()
+            .expect("offline metadata resolves the patched project");
+
         let project = Project::open(&root, ManagedBackends::NONE)
             .await
             .expect("fixture project opens");
@@ -891,6 +950,35 @@ mod tests {
             assert!(
                 gradle.contains(&format!("resolve(\"{}\")", entry.project_root)),
                 "the rendered projectRoot uses the android-dir-relative path: {gradle}"
+            );
+        });
+    }
+
+    /// A cold managed-backend cache: opening with `ManagedBackends::NONE`
+    /// leaves no ffi companion, and the Gradle packaging step reads its
+    /// manifest for the classpath staging. The Android scaffold step must
+    /// render it rather than rely on a prior native-Android open.
+    #[test]
+    fn the_android_scaffold_renders_the_ffi_companion_on_a_cold_cache() {
+        smol::block_on(async {
+            let (_temporary, project) = fixture_project("").await;
+            assert!(
+                !project.ffi_crate_path().join("Cargo.toml").exists(),
+                "fixture opened with no managed backends: no companion scaffolded"
+            );
+            let (_machine, host) = machine_with_staged_host(Path::new("staged"), &["gpu"]);
+            let host_project_dir =
+                require_painter_module(&host, &project, HydrolysisAndroidPainter::Gpu)
+                    .await
+                    .expect("host project dir");
+
+            scaffold_android_project(&project, HydrolysisAndroidPainter::Gpu, &host_project_dir)
+                .await
+                .expect("android scaffold renders");
+
+            assert!(
+                project.ffi_crate_path().join("Cargo.toml").exists(),
+                "the packaging path rendered the companion manifest it reads"
             );
         });
     }

@@ -2873,12 +2873,12 @@ mod scaffold_tests {
         ))
         .expect("project creation must succeed");
 
-        write_vendor_stub(
+        crate::framework::test_fixtures::write_vendor_stub(
             &vendor_dir.join("waterui"),
             "waterui",
             &["dynamic_linking", "media"],
         );
-        write_vendor_stub(
+        crate::framework::test_fixtures::write_vendor_stub(
             &vendor_dir.join("waterui-ffi"),
             "waterui-ffi",
             &[
@@ -2895,7 +2895,7 @@ mod scaffold_tests {
                 "webview-cef",
             ],
         );
-        write_vendor_stub(
+        crate::framework::test_fixtures::write_vendor_stub(
             &vendor_dir.join("waterui-apple"),
             "waterui-apple",
             &["map", "media", "webview"],
@@ -2982,22 +2982,6 @@ mod scaffold_tests {
                 android_path.display()
             );
         }
-    }
-
-    /// Write a stub crate at `dir` whose manifest declares `features` — cargo
-    /// validates every `dep/feature` a manifest forwards, so the stubs cover
-    /// the feature sets the generated manifests name.
-    fn write_vendor_stub(dir: &Path, name: &str, features: &[&str]) {
-        std::fs::create_dir_all(dir.join("src")).expect("stub crate dir");
-        let mut stub_manifest = toml_edit::DocumentMut::new();
-        stub_manifest["package"]["name"] = toml_edit::value(name);
-        stub_manifest["package"]["version"] = toml_edit::value("0.4.1");
-        stub_manifest["package"]["edition"] = toml_edit::value("2021");
-        for feature in features {
-            stub_manifest["features"][feature] = toml_edit::value(toml_edit::Array::new());
-        }
-        std::fs::write(dir.join("Cargo.toml"), stub_manifest.to_string()).expect("stub manifest");
-        std::fs::write(dir.join("src/lib.rs"), "").expect("stub lib");
     }
 
     /// An ffi companion a previous apple-selected render left behind — a
