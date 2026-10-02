@@ -19,6 +19,9 @@ use crate::{
 };
 
 #[cfg(target_os = "macos")]
+use crate::apple::provisioning;
+
+#[cfg(target_os = "macos")]
 use crate::toolchain::Host;
 
 /// The on-disk layout of an assembled application bundle.
@@ -477,18 +480,37 @@ pub async fn sign_apple_app(
     backend: &AppleBackend,
     backend_root: &Path,
     project: &Project,
+    deployment_target: &str,
 ) -> eyre::Result<()> {
     if platform == TargetPlatform::MacOS {
         #[cfg(target_os = "macos")]
         {
+            use crate::platform::PackageAudience;
+
             let requires_stable_identity =
                 project.manifest().permissions.iter().any(|(key, entry)| {
                     entry.is_enabled() && !key.macos_usage_description_keys().is_empty()
                 });
+            let signing = match options.audience() {
+                PackageAudience::Development => crate::macos_bundle::MacOsSigning::Development {
+                    requires_stable_identity,
+                },
+                PackageAudience::Distribution => {
+                    let entitlements = backend_root
+                        .join(&backend.scheme)
+                        .join(format!("{}.entitlements", backend.scheme));
+                    crate::macos_bundle::MacOsSigning::Distribution(
+                        crate::macos_bundle::DistributionSigning::from_manifest(
+                            project.manifest().signing.macos.as_ref(),
+                            entitlements.is_file().then_some(entitlements),
+                        )?,
+                    )
+                }
+            };
             crate::macos_bundle::sign_macos_app(
                 &layout.app_path,
                 project.bundle_identifier(),
-                requires_stable_identity,
+                &signing,
             )
             .await?;
             return Ok(());
@@ -513,7 +535,16 @@ pub async fn sign_apple_app(
     let entitlements = backend_root
         .join(&backend.scheme)
         .join(format!("{}.entitlements", backend.scheme));
-    sign_device_app(layout, project, &entitlements).await
+    sign_device_app(
+        layout,
+        project,
+        options,
+        platform,
+        &entitlements,
+        backend_root,
+        deployment_target,
+    )
+    .await
 }
 
 /// Run `codesign` over every member of `frameworks_dir`, then the bundle
@@ -574,42 +605,100 @@ async fn codesign_path(
     Ok(())
 }
 
-/// Sign a device build with the resolved development identity, embedding the
-/// development provisioning profile that covers the bundle id — the
-/// responsibilities `xcodebuild` automatic signing used to take.
+/// Sign a device build with the resolved development identity.
 ///
 /// The provisioning profile supplies the entitlements (application
 /// identifier, team identifier, `get-task-allow`) the signature must claim;
-/// the generated project's `.entitlements` file is merged over them.
+/// the generated project's `.entitlements` file is merged over them. When no
+/// installed profile validates for the request, `xcodebuild
+/// -allowProvisioningUpdates` mints one first; selection is re-run and a
+/// second failure reports every candidate's rejection.
+///
+/// The entitlement dictionary the signature claims is built from the
+/// selected profile's grants — concretized per TN2415 so no wildcard value
+/// reaches `codesign` — not copied from it verbatim.
 #[cfg(target_os = "macos")]
 async fn sign_device_app(
     layout: &AppleAppLayout,
     project: &Project,
+    options: &PackageOptions,
+    platform: TargetPlatform,
     entitlements_path: &Path,
+    backend_root: &Path,
+    deployment_target: &str,
 ) -> eyre::Result<()> {
     let host = Host::current();
     let bundle_id = project.bundle_identifier();
     let team = crate::apple::toolchain::development_team_id(&host).await?;
-    let profile = find_development_profile(&host, &team, bundle_id).await?;
-    let profile_data = decode_profile(&host, &profile).await?;
-    let identity = development_identity(&host, &team, &profile, &profile_data).await?;
 
-    copy_file(&profile, layout.app_path.join("embedded.mobileprovision")).await?;
-
-    let mut entitlements = profile_entitlements(&profile, &profile_data)?;
-    if entitlements_path.is_file()
-        && let plist::Value::Dictionary(project_entitlements) =
-            plist::Value::from_file(entitlements_path).wrap_err_with(|| {
+    let project_entitlements = match fs::read(entitlements_path).await {
+        Ok(bytes) => {
+            match plist::Value::from_reader(std::io::Cursor::new(bytes)).wrap_err_with(|| {
                 format!(
                     "Failed to read entitlements {}",
                     entitlements_path.display()
                 )
-            })?
-    {
-        for (key, value) in project_entitlements {
-            entitlements.insert(key, value);
+            })? {
+                plist::Value::Dictionary(dict) => dict,
+                _ => bail!(
+                    "entitlements {} is not a plist dictionary",
+                    entitlements_path.display()
+                ),
+            }
         }
-    }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => plist::Dictionary::new(),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!(
+                    "Failed to read entitlements {}",
+                    entitlements_path.display()
+                )
+            });
+        }
+    };
+
+    let request = provisioning::SigningRequest {
+        team: &team,
+        bundle_id,
+        device_udid: options.device_udid(),
+        entitlements: &project_entitlements,
+        platform,
+    };
+    let selection = match provisioning::select_development_profile(&host, &request).await {
+        Ok(selection) => selection,
+        Err(provisioning::SelectError::NoMatch(first)) => {
+            info!("{first}; asking xcodebuild to provision one");
+            provisioning::provision_via_xcodebuild(
+                &host,
+                &request,
+                &backend_root.join("DerivedData/Provisioning"),
+                deployment_target,
+            )
+            .await?;
+            match provisioning::select_development_profile(&host, &request).await {
+                Ok(selection) => selection,
+                Err(provisioning::SelectError::NoMatch(still)) => {
+                    bail!(
+                        "xcodebuild installed a profile but no installed profile qualifies: {still}"
+                    )
+                }
+                Err(provisioning::SelectError::Failed(error)) => return Err(error),
+            }
+        }
+        Err(provisioning::SelectError::Failed(error)) => return Err(error),
+    };
+
+    // Selection already paired the profile with a usable keychain identity:
+    // `selection.identity` is the SHA-1 `codesign --sign` takes.
+    let identity = &selection.identity;
+    copy_file(
+        &selection.path,
+        layout.app_path.join("embedded.mobileprovision"),
+    )
+    .await?;
+
+    let entitlements =
+        provisioning::signing_entitlements(&selection.data, &request, &selection.app_id_prefix)?;
     let app_name = layout
         .app_path
         .file_name()
@@ -625,7 +714,7 @@ async fn sign_device_app(
     codesign_bundle(
         &layout.app_path,
         &layout.frameworks_dir,
-        &identity,
+        identity,
         Some(&merged),
         Some(bundle_id),
     )
@@ -646,292 +735,11 @@ async fn sign_device_app(
 async fn sign_device_app(
     _layout: &AppleAppLayout,
     _project: &Project,
+    _options: &PackageOptions,
+    _platform: TargetPlatform,
     _entitlements_path: &Path,
+    _backend_root: &Path,
+    _deployment_target: &str,
 ) -> eyre::Result<()> {
     bail!("Apple device signing requires macOS (codesign and the provisioning profiles live there)")
-}
-
-/// The keychain development identity `profile` was issued for, from
-/// `security find-identity -v -p codesigning`.
-///
-/// Xcode pairs a provisioning profile with the `Apple Development`
-/// certificate listed in its `DeveloperCertificates`; `find-identity`
-/// reports the same certificate SHA-1 for each keychain identity, so the
-/// identity whose hash the profile names is the one `codesign` should
-/// use.
-#[cfg(target_os = "macos")]
-async fn development_identity(
-    host: &Host,
-    team: &str,
-    profile: &Path,
-    profile_data: &plist::Dictionary,
-) -> eyre::Result<String> {
-    let output = host
-        .output("security", ["find-identity", "-v", "-p", "codesigning"])
-        .await
-        .wrap_err("failed to run `security find-identity`")?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    pick_profile_identity(&stdout, profile_data).ok_or_else(|| {
-        eyre::eyre!(
-            "The keychain holds no `Apple Development` certificate the \
-             provisioning profile {} was issued for (team {team}). Open \
-             Xcode → Settings → Accounts → Manage Certificates and add the \
-             development certificate this profile lists, then re-run \
-             `water package`.",
-            profile.display()
-        )
-    })
-}
-
-/// SHA-1 of a DER certificate as uppercase hex — the hash `find-identity`
-/// prints for each identity.
-#[cfg(target_os = "macos")]
-fn certificate_sha1_hex(der: &[u8]) -> String {
-    use sha1::Digest as _;
-    hex::encode_upper(sha1::Sha1::digest(der))
-}
-
-/// SHA-1 hashes of every certificate in a decoded profile's
-/// `DeveloperCertificates` array.
-#[cfg(target_os = "macos")]
-fn profile_certificate_hashes(data: &plist::Dictionary) -> std::collections::HashSet<String> {
-    data.get("DeveloperCertificates")
-        .and_then(plist::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|value| value.as_data().map(certificate_sha1_hex))
-        .collect()
-}
-
-/// `(sha-1, display name)` pairs `security find-identity -v -p
-/// codesigning` lists, for development identities only — each entry looks
-/// like `  1) 40HEXDIGITS "Apple Development: name (id)"`.
-#[cfg(target_os = "macos")]
-fn development_identities(output: &str) -> Vec<(String, String)> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let entry = line.split_once(')')?.1.trim();
-            let (hash, name) = entry.split_once(' ')?;
-            let name = name.trim().trim_matches('"');
-            crate::apple::toolchain::is_development_certificate_name(name)
-                .then(|| (hash.to_string(), name.to_string()))
-        })
-        .collect()
-}
-
-/// The identity hash the profile's `DeveloperCertificates` names, if the
-/// keychain holds it.
-#[cfg(target_os = "macos")]
-fn pick_profile_identity(find_identity: &str, data: &plist::Dictionary) -> Option<String> {
-    let accepted = profile_certificate_hashes(data);
-    development_identities(find_identity)
-        .into_iter()
-        .map(|(hash, _)| hash)
-        .find(|hash| accepted.contains(hash))
-}
-
-/// Decode a `.mobileprovision` file with `security cms` into its plist
-/// dictionary — `security cms -D -i` writes the embedded plist to stdout.
-#[cfg(target_os = "macos")]
-async fn decode_profile(host: &Host, profile: &Path) -> eyre::Result<plist::Dictionary> {
-    let output = host
-        .output(
-            "security",
-            [
-                "cms".into(),
-                "-D".into(),
-                "-i".into(),
-                profile.as_os_str().to_owned(),
-            ],
-        )
-        .await
-        .wrap_err_with(|| format!("failed to decode {}", profile.display()))?;
-    if !output.status.success() {
-        bail!(
-            "`security cms` rejected {}: {}",
-            profile.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let value = plist::Value::from_reader(std::io::Cursor::new(&output.stdout))
-        .wrap_err_with(|| format!("{} is not a provisioning profile", profile.display()))?;
-    let plist::Value::Dictionary(root) = value else {
-        bail!(
-            "{} does not decode to a plist dictionary",
-            profile.display()
-        );
-    };
-    Ok(root)
-}
-
-/// The `Entitlements` dictionary of a decoded provisioning profile.
-#[cfg(target_os = "macos")]
-fn profile_entitlements(
-    profile: &Path,
-    data: &plist::Dictionary,
-) -> eyre::Result<plist::Dictionary> {
-    match data.get("Entitlements") {
-        Some(plist::Value::Dictionary(entitlements)) => Ok(entitlements.clone()),
-        _ => bail!("{} carries no Entitlements dictionary", profile.display()),
-    }
-}
-
-/// The installed development provisioning profile whose application
-/// identifier is `<team>.<bundle_id>` (or a wildcard), searched in the two
-/// profile directories Xcode maintains.
-#[cfg(target_os = "macos")]
-async fn find_development_profile(
-    host: &Host,
-    team: &str,
-    bundle_id: &str,
-) -> eyre::Result<PathBuf> {
-    use smol::stream::StreamExt as _;
-
-    let expected = format!("{team}.{bundle_id}");
-    let mut candidates = Vec::new();
-    let Some(home) = host.home_dir() else {
-        bail!("Cannot locate the provisioning profile directory: no home directory");
-    };
-    for directory in [
-        home.join("Library/MobileDevice/Provisioning Profiles"),
-        home.join("Library/Developer/Xcode/UserData/Provisioning Profiles"),
-    ] {
-        if !directory.is_dir() {
-            continue;
-        }
-        let mut entries = fs::read_dir(&directory).await?;
-        while let Some(entry) = entries.next().await {
-            let path = entry?.path();
-            if path.extension().and_then(std::ffi::OsStr::to_str) == Some("mobileprovision") {
-                candidates.push(path);
-            }
-        }
-    }
-    candidates.sort();
-
-    for profile in candidates {
-        let Ok(data) = decode_profile(host, &profile).await else {
-            continue;
-        };
-        let Some(identifier) = data
-            .get("Entitlements")
-            .and_then(plist::Value::as_dictionary)
-            .and_then(|entitlements| entitlements.get("application-identifier"))
-            .and_then(plist::Value::as_string)
-        else {
-            continue;
-        };
-        if identifier == expected || identifier == format!("{team}.*") {
-            return Ok(profile);
-        }
-    }
-
-    bail!(
-        "No development provisioning profile for {expected} found in \
-         ~/Library/MobileDevice/Provisioning Profiles. `xcodebuild` used to \
-         mint one; open the project in Xcode and build for a device once, or \
-         install a profile from the Apple Developer portal."
-    )
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::{
-        certificate_sha1_hex, development_identities, pick_profile_identity,
-        profile_certificate_hashes,
-    };
-
-    /// The self-signed `Apple Development`-shaped fixture certificate from
-    /// `toolchain/testdata`; `sha1sum` of its DER is
-    /// `5d03dd01b4f95d47874c9bfd9367a978d838a228`.
-    const DEV_CERT_PEM: &str = include_str!("../toolchain/testdata/apple_development.pem");
-    const DEV_CERT_SHA1: &str = "5D03DD01B4F95D47874C9BFD9367A978D838A228";
-    const OTHER_CERT_SHA1: &str = "AAAAAAAABBBBBBBBCCCCCCCCDDDDDDDDEEEEEEEE";
-
-    fn dev_cert_der() -> Vec<u8> {
-        x509_parser::pem::Pem::iter_from_buffer(DEV_CERT_PEM.as_bytes())
-            .next()
-            .expect("the fixture holds one PEM block")
-            .expect("the fixture PEM decodes")
-            .contents
-    }
-
-    fn find_identity_output() -> String {
-        format!(
-            "     1) {DEV_CERT_SHA1} \"Apple Development: devin.test@example.com (TESTCERT42)\"\n     2) {OTHER_CERT_SHA1} \"Apple Development: devin.other@example.com (OTHERID9X)\"\n     2 valid identities found\n"
-        )
-    }
-
-    #[test]
-    fn certificate_sha1_matches_openssl() {
-        assert_eq!(certificate_sha1_hex(&dev_cert_der()), DEV_CERT_SHA1);
-    }
-
-    #[test]
-    fn identity_pairs_with_a_profile_certificate() {
-        let profile = plist::Dictionary::from_iter([(
-            "DeveloperCertificates".to_string(),
-            plist::Value::Array(vec![plist::Value::Data(dev_cert_der())]),
-        )]);
-        assert_eq!(
-            pick_profile_identity(&find_identity_output(), &profile).as_deref(),
-            Some(DEV_CERT_SHA1)
-        );
-    }
-
-    #[test]
-    fn identity_absent_when_profile_lists_another_certificate() {
-        let profile = plist::Dictionary::from_iter([(
-            "DeveloperCertificates".to_string(),
-            plist::Value::Array(vec![plist::Value::Data(vec![0xDE, 0xAD])]),
-        )]);
-        assert_eq!(
-            pick_profile_identity(&find_identity_output(), &profile),
-            None
-        );
-    }
-
-    #[test]
-    fn non_development_identities_are_skipped() {
-        let find_identity = format!(
-            "     1) {DEV_CERT_SHA1} \"Devin Signing Test\"\n     1 valid identities found\n"
-        );
-        let profile = plist::Dictionary::from_iter([(
-            "DeveloperCertificates".to_string(),
-            plist::Value::Array(vec![plist::Value::Data(dev_cert_der())]),
-        )]);
-        assert_eq!(pick_profile_identity(&find_identity, &profile), None);
-    }
-
-    #[test]
-    fn a_profile_without_certificates_matches_nothing() {
-        assert_eq!(
-            pick_profile_identity(&find_identity_output(), &plist::Dictionary::new()),
-            None
-        );
-    }
-
-    #[test]
-    fn find_identity_parsing_keeps_development_names_only() {
-        let output = find_identity_output()
-            + "     3) DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF \"Apple Distribution: x\"\n";
-        let identities = development_identities(&output);
-        assert_eq!(identities.len(), 2);
-        assert_eq!(identities[0].0, DEV_CERT_SHA1);
-    }
-
-    #[test]
-    fn profile_hash_set_covers_every_certificate() {
-        let profile = plist::Dictionary::from_iter([(
-            "DeveloperCertificates".to_string(),
-            plist::Value::Array(vec![
-                plist::Value::Data(dev_cert_der()),
-                plist::Value::Data(vec![0x01, 0x02]),
-            ]),
-        )]);
-        let hashes = profile_certificate_hashes(&profile);
-        assert_eq!(hashes.len(), 2);
-        assert!(hashes.contains(DEV_CERT_SHA1));
-    }
 }

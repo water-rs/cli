@@ -194,6 +194,17 @@ async fn apple_build_features(
     let mut features = apple_dependency_features(project, browser_runtime).await?;
     if linkage == RustLinkage::SharedRuntime {
         features.push("dev".to_string());
+        // The inspector is devtooling: development sessions get it through the
+        // shared-runtime linkage while a packaged build leaves its server
+        // stack out. The generated manifest forwards `inspector` only when
+        // the resolved `waterui-ffi` declares it, so the build can only name
+        // it when the scaffold declared it.
+        if crate::templates::generated_ffi_manifest_declares(
+            &project.ffi_crate_path().join("Cargo.toml"),
+            "inspector",
+        )? {
+            features.push("inspector".to_string());
+        }
     }
     Ok(features)
 }
@@ -288,6 +299,16 @@ pub(crate) async fn build_rust_lib_with_links(
         }
     };
 
+    let staged_dir = options.output_dir().map(PathBuf::from);
+    let deps_dir = target_dir
+        .join(&target)
+        .join(if options.is_release() {
+            "release"
+        } else {
+            "debug"
+        })
+        .join("deps");
+
     // Stage the host library and shared runtime before the executable links,
     // so its dependencies already carry their final install names.
     if let Some(output_dir) = options.output_dir() {
@@ -308,6 +329,16 @@ pub(crate) async fn build_rust_lib_with_links(
             }
             dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
         }
+    } else if host_library == AppleHostLibrary::Dynamic {
+        // Without an output directory the link's runtime search dir is the
+        // deps dir below, which Cargo fills only with the hashed
+        // `libwaterui_dylib-<metadata>.dylib` — so `-lwaterui_dylib` cannot
+        // resolve. Stage the canonical install-name copy there first, with
+        // the same `@rpath` handling the packaged staging path performs
+        // (cli#272).
+        let libraries = RustDynamicLibraries::resolve(&built_target, &triple, project).await?;
+        let staged_runtime = libraries.stage_apple_canonical(&deps_dir).await?;
+        dynamic_runtime::prepare_host_runtime(&staged_runtime).await?;
     }
 
     if project.manifest().package.embedded {
@@ -321,15 +352,6 @@ pub(crate) async fn build_rust_lib_with_links(
 
     // The Rust entry links the companion rlib, carrying backend native links
     // and app exports into one image.
-    let staged_dir = options.output_dir().map(PathBuf::from);
-    let deps_dir = target_dir
-        .join(&target)
-        .join(if options.is_release() {
-            "release"
-        } else {
-            "debug"
-        })
-        .join("deps");
     #[cfg(target_os = "macos")]
     if host_library == AppleHostLibrary::Dynamic {
         let ffi_rlib = deps_dir.join(format!(
@@ -497,16 +519,9 @@ pub async fn apple_deployment_target(
     _project: &Project,
     platform: TargetPlatform,
 ) -> eyre::Result<(&'static str, String)> {
-    let environment = match platform {
-        TargetPlatform::MacOS => "MACOSX_DEPLOYMENT_TARGET",
-        TargetPlatform::IOS | TargetPlatform::IOSSimulator => "IPHONEOS_DEPLOYMENT_TARGET",
-        TargetPlatform::TvOS | TargetPlatform::TvOSSimulator => "TVOS_DEPLOYMENT_TARGET",
-        TargetPlatform::WatchOS | TargetPlatform::WatchOSSimulator => "WATCHOS_DEPLOYMENT_TARGET",
-        TargetPlatform::VisionOS | TargetPlatform::VisionOSSimulator => "XROS_DEPLOYMENT_TARGET",
-        other => {
-            bail!("Platform {other:?} does not have an Apple deployment target");
-        }
-    };
+    let environment = platform.deployment_target_setting().ok_or_else(|| {
+        eyre::eyre!("Platform {platform:?} does not have an Apple deployment target")
+    })?;
     let target = apple_deployment_target_for(platform).ok_or_else(|| {
         eyre::eyre!("Platform {platform:?} does not have an Apple deployment target")
     })?;
@@ -798,6 +813,7 @@ pub async fn package_apple(
         backend,
         project_path.as_path(),
         project,
+        &deployment_target,
     )
     .await?;
 

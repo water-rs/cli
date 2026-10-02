@@ -63,6 +63,11 @@ pub(crate) async fn run_gradle_tasks(
         cmd.env("ANDROID_HOME", &sdk_path)
             .env("ANDROID_SDK_ROOT", &sdk_path);
     }
+    // WATERUI_ANDROID_UNSIGNED is the package step's signal to skip the
+    // generated release signingConfig; a value inherited from the caller's
+    // own environment would silently unsigned an asked-for signed package, so
+    // only the value extra_envs supplies may reach Gradle.
+    cmd.env_remove(crate::android::signing::UNSIGNED_ENV);
     for (key, value) in extra_envs {
         cmd.env(key, value);
     }
@@ -541,14 +546,28 @@ impl AndroidPlatform {
     /// `built` is the build's target result — its `app_symbols()` carry the
     /// `waterui_meta_bundle_*` statics that declare the asset mounts.
     ///
+    /// `prepared` is the release-signing decision [`PreparedSigning::resolve`]
+    /// produced for this project and these options — before the Rust builds
+    /// when the caller sequences them (`water package`, `water run`), or at
+    /// the single in-package resolution otherwise. It is re-checked against
+    /// this call's project and options, so a plan resolved elsewhere cannot
+    /// sign or unsign this package.
+    ///
     /// # Errors
-    /// Returns an error if Gradle build fails.
+    /// Returns an error if the plan does not bind to this project/options, or
+    /// if Gradle build fails.
     pub async fn package_with_abis(
         project: &Project,
         options: PackageOptions,
         abis: &[AndroidAbi],
         built: &BuiltTarget,
+        prepared: &crate::android::signing::PreparedSigning,
     ) -> eyre::Result<Artifact> {
+        // Prove the plan belongs to this project and these options before
+        // any work: a plan resolved for another project or stale options is
+        // an error, never a signing decision.
+        let release_signing = prepared.release_signing_for(project.root(), &options)?;
+
         let backend_path = project.backend_path::<AndroidBackend>();
 
         // Copy project assets and dependency fonts
@@ -589,15 +608,20 @@ impl AndroidPlatform {
             .collect::<Vec<_>>()
             .join(",");
 
-        run_gradle_tasks(
-            &backend_path,
-            &[command_name],
-            &[
-                ("WATERUI_SKIP_RUST_BUILD", "1".to_string()),
-                ("WATERUI_ANDROID_ABIS", abis_str),
-            ],
-        )
-        .await?;
+        // Debug packages keep the Gradle debug keystore (the plan carries
+        // no decision for them). Release packages apply the decision the
+        // prepared plan holds — Signed, unsigned-without-config, or
+        // `--unsigned` suppressing the generated signingConfig through the
+        // environment.
+        let mut envs = vec![
+            ("WATERUI_SKIP_RUST_BUILD", "1".to_string()),
+            ("WATERUI_ANDROID_ABIS", abis_str),
+        ];
+        if release_signing == Some(crate::android::signing::ReleaseSigning::Suppressed) {
+            envs.push((crate::android::signing::UNSIGNED_ENV, "1".to_string()));
+        }
+
+        run_gradle_tasks(&backend_path, &[command_name], &envs).await?;
 
         let path = packaged_artifact(&backend_path, output_kind, variant).await?;
         Ok(Artifact::new(project.bundle_identifier(), path))
@@ -801,6 +825,17 @@ async fn configure_android_rust_build(
                 "LLVM_COMPILER_RT_LIB",
                 ndk_builtins_lib(&context.ndk_path, context.abi)?,
             );
+        // The inspector is devtooling: development sessions get it through
+        // the shared-runtime linkage while a packaged build leaves its
+        // server stack out. The generated manifest forwards `inspector` only
+        // when the resolved `waterui-ffi` declares it, so the build can only
+        // name it when the scaffold declared it.
+        if crate::templates::generated_ffi_manifest_declares(
+            &project.ffi_crate_path().join("Cargo.toml"),
+            "inspector",
+        )? {
+            build = build.with_feature("inspector");
+        }
     }
     if let Some(sccache_path) = options.sccache_path() {
         build = build.with_sccache(sccache_path.to_path_buf());

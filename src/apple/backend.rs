@@ -244,7 +244,7 @@ impl Backend for AppleBackend {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::Path};
 
     use super::AppleBackend;
     use crate::{
@@ -253,6 +253,75 @@ mod tests {
         project::{CreateOptions, ManagedBackends, Project},
         project_types::BundleIdentifier,
     };
+
+    /// The channel's pins resolve without a network: `waterui` and
+    /// `waterui-ffi` ride `[patch.crates-io]` onto vendor stubs (the only
+    /// source `[patch]` can redirect offline), and `waterui-apple` gets a
+    /// `backend_path` stub — a path dependency — so the ffi companion's
+    /// feature-table probe resolves entirely locally.
+    fn vendor_offline_resolution(root: &Path, vendor_dir: &Path) {
+        for (name, features) in [
+            ("waterui", &["dynamic_linking", "media"][..]),
+            (
+                "waterui-ffi",
+                &[
+                    "android-jni",
+                    "c-api",
+                    "chromium",
+                    "dev",
+                    "gpu",
+                    "inspector",
+                    "map",
+                    "media",
+                    "video",
+                    "webview",
+                    "webview-cef",
+                ][..],
+            ),
+            ("waterui-apple", &["map", "media", "webview"][..]),
+        ] {
+            let stub = vendor_dir.join(name);
+            std::fs::create_dir_all(stub.join("src")).expect("stub crate dir");
+            let mut stub_manifest = toml_edit::DocumentMut::new();
+            stub_manifest["package"]["name"] = toml_edit::value(name);
+            stub_manifest["package"]["version"] = toml_edit::value("0.4.1");
+            stub_manifest["package"]["edition"] = toml_edit::value("2021");
+            for feature in features {
+                stub_manifest["features"][feature] = toml_edit::value(toml_edit::Array::new());
+            }
+            std::fs::write(stub.join("Cargo.toml"), stub_manifest.to_string())
+                .expect("stub manifest");
+            std::fs::write(stub.join("src/lib.rs"), "").expect("stub lib");
+        }
+        let manifest_path = root.join("Cargo.toml");
+        let mut document: toml_edit::DocumentMut = std::fs::read_to_string(&manifest_path)
+            .expect("project Cargo.toml exists")
+            .parse()
+            .expect("project Cargo.toml parses");
+        for name in ["waterui", "waterui-ffi"] {
+            document["patch"]["crates-io"][name]["path"] =
+                toml_edit::value(vendor_dir.join(name).to_string_lossy().as_ref());
+        }
+        std::fs::write(&manifest_path, document.to_string()).expect("write the patch table");
+        let water_toml = root.join("Water.toml");
+        let mut water_document: toml_edit::DocumentMut = std::fs::read_to_string(&water_toml)
+            .expect("Water.toml exists")
+            .parse()
+            .expect("Water.toml parses");
+        water_document["backends"]["apple"]["backend_path"] =
+            toml_edit::value(vendor_dir.join("waterui-apple").to_string_lossy().as_ref());
+        std::fs::write(&water_toml, water_document.to_string())
+            .expect("declare the vendored apple backend");
+
+        // `Project::open` resolves the project's layout with `cargo metadata
+        // --locked`; a plain offline resolve records the patched sources in
+        // the lock first.
+        cargo_metadata::MetadataCommand::new()
+            .manifest_path(&manifest_path)
+            .other_options(vec!["--offline".to_string()])
+            .exec()
+            .expect("offline metadata resolves the patched project");
+    }
 
     /// The scaffold emits only the entitlements file — no Xcode project
     /// exists to regenerate — yet the staleness check still detects an edit
@@ -277,6 +346,9 @@ mod tests {
             },
         ))
         .expect("project creation must succeed");
+
+        vendor_offline_resolution(&root, &dir.path().join("vendor"));
+
         let project = smol::block_on(Project::open(
             &root,
             ManagedBackends::for_backend(TargetBackend::Apple),

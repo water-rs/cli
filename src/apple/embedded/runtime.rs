@@ -299,7 +299,7 @@ mod tests {
             framework: true,
         };
         let closure = RuntimeClosure::new(vec![framework.clone()]);
-        assert!(closure.archives.is_empty());
+        assert_eq!(closure.archives, [] as [String; 0]);
         assert_eq!(closure.remaining, [framework]);
     }
 }

@@ -28,9 +28,10 @@ use crate::{
 #[cfg(target_os = "macos")]
 use crate::{
     macos_bundle::{
-        MacOsAppNames, MacOsUsageDescription, package_binary_as_app, package_cef_helper_app,
-        sign_macos_app as sign_app,
+        MacOsAppNames, MacOsSigning, MacOsUsageDescription, package_binary_as_app,
+        package_cef_helper_app, sign_macos_app as sign_app,
     },
+    platform::PackageAudience,
     project::BrowserRuntimePlan,
 };
 
@@ -347,15 +348,16 @@ pub async fn package_hydrolysis(
     #[cfg(target_os = "macos")]
     {
         if platform == TargetPlatform::MacOS {
-            return package_hydrolysis_macos(
+            return package_hydrolysis_macos(HydrolysisMacosPackage {
                 project,
                 platform,
-                &backend_path,
-                final_binary_path,
+                backend_path: &backend_path,
+                binary_path: final_binary_path,
                 profile_directory,
                 runtime_plan,
-                shared_libraries.as_ref(),
-            )
+                shared_libraries: shared_libraries.as_ref(),
+                options: &options,
+            })
             .await;
         }
     }
@@ -407,15 +409,39 @@ pub async fn package_hydrolysis(
     Ok(Artifact::new(project.bundle_identifier(), packaged_binary))
 }
 
+/// The inputs `package_hydrolysis_macos` assembles the `.app` from.
+#[cfg(target_os = "macos")]
+struct HydrolysisMacosPackage<'a> {
+    /// The project being packaged.
+    project: &'a Project,
+    /// The platform being packaged — always `TargetPlatform::MacOS`.
+    platform: TargetPlatform,
+    /// The managed backend directory the bundle's resources come from.
+    backend_path: &'a Path,
+    /// The built application binary.
+    binary_path: &'a Path,
+    /// The Cargo profile directory staged resources resolve against.
+    profile_directory: &'a Path,
+    /// The browser runtime the bundle embeds.
+    runtime_plan: BrowserRuntimePlan,
+    /// The shared Rust runtime dylibs, when the package embeds them.
+    shared_libraries: Option<&'a RustDynamicLibraries>,
+    /// The packaging options — the audience decides how the bundle is signed.
+    options: &'a PackageOptions,
+}
+
 #[cfg(target_os = "macos")]
 async fn package_hydrolysis_macos(
-    project: &Project,
-    platform: TargetPlatform,
-    backend_path: &Path,
-    binary_path: &Path,
-    profile_directory: &Path,
-    runtime_plan: BrowserRuntimePlan,
-    shared_libraries: Option<&RustDynamicLibraries>,
+    HydrolysisMacosPackage {
+        project,
+        platform,
+        backend_path,
+        binary_path,
+        profile_directory,
+        runtime_plan,
+        shared_libraries,
+        options,
+    }: HydrolysisMacosPackage<'_>,
 ) -> eyre::Result<Artifact> {
     let app_name = project
         .manifest()
@@ -487,12 +513,18 @@ async fn package_hydrolysis_macos(
         )
         .await?;
     }
-    sign_app(
-        &app_path,
-        project.bundle_identifier(),
-        !usage_descriptions.is_empty(),
-    )
-    .await?;
+    let signing = match options.audience() {
+        PackageAudience::Development => MacOsSigning::Development {
+            requires_stable_identity: !usage_descriptions.is_empty(),
+        },
+        PackageAudience::Distribution => {
+            MacOsSigning::Distribution(crate::macos_bundle::DistributionSigning::from_manifest(
+                project.manifest().signing.macos.as_ref(),
+                None,
+            )?)
+        }
+    };
+    sign_app(&app_path, project.bundle_identifier(), &signing).await?;
     Ok(Artifact::new(project.bundle_identifier(), app_path))
 }
 
@@ -1010,7 +1042,7 @@ mod tests {
             let artifact = super::package_hydrolysis(
                 &project,
                 crate::platform::TargetPlatform::Linux,
-                PackageOptions::packaging(false, true),
+                PackageOptions::packaging(crate::platform::PackageAudience::Development, true),
                 Some(&built),
             )
             .await

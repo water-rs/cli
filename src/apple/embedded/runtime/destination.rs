@@ -124,8 +124,8 @@ mod tests {
                 .members()
                 .collect::<object::read::Result<Vec<_>>>()
                 .unwrap();
+            assert_ne!(outputs, [] as [std::path::PathBuf; 0]);
             assert_eq!(outputs.len(), members.len());
-            assert!(!outputs.is_empty());
             for (member, output) in members.into_iter().zip(outputs) {
                 let original = object::File::parse(member.data(input.as_slice()).unwrap()).unwrap();
                 let data = fs::read(&output).await.unwrap();

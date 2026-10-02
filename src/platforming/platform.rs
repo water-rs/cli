@@ -335,6 +335,67 @@ impl TargetPlatform {
         }
     }
 
+    /// The platform name an xcodebuild `-destination` specifier uses
+    /// (`platform=iOS,id=…`, `generic/platform=tvOS`) for this platform's
+    /// device family.
+    #[must_use]
+    pub const fn xcode_destination_name(&self) -> Option<&'static str> {
+        match self {
+            Self::MacOS => Some("macOS"),
+            Self::IOS | Self::IOSSimulator => Some("iOS"),
+            Self::TvOS | Self::TvOSSimulator => Some("tvOS"),
+            Self::WatchOS | Self::WatchOSSimulator => Some("watchOS"),
+            Self::VisionOS | Self::VisionOSSimulator => Some("visionOS"),
+            Self::Android
+            | Self::Linux
+            | Self::Windows
+            | Self::Web
+            | Self::Esp32S3
+            | Self::Esp32C3
+            | Self::Esp32P4 => None,
+        }
+    }
+
+    /// The `TARGETED_DEVICE_FAMILY` value Xcode projects for this platform
+    /// declare (`1,2` = iPhone+iPad, `3` = Apple TV, `4` = Apple Watch,
+    /// `7` = Apple Vision).
+    #[must_use]
+    pub const fn targeted_device_family(&self) -> Option<&'static str> {
+        match self {
+            Self::IOS | Self::IOSSimulator => Some("1,2"),
+            Self::TvOS | Self::TvOSSimulator => Some("3"),
+            Self::WatchOS | Self::WatchOSSimulator => Some("4"),
+            Self::VisionOS | Self::VisionOSSimulator => Some("7"),
+            Self::MacOS
+            | Self::Android
+            | Self::Linux
+            | Self::Windows
+            | Self::Web
+            | Self::Esp32S3
+            | Self::Esp32C3
+            | Self::Esp32P4 => None,
+        }
+    }
+
+    /// The `*_DEPLOYMENT_TARGET` Xcode build setting this platform uses.
+    #[must_use]
+    pub const fn deployment_target_setting(&self) -> Option<&'static str> {
+        match self {
+            Self::MacOS => Some("MACOSX_DEPLOYMENT_TARGET"),
+            Self::IOS | Self::IOSSimulator => Some("IPHONEOS_DEPLOYMENT_TARGET"),
+            Self::TvOS | Self::TvOSSimulator => Some("TVOS_DEPLOYMENT_TARGET"),
+            Self::WatchOS | Self::WatchOSSimulator => Some("WATCHOS_DEPLOYMENT_TARGET"),
+            Self::VisionOS | Self::VisionOSSimulator => Some("XROS_DEPLOYMENT_TARGET"),
+            Self::Android
+            | Self::Linux
+            | Self::Windows
+            | Self::Web
+            | Self::Esp32S3
+            | Self::Esp32C3
+            | Self::Esp32P4 => None,
+        }
+    }
+
     /// Get the architecture for this platform.
     #[must_use]
     pub fn arch(&self) -> Architecture {
@@ -387,25 +448,42 @@ pub fn ensure_desktop_platform_is_host(
 // Package Options
 // ============================================================================
 
+/// Who a packaged application is for.
+///
+/// The audience decides how the artifact is sealed for delivery: a
+/// distribution package must survive delivery to a machine that never saw
+/// the developer's keychain, while a development package only has to run
+/// where it was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackageAudience {
+    /// A package for the developer's own machine: ad hoc signature on macOS,
+    /// a direct-install artifact on Android.
+    #[default]
+    Development,
+    /// A package for users elsewhere: Developer ID signature, hardened
+    /// runtime and notarization on macOS; a store-upload artifact on Android.
+    Distribution,
+}
+
 /// Configuration options for packaging the application.
 ///
 /// This struct contains settings that control how the application
 /// is packaged for distribution across different platforms.
 #[derive(Debug, Clone)]
 pub struct PackageOptions {
-    /// Whether to prepare the package for store distribution.
+    /// Who the package is for.
     ///
-    /// When `true`, the package will be configured for submission to
-    /// official app stores (App Store for iOS/macOS or Play Store for Android).
-    ///
-    /// When `false`, the package will be prepared for direct distribution
-    /// or development purposes.
+    /// A distribution package is configured for delivery outside the
+    /// developer's machine (notarized Developer ID signature on macOS, an
+    /// upload artifact for the App Store or Play Store); a development
+    /// package is for direct use on the machine that built it.
     ///
     /// # Warning
     ///
-    /// Enable this option only change your packaging format, it does not change your build configuration.
-    /// For a real world distribution build, you may also want to disable `debug` in `BuildOptions`.
-    distribution: bool,
+    /// The audience only changes the packaging format, not the build
+    /// configuration. For a real world distribution build, you may also want
+    /// to disable `debug` in `BuildOptions`.
+    audience: PackageAudience,
 
     /// Whether to enable debug mode in the packaged application.
     ///
@@ -421,6 +499,12 @@ pub struct PackageOptions {
 
     /// How a build for a physical device is code-signed.
     device_signing: DeviceSigning,
+
+    /// Hardware UDID of the physical Apple device the package targets, when
+    /// packaging for one (`water run`); `None` for a device-agnostic
+    /// `water package`, which skips the profile's `ProvisionedDevices`
+    /// check and provisions with a generic iOS destination.
+    device_udid: Option<String>,
 
     /// Whether the package embeds the shared `WaterUI` Rust runtime.
     shared_rust_runtime: bool,
@@ -466,9 +550,10 @@ impl PackageOptions {
     #[must_use]
     pub const fn development() -> Self {
         Self {
-            distribution: false,
+            audience: PackageAudience::Development,
             debug: true,
             device_signing: DeviceSigning::Automatic,
+            device_udid: None,
             shared_rust_runtime: true,
             web_frontend: WebFrontendMode::Stage,
             progress: None,
@@ -477,11 +562,12 @@ impl PackageOptions {
 
     /// Create options for a self-contained package artifact.
     #[must_use]
-    pub const fn packaging(distribution: bool, debug: bool) -> Self {
+    pub const fn packaging(audience: PackageAudience, debug: bool) -> Self {
         Self {
-            distribution,
+            audience,
             debug,
             device_signing: DeviceSigning::Automatic,
+            device_udid: None,
             shared_rust_runtime: false,
             web_frontend: WebFrontendMode::Stage,
             progress: None,
@@ -499,6 +585,21 @@ impl PackageOptions {
     #[must_use]
     pub const fn device_signing(&self) -> DeviceSigning {
         self.device_signing
+    }
+
+    /// Bind the package to a physical Apple device by hardware UDID, so
+    /// provisioning registers the device and the selected profile must list
+    /// it. `None` keeps the package device-agnostic.
+    #[must_use]
+    pub fn with_device_udid(mut self, device_udid: Option<String>) -> Self {
+        self.device_udid = device_udid;
+        self
+    }
+
+    /// The hardware UDID of the device the package targets, if any.
+    #[must_use]
+    pub fn device_udid(&self) -> Option<&str> {
+        self.device_udid.as_deref()
     }
 
     /// Override the debug flag without changing the runtime linkage.
@@ -519,10 +620,16 @@ impl PackageOptions {
         self
     }
 
+    /// Who the package is for.
+    #[must_use]
+    pub const fn audience(&self) -> PackageAudience {
+        self.audience
+    }
+
     /// Whether to package in distribution mode
     #[must_use]
     pub const fn is_distribution(&self) -> bool {
-        self.distribution
+        matches!(self.audience, PackageAudience::Distribution)
     }
 
     /// Whether to package in debug mode
@@ -644,8 +751,8 @@ mod package_options_tests {
         assert!(development.uses_shared_rust_runtime());
 
         for options in [
-            PackageOptions::packaging(false, true),
-            PackageOptions::packaging(true, false),
+            PackageOptions::packaging(super::PackageAudience::Development, true),
+            PackageOptions::packaging(super::PackageAudience::Distribution, false),
         ] {
             assert!(!options.uses_shared_rust_runtime());
         }

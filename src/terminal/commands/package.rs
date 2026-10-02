@@ -22,7 +22,9 @@ use waterui_cli::{
         platform::{build_hydrolysis, package_hydrolysis},
     },
     package_output::place_in_project,
-    platform::{DeviceSigning, PackageOptions, TargetPlatform as LibTargetPlatform},
+    platform::{
+        DeviceSigning, PackageAudience, PackageOptions, TargetPlatform as LibTargetPlatform,
+    },
     project::{ManagedBackends, Project},
     winui::platform::{build_winui, package_winui},
 };
@@ -132,10 +134,13 @@ pub struct Args {
     #[arg(long)]
     distribution: bool,
 
-    /// Leave an iOS device build unsigned, for a host with no signing
-    /// identity (CI, a build VM). Linkage and profile are those of the signed
-    /// build; sign the `.app` (`codesign`) before installing it.
-    #[arg(long, conflicts_with = "distribution")]
+    /// Leave a release build unsigned, for a host with no signing identity
+    /// (CI, a build VM). Applies to iOS device builds with the Apple backend
+    /// and Android builds with the Android or Hydrolysis backend. Linkage and
+    /// profile are those of the signed build; sign the artifact (`codesign`,
+    /// `apksigner`) before installing it. On Android it combines with
+    /// `--distribution` to produce an unsigned AAB; on iOS it does not.
+    #[arg(long)]
     unsigned: bool,
 
     /// Project directory path (defaults to current directory).
@@ -191,6 +196,13 @@ struct PackagingContext {
     project: Project,
     backend: TargetBackend,
     build_options: BuildOptions,
+    /// The final package options the Gradle/Xcode step runs with, resolved
+    /// alongside the signing plan so the plan binds to exactly these values.
+    package_options: PackageOptions,
+    /// The release-signing plan an Android-platform package resolved before
+    /// the Rust builds — bound to this project and `package_options`.
+    /// `None` on every other platform.
+    prepared_signing: Option<waterui_cli::android::signing::PreparedSigning>,
 }
 
 /// Run the package command.
@@ -236,7 +248,13 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     }
 
     validate_arch_args(args.platform, backend, &args.arch)?;
-    validate_unsigned_args(args.platform, backend, args.unsigned)?;
+    validate_unsigned_args(
+        args.platform,
+        backend,
+        args.profile(),
+        args.unsigned,
+        args.distribution,
+    )?;
     backend
         .cli_backend()
         .lib_backend()
@@ -246,6 +264,33 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     {
         bail!("--painter only applies to `--platform android --backend hydrolysis`");
     }
+
+    // Resolve the release-signing plan once, before the Rust builds: a
+    // release package without [signing.android] can only produce artifacts
+    // nothing installs or accepts. The plan is bound to this project and to
+    // the final package options, and the Gradle step re-proves that binding
+    // instead of re-probing the manifest and the environment. `[signing.
+    // android]` is an Android platform contract, so both Android backends
+    // resolve it here.
+    let package_options = PackageOptions::packaging(
+        if args.distribution {
+            PackageAudience::Distribution
+        } else {
+            PackageAudience::Development
+        },
+        args.profile().is_development(),
+    )
+    .with_device_signing(if args.unsigned {
+        DeviceSigning::Unsigned
+    } else {
+        DeviceSigning::Automatic
+    })
+    .with_progress(shell.build_progress());
+    let prepared_signing = (lib_platform(args.platform) == LibTargetPlatform::Android)
+        .then(|| {
+            waterui_cli::android::signing::PreparedSigning::resolve(&project, &package_options)
+        })
+        .transpose()?;
 
     if backend.is_experimental()
         && !super::confirm_experimental_backend(shell, backend_name(backend), args.yes)?
@@ -266,6 +311,8 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
         project,
         backend,
         build_options,
+        package_options,
+        prepared_signing,
     }))
 }
 
@@ -498,7 +545,7 @@ async fn package_artifact(
 ) -> Result<()> {
     let spinner = shell.spinner("Packaging application...");
     let artifact = shell
-        .display_output(package_artifact_inner(shell, args, context, built))
+        .display_output(package_artifact_inner(args, context, built))
         .await?;
     let artifact = place_in_project(&context.project, artifact).await?;
     // Consumers read the host library beside the `.app` this command reports,
@@ -517,27 +564,27 @@ async fn package_artifact(
 }
 
 async fn package_artifact_inner(
-    shell: &Shell,
     args: &Args,
     context: &PackagingContext,
     built: Option<&BuiltTarget>,
 ) -> Result<Artifact> {
-    let package_options =
-        PackageOptions::packaging(args.distribution, args.profile().is_development())
-            .with_device_signing(if args.unsigned {
-                DeviceSigning::Unsigned
-            } else {
-                DeviceSigning::Automatic
-            })
-            .with_progress(shell.build_progress());
+    let package_options = context.package_options.clone();
     match context.backend {
         TargetBackend::Android => {
             let abis: Vec<AndroidAbi> = args.arch.iter().map(|arch| arch.to_abi()).collect();
             let built = built.ok_or_else(|| {
                 eyre::eyre!("Internal error: Android packaging has no build result")
             })?;
-            AndroidPlatform::package_with_abis(&context.project, package_options, &abis, built)
-                .await
+            AndroidPlatform::package_with_abis(
+                &context.project,
+                package_options,
+                &abis,
+                built,
+                context.prepared_signing.as_ref().ok_or_else(|| {
+                    eyre::eyre!("Internal error: Android packaging has no signing plan")
+                })?,
+            )
+            .await
         }
         TargetBackend::Apple => {
             let built = built.ok_or_else(|| {
@@ -585,6 +632,9 @@ async fn package_artifact_inner(
                         eyre::eyre!(
                             "Internal error: Hydrolysis Android packaging has no build result"
                         )
+                    })?,
+                    context.prepared_signing.as_ref().ok_or_else(|| {
+                        eyre::eyre!("Internal error: Android packaging has no signing plan")
                     })?,
                 )
                 .await
@@ -643,12 +693,36 @@ fn resolve_backend(platform: TargetPlatform, backend: TargetBackend) -> Result<T
 fn validate_unsigned_args(
     platform: TargetPlatform,
     backend: TargetBackend,
+    profile: BuildProfile,
     unsigned: bool,
+    distribution: bool,
 ) -> Result<()> {
-    if unsigned && !(platform == TargetPlatform::Ios && backend == TargetBackend::Apple) {
+    let android = platform == TargetPlatform::Android;
+    let applies = (platform == TargetPlatform::Ios && backend == TargetBackend::Apple)
+        || (android && matches!(backend, TargetBackend::Android | TargetBackend::Hydrolysis));
+    if unsigned && !applies {
         bail!(
-            "--unsigned only applies to an iOS device build with the Apple backend; \
-             simulator and desktop packages are not signed per device"
+            "--unsigned only applies to an iOS device build with the Apple backend or an \
+             Android build with the Android or Hydrolysis backend; simulator and desktop \
+             packages are not signed per device"
+        );
+    }
+    // Debug+unsigned is only a problem on Android, where --unsigned would be
+    // silently ignored: an Android debug package always signs with the debug
+    // keystore. iOS's credential-free debug package path relies on the
+    // combination, so it stays valid there.
+    if unsigned && profile.is_development() && android {
+        bail!(
+            "--unsigned applies to release packages only; a debug build signs \
+             with the debug signing identity"
+        );
+    }
+    // The App Store rejects unsigned bundles, so an unsigned iOS
+    // distribution package cannot exist; Play accepts an unsigned AAB the
+    // uploader signs themselves, so Android permits the combination.
+    if unsigned && distribution && platform == TargetPlatform::Ios {
+        bail!(
+            "--unsigned cannot produce an iOS distribution package; the App Store requires a signed bundle"
         );
     }
     Ok(())
@@ -790,7 +864,67 @@ const fn backend_name(backend: TargetBackend) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{AndroidArch, TargetBackend, TargetPlatform, resolve_backend, validate_arch_args};
+    use super::{
+        AndroidArch, BuildProfile, TargetBackend, TargetPlatform, resolve_backend,
+        validate_arch_args, validate_unsigned_args,
+    };
+
+    #[test]
+    fn unsigned_args_follow_the_platform_signing_contract() {
+        let v = validate_unsigned_args;
+        let (ios, android, macos) = (
+            TargetPlatform::Ios,
+            TargetPlatform::Android,
+            TargetPlatform::Macos,
+        );
+        let (apple, android_be, hydrolysis, gtk4) = (
+            TargetBackend::Apple,
+            TargetBackend::Android,
+            TargetBackend::Hydrolysis,
+            TargetBackend::Gtk4,
+        );
+        let (release, debug) = (BuildProfile::Release, BuildProfile::Debug);
+
+        // iOS: release unsigned is the credential-free path — including debug,
+        // which never needed an identity — but an unsigned App Store bundle
+        // cannot exist.
+        assert!(v(ios, apple, release, true, false).is_ok());
+        assert!(v(ios, apple, debug, true, false).is_ok());
+        assert!(v(ios, apple, release, true, true).is_err());
+
+        // Android, both backends: unsigned is valid for release APK and AAB
+        // (distribution), never for debug — the flag would be ignored since a
+        // debug build always signs with the debug keystore.
+        for backend in [android_be, hydrolysis] {
+            assert!(
+                v(android, backend, release, true, false).is_ok(),
+                "{backend:?}"
+            );
+            assert!(
+                v(android, backend, release, true, true).is_ok(),
+                "{backend:?}"
+            );
+            assert!(
+                v(android, backend, debug, true, false).is_err(),
+                "{backend:?}"
+            );
+        }
+
+        // Everywhere else --unsigned means nothing.
+        assert!(v(macos, apple, release, true, false).is_err());
+        assert!(v(ios, hydrolysis, release, true, false).is_err());
+        assert!(v(macos, gtk4, release, true, false).is_err());
+        // No --unsigned: every combination validates.
+        for (platform, backend) in [
+            (ios, apple),
+            (android, android_be),
+            (android, hydrolysis),
+            (macos, gtk4),
+        ] {
+            assert!(v(platform, backend, release, false, false).is_ok());
+            assert!(v(platform, backend, debug, false, false).is_ok());
+        }
+    }
 
     #[test]
     fn only_gtk4_and_winui_are_experimental() {

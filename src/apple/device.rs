@@ -608,6 +608,13 @@ impl Device for AppleDevice {
         }
     }
 
+    fn device_udid(&self) -> Option<&str> {
+        match self {
+            Self::Physical(device) => device.device_udid(),
+            Self::Simulator(_) | Self::Current(_) => None,
+        }
+    }
+
     async fn run(
         &self,
         host: &Host,

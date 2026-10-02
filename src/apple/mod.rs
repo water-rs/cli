@@ -112,5 +112,8 @@ pub mod local {
 /// Apple platform configuration.
 pub mod physical;
 pub mod platform;
+/// Development provisioning profiles: validation and `xcodebuild` acquisition.
+#[cfg(target_os = "macos")]
+pub mod provisioning;
 /// Apple toolchain management.
 pub mod toolchain;
