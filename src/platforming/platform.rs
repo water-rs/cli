@@ -20,11 +20,11 @@ use target_lexicon::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetPlatform {
     // Apple platforms
-    /// macOS (current machine architecture)
+    /// macOS (ARM64)
     MacOS,
     /// iOS (physical device, ARM64)
     IOS,
-    /// iOS Simulator (host machine architecture)
+    /// iOS Simulator (ARM64)
     IOSSimulator,
     /// tvOS (physical device)
     TvOS,
@@ -173,12 +173,12 @@ impl TargetPlatform {
     /// Get the target triple for this platform.
     ///
     /// # Panics
-    /// May panic if `target_lexicon` cannot resolve the current host triple for simulator or host-native targets.
+    /// May panic if `target_lexicon` cannot resolve the current host triple for host-native targets.
     #[must_use]
     pub fn triple(&self) -> Triple {
         match self {
             Self::MacOS => Triple {
-                architecture: DefaultToHost::default().0.architecture,
+                architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
                 vendor: Vendor::Apple,
                 operating_system: OperatingSystem::Darwin(None),
                 environment: Environment::Unknown,
@@ -191,20 +191,13 @@ impl TargetPlatform {
                 environment: Environment::Unknown,
                 binary_format: target_lexicon::BinaryFormat::Macho,
             },
-            Self::IOSSimulator => {
-                let arch = DefaultToHost::default().0.architecture;
-                let env = match arch {
-                    Architecture::X86_64 => Environment::Unknown,
-                    _ => Environment::Sim,
-                };
-                Triple {
-                    architecture: arch,
-                    vendor: Vendor::Apple,
-                    operating_system: OperatingSystem::IOS(None),
-                    environment: env,
-                    binary_format: target_lexicon::BinaryFormat::Macho,
-                }
-            }
+            Self::IOSSimulator => Triple {
+                architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
+                vendor: Vendor::Apple,
+                operating_system: OperatingSystem::IOS(None),
+                environment: Environment::Sim,
+                binary_format: target_lexicon::BinaryFormat::Macho,
+            },
             Self::TvOS => Triple {
                 architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
                 vendor: Vendor::Apple,
@@ -213,7 +206,7 @@ impl TargetPlatform {
                 binary_format: target_lexicon::BinaryFormat::Macho,
             },
             Self::TvOSSimulator => Triple {
-                architecture: DefaultToHost::default().0.architecture,
+                architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
                 vendor: Vendor::Apple,
                 operating_system: OperatingSystem::TvOS(None),
                 environment: Environment::Sim,
@@ -227,7 +220,7 @@ impl TargetPlatform {
                 binary_format: target_lexicon::BinaryFormat::Macho,
             },
             Self::WatchOSSimulator => Triple {
-                architecture: DefaultToHost::default().0.architecture,
+                architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
                 vendor: Vendor::Apple,
                 operating_system: OperatingSystem::WatchOS(None),
                 environment: Environment::Sim,
@@ -241,7 +234,7 @@ impl TargetPlatform {
                 binary_format: target_lexicon::BinaryFormat::Macho,
             },
             Self::VisionOSSimulator => Triple {
-                architecture: DefaultToHost::default().0.architecture,
+                architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
                 vendor: Vendor::Apple,
                 operating_system: OperatingSystem::VisionOS(None),
                 environment: Environment::Sim,
@@ -351,11 +344,12 @@ impl TargetPlatform {
             | Self::TvOSSimulator
             | Self::WatchOSSimulator
             | Self::VisionOSSimulator
-            | Self::Linux
-            | Self::Windows => DefaultToHost::default().0.architecture,
-            Self::IOS | Self::TvOS | Self::WatchOS | Self::VisionOS | Self::Android => {
-                Architecture::Aarch64(Aarch64Architecture::Aarch64)
-            }
+            | Self::IOS
+            | Self::TvOS
+            | Self::WatchOS
+            | Self::VisionOS
+            | Self::Android => Architecture::Aarch64(Aarch64Architecture::Aarch64),
+            Self::Linux | Self::Windows => DefaultToHost::default().0.architecture,
             Self::Web => Architecture::Wasm32,
             Self::Esp32S3 => Architecture::XTensa,
             Self::Esp32C3 => Architecture::Riscv32(Riscv32Architecture::Riscv32imc),
@@ -366,10 +360,9 @@ impl TargetPlatform {
 
 /// Reject a desktop platform label that does not name the host OS.
 ///
-/// `macos`, `linux` and `windows` platforms build host-native binaries —
-/// their [`TargetPlatform::triple`] is `Triple::host()` — so resolving
-/// `--platform linux` on a macOS host produces a darwin binary that cannot
-/// run on Linux. `water run` and `water preview` funnel through this check
+/// `macos`, `linux` and `windows` platforms require a matching host OS.
+/// macOS targets ARM64; Linux and Windows use `Triple::host()`.
+/// `water run` and `water preview` funnel through this check
 /// so the gate is identical for both.
 ///
 /// `desktop_os` is `Some` only for host-native platform labels; mobile, web
@@ -567,7 +560,32 @@ impl PackageOptions {
 
 #[cfg(test)]
 mod host_support_tests {
-    use super::{TargetBackend, TargetPlatform};
+    use super::{Aarch64Architecture, Architecture, Environment, TargetBackend, TargetPlatform};
+
+    #[test]
+    fn apple_defaults_are_arm64_for_devices_and_simulators() {
+        for platform in [
+            TargetPlatform::MacOS,
+            TargetPlatform::IOS,
+            TargetPlatform::IOSSimulator,
+            TargetPlatform::TvOS,
+            TargetPlatform::TvOSSimulator,
+            TargetPlatform::WatchOS,
+            TargetPlatform::WatchOSSimulator,
+            TargetPlatform::VisionOS,
+            TargetPlatform::VisionOSSimulator,
+        ] {
+            assert_eq!(
+                platform.arch(),
+                Architecture::Aarch64(Aarch64Architecture::Aarch64)
+            );
+            assert_eq!(platform.triple().architecture, platform.arch());
+        }
+        assert_eq!(
+            TargetPlatform::IOSSimulator.triple().environment,
+            Environment::Sim
+        );
+    }
 
     #[test]
     fn cross_compiling_backends_accept_any_platform_pairing() {

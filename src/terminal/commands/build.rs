@@ -4,9 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args as ClapArgs, ValueEnum};
 use eyre::{Result, bail};
-use target_lexicon::{
-    Aarch64Architecture, Architecture, BinaryFormat, Environment, OperatingSystem, Triple, Vendor,
-};
+use target_lexicon::{Aarch64Architecture, Architecture};
 
 use super::TargetBackend;
 use crate::shell::Shell;
@@ -68,12 +66,23 @@ impl TargetPlatform {
 pub enum TargetArch {
     /// ARM64 / `AArch64` (Apple Silicon, modern Android devices).
     Arm64,
-    /// `x86_64` (Intel Macs, Android emulators on Intel/AMD).
+    /// `x86_64` (Android emulators on Intel/AMD).
     X86_64,
     /// `ARMv7` (older 32-bit Android devices).
     Armv7,
     /// x86 (older 32-bit Android emulators).
     X86,
+}
+
+impl TargetArch {
+    const fn architecture(self) -> Architecture {
+        match self {
+            Self::Arm64 => Architecture::Aarch64(Aarch64Architecture::Aarch64),
+            Self::X86_64 => Architecture::X86_64,
+            Self::Armv7 => Architecture::Arm(target_lexicon::ArmArchitecture::Armv7),
+            Self::X86 => Architecture::X86_32(target_lexicon::X86_32Architecture::I686),
+        }
+    }
 }
 
 /// Arguments for the build command.
@@ -87,7 +96,7 @@ pub struct Args {
     #[arg(short, long, value_enum)]
     backend: Option<TargetBackend>,
 
-    /// Target architecture. Defaults to arm64 for iOS/Android, native for macOS/iOS Simulator.
+    /// Target architecture. Apple targets support only arm64; Android defaults to arm64.
     #[arg(short, long, value_enum)]
     arch: Option<TargetArch>,
 
@@ -229,12 +238,7 @@ async fn run_embedded_apple_build(
     args: &Args,
     context: &BuildContext,
 ) -> Result<()> {
-    let architecture = args.arch.map(|arch| match arch {
-        TargetArch::Arm64 => Architecture::Aarch64(Aarch64Architecture::Aarch64),
-        TargetArch::X86_64 => Architecture::X86_64,
-        TargetArch::Armv7 => Architecture::Arm(target_lexicon::ArmArchitecture::Armv7),
-        TargetArch::X86 => Architecture::X86_32(target_lexicon::X86_32Architecture::I686),
-    });
+    let architecture = args.arch.map(TargetArch::architecture);
     let spinner = shell.spinner("Building embedded Apple package...");
     let result = Box::pin(
         shell.display_output(waterui_cli::apple::embedded::build_xcframework(
@@ -357,12 +361,6 @@ async fn build_options(shell: &Shell, args: &Args, backend: TargetBackend) -> Bu
         super::detect_sccache_path(shell, &waterui_cli::toolchain::Host::current()).await
     {
         build_options = build_options.with_sccache(sccache_path);
-    }
-
-    if backend == TargetBackend::Apple
-        && let Some(triple) = apple_target_triple_override(args.platform, args.arch)
-    {
-        build_options = build_options.with_target_triple(triple);
     }
 
     build_options
@@ -546,6 +544,11 @@ fn validate_arch_args(
     backend: TargetBackend,
     arch: Option<TargetArch>,
 ) -> Result<()> {
+    if backend == TargetBackend::Apple
+        && let Some(arch) = arch
+    {
+        waterui_cli::apple::platform::validate_architecture(arch.architecture())?;
+    }
     // Hydrolysis on Android takes --arch like the Android backend; on its
     // desktop platforms the triple is the host's.
     let arch_free_backend = matches!(
@@ -654,20 +657,17 @@ async fn build_for_apple(
                 target_arch
             );
         }
-        (TargetPlatform::IosSimulator, None | Some(TargetArch::Arm64 | TargetArch::X86_64)) => {
+        (TargetPlatform::IosSimulator, None | Some(TargetArch::Arm64)) => {
             build_rust_lib(project, LibTargetPlatform::IOSSimulator, options).await
         }
         (TargetPlatform::IosSimulator, Some(target_arch)) => {
-            bail!(
-                "iOS Simulator only supports arm64 or x86_64, not {:?}",
-                target_arch
-            );
+            bail!("iOS Simulator only supports arm64, not {:?}", target_arch);
         }
-        (TargetPlatform::Macos, None | Some(TargetArch::Arm64 | TargetArch::X86_64)) => {
+        (TargetPlatform::Macos, None | Some(TargetArch::Arm64)) => {
             build_rust_lib(project, LibTargetPlatform::MacOS, options).await
         }
         (TargetPlatform::Macos, Some(target_arch)) => {
-            bail!("macOS only supports arm64 or x86_64, not {:?}", target_arch);
+            bail!("macOS only supports arm64, not {:?}", target_arch);
         }
         (
             TargetPlatform::Android
@@ -743,51 +743,37 @@ const fn backend_name(backend: TargetBackend) -> &'static str {
     }
 }
 
-const fn apple_target_triple_override(
-    platform: TargetPlatform,
-    arch: Option<TargetArch>,
-) -> Option<Triple> {
-    match (platform, arch) {
-        (TargetPlatform::Macos, Some(TargetArch::Arm64)) => Some(Triple {
-            architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
-            vendor: Vendor::Apple,
-            operating_system: OperatingSystem::Darwin(None),
-            environment: Environment::Unknown,
-            binary_format: BinaryFormat::Macho,
-        }),
-        (TargetPlatform::Macos, Some(TargetArch::X86_64)) => Some(Triple {
-            architecture: Architecture::X86_64,
-            vendor: Vendor::Apple,
-            operating_system: OperatingSystem::Darwin(None),
-            environment: Environment::Unknown,
-            binary_format: BinaryFormat::Macho,
-        }),
-        (TargetPlatform::IosSimulator, Some(TargetArch::Arm64)) => Some(Triple {
-            architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
-            vendor: Vendor::Apple,
-            operating_system: OperatingSystem::IOS(None),
-            environment: Environment::Sim,
-            binary_format: BinaryFormat::Macho,
-        }),
-        (TargetPlatform::IosSimulator, Some(TargetArch::X86_64)) => Some(Triple {
-            architecture: Architecture::X86_64,
-            vendor: Vendor::Apple,
-            operating_system: OperatingSystem::IOS(None),
-            environment: Environment::Unknown,
-            binary_format: BinaryFormat::Macho,
-        }),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, TargetBackend, TargetPlatform, build_profile, resolve_backend,
-        validate_output_dir_args,
+        Args, TargetArch, TargetBackend, TargetPlatform, build_profile, resolve_backend,
+        validate_arch_args, validate_output_dir_args,
     };
     use clap::Parser as _;
     use waterui_cli::build::BuildProfile;
+
+    #[test]
+    fn apple_rejects_intel_but_android_keeps_all_architectures() {
+        for platform in [
+            TargetPlatform::Macos,
+            TargetPlatform::Ios,
+            TargetPlatform::IosSimulator,
+        ] {
+            for arch in [TargetArch::X86_64, TargetArch::X86, TargetArch::Armv7] {
+                let error =
+                    validate_arch_args(platform, TargetBackend::Apple, Some(arch)).unwrap_err();
+                assert!(error.to_string().contains("only support arm64"));
+                assert!(
+                    validate_arch_args(TargetPlatform::Android, TargetBackend::Android, Some(arch))
+                        .is_ok()
+                );
+            }
+            assert!(validate_arch_args(platform, TargetBackend::Apple, None).is_ok());
+            assert!(
+                validate_arch_args(platform, TargetBackend::Apple, Some(TargetArch::Arm64)).is_ok()
+            );
+        }
+    }
 
     /// The build `Args` wrapped in a `Parser` so tests can exercise the real
     /// flag surface instead of constructing the clap struct field by field.

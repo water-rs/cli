@@ -8,7 +8,7 @@ use std::{
 use askama::Template;
 use eyre::{Result, bail};
 use smol::fs;
-use target_lexicon::{Aarch64Architecture, Architecture};
+use target_lexicon::Architecture;
 
 mod runtime;
 
@@ -77,51 +77,33 @@ fn collect_platform_links(
 struct Slice {
     platform: TargetPlatform,
     name: &'static str,
-    triples: Vec<&'static str>,
+    triple: &'static str,
 }
 
 fn slices(architecture: Option<Architecture>) -> Result<Vec<Slice>> {
-    let arm = match architecture {
-        None | Some(Architecture::Aarch64(Aarch64Architecture::Aarch64)) => true,
-        Some(Architecture::X86_64) => false,
-        Some(other) => bail!("Apple embedded artifacts do not support {other}"),
-    };
-    let intel = architecture.is_none() || architecture == Some(Architecture::X86_64);
+    if let Some(architecture) = architecture {
+        super::platform::validate_architecture(architecture)?;
+    }
     let mut result = Vec::new();
-    for (platform, name, arm_triple, intel_triple) in [
-        (
-            TargetPlatform::MacOS,
-            "macos",
-            "aarch64-apple-darwin",
-            Some("x86_64-apple-darwin"),
-        ),
-        (TargetPlatform::IOS, "ios", "aarch64-apple-ios", None),
+    for (platform, name, triple) in [
+        (TargetPlatform::MacOS, "macos", "aarch64-apple-darwin"),
+        (TargetPlatform::IOS, "ios", "aarch64-apple-ios"),
         (
             TargetPlatform::IOSSimulator,
             "ios-simulator",
             "aarch64-apple-ios-sim",
-            Some("x86_64-apple-ios"),
         ),
     ] {
-        let mut triples = Vec::new();
-        if arm {
-            triples.push(arm_triple);
-        }
-        if intel && let Some(triple) = intel_triple {
-            triples.push(triple);
-        }
-        if !triples.is_empty() {
-            result.push(Slice {
-                platform,
-                name,
-                triples,
-            });
-        }
+        result.push(Slice {
+            platform,
+            name,
+            triple,
+        });
     }
     Ok(result)
 }
 
-/// Build static Rust slices, then export the resolved backend's Swift seam
+/// Build static Rust slices, then export the resolved backend's thin Swift adapter
 /// and compiler-discovered resources as a local Swift package.
 ///
 /// Cargo caches stay outside the replaced package directory. Each invocation
@@ -199,57 +181,51 @@ async fn assemble_slices(
     for slice in selected {
         let directory = staging.join(slice.name);
         fs::create_dir_all(&directory).await?;
-        let mut archives = Vec::new();
-        for triple in &slice.triples {
-            let (built, native_links) = Box::pin(platform::build_rust_lib_with_links(
-                project,
-                slice.platform,
-                options
-                    .clone()
-                    .with_static_runtime()
-                    .with_target_triple(
-                        triple
-                            .parse()
-                            .map_err(|_| eyre::eyre!("unsupported Apple architecture {triple}"))?,
-                    )
-                    .with_output_dir(directory.join(triple)),
-            ))
-            .await?;
-            // Stage each target's actual symbol set: platform-gated asset
-            // declarations must not disappear when a later slice is built.
-            let (archive, symbols) = smol::unblock(move || {
-                let symbols = built.app_symbols()?;
-                Ok::<_, eyre::Report>((built.artifact, symbols))
-            })
-            .await?;
-            manifests.push(assets::plan_library_resources(project, &symbols, false).await?);
-            let swift_platform = if slice.platform == TargetPlatform::MacOS {
-                "macOS"
-            } else {
-                "iOS"
-            };
-            let mut closure = RuntimeClosure::new(native_links);
-            closure
-                .normalize_sdk_frameworks(host, slice.platform)
-                .await?;
-            let archive = closure
-                .compose(
-                    host,
-                    slice.platform,
-                    triple,
-                    &archive,
-                    &directory.join(format!("{triple}-closed.a")),
-                    &staging.join("package/Sources/WaterUI/Resources/Notices"),
+        let triple = slice.triple;
+        let (built, native_links) = Box::pin(platform::build_rust_lib_with_links(
+            project,
+            slice.platform,
+            options
+                .clone()
+                .with_static_runtime()
+                .with_target_triple(
+                    triple
+                        .parse()
+                        .map_err(|_| eyre::eyre!("unsupported Apple architecture {triple}"))?,
                 )
-                .await?;
-            collect_platform_links(&mut links, swift_platform, triple, closure.remaining)?;
-            archives.push(archive);
-        }
+                .with_output_dir(directory.join(triple)),
+        ))
+        .await?;
+        // Stage each target's actual symbol set: platform-gated asset
+        // declarations must not disappear when a later slice is built.
+        let (archive, symbols) = smol::unblock(move || {
+            let symbols = built.app_symbols()?;
+            Ok::<_, eyre::Report>((built.artifact, symbols))
+        })
+        .await?;
+        manifests.push(assets::plan_library_resources(project, &symbols, false).await?);
+        let swift_platform = if slice.platform == TargetPlatform::MacOS {
+            "macOS"
+        } else {
+            "iOS"
+        };
+        let mut closure = RuntimeClosure::new(native_links);
+        closure
+            .normalize_sdk_frameworks(host, slice.platform)
+            .await?;
+        let archive = closure
+            .compose(
+                host,
+                slice.platform,
+                triple,
+                &archive,
+                &directory.join(format!("{triple}-closed.a")),
+                &staging.join("package/Sources/WaterUI/Resources/Notices"),
+            )
+            .await?;
+        collect_platform_links(&mut links, swift_platform, triple, closure.remaining)?;
         let library = directory.join("libWaterUINative.a");
-        let mut lipo = vec![OsString::from("lipo"), OsString::from("-create")];
-        lipo.extend(archives.into_iter().map(PathBuf::into_os_string));
-        lipo.extend([OsString::from("-output"), library.clone().into_os_string()]);
-        host.run("xcrun", lipo).await?;
+        fs::copy(&archive, &library).await?;
         arguments.extend([OsString::from("-library"), library.into_os_string()]);
     }
     arguments.extend([
@@ -348,16 +324,21 @@ async fn replace_package(source: &std::path::Path, destination: &std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use target_lexicon::Aarch64Architecture;
 
     #[test]
-    fn default_artifact_has_device_and_universal_desktop_and_simulator() {
+    fn default_artifact_has_only_arm64_desktop_device_and_simulator() {
         let selected = slices(None).unwrap();
         assert_eq!(
             selected
                 .iter()
-                .map(|slice| slice.triples.len())
+                .map(|slice| slice.triple)
                 .collect::<Vec<_>>(),
-            [2, 1, 2]
+            [
+                "aarch64-apple-darwin",
+                "aarch64-apple-ios",
+                "aarch64-apple-ios-sim"
+            ]
         );
         assert_eq!(selected[1].platform, TargetPlatform::IOS);
         assert_eq!(selected[2].platform, TargetPlatform::IOSSimulator);
@@ -366,25 +347,25 @@ mod tests {
     #[test]
     fn unsupported_architectures_return_diagnostics() {
         for architecture in [
+            Architecture::X86_64,
             Architecture::Arm(target_lexicon::ArmArchitecture::Armv7),
             Architecture::X86_32(target_lexicon::X86_32Architecture::I686),
         ] {
             let error = slices(Some(architecture)).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                format!("Apple embedded artifacts do not support {architecture}")
+                format!(
+                    "Apple targets only support arm64; unsupported architecture {architecture}"
+                )
             );
         }
     }
 
     #[test]
-    fn intel_has_no_device_slice() {
-        let selected = slices(Some(Architecture::X86_64)).unwrap();
-        assert_eq!(selected.len(), 2);
-        assert!(
-            selected
-                .iter()
-                .all(|slice| slice.platform != TargetPlatform::IOS)
+    fn explicit_arm64_matches_default_slices() {
+        assert_eq!(
+            slices(Some(Architecture::Aarch64(Aarch64Architecture::Aarch64))).unwrap(),
+            slices(None).unwrap()
         );
     }
 
@@ -456,14 +437,8 @@ mod tests {
             })
             .to_vec();
         let mut links = Vec::new();
-        collect_platform_links(
-            &mut links,
-            "macOS",
-            "aarch64-apple-darwin",
-            contract.clone(),
-        )
-        .unwrap();
-        collect_platform_links(&mut links, "macOS", "x86_64-apple-darwin", contract.clone())
+        collect_platform_links(&mut links, "iOS", "aarch64-apple-ios", contract.clone()).unwrap();
+        collect_platform_links(&mut links, "iOS", "aarch64-apple-ios-sim", contract.clone())
             .unwrap();
         assert_eq!(links.len(), 1);
         for changed in [
@@ -475,7 +450,7 @@ mod tests {
             contract[..2].to_vec(),
         ] {
             assert!(
-                collect_platform_links(&mut links, "macOS", "x86_64-apple-darwin", changed)
+                collect_platform_links(&mut links, "iOS", "aarch64-apple-ios-sim", changed)
                     .is_err()
             );
         }

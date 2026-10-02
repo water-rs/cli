@@ -285,12 +285,6 @@ pub fn sccache() -> Option<ManagedTool> {
             "2c165dd599675a31be5d0e100e8df2bb22919d75ac711f9060acd96fcb7c6626",
             ArchiveKind::TarGz,
         )
-    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-        (
-            "x86_64-apple-darwin",
-            "1dade83cc49eeb42337565eccd534b05982820a8e44b851bd7937467a18c7aef",
-            ArchiveKind::TarGz,
-        )
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         (
             "aarch64-apple-darwin",

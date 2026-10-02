@@ -7,7 +7,7 @@ use std::{
 
 use eyre::{Context, Result, bail};
 use smol::fs;
-use target_lexicon::{Aarch64Architecture, Architecture, Triple};
+use target_lexicon::Triple;
 
 use crate::{build::NativeLink, platform::TargetPlatform, toolchain::Host};
 
@@ -143,11 +143,8 @@ fn composition_arguments(
     let target: Triple = triple
         .parse()
         .map_err(|_| eyre::eyre!("Invalid Apple target {triple}"))?;
-    let arch = match target.architecture {
-        Architecture::Aarch64(Aarch64Architecture::Aarch64) => "arm64",
-        Architecture::X86_64 => "x86_64",
-        other => bail!("Unsupported static Apple architecture {other}"),
-    };
+    crate::apple::platform::validate_architecture(target.architecture)?;
+    let arch = "arm64";
     let mut args = ["--sdk", sdk, "libtool", "-static", "-arch_only", arch, "-o"]
         .map(OsString::from)
         .to_vec();

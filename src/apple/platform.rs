@@ -35,6 +35,19 @@ use crate::{
 /// library target stays for the embedding path.
 pub const APPLE_ENTRY_BINARY_NAME: &str = "waterui-apple-main";
 
+/// Validate the architecture supported by every Apple build and package path.
+///
+/// # Errors
+/// Returns a diagnostic for any architecture other than ARM64.
+pub fn validate_architecture(architecture: target_lexicon::Architecture) -> eyre::Result<()> {
+    if architecture
+        != target_lexicon::Architecture::Aarch64(target_lexicon::Aarch64Architecture::Aarch64)
+    {
+        bail!("Apple targets only support arm64; unsupported architecture {architecture}");
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Build Utilities
 // ============================================================================
@@ -206,6 +219,11 @@ pub(crate) async fn build_rust_lib_with_links(
     platform: TargetPlatform,
     options: BuildOptions,
 ) -> eyre::Result<(BuiltTarget, Vec<crate::build::NativeLink>)> {
+    let triple = options
+        .target_triple()
+        .cloned()
+        .unwrap_or_else(|| platform.triple());
+    validate_architecture(triple.architecture)?;
     let options = if project.manifest().package.embedded {
         options.with_static_runtime()
     } else {
@@ -220,10 +238,6 @@ pub(crate) async fn build_rust_lib_with_links(
         .browser_runtime_plan(platform, TargetBackend::Apple)
         .await?;
 
-    let triple = options
-        .target_triple()
-        .cloned()
-        .unwrap_or_else(|| platform.triple());
     let target = triple.to_string();
     let target_underscore = target.replace('-', "_");
     let host_library = AppleHostLibrary::for_linkage(options.linkage());
