@@ -1342,6 +1342,7 @@ impl Project {
                 package_manager: scaffold.package_manager,
             }),
             assets: None,
+            signing: SigningConfig::default(),
         };
 
         // Save Water.toml
@@ -1928,6 +1929,41 @@ pub struct Manifest {
     /// themselves (`[assets]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assets: Option<AssetsConfig>,
+    /// Distribution signing configuration (`[signing]`).
+    #[serde(default, skip_serializing_if = "SigningConfig::is_empty")]
+    pub signing: SigningConfig,
+}
+
+/// Distribution signing configuration (`[signing]`).
+///
+/// Each platform's distribution packaging reads its own subsection; a
+/// project that never packages for distribution leaves the table out.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SigningConfig {
+    /// macOS Developer ID distribution signing (`[signing.macos]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub macos: Option<MacosSigningConfig>,
+}
+
+impl SigningConfig {
+    /// Whether no platform carries signing configuration.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.macos.is_none()
+    }
+}
+
+/// macOS Developer ID distribution signing (`[signing.macos]`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct MacosSigningConfig {
+    /// The Apple Developer team the package signs for — matched against the
+    /// Developer ID Application certificate's subject organizational unit.
+    pub team_id: String,
+    /// The `notarytool` keychain profile the submission authenticates with,
+    /// created with `xcrun notarytool store-credentials`.
+    pub notary_profile: String,
 }
 
 /// Permission entry in `[permissions]`.
@@ -2047,6 +2083,7 @@ impl Manifest {
             launch: None,
             web: None,
             assets: None,
+            signing: SigningConfig::default(),
         }
     }
 }

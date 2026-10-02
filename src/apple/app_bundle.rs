@@ -485,14 +485,32 @@ pub async fn sign_apple_app(
     if platform == TargetPlatform::MacOS {
         #[cfg(target_os = "macos")]
         {
+            use crate::platform::PackageAudience;
+
             let requires_stable_identity =
                 project.manifest().permissions.iter().any(|(key, entry)| {
                     entry.is_enabled() && !key.macos_usage_description_keys().is_empty()
                 });
+            let signing = match options.audience() {
+                PackageAudience::Development => crate::macos_bundle::MacOsSigning::Development {
+                    requires_stable_identity,
+                },
+                PackageAudience::Distribution => {
+                    let entitlements = backend_root
+                        .join(&backend.scheme)
+                        .join(format!("{}.entitlements", backend.scheme));
+                    crate::macos_bundle::MacOsSigning::Distribution(
+                        crate::macos_bundle::DistributionSigning::from_manifest(
+                            project.manifest().signing.macos.as_ref(),
+                            entitlements.is_file().then_some(entitlements),
+                        )?,
+                    )
+                }
+            };
             crate::macos_bundle::sign_macos_app(
                 &layout.app_path,
                 project.bundle_identifier(),
-                requires_stable_identity,
+                &signing,
             )
             .await?;
             return Ok(());
