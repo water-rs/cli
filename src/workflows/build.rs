@@ -405,9 +405,10 @@ impl RustDynamicLibraries {
     /// [`stage_apple_canonical`](Self::stage_apple_canonical) copies it into
     /// `destination` — the file the `-lwaterui_dylib` link flag and the
     /// `@rpath/libwaterui_dylib.dylib` install name resolve to. Apple-only:
-    /// cargo writes only the hashed `deps/` name (water-rs/cli#197). On other
-    /// triples the staged copy already carries the recorded name, so this is
-    /// its own path.
+    /// the reported artifact path may be a hashed `deps/` name or already
+    /// the canonical unhashed one, and staging must honor both (water-rs/cli#197,
+    /// water-rs/cli#291). On other triples the staged copy already carries
+    /// the recorded name, so this is its own path.
     #[must_use]
     pub fn apple_canonical_waterui(&self, destination: &Path) -> PathBuf {
         if is_apple_triple(&self.triple) {
@@ -421,10 +422,28 @@ impl RustDynamicLibraries {
     /// canonical Apple name [`apple_canonical_waterui`] returns, alongside
     /// the recorded name [`stage`](Self::stage) writes.
     ///
+    /// The reported artifact can already occupy the canonical destination —
+    /// an unhashed `deps/` dylib name is already the canonical one — and
+    /// then staging is a no-op, never a copy: `copy_file` deletes its
+    /// destination before reflinking, so copying the reported path over
+    /// itself would destroy the runtime it stages.
+    ///
     /// # Errors
-    /// Returns an error if the copy fails.
+    /// Returns an error if the copy fails, or if the reported runtime
+    /// cannot be validated at the canonical destination.
     pub async fn stage_apple_canonical(&self, destination: &Path) -> eyre::Result<PathBuf> {
         let staged = self.apple_canonical_waterui(destination);
+        if self.waterui.source == staged {
+            smol::fs::metadata(&self.waterui.source)
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "Failed to validate the reported shared WaterUI runtime {}",
+                        self.waterui.source.display()
+                    )
+                })?;
+            return Ok(staged);
+        }
         crate::utils::copy_file(&self.waterui.source, &staged)
             .await
             .wrap_err_with(|| {
@@ -4642,6 +4661,93 @@ mod tests {
         assert_eq!(
             Path::new("/dist/libwaterui_dylib-0123456789abcdef.so"),
             linux.apple_canonical_waterui(destination)
+        );
+    }
+
+    /// Staging inputs shared by the canonical-destination cases: `source` is
+    /// the artifact Cargo reported for `waterui-dylib`; the standard library
+    /// takes no part in canonical naming.
+    fn canonical_staging_libraries(source: PathBuf) -> super::RustDynamicLibraries {
+        super::RustDynamicLibraries {
+            waterui: super::StagedDynamicLibrary::reported(source).expect("reported name"),
+            standard_library: super::StagedDynamicLibrary::reported(PathBuf::from(
+                "/deps/libstd-0123456789abcdef.dylib",
+            ))
+            .expect("standard library name"),
+            triple: triple("aarch64-apple-darwin"),
+        }
+    }
+
+    fn dylib_bytes() -> Vec<u8> {
+        (0_u32..25_000).flat_map(u32::to_le_bytes).collect()
+    }
+
+    /// When the reported runtime already occupies the canonical destination,
+    /// staging must leave its bytes alone: `copy_file` deletes its
+    /// destination before reflinking, so a self-copy would destroy the
+    /// artifact it stages (water-rs/cli#291).
+    #[test]
+    fn canonical_stage_preserves_an_already_canonical_source() {
+        let temporary = tempdir().expect("tempdir");
+        let destination = temporary.path().join("deps");
+        std::fs::create_dir_all(&destination).expect("deps dir");
+        let source = destination.join("libwaterui_dylib.dylib");
+        let bytes = dylib_bytes();
+        std::fs::write(&source, &bytes).expect("reported artifact");
+        let libraries = canonical_staging_libraries(source.clone());
+
+        let staged = smol::block_on(libraries.stage_apple_canonical(&destination))
+            .expect("already-canonical staging is a no-op");
+        assert_eq!(staged, source);
+        smol::block_on(libraries.stage_apple_canonical(&destination))
+            .expect("restaging stays a no-op");
+        assert_eq!(
+            std::fs::read(&source).expect("read artifact"),
+            bytes,
+            "repeated canonical staging must preserve the artifact"
+        );
+    }
+
+    /// A reported runtime living anywhere else still reflinks under the
+    /// canonical name, source left intact.
+    #[test]
+    fn canonical_stage_copies_a_distinct_source() {
+        let temporary = tempdir().expect("tempdir");
+        let source = temporary
+            .path()
+            .join("deps/libwaterui_dylib-0123456789abcdef.dylib");
+        let destination = temporary.path().join("dist");
+        std::fs::create_dir_all(source.parent().expect("deps dir")).expect("deps dir");
+        std::fs::create_dir_all(&destination).expect("dist dir");
+        let bytes = dylib_bytes();
+        std::fs::write(&source, &bytes).expect("reported artifact");
+        let libraries = canonical_staging_libraries(source.clone());
+
+        let staged = smol::block_on(libraries.stage_apple_canonical(&destination))
+            .expect("distinct source stages");
+        assert_eq!(staged, destination.join("libwaterui_dylib.dylib"));
+        assert_eq!(std::fs::read(&staged).expect("read staged copy"), bytes);
+        assert_eq!(
+            std::fs::read(&source).expect("read source"),
+            bytes,
+            "staging leaves the reported source in place"
+        );
+    }
+
+    /// A reported runtime that does not exist is a build defect, never a
+    /// silent no-op — presence is validated at this artifact boundary.
+    #[test]
+    fn canonical_stage_errors_when_the_reported_source_is_missing() {
+        let temporary = tempdir().expect("tempdir");
+        let destination = temporary.path().join("deps");
+        std::fs::create_dir_all(&destination).expect("deps dir");
+        let source = destination.join("libwaterui_dylib.dylib");
+        let error =
+            smol::block_on(canonical_staging_libraries(source).stage_apple_canonical(&destination))
+                .expect_err("a missing reported source must error");
+        assert!(
+            format!("{error:#}").contains("libwaterui_dylib.dylib"),
+            "the error names the missing reported artifact: {error:#}"
         );
     }
 
