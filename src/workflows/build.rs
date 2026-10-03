@@ -1582,6 +1582,27 @@ impl RustBuild {
         .await
     }
 
+    /// Build a static library (staticlib) and return Cargo's reported build result.
+    ///
+    /// The manifest's declared crate types all emit — no `--crate-type`
+    /// selection — so the dependency units carry the same fingerprints a
+    /// sibling binary build in this target directory computes; a narrowed
+    /// build would compile the whole dependency graph a second time for the
+    /// entry binary that follows. The `.a`/`.lib` is picked out of Cargo's
+    /// report by extension.
+    ///
+    /// # Errors
+    /// - `RustBuildError::FailToExecuteCargoBuild`: If there was an error executing the cargo build command.
+    /// - `RustBuildError::FailToBuildRustLibrary`: If the library was not found after building.
+    pub async fn build_staticlib(&self, release: bool) -> Result<BuiltTarget, RustBuildError> {
+        self.build_inner(
+            release,
+            CargoTarget::Lib,
+            crate_type_artifact_extension("staticlib", &self.triple),
+        )
+        .await
+    }
+
     /// Builds one named binary and returns its full output path.
     ///
     /// The path is `<profile>/<name>` re-issued from the binary unit's own
@@ -4127,6 +4148,60 @@ mod tests {
             .is_err(),
             "an artifact for another manifest is never selected"
         );
+    }
+
+    /// A manifest declaring `staticlib`, `cdylib` and `rlib` reports all
+    /// emitted files on one artifact message; the archive selector picks the
+    /// `.a` out of the set by extension and never the shared library or rlib.
+    #[test]
+    fn reported_artifact_selects_the_static_archive_from_declared_types() {
+        let temporary = tempdir().expect("tempdir");
+        let crate_dir = temporary.path().join("demo-ffi-deadbeef");
+        std::fs::create_dir_all(&crate_dir).expect("crate dir");
+        std::fs::write(crate_dir.join("Cargo.toml"), "[package]\n").expect("manifest");
+        let manifest =
+            dunce::canonicalize(crate_dir.join("Cargo.toml")).expect("canonical manifest");
+        let deps = crate_dir.join("target/release");
+        std::fs::create_dir_all(&deps).expect("profile dir");
+        let archive = deps.join("libdemo_ffi.a");
+        let dylib = deps.join("libdemo_ffi.dylib");
+        let rlib = deps.join("libdemo_ffi.rlib");
+        for file in [&archive, &dylib, &rlib] {
+            std::fs::write(file, []).expect("reported artifact");
+        }
+
+        let stdout = serde_json::json!({
+            "reason": "compiler-artifact",
+            "package_id": "path+file:///x#demo-ffi@0.1.0",
+            "manifest_path": manifest,
+            "target": {
+                "kind": ["lib"],
+                "crate_types": ["staticlib", "cdylib", "rlib"],
+                "name": "demo_ffi",
+                "src_path": crate_dir.join("src/lib.rs"),
+                "edition": "2021",
+                "doc": true,
+                "doctest": true,
+                "test": true,
+            },
+            "profile": {
+                "opt_level": "3",
+                "debuginfo": 0,
+                "debug_assertions": false,
+                "overflow_checks": false,
+                "test": false,
+            },
+            "features": [],
+            "filenames": [archive, dylib, rlib],
+            "executable": null,
+            "fresh": false,
+        })
+        .to_string();
+
+        let resolved =
+            super::reported_artifact(stdout.as_bytes(), &crate_dir, CargoTarget::Lib, Some("a"))
+                .expect("the declared static archive resolves");
+        assert_eq!(resolved, archive);
     }
 
     /// A dependency's uplifted dylib is unhashed, so a `fresh` report does not
