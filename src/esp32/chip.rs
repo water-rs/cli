@@ -30,7 +30,7 @@ pub enum Esp32Arch {
 /// The variant determines the chip's architecture and every architecture- and
 /// chip-specific build/emulation parameter. Parse one with
 /// [`Esp32Chip::from_str`]; the chip string is the single source of truth
-/// (`[backends.esp32] chip` in `Water.toml`, or the selected platform).
+/// (`[esp32] chip` in `Water.toml`, or the selected platform).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Esp32Chip {
     /// ESP32-S3: dual-core Xtensa LX7.

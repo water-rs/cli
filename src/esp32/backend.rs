@@ -25,57 +25,68 @@ fn subset_font(path: &Path, ranges: &str, output_dir: &Path) -> eyre::Result<Pat
 
 #[cfg(not(feature = "esp32"))]
 fn subset_font(_path: &Path, _ranges: &str, _output_dir: &Path) -> eyre::Result<PathBuf> {
-    eyre::bail!("[backends.esp32] font_ranges requires the `esp32` feature of waterui-cli")
+    eyre::bail!("[esp32] font_ranges requires the `esp32` feature of waterui-cli")
 }
 
-/// Configuration for the ESP32 backend in a `WaterUI` project.
+/// The `[esp32]` table in `Water.toml`: the project's ESP32 device
+/// configuration — chip, panel geometry, and the fonts firmware embeds.
 ///
-/// `[backends.esp32]` in `Water.toml`
+/// The generated harness lives under the managed backends root; that
+/// runtime state is [`Esp32Backend`], not manifest configuration.
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Esp32Backend {
-    /// The generated harness's directory below the managed backends root.
-    #[serde(skip, default = "default_esp32_project_path")]
-    project_path: PathBuf,
+pub struct Esp32Config {
     #[serde(
         default = "default_esp32_chip",
         skip_serializing_if = "is_default_esp32_chip"
     )]
     chip: String,
+    /// Panel width in pixels the generated harness reports to dew.
     #[serde(
         default = "default_esp32_panel_width",
         skip_serializing_if = "is_default_esp32_panel_width"
     )]
-    panel_width: u32,
+    pub panel_width: u32,
+    /// Panel height in pixels the generated harness reports to dew.
     #[serde(
         default = "default_esp32_panel_height",
         skip_serializing_if = "is_default_esp32_panel_height"
     )]
-    panel_height: u32,
+    pub panel_height: u32,
+    /// Height in pixels of the drawing band dew flush-strategies panel
+    /// updates over.
     #[serde(
         default = "default_esp32_band_height",
         skip_serializing_if = "is_default_esp32_band_height"
     )]
-    band_height: u32,
+    pub band_height: u32,
     /// TTF/OTF binaries bundled into flash for dew text shaping, relative to
     /// the project root. Firmware has no font directory to enumerate, so a
     /// text-rendering app must list at least one face here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fonts: Vec<PathBuf>,
+    pub fonts: Vec<PathBuf>,
     /// Unicode ranges to subset every bundled font to before embedding
     /// (e.g. `["U+0020-007E", "U+00A0-00FF"]`). Absent means the whole font
     /// is embedded. Subsetting is explicit because it silently drops glyphs
     /// outside the ranges; when set, a full Latin face shrinks from
     /// hundreds of kilobytes of flash to a few dozen.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    font_ranges: Vec<String>,
+    pub font_ranges: Vec<String>,
 }
 
-impl Esp32Backend {
-    /// Create a new ESP32 backend configuration with default settings.
+/// The generated ESP32 `dew` harness, managed by the CLI under the
+/// project's managed backends root. Runtime state only — the persisted
+/// device configuration is [`Esp32Config`].
+#[derive(Debug, Clone)]
+pub struct Esp32Backend {
+    /// The generated harness's directory below the managed backends root.
+    project_path: PathBuf,
+}
+
+impl Esp32Config {
+    /// Create a new ESP32 configuration with default settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            project_path: default_esp32_project_path(),
             chip: default_esp32_chip(),
             panel_width: default_esp32_panel_width(),
             panel_height: default_esp32_panel_height(),
@@ -90,12 +101,6 @@ impl Esp32Backend {
     pub fn with_chip(mut self, chip: Esp32Chip) -> Self {
         self.chip = chip.id().to_string();
         self
-    }
-
-    /// Get the path to the ESP32 harness project within the `WaterUI` project.
-    #[must_use]
-    pub const fn project_path(&self) -> &PathBuf {
-        &self.project_path
     }
 
     /// Get the configured target chip identifier (e.g. "esp32s3").
@@ -143,7 +148,7 @@ impl Esp32Backend {
                 };
                 if !path.is_file() {
                     eyre::bail!(
-                        "[backends.esp32] fonts entry {} does not exist (resolved to {})",
+                        "[esp32] fonts entry {} does not exist (resolved to {})",
                         font.display(),
                         path.display()
                     );
@@ -163,6 +168,20 @@ impl Esp32Backend {
             self.band_height,
         )
         .with_fonts(fonts))
+    }
+}
+
+impl Default for Esp32Config {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Esp32Backend {
+    /// Get the path to the ESP32 harness project within the `WaterUI` project.
+    #[must_use]
+    pub const fn project_path(&self) -> &PathBuf {
+        &self.project_path
     }
 
     /// Check whether generated ESP32 harness files should be regenerated.
@@ -185,7 +204,7 @@ impl Esp32Backend {
             })?;
         let main_rs = std::fs::read_to_string(backend_path.join("src/main.rs")).unwrap_or_default();
         let config = project
-            .esp32_backend()
+            .esp32_config()
             .cloned()
             .unwrap_or_default()
             .template_entry(project.root(), &backend_path.join("fonts"))?;
@@ -265,7 +284,9 @@ impl Esp32Backend {
 
 impl Default for Esp32Backend {
     fn default() -> Self {
-        Self::new()
+        Self {
+            project_path: PathBuf::from("esp32"),
+        }
     }
 }
 
@@ -281,7 +302,8 @@ impl Backend for Esp32Backend {
 
     async fn init(project: &Project) -> Result<Self, crate::backend::FailToInitBackend> {
         let manifest = project.manifest();
-        let backend = project.esp32_backend().cloned().unwrap_or_default();
+        let backend = Self::default();
+        let config = project.esp32_config().cloned().unwrap_or_default();
 
         let app_name = manifest
             .package
@@ -289,7 +311,7 @@ impl Backend for Esp32Backend {
             .chars()
             .filter(|c| c.is_alphanumeric())
             .collect::<String>();
-        let template_entry = backend
+        let template_entry = config
             .template_entry(
                 project.root(),
                 &project.backend_path::<Self>().join("fonts"),
@@ -297,7 +319,7 @@ impl Backend for Esp32Backend {
             .map_err(crate::backend::FailToInitBackend::Config)?;
         if template_entry.fonts.is_empty() {
             tracing::warn!(
-                "[backends.esp32] bundles no fonts; dew fails fast at the first text layout. \
+                "[esp32] bundles no fonts; dew fails fast at the first text layout. \
                  Add `fonts = [\"path/to/Font.ttf\"]` (relative to the project root) to render text."
             );
         }
@@ -353,10 +375,6 @@ impl Backend for Esp32Backend {
     async fn clean(&self, project: &Project, _platform: TargetPlatform) -> eyre::Result<()> {
         clean_esp32(project).await
     }
-}
-
-fn default_esp32_project_path() -> PathBuf {
-    PathBuf::from("esp32")
 }
 
 fn default_esp32_chip() -> String {

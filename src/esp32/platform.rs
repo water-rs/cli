@@ -196,7 +196,7 @@ pub fn esp_toolchain_envs(chip: Esp32Chip) -> eyre::Result<Vec<(String, OsString
 /// Resolve the configured chip for `project`'s ESP32 backend.
 fn esp32_chip(project: &Project) -> eyre::Result<Esp32Chip> {
     project
-        .esp32_backend()
+        .esp32_config()
         .cloned()
         .unwrap_or_default()
         .resolved_chip()

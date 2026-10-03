@@ -134,7 +134,7 @@ async fn ensure_generated_backend(
         TargetBackend::Hydrolysis => HydrolysisBackend::requires_regeneration(&project).await?,
         TargetBackend::WinUi => WinUiBackend::requires_regeneration(&project).await?,
         TargetBackend::Dew => {
-            project.esp32_backend().is_none() || Esp32Backend::requires_regeneration(&project)?
+            project.esp32_config().is_none() || Esp32Backend::requires_regeneration(&project)?
         }
     };
     if !needs_generation {

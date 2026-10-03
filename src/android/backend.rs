@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::{
     android::platform::{AndroidAbi, AndroidPlatform, clean_android, is_android_platform},
     backend::Backend,
@@ -12,47 +10,30 @@ use crate::{
     templates::{self, TemplateContext},
 };
 
-/// Configuration for the Android backend in a `WaterUI` project.
+/// The generated Android backend in a `WaterUI` project.
 ///
-/// `[backends.android]` in `Water.toml` persists only `backend_path`; the
-/// project path locates the Gradle project the CLI generates in the managed
-/// build cache.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+/// Runtime state only — nothing is persisted in `Water.toml`. The project
+/// path locates the Gradle project the CLI generates in the managed build
+/// cache; a local runtime checkout is discovered at
+/// `waterui_path/backends/android`, never declared.
+#[derive(Debug, Clone)]
 pub struct AndroidBackend {
-    #[serde(skip, default = "default_android_project_path")]
     project_path: PathBuf,
-    /// Path to a local `android-backend` checkout used as the runtime source.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    backend_path: Option<String>,
 }
 
 impl AndroidBackend {
-    /// Create a new Android backend configuration with default settings.
+    /// Create a new Android backend with default settings.
     #[must_use]
     pub fn new() -> Self {
         Self {
             project_path: default_android_project_path(),
-            backend_path: None,
         }
-    }
-
-    /// Set the local `android-backend` checkout used as the runtime source.
-    #[must_use]
-    pub fn with_backend_path(mut self, path: impl Into<String>) -> Self {
-        self.backend_path = Some(path.into());
-        self
     }
 
     /// Get the path to the Android project within the `WaterUI` project.
     #[must_use]
     pub const fn project_path(&self) -> &PathBuf {
         &self.project_path
-    }
-
-    /// Get the local `android-backend` checkout used as the runtime source.
-    #[must_use]
-    pub fn backend_path(&self) -> Option<&str> {
-        self.backend_path.as_deref()
     }
 
     /// Get the path to the Gradle wrapper script within the Android project.
@@ -148,10 +129,6 @@ impl Backend for AndroidBackend {
 
         Ok(Self {
             project_path: default_android_project_path(),
-            backend_path: manifest
-                .backends
-                .android()
-                .and_then(|backend| backend.backend_path.clone()),
         })
     }
 

@@ -336,11 +336,6 @@ pub struct TemplateContext {
     pub bundle_identifier: BundleIdentifier,
     /// The author name
     pub author: String,
-    /// Path to the Android backend (relative or absolute)
-    pub android_backend_path: Option<PathBuf>,
-    /// `[backends.apple] backend_path` — a local Apple backend checkout that
-    /// replaces the remote Rust backend dependency.
-    pub apple_backend_path: Option<PathBuf>,
     /// Whether the project selected the Apple backend for this invocation —
     /// the ffi companion only depends on `waterui-apple` and declares its
     /// entry-owning bin when this is set, so an Android-only build never
@@ -412,8 +407,6 @@ impl TemplateContext {
             crate_version: String::new(),
             bundle_identifier: options.bundle_identifier.clone(),
             author: options.author.clone(),
-            android_backend_path: None,
-            apple_backend_path: None,
             apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
@@ -442,7 +435,6 @@ impl TemplateContext {
         app_name: impl Into<String>,
         framework: &ResolvedFramework,
     ) -> Self {
-        let apple = manifest.backends.apple();
         Self {
             app_display_name: manifest.package.name.clone(),
             app_name: app_name.into(),
@@ -450,16 +442,7 @@ impl TemplateContext {
             crate_version: String::new(),
             bundle_identifier: manifest.package.bundle_identifier.clone(),
             author: String::new(),
-            android_backend_path: manifest
-                .backends
-                .android()
-                .and_then(|backend| backend.backend_path().map(PathBuf::from)),
-            apple_backend_path: apple
-                .and_then(|backend| backend.backend_path.as_deref())
-                .map(PathBuf::from),
-            // Selected at invocation, never from declared config: a project
-            // that declares `[backends.apple]` but builds for Android must
-            // still emit no `waterui-apple` pieces.
+            // Selected at invocation, never from declared config.
             apple_backend_selected: false,
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
             framework: framework.clone(),
@@ -512,8 +495,6 @@ impl TemplateContext {
             crate_version: String::new(),
             bundle_identifier,
             author: String::new(),
-            android_backend_path: None,
-            apple_backend_path: None,
             apple_backend_selected: false,
             waterui_path,
             framework: framework.clone(),
@@ -776,8 +757,8 @@ impl TemplateContext {
 
     /// Whether the Android project consumes the runtime as the remote
     /// coordinate `android_remote_backend_dependency` names rather than a
-    /// local checkout: true unless `[backends.android] backend_path` names one
-    /// or `waterui_path/backends/android` is a Gradle project.
+    /// local checkout: true unless `waterui_path/backends/android` is a
+    /// Gradle project.
     #[must_use]
     pub fn use_remote_dev_backend(&self) -> bool {
         self.compute_android_backend_path().is_none()
@@ -814,7 +795,6 @@ impl TemplateContext {
     #[must_use]
     pub fn android_runtime_checkout(&self) -> Option<PathBuf> {
         android_runtime_checkout(
-            self.android_backend_path.as_deref(),
             self.waterui_workspace_root().as_deref(),
             self.project_root_path.as_deref(),
         )
@@ -851,7 +831,7 @@ impl TemplateContext {
     /// `target`, resolved from the backend project's directory.
     ///
     /// `target` is absolute, or relative to the project root the way
-    /// `waterui_path` and `[backends.apple] backend_path` are. This accounts
+    /// `waterui_path` is. This accounts
     /// for the project being in a generated backend subdirectory.
     fn backend_relative_path(&self, target: &Path) -> String {
         // If `target` is absolute, use it directly. This avoids producing
@@ -902,49 +882,46 @@ impl TemplateContext {
         normalize_path_for_config(&backend_path)
     }
 
-    /// The path to the local Apple backend checkout `[backends.apple]`
-    /// `backend_path` names, resolved from the generated project's directory.
-    /// `None` consumes the pinned remote Rust backend instead.
+    /// The path to the local Apple backend checkout at
+    /// `waterui_path/backends/apple`, resolved from the generated project's
+    /// directory. `None` consumes the pinned remote Rust backend instead.
     ///
-    /// Without a manifest override, `waterui_path/backends/apple` is used when
-    /// it contains a Rust manifest: dropping this silently retargeted every
-    /// local-checkout build — including the backend's own e2e suite — onto the
-    /// pinned remote release.
+    /// The canonical checkout slot is the only local source: without the
+    /// probe every local-checkout build — including the backend's own e2e
+    /// suite — would silently retarget onto the pinned remote release.
     fn compute_apple_backend_path(&self) -> Option<String> {
-        self.apple_backend_path
-            .as_ref()
-            .map(|path| self.backend_relative_path(path))
-            .or_else(|| {
-                let local = self.waterui_workspace_root()?.join("backends/apple");
-                local
-                    .join("Cargo.toml")
-                    .is_file()
-                    .then(|| self.backend_relative_path(&local))
-            })
+        let slot = Path::new("backends/apple");
+        if !self
+            .waterui_workspace_root()?
+            .join(slot)
+            .join("Cargo.toml")
+            .is_file()
+        {
+            return None;
+        }
+        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join(slot)))
     }
 
-    /// The path to the local Android backend checkout `[backends.android]`
-    /// `backend_path` names, resolved from the Android project's directory.
-    /// `None` consumes the remote runtime coordinate instead.
+    /// The path to the local Android backend checkout at
+    /// `waterui_path/backends/android`, resolved from the Android project's
+    /// directory. `None` consumes the remote runtime coordinate instead.
     ///
-    /// Without a manifest override, `waterui_path/backends/android` is used
-    /// when it is a real Gradle project: the framework tree carries no
-    /// `backends/android` gitlink any more (water-rs/waterui#940), so a local
-    /// checkout without one builds against the runtime the framework
-    /// declares through `android-backend-revision`, while a checkout that
-    /// does carry a runtime there — a backend e2e overlay, an older
-    /// revision — keeps building against it.
+    /// The framework tree carries no `backends/android` gitlink any more
+    /// (water-rs/waterui#940), so a local checkout without one builds against
+    /// the runtime the framework declares through `android-backend-revision`,
+    /// while a checkout that does carry a runtime there — a backend e2e
+    /// overlay, an older revision — keeps building against it.
     fn compute_android_backend_path(&self) -> Option<String> {
-        self.android_backend_path
-            .as_ref()
-            .map(|path| self.backend_relative_path(path))
-            .or_else(|| {
-                let local = self.waterui_workspace_root()?.join("backends/android");
-                local
-                    .join("settings.gradle.kts")
-                    .is_file()
-                    .then(|| self.backend_relative_path(&local))
-            })
+        let slot = Path::new("backends/android");
+        if !self
+            .waterui_workspace_root()?
+            .join(slot)
+            .join("settings.gradle.kts")
+            .is_file()
+        {
+            return None;
+        }
+        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join(slot)))
     }
 
     /// Absolute path of the `WaterUI` workspace root when building against a
@@ -996,10 +973,9 @@ impl TemplateContext {
     }
 
     /// The `waterui-apple` dependency the generated FFI crate declares: a
-    /// `path` into a local Apple backend checkout when `[backends.apple]`
-    /// `backend_path` names one, and the backend repository's git source at
-    /// the resolved pin otherwise — the same `[backends.apple]`-then-channel
-    /// order the scaffolded project applied.
+    /// `path` into the `waterui_path/backends/apple` checkout when one is
+    /// staged, and the backend repository's git source at the resolved pin
+    /// otherwise.
     fn waterui_apple_dependency(&self) -> GeneratedDependencyDetail {
         if let Some(backend_path) = self.compute_apple_backend_path() {
             return GeneratedDependencyDetail {
@@ -1081,30 +1057,24 @@ impl TemplateNamespace {
 }
 
 /// The local Android runtime checkout a project consumes, as an absolute
-/// path: `[backends.android] backend_path` when set, else
-/// `<waterui_path>/backends/android` when it is a Gradle project. `None`
-/// means the generated project resolves the remote coordinate. Relative
-/// inputs resolve against `project_root`.
+/// path: `<waterui_path>/backends/android` when it is a Gradle project.
+/// `None` means the generated project resolves the remote coordinate.
 ///
 /// Single source for the same resolution [`TemplateContext`] performs for
 /// template renders — the embedded build needs it again when it publishes
 /// the runtime to `mavenLocal`.
 pub fn android_runtime_checkout(
-    backend_path: Option<&Path>,
     waterui_path: Option<&Path>,
     project_root: Option<&Path>,
 ) -> Option<PathBuf> {
-    let resolve = |path: &Path| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            project_root.map_or_else(|| path.to_path_buf(), |root| root.join(path))
-        }
+    let path = waterui_path?;
+    let root = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.map_or_else(|| path.to_path_buf(), |root| root.join(path))
     };
-    backend_path.map(resolve).or_else(|| {
-        let local = resolve(waterui_path?).join("backends/android");
-        local.join("settings.gradle.kts").is_file().then_some(local)
-    })
+    let local = root.join("backends/android");
+    local.join("settings.gradle.kts").is_file().then_some(local)
 }
 
 fn scaffold_template_dispatch_path(namespace: TemplateNamespace, relative_path: &Path) -> String {
@@ -1357,8 +1327,6 @@ mod tests {
             bundle_identifier: BundleIdentifier::try_from("com.example.test")
                 .expect("test bundle identifier must be valid"),
             author: String::new(),
-            android_backend_path: None,
-            apple_backend_path: None,
             apple_backend_selected: true,
             waterui_path,
             framework: stable_framework(),
@@ -1501,22 +1469,30 @@ mod tests {
         );
     }
 
-    /// `[backends.android] backend_path` names a local runtime checkout: the
-    /// generated `settings.gradle.kts` includes it as a composite build and
-    /// leaves the `JitPack` repository off. Without the key the project
-    /// resolves the remote runtime coordinate.
+    /// A `waterui_path` checkout's `backends/android` Gradle project is a
+    /// local runtime checkout: the generated `settings.gradle.kts` includes
+    /// it as a composite build and leaves the `JitPack` repository off.
+    /// Without it the project resolves the remote runtime coordinate.
     #[test]
-    fn android_backend_path_renders_a_composite_build() {
-        let manifest: crate::project::Manifest = toml::from_str(
+    fn android_backends_android_renders_a_composite_build() {
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/android");
+        std::fs::create_dir_all(&backend_dir).expect("android backend dir");
+        std::fs::write(
+            backend_dir.join("settings.gradle.kts"),
+            "// composite build marker\n",
+        )
+        .expect("backend settings.gradle.kts");
+        let manifest: crate::project::Manifest = toml::from_str(&format!(
             r#"
+                waterui_path = "{}"
+
                 [package]
                 name = "Demo"
                 bundle_identifier = "dev.waterui.demo"
-
-                [backends.android]
-                backend_path = "/opt/android-backend"
             "#,
-        )
+            waterui_root.path().display()
+        ))
         .expect("manifest parses");
 
         let context = |manifest: &crate::project::Manifest| {
@@ -1547,15 +1523,21 @@ mod tests {
 
         let local = render(&context(&manifest));
         assert!(
-            local.contains("includeBuild(\"/opt/android-backend\")"),
+            local.contains(&format!("includeBuild(\"{}\")", backend_dir.display())),
             "{local}"
         );
         // The JitPack repository stays off while the composite build is on.
         assert!(local.contains("if (false) {"), "{local}");
         assert!(local.contains("if (!false) {"), "{local}");
 
-        let mut remote_manifest = manifest;
-        remote_manifest.backends.clear_android();
+        let remote_manifest: crate::project::Manifest = toml::from_str(
+            r#"
+                [package]
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+            "#,
+        )
+        .expect("remote manifest parses");
         let remote = render(&context(&remote_manifest));
         assert!(remote.contains("if (true) {"), "{remote}");
         assert!(remote.contains("if (!true) {"), "{remote}");
@@ -1637,10 +1619,13 @@ mod tests {
 
         // A local runtime checkout swaps the module's dependency to the
         // mavenLocal coordinate and draws the composite build in.
-        let checkout = tempfile::tempdir().expect("checkout dir");
-        std::fs::write(checkout.path().join("version.txt"), "7.8.9").expect("version.txt");
+        let waterui_root = tempfile::tempdir().expect("waterui root");
+        let checkout = waterui_root.path().join("backends/android");
+        std::fs::create_dir_all(&checkout).expect("backend dir");
+        std::fs::write(checkout.join("settings.gradle.kts"), "\n").expect("settings.gradle.kts");
+        std::fs::write(checkout.join("version.txt"), "7.8.9").expect("version.txt");
         let mut local_ctx = ctx.clone();
-        local_ctx.android_backend_path = Some(checkout.path().to_path_buf());
+        local_ctx.waterui_path = Some(waterui_root.path().to_path_buf());
         let local_module = render("waterui/build.gradle.kts.tpl", &local_ctx);
         assert!(
             local_module.contains("api(\"dev.waterui.android:runtime:7.8.9\")"),
@@ -2027,42 +2012,61 @@ mod tests {
     }
 
     #[test]
-    fn relative_apple_backend_path_produces_clean_relative_backend_path() {
-        let mut ctx = ctx(None, Some(PathBuf::from("managed_backends/apple")), None);
-        ctx.apple_backend_path = Some(PathBuf::from("../apple-backend"));
+    fn relative_waterui_path_produces_clean_relative_backend_path() {
+        let root = tempdir().expect("tempdir");
+        let waterui_root = root.path().join("waterui");
+        let backend_dir = waterui_root.join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
+        let project_root = root.path().join("proj");
+        std::fs::create_dir_all(&project_root).expect("project root");
+
+        let ctx = ctx(
+            Some(PathBuf::from("../waterui")),
+            Some(project_root.join("managed_backends/apple")),
+            Some(project_root.clone()),
+        );
 
         let path = ctx
             .compute_apple_backend_path()
             .expect("expected relative backend path");
+        let expected =
+            pathdiff::diff_paths(&backend_dir, project_root.join("managed_backends/apple"))
+                .expect("backend diff path");
 
-        assert_eq!(path, "../../../apple-backend");
+        assert_eq!(path, normalize_path_for_config(&expected));
         assert!(!path.contains("//"));
     }
 
     #[test]
-    fn absolute_apple_backend_path_is_used_directly() {
-        let abs = if cfg!(windows) {
-            PathBuf::from(r"C:\waterui\backends\apple")
-        } else {
-            PathBuf::from("/waterui/backends/apple")
-        };
+    fn absolute_waterui_path_backends_apple_is_used_directly() {
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
 
-        let mut ctx = ctx(None, Some(PathBuf::from("apple")), None);
-        ctx.apple_backend_path = Some(abs);
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(PathBuf::from("apple")),
+            None,
+        );
         let path = ctx
             .compute_apple_backend_path()
             .expect("expected backend path");
 
-        let expected = if cfg!(windows) {
-            "C:/waterui/backends/apple"
-        } else {
-            "/waterui/backends/apple"
-        };
-        assert_eq!(path, expected);
+        assert_eq!(path, normalize_path_for_config(&backend_dir));
     }
 
     #[test]
-    fn waterui_path_backends_apple_is_used_when_no_manifest_override() {
+    fn waterui_path_backends_apple_is_used() {
         let waterui_root = tempdir().expect("tempdir");
         let backend_dir = waterui_root.path().join("backends/apple");
         std::fs::create_dir_all(&backend_dir).expect("backend dir");
@@ -2104,11 +2108,25 @@ mod tests {
 
     #[test]
     fn waterui_apple_dependency_prefers_a_local_checkout() {
-        let mut ctx = ctx(None, Some(PathBuf::from("managed_backends/apple")), None);
-        ctx.apple_backend_path = Some(PathBuf::from("../apple-backend"));
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(PathBuf::from("managed_backends/apple")),
+            None,
+        );
 
         let detail = ctx.waterui_apple_dependency();
-        assert_eq!(detail.path.as_deref(), Some("../../../apple-backend"));
+        assert_eq!(
+            detail.path.as_deref(),
+            Some(normalize_path_for_config(&backend_dir).as_str())
+        );
         assert!(detail.git.is_none() && detail.rev.is_none() && detail.tag.is_none());
     }
 
@@ -2127,22 +2145,24 @@ mod tests {
             PathBuf::from("/Users/lexo/.water/build_cache/Users/lexo/demo/managed_backends/apple")
         };
 
-        let mut ctx = ctx(
-            None,
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
             Some(backend_project_path.clone()),
             Some(project_root.clone()),
         );
-        ctx.apple_backend_path = Some(PathBuf::from("../waterui/backends/apple"));
 
         let path = ctx
             .compute_apple_backend_path()
             .expect("expected backend path");
-        let expected_backend_path = pathdiff::diff_paths(
-            project_root.join("../waterui/backends/apple"),
-            &backend_project_path,
-        )
-        .expect("backend diff path");
-        assert_eq!(path, normalize_path_for_config(&expected_backend_path));
+        assert_eq!(path, normalize_path_for_config(&backend_dir));
 
         let expected_project_root =
             pathdiff::diff_paths(&project_root, &backend_project_path).expect("project root diff");
@@ -2179,7 +2199,7 @@ mod tests {
     /// The Apple backend follows the framework's channel: `dev` and
     /// `nightly` pin the `apple-backend-revision` the channel resolved or
     /// certified, never the stable `apple-backend-version` tag — and a
-    /// `[backends.apple]` override still outranks either.
+    /// `waterui_path` checkout still outranks either.
     #[test]
     fn apple_dependency_pins_the_channel_backend_on_dev_and_nightly() {
         let dependency = |framework: ResolvedFramework| {

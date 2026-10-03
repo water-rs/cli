@@ -532,64 +532,44 @@ pub async fn apple_deployment_target(
 // Validation
 // ============================================================================
 
-/// The local Apple backend `[backend.apple] backend_path` names is the
-/// checkout the generated project references — validate its Rust manifest.
-/// `waterui_path` alone no longer supplies one: the framework
-/// checkout carries no `backends/apple` tree since the submodule was dropped.
+/// The local Apple backend the generated project references is the
+/// canonical `waterui_path/backends/apple` checkout — validate its Rust
+/// manifest when the slot is present. A bare `waterui_path` supplies none:
+/// the framework checkout carries no `backends/apple` tree since the
+/// submodule was dropped, and the project then consumes the pinned remote
+/// backend revision.
 fn validate_local_apple_backend(project: &Project) -> eyre::Result<()> {
-    let Some(backend_path) = project
-        .manifest()
-        .backends
-        .apple()
-        .and_then(|backend| backend.backend_path.as_deref())
-    else {
+    let Some(waterui_path) = project.manifest().waterui_path.as_deref() else {
         return Ok(());
     };
-
-    let backend_root = {
-        let candidate = PathBuf::from(backend_path);
+    let waterui_root = {
+        let candidate = PathBuf::from(waterui_path);
         if candidate.is_absolute() {
             candidate
         } else {
             project.root().join(candidate)
         }
     };
-
-    let package_manifest = backend_root.join("Cargo.toml");
-    if package_manifest.exists() {
+    let backend_root = waterui_root.join("backends/apple");
+    if !backend_root.exists() || backend_root.join("Cargo.toml").is_file() {
         return Ok(());
     }
-
     bail!(
-        "`[backend.apple] backend_path` points at `{}`, which has no `Cargo.toml` — \
-         the Apple backend lives in its own repository now; point it at an \
-         `apple-backend` checkout, or remove `backend_path` to consume the pinned \
-         Rust backend revision.",
+        "`waterui_path/backends/apple` at `{}` is not an `apple-backend` checkout — \
+         it has no `Cargo.toml`; stage a real backend checkout there, or remove it \
+         to consume the pinned Rust backend revision.",
         backend_root.display()
     );
 }
 
-/// The checkout the project's `waterui-apple` dependency compiles from:
-/// `[backends.apple] backend_path` when declared, otherwise the source
-/// directory `cargo metadata` resolved for the ffi crate's dependency.
+/// The checkout the project's `waterui-apple` dependency compiles from —
+/// the source directory `cargo metadata` resolved for the ffi crate's
+/// dependency, whether it names the canonical `waterui_path/backends/apple`
+/// checkout or the pinned remote source.
 ///
 /// # Errors
 /// Returns an error when the backend source cannot be located.
 pub(crate) async fn apple_backend_source_root(project: &Project) -> eyre::Result<PathBuf> {
-    if let Some(backend_path) = project
-        .manifest()
-        .backends
-        .apple()
-        .and_then(|backend| backend.backend_path.as_deref())
-    {
-        let candidate = PathBuf::from(backend_path);
-        return Ok(if candidate.is_absolute() {
-            candidate
-        } else {
-            project.root().join(candidate)
-        });
-    }
-
     let manifest_path_arg: OsString = project.ffi_crate_path().join("Cargo.toml").into();
     let output = crate::utils::run_command_os(
         "cargo",

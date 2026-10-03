@@ -119,11 +119,6 @@ pub async fn build_aar(
     // backend tree.
     let manifest = project.manifest();
     if let Some(runtime_checkout) = crate::templates::android_runtime_checkout(
-        manifest
-            .backends
-            .android()
-            .and_then(|backend| backend.backend_path())
-            .map(Path::new),
         manifest.waterui_path.as_deref().map(Path::new),
         Some(project.root()),
     ) {

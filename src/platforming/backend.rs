@@ -9,28 +9,24 @@ use crate::{
     apple::backend::AppleBackend,
     build::{BuildOptions, BuiltTarget},
     device::Artifact,
-    esp32::backend::Esp32Backend,
     platform::{PackageOptions, TargetPlatform},
     project::Project,
 };
 
-/// Backend configuration in a `WaterUI` project.
+/// The runtime backends a [`Project`] manages.
 ///
-/// `[backends]` in `Water.toml` carries only what the project author can
-/// supply: a local runtime checkout (`backend_path`) for Apple and Android,
-/// and the ESP32 device configuration. The Apple and Android entries are also
-/// filled in memory when [`Project::open`] generates those backends in the
-/// managed build cache.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+/// Project-owned state filled when [`Project::open`] generates the selected
+/// backends in the managed build cache — never persisted in `Water.toml`.
+/// Persisted backend-facing configuration lives in the manifest's typed
+/// tables (`[esp32]` device configuration, `[hydrolysis]` painter).
+#[derive(Debug, Clone, Default)]
 pub struct Backends {
     android: Option<AndroidBackend>,
     apple: Option<AppleBackend>,
-    esp32: Option<Esp32Backend>,
-    hydrolysis: Option<HydrolysisConfig>,
 }
 
-/// The `[backends.hydrolysis]` table: per-backend selections the project
-/// author declares for the Hydrolysis backend.
+/// The `[hydrolysis]` table: selections the project author declares for
+/// the Hydrolysis backend.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct HydrolysisConfig {
     /// The Android painter the generated app mounts on the shared Hydrolysis
@@ -43,10 +39,7 @@ impl Backends {
     /// Check if no backends are configured.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.android.is_none()
-            && self.apple.is_none()
-            && self.esp32.is_none()
-            && self.hydrolysis.is_none()
+        self.android.is_none() && self.apple.is_none()
     }
 
     /// Get the Android backend configuration, if any.
@@ -80,38 +73,6 @@ impl Backends {
     pub fn clear_android(&mut self) {
         self.android = None;
     }
-
-    /// Get the ESP32 backend configuration, if any.
-    #[must_use]
-    pub const fn esp32(&self) -> Option<&Esp32Backend> {
-        self.esp32.as_ref()
-    }
-
-    /// Set the ESP32 backend configuration.
-    pub fn set_esp32(&mut self, backend: Esp32Backend) {
-        self.esp32 = Some(backend);
-    }
-
-    /// Remove ESP32 backend configuration.
-    pub fn clear_esp32(&mut self) {
-        self.esp32 = None;
-    }
-
-    /// Get the Hydrolysis backend configuration, if any.
-    #[must_use]
-    pub const fn hydrolysis(&self) -> Option<&HydrolysisConfig> {
-        self.hydrolysis.as_ref()
-    }
-
-    /// Set the Hydrolysis backend configuration.
-    pub const fn set_hydrolysis(&mut self, config: HydrolysisConfig) {
-        self.hydrolysis = Some(config);
-    }
-
-    /// Remove Hydrolysis backend configuration.
-    pub const fn clear_hydrolysis(&mut self) {
-        self.hydrolysis = None;
-    }
 }
 
 /// Error type for failing to initialize a backend.
@@ -121,7 +82,7 @@ pub enum FailToInitBackend {
     #[error("Failed to write template files: {0}")]
     Io(#[from] std::io::Error),
     /// Invalid backend configuration prevented scaffolding (e.g. an
-    /// unsupported chip in `[backends.esp32]`).
+    /// unsupported chip in `[esp32]`).
     #[error("Invalid backend configuration: {0}")]
     Config(#[source] eyre::Error),
 }

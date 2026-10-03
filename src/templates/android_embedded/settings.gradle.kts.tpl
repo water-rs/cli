@@ -29,7 +29,7 @@ rootProject.name = "{{ ctx.app_name }}-embedded"
 include(":waterui")
 
 // For local dev mode: uses the android-backend checkout the project resolves
-// through `[backends.android] backend_path` or a local WaterUI tree.
+// through a local WaterUI tree's `backends/android` checkout.
 if (!{{ ctx.use_remote_dev_backend() }}) {
     includeBuild("{{ ctx.android_backend_path() }}") {
         dependencySubstitution {

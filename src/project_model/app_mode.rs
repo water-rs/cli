@@ -11,17 +11,11 @@ use std::fmt;
 /// names the whole table.
 const APP_MODE_KEYS: &[(&[&str], &str)] = &[
     (&["package"], "type"),
-    (&["backends"], "path"),
-    (&["backends", "apple"], "project_path"),
-    (&["backends", "apple"], "scheme"),
-    (&["backends", "apple"], "branch"),
-    (&["backends", "apple"], "revision"),
-    (&["backends", "android"], "project_path"),
-    (&["backends", "android"], "version"),
-    (&["backends", "esp32"], "project_path"),
-    (&["backends", "gtk4"], ""),
-    (&["backends", "hydrolysis"], "project_path"),
-    (&["backends", "winui"], ""),
+    // `Water.toml` carries no `[backends]` table at all: local runtime
+    // checkouts live at `waterui_path/backends/{apple,android}`, the ESP32
+    // device configuration is `[esp32]`, and the Hydrolysis painter is
+    // `[hydrolysis]` — the whole table is retired, keys and subtables alike.
+    (&["backends"], ""),
 ];
 
 /// What an app-mode project carries that the CLI no longer reads.
@@ -89,21 +83,48 @@ mod tests {
     fn a_current_manifest_has_no_leftovers() {
         let manifest = parse(
             r#"
+                waterui_path = "../waterui"
+
                 [package]
                 name = "Demo"
                 bundle_identifier = "dev.waterui.demo"
 
-                [backends.apple]
-                backend_path = "../apple-backend"
-
-                [backends.android]
-                backend_path = "/opt/android-backend"
-
-                [backends.esp32]
+                [esp32]
                 chip = "esp32s3"
+
+                [hydrolysis]
+                painter = "gpu"
             "#,
         );
         assert_eq!(AppModeLeftovers::find(&manifest), None);
+    }
+
+    /// Any `[backends]` table is retired configuration — the old
+    /// `backend_path` override included — and is named rather than silently
+    /// dropped.
+    #[test]
+    fn a_backends_table_is_named() {
+        for manifest in [
+            "[backends]",
+            "[backends]\npath = \"backends\"",
+            "[backends.apple]\nbackend_path = \"../apple-backend\"",
+            "[backends.esp32]\nchip = \"esp32c3\"",
+            "[backends.hydrolysis]\npainter = \"gpu\"",
+        ] {
+            let manifest = parse(&format!(
+                "[package]\nname = \"Demo\"\nbundle_identifier = \"dev.waterui.demo\"\n\n{manifest}"
+            ));
+            let leftovers = AppModeLeftovers::find(&manifest)
+                .unwrap_or_else(|| panic!("retired backends table: {manifest}"));
+            assert_eq!(leftovers.keys, ["backends"]);
+        }
+        // A top-level dotted table header names `backends` the same way.
+        let manifest = parse(
+            "backends.apple.scheme = \"demo\"\n\n[package]\nname = \"Demo\"\nbundle_identifier = \"dev.waterui.demo\"",
+        );
+        let leftovers = AppModeLeftovers::find(&manifest)
+            .unwrap_or_else(|| panic!("retired backends table: {manifest}"));
+        assert_eq!(leftovers.keys, ["backends"]);
     }
 
     #[test]
@@ -127,17 +148,9 @@ mod tests {
             "#,
         );
         let leftovers = AppModeLeftovers::find(&manifest).expect("app-mode project");
-        assert_eq!(
-            leftovers.keys,
-            [
-                "package.type",
-                "backends.path",
-                "backends.apple.scheme",
-                "backends.gtk4"
-            ]
-        );
+        assert_eq!(leftovers.keys, ["package.type", "backends"]);
         let message = leftovers.to_string();
-        assert!(message.contains("backends.apple.scheme"));
+        assert!(message.contains("backends"));
     }
 
     /// `type = "playground"` is the removed mode selector too: the key is no
