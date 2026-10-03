@@ -1647,7 +1647,10 @@ mod tests {
 
         let local = render(&context(&manifest));
         assert!(
-            local.contains(&format!("includeBuild(\"{}\")", backend_dir.display())),
+            local.contains(&format!(
+                "includeBuild(\"{}\")",
+                normalize_path_for_config(&backend_dir)
+            )),
             "{local}"
         );
         // The JitPack repository stays off while the composite build is on.
