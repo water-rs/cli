@@ -7,20 +7,16 @@
 //! the native dependencies the graph declares reach the link line through
 //! crate metadata, which a bare archive input would drop.
 
+#[cfg(target_vendor = "apple")]
 use {{ ctx.ffi_crate_ident() }}::waterui_apple_main;
-{% if ctx.cef_runtime_enabled() %}
-/// CEF installs its `NSApplication` subclass before AppKit creates the
-/// shared application, so this runs before `entry::run` touches
-/// `NSApplication.shared` — macOS only.
-#[cfg(target_os = "macos")]
-use {{ ctx.ffi_crate_ident() }}::waterui_cef_prepare_macos_application;
-{% endif %}
 
+#[cfg(target_vendor = "apple")]
 fn main() -> ! {
     {% if ctx.cef_runtime_enabled() %}
     #[cfg(target_os = "macos")]
-    unsafe {
-        waterui_cef_prepare_macos_application();
+    {
+        waterui_browser_cef::initialize_sandbox_early();
+        waterui_browser_cef::initialize_macos_application();
     }
     {% endif %}
     // SAFETY: this is the process's entry on the main thread.
@@ -28,4 +24,9 @@ fn main() -> ! {
         waterui_apple_main({{ ctx.accessory }});
     }
     unreachable!("waterui_apple_main never returns");
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn main() {
+    panic!("waterui-apple-main requires an Apple target");
 }

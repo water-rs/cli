@@ -446,7 +446,7 @@ async fn compile_asset_catalog(
     bail!("Apple packaging requires macOS (actool is part of the Xcode toolchain)")
 }
 
-async fn copy_dir_contents(from: &Path, to: &Path) -> eyre::Result<()> {
+pub(crate) async fn copy_dir_contents(from: &Path, to: &Path) -> eyre::Result<()> {
     let source = from.to_path_buf();
     let destination = to.to_path_buf();
     smol::unblock(move || {

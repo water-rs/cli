@@ -52,11 +52,7 @@ pub async fn stage_for_apple(
     symbols: &ArtifactSymbols,
     dev_server: bool,
 ) -> eyre::Result<BundleManifest> {
-    let manifest = build_manifest(project, symbols, dev_server).await?;
-    let assets_dest = dest_dir.join(ASSET_ROOT_DIR);
-    reset_dir(&assets_dest).await?;
-    copy_manifest_assets(&manifest, &assets_dest).await?;
-    write_manifest_stamp(&manifest, &assets_dest).await?;
+    let manifest = stage_library_resources(project, dest_dir, symbols, dev_server).await?;
 
     let xcassets_dest = dest_dir.join("WaterUIAssets.xcassets");
     reset_dir(&xcassets_dest).await?;
@@ -100,6 +96,29 @@ pub async fn stage_for_apple(
     }
 
     Ok(manifest)
+}
+
+/// Stage compiler-discovered resources without an application's icon or launch catalog.
+pub async fn stage_library_resources(
+    project: &Project,
+    dest_dir: &Path,
+    symbols: &ArtifactSymbols,
+    dev_server: bool,
+) -> eyre::Result<BundleManifest> {
+    let manifest = build_manifest(project, symbols, dev_server).await?;
+    write_library_resources(&manifest, dest_dir).await?;
+    Ok(manifest)
+}
+
+/// Write one complete resource plan, including the content stamp.
+pub async fn write_library_resources(
+    manifest: &BundleManifest,
+    dest_dir: &Path,
+) -> eyre::Result<()> {
+    let assets_dest = dest_dir.join(ASSET_ROOT_DIR);
+    reset_dir(&assets_dest).await?;
+    copy_manifest_assets(manifest, &assets_dest).await?;
+    write_manifest_stamp(manifest, &assets_dest).await
 }
 
 /// The project's launch screen, resolved, with the artwork it shows.
@@ -380,7 +399,7 @@ fn plan_main_assets(project: &Project) -> eyre::Result<Vec<PlannedAsset>> {
 /// statics. `symbols` is the library artifact the target build produced for
 /// the project crate — planning runs after the build, so nothing here spawns
 /// a compile of its own.
-async fn build_manifest(
+pub async fn build_manifest(
     project: &Project,
     symbols: &ArtifactSymbols,
     dev_server: bool,

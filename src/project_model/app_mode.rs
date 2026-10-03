@@ -11,17 +11,11 @@ use std::fmt;
 /// names the whole table.
 const APP_MODE_KEYS: &[(&[&str], &str)] = &[
     (&["package"], "type"),
-    (&["backends"], "path"),
-    (&["backends", "apple"], "project_path"),
-    (&["backends", "apple"], "scheme"),
-    (&["backends", "apple"], "branch"),
-    (&["backends", "apple"], "revision"),
-    (&["backends", "android"], "project_path"),
-    (&["backends", "android"], "version"),
-    (&["backends", "esp32"], "project_path"),
-    (&["backends", "gtk4"], ""),
-    (&["backends", "hydrolysis"], "project_path"),
-    (&["backends", "winui"], ""),
+    // `Water.toml` carries no `[backends]` table at all: local runtime
+    // checkouts live at `waterui_path/backends/{apple,android}`, the ESP32
+    // device configuration is `[esp32]`, and the Hydrolysis painter is
+    // `[hydrolysis]` — the whole table is retired, keys and subtables alike.
+    (&["backends"], ""),
 ];
 
 /// What an app-mode project carries that the CLI no longer reads.
@@ -39,13 +33,17 @@ impl AppModeLeftovers {
         let keys: Vec<String> = APP_MODE_KEYS
             .iter()
             .filter(|(table, key)| {
-                let Some(table) = table
-                    .iter()
-                    .try_fold(manifest, |table, name| table.get(*name)?.as_table())
-                else {
+                // Intermediate path segments must resolve to tables; the
+                // last segment need only be present — a scalar
+                // `backends = "…"` still names the retired table.
+                let Some(value) = manifest.get(table[0]).and_then(|value| {
+                    table[1..]
+                        .iter()
+                        .try_fold(value, |value, name| value.as_table()?.get(*name))
+                }) else {
                     return false;
                 };
-                key.is_empty() || table.contains_key(*key)
+                key.is_empty() || value.as_table().is_some_and(|t| t.contains_key(*key))
             })
             .map(|(table, key)| {
                 let mut dotted = table.join(".");
@@ -89,21 +87,51 @@ mod tests {
     fn a_current_manifest_has_no_leftovers() {
         let manifest = parse(
             r#"
+                waterui_path = "../waterui"
+
                 [package]
                 name = "Demo"
                 bundle_identifier = "dev.waterui.demo"
 
-                [backends.apple]
-                backend_path = "../apple-backend"
-
-                [backends.android]
-                backend_path = "/opt/android-backend"
-
-                [backends.esp32]
+                [esp32]
                 chip = "esp32s3"
+
+                [hydrolysis]
+                painter = "gpu"
             "#,
         );
         assert_eq!(AppModeLeftovers::find(&manifest), None);
+    }
+
+    /// Any `[backends]` table is retired configuration — the old
+    /// `backend_path` override included — and is named rather than silently
+    /// dropped.
+    #[test]
+    fn a_backends_table_is_named() {
+        for manifest in [
+            "[backends]",
+            "[backends]\npath = \"backends\"",
+            "[backends.apple]\nbackend_path = \"../apple-backend\"",
+            "[backends.esp32]\nchip = \"esp32c3\"",
+            "[backends.hydrolysis]\npainter = \"gpu\"",
+        ] {
+            let manifest = parse(&format!(
+                "[package]\nname = \"Demo\"\nbundle_identifier = \"dev.waterui.demo\"\n\n{manifest}"
+            ));
+            let leftovers = AppModeLeftovers::find(&manifest)
+                .unwrap_or_else(|| panic!("retired backends table: {manifest}"));
+            assert_eq!(leftovers.keys, ["backends"]);
+        }
+        // A top-level dotted table header or scalar names `backends` the
+        // same way — the key is retired whatever shape it takes.
+        for manifest in ["backends.apple.scheme = \"demo\"", "backends = \"retired\""] {
+            let manifest = parse(&format!(
+                "{manifest}\n\n[package]\nname = \"Demo\"\nbundle_identifier = \"dev.waterui.demo\""
+            ));
+            let leftovers = AppModeLeftovers::find(&manifest)
+                .unwrap_or_else(|| panic!("retired backends table: {manifest}"));
+            assert_eq!(leftovers.keys, ["backends"]);
+        }
     }
 
     #[test]
@@ -127,17 +155,9 @@ mod tests {
             "#,
         );
         let leftovers = AppModeLeftovers::find(&manifest).expect("app-mode project");
-        assert_eq!(
-            leftovers.keys,
-            [
-                "package.type",
-                "backends.path",
-                "backends.apple.scheme",
-                "backends.gtk4"
-            ]
-        );
+        assert_eq!(leftovers.keys, ["package.type", "backends"]);
         let message = leftovers.to_string();
-        assert!(message.contains("backends.apple.scheme"));
+        assert!(message.contains("backends"));
     }
 
     /// `type = "playground"` is the removed mode selector too: the key is no

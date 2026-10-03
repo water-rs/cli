@@ -261,14 +261,19 @@ async fn scaffold_inspector_app(path: &Path, requirements: &InspectorRequirement
     manifest.save(project.root()).await?;
 
     let ctx = TemplateContext::for_support_app(
-        "WaterUI Inspector",
-        project.crate_name().clone(),
-        crate::project_types::BundleIdentifier::try_from("dev.waterui.inspector")
+        crate::templates::SupportAppIdentity {
+            display_name: "WaterUI Inspector".to_string(),
+            crate_name: project.crate_name().clone(),
+            bundle_identifier: crate::project_types::BundleIdentifier::try_from(
+                "dev.waterui.inspector",
+            )
             .expect("inspector support bundle identifier must be valid"),
+        },
         waterui_path,
         &project.resolved_framework().await?,
         false,
         None,
+        project.local_sources(),
     );
 
     crate::templates::inspector::scaffold(project.root(), &ctx)

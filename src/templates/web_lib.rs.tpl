@@ -1,4 +1,5 @@
 use waterui::app::App;
+use waterui::env::use_env;
 use waterui::prelude::*;
 use waterui::{include_web, js_api, preview};
 
@@ -20,7 +21,10 @@ impl Api {
 // `water package`/`water run --release` stages the production build.
 #[preview]
 fn main() -> impl View {
-    include_web!("{{ ctx.web_arg() }}").serve(Api)
+    use_env(|env: Environment| {
+        let resources = ResourceContext::from_environment(&env);
+        include_web!(resources, "{{ ctx.web_arg() }}").serve(Api)
+    })
 }
 
 pub fn app(env: Environment) -> App {

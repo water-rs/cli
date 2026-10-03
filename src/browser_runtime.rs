@@ -606,13 +606,12 @@ fn cef_distribution_directory(
 ) -> eyre::Result<&'static str> {
     match (platform, architecture) {
         (TargetPlatform::MacOS, "aarch64") => Ok("cef_macos_aarch64"),
-        (TargetPlatform::MacOS, "x86_64") => Ok("cef_macos_x86_64"),
         (TargetPlatform::Linux, "aarch64") => Ok("cef_linux_aarch64"),
         (TargetPlatform::Linux, "x86_64") => Ok("cef_linux_x86_64"),
         (TargetPlatform::Windows, "aarch64") => Ok("cef_windows_aarch64"),
         (TargetPlatform::Windows, "x86_64") => Ok("cef_windows_x86_64"),
         _ => Err(eyre::eyre!(
-            "CEF does not publish a runtime for {platform:?}/{architecture}"
+            "Unsupported CEF runtime target {platform:?}/{architecture}"
         )),
     }
 }
@@ -809,6 +808,21 @@ mod tests {
     use crate::project::{BrowserRuntimePlan, ResolvedWebViewBackend};
     #[cfg(unix)]
     use std::io::Write as _;
+
+    #[test]
+    fn cef_rejects_intel_apple_and_preserves_other_intel_targets() {
+        assert!(super::cef_distribution_directory(TargetPlatform::MacOS, "x86_64").is_err());
+        for platform in [
+            TargetPlatform::MacOS,
+            TargetPlatform::Linux,
+            TargetPlatform::Windows,
+        ] {
+            assert!(super::cef_distribution_directory(platform, "aarch64").is_ok());
+        }
+        for platform in [TargetPlatform::Linux, TargetPlatform::Windows] {
+            assert!(super::cef_distribution_directory(platform, "x86_64").is_ok());
+        }
+    }
 
     #[test]
     fn chromium_and_cef_share_one_runtime() {

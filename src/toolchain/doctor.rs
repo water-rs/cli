@@ -628,12 +628,12 @@ impl ProjectContext {
     }
 
     /// The chips the project's ESP32 (Dew) backend can target: the chip
-    /// `[backends.esp32]` declares, or every supported chip. `None` when no
-    /// project is present.
+    /// `[esp32]` declares, or every supported chip. `None` when no project
+    /// is present.
     fn esp32_chips(&self) -> Option<eyre::Result<Vec<Esp32Chip>>> {
         let manifest = self.manifest.as_ref()?;
-        if let Some(backend) = manifest.backends.esp32() {
-            return Some(backend.resolved_chip().map(|chip| vec![chip]));
+        if let Some(config) = &manifest.esp32 {
+            return Some(config.resolved_chip().map(|chip| vec![chip]));
         }
         Some(Ok(vec![
             Esp32Chip::Esp32S3,
@@ -1162,7 +1162,7 @@ async fn esp32_check(host: &Host, project: &ProjectContext) -> DoctorItem {
             return DoctorItem::missing(
                 ids::ESP32_TOOLCHAIN,
                 NAME,
-                format!("Invalid `[backends.esp32]` configuration: {error}"),
+                format!("Invalid `[esp32]` configuration: {error}"),
             );
         }
     };
@@ -1456,7 +1456,7 @@ mod tests {
     ];
 
     /// A minimal `Water.toml` app manifest; `extra` is appended verbatim
-    /// (`[backends.*]`, `[web]`, ...).
+    /// (`[esp32]`, `[web]`, ...).
     fn manifest(extra: &str) -> String {
         format!(
             "[package]\nname = \"Fixture\"\nbundle_identifier = \"dev.waterui.fixture\"\n\n{extra}"
@@ -1533,7 +1533,7 @@ mod tests {
     #[test]
     fn doctor_probes_android_components_when_sdk_ready() {
         let machine = TestMachine::new();
-        machine.file("Water.toml", &manifest("[backends.android]\n"));
+        machine.file("Water.toml", &manifest(""));
         let sdk = machine.install_android_sdk();
         let host = machine.host([(
             String::from("ANDROID_SDK_ROOT"),
@@ -1687,7 +1687,7 @@ mod tests {
     #[test]
     fn doctor_wasm_pack_fixable_when_hydrolysis_selected() {
         let machine = TestMachine::new();
-        machine.file("Water.toml", &manifest("[backends.hydrolysis]\n"));
+        machine.file("Water.toml", &manifest(""));
         machine.install("cargo");
         let host = machine.host(Vec::<(String, String)>::new());
         let items = smol::block_on(doctor(&host));
@@ -1866,10 +1866,7 @@ mod tests {
     #[test]
     fn doctor_probes_every_backend_inside_a_project() {
         let machine = TestMachine::new();
-        machine.file(
-            "Water.toml",
-            &manifest("[backends.esp32]\nchip = \"esp32c3\"\n"),
-        );
+        machine.file("Water.toml", &manifest("[esp32]\nchip = \"esp32c3\"\n"));
         let host = machine.host(Vec::<(String, String)>::new());
         let items = smol::block_on(doctor(&host));
 
@@ -1893,15 +1890,12 @@ mod tests {
         }
     }
 
-    /// An `[backends.esp32]` chip the CLI does not support is a diagnostic,
+    /// An `[esp32]` chip the CLI does not support is a diagnostic,
     /// not a skipped item.
     #[test]
     fn doctor_reports_invalid_esp32_chip() {
         let machine = TestMachine::new();
-        machine.file(
-            "Water.toml",
-            &manifest("[backends.esp32]\nchip = \"atmega328p\"\n"),
-        );
+        machine.file("Water.toml", &manifest("[esp32]\nchip = \"atmega328p\"\n"));
         let host = machine.host(Vec::<(String, String)>::new());
         let items = smol::block_on(doctor(&host));
 
@@ -1976,7 +1970,7 @@ mod tests {
         machine.install_android_ndk("29.0.14206865");
         machine.install_android_emulator();
         machine.install("rustup");
-        machine.file("Water.toml", &manifest("[backends.android]\n"));
+        machine.file("Water.toml", &manifest(""));
         machine.respond("EMULATOR_AVDS", "Medium_Phone_API_37\n");
         machine.respond(
             "RUSTUP_ACTIVE_TOOLCHAIN",

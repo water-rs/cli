@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use eyre::WrapErr as _;
-use serde::{Deserialize, Serialize};
 use waterui_assets_planner::ColorScheme;
 
 use crate::{
@@ -15,22 +14,18 @@ use crate::{
     templates::{self, TemplateContext},
 };
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-/// Configuration for the Apple backend in a `WaterUI` project.
+/// The generated Apple backend in a `WaterUI` project.
 ///
-/// `[backends.apple]` in `Water.toml` persists only `backend_path`; the
-/// project path and scheme describe the scaffold the CLI generates in the
-/// managed build cache.
+/// Runtime state only — nothing is persisted in `Water.toml`. The project
+/// path and scheme describe the scaffold the CLI generates in the managed
+/// build cache; a local runtime checkout is discovered at
+/// `waterui_path/backends/apple`, never declared.
+#[derive(Debug, Clone)]
 pub struct AppleBackend {
     /// Path to the generated Apple project below the managed backends root.
-    #[serde(skip, default = "default_apple_project_path")]
     pub project_path: PathBuf,
     /// The scheme to use for building the Apple project.
-    #[serde(skip)]
     pub scheme: String,
-    /// Local path to the Apple backend for local dev.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend_path: Option<String>,
 }
 
 /// What this project's built application bundle is called.
@@ -69,15 +64,7 @@ impl AppleBackend {
         Self {
             project_path: default_apple_project_path(),
             scheme: scheme.into(),
-            backend_path: None,
         }
-    }
-
-    /// Set the local backend path for development.
-    #[must_use]
-    pub fn with_backend_path(mut self, path: impl Into<String>) -> Self {
-        self.backend_path = Some(path.into());
-        self
     }
 
     /// Get the path to the Apple project within the `WaterUI` project.
@@ -140,6 +127,7 @@ impl AppleBackend {
             crate_name_for_template,
             app_name,
             &project.resolved_framework().await?,
+            project.local_sources(),
         )
         .with_backend_project_path(project.backend_path::<Self>())
         .with_project_root_path(project.root().to_path_buf())
@@ -151,8 +139,8 @@ impl AppleBackend {
     }
 
     /// Whether the generated Apple project differs from what the current
-    /// templates and manifest would render — a `[backends.apple]`
-    /// `backend_path`, `branch` or `revision` change rewrites the backend
+    /// templates and manifest would render — a `waterui_path` checkout,
+    /// `branch` or `revision` change rewrites the backend
     /// dependency the ffi crate's manifest pins.
     ///
     /// # Errors
@@ -190,9 +178,6 @@ impl Backend for AppleBackend {
     }
 
     async fn init(project: &Project) -> Result<Self, crate::backend::FailToInitBackend> {
-        // A `[backends.apple]` source override the manifest already carries is
-        // a user choice; init re-scaffolds the project without rewriting it.
-        let existing = project.manifest().backends.apple();
         let (scheme, _, _) = Self::scaffold_names();
         let project_path = default_apple_project_path();
 
@@ -207,7 +192,6 @@ impl Backend for AppleBackend {
         Ok(Self {
             project_path,
             scheme,
-            backend_path: existing.and_then(|backend| backend.backend_path.clone()),
         })
     }
 
@@ -256,14 +240,24 @@ mod tests {
 
     /// The channel's pins resolve without a network: `waterui` and
     /// `waterui-ffi` ride `[patch.crates-io]` onto vendor stubs (the only
-    /// source `[patch]` can redirect offline), and `waterui-apple` gets a
-    /// `backend_path` stub — a path dependency — so the ffi companion's
-    /// feature-table probe resolves entirely locally.
+    /// source `[patch]` can redirect offline), and `waterui-apple` is the
+    /// canonical `backends/apple` slot in the stub checkout `waterui_path`
+    /// names — a path dependency — so the ffi companion's feature-table
+    /// probe resolves entirely locally.
     fn vendor_offline_resolution(root: &Path, vendor_dir: &Path) {
-        for (name, features) in [
-            ("waterui", &["dynamic_linking", "media"][..]),
+        // The vendored checkout mirrors the real framework layout: the
+        // `waterui` facade is the root package, `waterui-ffi` lives at
+        // `ffi`, and the Apple backend is the canonical `backends/apple`
+        // slot the generated manifest resolves as a path dependency.
+        let stubs = [
+            (
+                "waterui",
+                vendor_dir.to_path_buf(),
+                &["dynamic_linking", "media"][..],
+            ),
             (
                 "waterui-ffi",
+                vendor_dir.join("ffi"),
                 &[
                     "android-jni",
                     "c-api",
@@ -278,9 +272,13 @@ mod tests {
                     "webview-cef",
                 ][..],
             ),
-            ("waterui-apple", &["map", "media", "webview"][..]),
-        ] {
-            let stub = vendor_dir.join(name);
+            (
+                "waterui-apple",
+                vendor_dir.join("backends/apple"),
+                &["map", "media", "webview"][..],
+            ),
+        ];
+        for (name, stub, features) in stubs {
             std::fs::create_dir_all(stub.join("src")).expect("stub crate dir");
             let mut stub_manifest = toml_edit::DocumentMut::new();
             stub_manifest["package"]["name"] = toml_edit::value(name);
@@ -288,6 +286,10 @@ mod tests {
             stub_manifest["package"]["edition"] = toml_edit::value("2021");
             for feature in features {
                 stub_manifest["features"][feature] = toml_edit::value(toml_edit::Array::new());
+            }
+            if name == "waterui" {
+                stub_manifest["workspace"]["members"] =
+                    toml_edit::value(toml_edit::Array::from_iter(["ffi", "backends/apple"]));
             }
             std::fs::write(stub.join("Cargo.toml"), stub_manifest.to_string())
                 .expect("stub manifest");
@@ -298,9 +300,12 @@ mod tests {
             .expect("project Cargo.toml exists")
             .parse()
             .expect("project Cargo.toml parses");
-        for name in ["waterui", "waterui-ffi"] {
+        for (name, dir) in [
+            ("waterui", vendor_dir.to_path_buf()),
+            ("waterui-ffi", vendor_dir.join("ffi")),
+        ] {
             document["patch"]["crates-io"][name]["path"] =
-                toml_edit::value(vendor_dir.join(name).to_string_lossy().as_ref());
+                toml_edit::value(dir.to_string_lossy().as_ref());
         }
         std::fs::write(&manifest_path, document.to_string()).expect("write the patch table");
         let water_toml = root.join("Water.toml");
@@ -308,10 +313,9 @@ mod tests {
             .expect("Water.toml exists")
             .parse()
             .expect("Water.toml parses");
-        water_document["backends"]["apple"]["backend_path"] =
-            toml_edit::value(vendor_dir.join("waterui-apple").to_string_lossy().as_ref());
+        water_document["waterui_path"] = toml_edit::value(vendor_dir.to_string_lossy().as_ref());
         std::fs::write(&water_toml, water_document.to_string())
-            .expect("declare the vendored apple backend");
+            .expect("name the vendored framework checkout");
 
         // `Project::open` resolves the project's layout with `cargo metadata
         // --locked`; a plain offline resolve records the patched sources in

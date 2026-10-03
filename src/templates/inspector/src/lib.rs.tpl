@@ -18,4 +18,5 @@ pub fn app(env: Environment) -> App {
     waterui_inspector_app::app(env)
 }
 
+#[cfg(not(target_vendor = "apple"))]
 waterui_ffi::export!();

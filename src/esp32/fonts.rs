@@ -2,7 +2,7 @@
 //!
 //! A whole TTF embeds hundreds of kilobytes of glyphs a firmware image will
 //! never draw — a full Latin face is ~770 KB, of which an ASCII UI uses a few
-//! dozen kilobytes. `[backends.esp32] font_ranges` opts a project into
+//! dozen kilobytes. `[esp32] font_ranges` opts a project into
 //! subsetting: every configured font is reduced to the requested Unicode
 //! ranges before it is embedded, the way LVGL and Slint prepare their
 //! offline fonts, while the runtime keeps consuming ordinary TTF bytes.

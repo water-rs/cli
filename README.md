@@ -6,6 +6,10 @@ Cross-platform build orchestration and development tooling for `WaterUI` applica
 
 `waterui-cli` is the command-line interface that powers the `water` binary, the primary tool for building, running, and managing `WaterUI` applications across iOS, macOS, and Android. It abstracts platform-specific build systems (Xcode for Apple, Gradle for Android) and provides a unified developer experience with device management, project scaffolding, and instant view previews.
 
+Apple targets require ARM64. Embedded Apple packages contain ARM64 macOS, iOS device,
+and iOS simulator slices; Intel Apple targets are unsupported. Android, Linux, and
+Windows retain their supported x86 architectures.
+
 The crate is split into two components:
 - **Library** (`src/lib.rs`): Core abstractions for platforms, devices, builds, and project management
 - **Terminal** (`src/terminal/`): User-facing CLI with argument parsing and formatted output

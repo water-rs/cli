@@ -40,7 +40,7 @@ use crate::{
 ///
 /// `gpu` is the Vello attachment the host's `android/gpu` module ships;
 /// `hwui` is the `RenderNode` painter of the planned `android/hwui` module.
-/// Selection is explicit — `[backends.hydrolysis] painter` in `Water.toml`
+/// Selection is explicit — `[hydrolysis] painter` in `Water.toml`
 /// or `--painter` — and an absent module in the pinned checkout is an error
 /// at scaffold time, never a substitution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
@@ -116,7 +116,7 @@ impl std::fmt::Display for HydrolysisAndroidPainter {
 }
 
 /// Resolve the Android painter for a Hydrolysis build: the command's
-/// `--painter` override, else `[backends.hydrolysis] painter` in
+/// `--painter` override, else `[hydrolysis] painter` in
 /// `Water.toml`, else the GPU painter the plan names the default.
 #[must_use]
 pub fn resolve_painter(
@@ -127,8 +127,8 @@ pub fn resolve_painter(
         .or_else(|| {
             project
                 .manifest()
-                .backends
-                .hydrolysis()
+                .hydrolysis
+                .as_ref()
                 .and_then(|config| config.painter)
         })
         .unwrap_or_default()
@@ -716,7 +716,7 @@ mod tests {
     }
 
     /// The painter is explicit: `--painter` wins over
-    /// `[backends.hydrolysis] painter`, which wins over the GPU default the
+    /// `[hydrolysis] painter`, which wins over the GPU default the
     /// plan names. Nothing in the chain substitutes silently.
     #[test]
     fn painter_resolution_prefers_the_override_then_the_manifest() {
@@ -732,7 +732,7 @@ mod tests {
             );
 
             let (_temporary, project) =
-                fixture_project("\n[backends.hydrolysis]\npainter = \"hwui\"\n").await;
+                fixture_project("\n[hydrolysis]\npainter = \"hwui\"\n").await;
             assert_eq!(
                 resolve_painter(&project, None),
                 HydrolysisAndroidPainter::Hwui

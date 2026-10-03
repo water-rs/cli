@@ -1223,7 +1223,7 @@ async fn seed_font_cache_scoped(
 /// current templates when missing or stale, exactly as the build and preview
 /// paths regenerate it. Scaffolding writes template files — nothing
 /// compiles. The ESP32 harness never takes part: no build scans it for
-/// fonts — `dew`'s fonts come from `[backends.esp32]` as plain files.
+/// fonts — `dew`'s fonts come from `[esp32] fonts` as plain files.
 ///
 /// The scanned set is the crates for the backends this host can run —
 /// Hydrolysis anywhere, GTK4 on Linux, `WinUI` on Windows — since the CLI
@@ -1703,6 +1703,8 @@ fn sha256_hex(s: &str) -> String {
     let result = hasher.finalize();
     hex::encode(result)
 }
+
+pub use unified::{build_manifest as plan_library_resources, write_library_resources};
 
 /// Stage project assets for Apple packaging (Asset Catalog + raw resources).
 ///

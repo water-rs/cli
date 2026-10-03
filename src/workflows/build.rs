@@ -1,5 +1,8 @@
 //! Build system
 
+mod native_links;
+pub(crate) use native_links::NativeLink;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,

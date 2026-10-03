@@ -3,8 +3,8 @@
 use waterui_core::Environment;
 use waterui_dew::espidf::{PanelConfig, run};
 
-/// Fonts bundled into flash for dew text shaping, from `[backends.esp32]
-/// fonts` in `Water.toml`. Firmware has no font directory to enumerate, so a
+/// Fonts bundled into flash for dew text shaping, from `[esp32] fonts` in
+/// `Water.toml`. Firmware has no font directory to enumerate, so a
 /// text-rendering app must list at least one TTF/OTF here; dew fails fast at
 /// the first text layout otherwise.
 const FONTS: &[&[u8]] = &[

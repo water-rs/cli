@@ -336,11 +336,6 @@ pub struct TemplateContext {
     pub bundle_identifier: BundleIdentifier,
     /// The author name
     pub author: String,
-    /// Path to the Android backend (relative or absolute)
-    pub android_backend_path: Option<PathBuf>,
-    /// `[backends.apple] backend_path` — a local Apple backend checkout that
-    /// replaces the remote Swift package reference.
-    pub apple_backend_path: Option<PathBuf>,
     /// Whether the project selected the Apple backend for this invocation —
     /// the ffi companion only depends on `waterui-apple` and declares its
     /// entry-owning bin when this is set, so an Android-only build never
@@ -348,6 +343,9 @@ pub struct TemplateContext {
     pub apple_backend_selected: bool,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
+    /// The canonical local backend sources the `waterui_path` checkout
+    /// supplies, resolved before the context was built.
+    pub local_sources: LocalBackendSources,
     /// Persisted framework source and native backend revisions.
     pub framework: ResolvedFramework,
     /// Browser engine and component selections for generated backend manifests.
@@ -403,6 +401,7 @@ impl TemplateContext {
         options: &crate::project::CreateOptions,
         crate_name: CrateName,
         framework: &ResolvedFramework,
+        local_sources: &LocalBackendSources,
     ) -> Self {
         let waterui_path = options.waterui_path.clone();
         Self {
@@ -412,10 +411,9 @@ impl TemplateContext {
             crate_version: String::new(),
             bundle_identifier: options.bundle_identifier.clone(),
             author: options.author.clone(),
-            android_backend_path: None,
-            apple_backend_path: None,
             apple_backend_selected: false,
             waterui_path,
+            local_sources: local_sources.clone(),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
             backend_project_path: None,
@@ -435,14 +433,17 @@ impl TemplateContext {
     }
 
     /// Build a context from an existing project manifest for backend scaffolding.
+    /// `local_sources` is the manifest's `waterui_path` resolved through
+    /// [`project_local_backend_sources`], never the raw manifest path — a
+    /// checkout carrying a malformed canonical slot already failed there.
     #[must_use]
     pub fn for_project_manifest(
         manifest: &crate::project::Manifest,
         crate_name: CrateName,
         app_name: impl Into<String>,
         framework: &ResolvedFramework,
+        local_sources: &LocalBackendSources,
     ) -> Self {
-        let apple = manifest.backends.apple();
         Self {
             app_display_name: manifest.package.name.clone(),
             app_name: app_name.into(),
@@ -450,18 +451,10 @@ impl TemplateContext {
             crate_version: String::new(),
             bundle_identifier: manifest.package.bundle_identifier.clone(),
             author: String::new(),
-            android_backend_path: manifest
-                .backends
-                .android()
-                .and_then(|backend| backend.backend_path().map(PathBuf::from)),
-            apple_backend_path: apple
-                .and_then(|backend| backend.backend_path.as_deref())
-                .map(PathBuf::from),
-            // Selected at invocation, never from declared config: a project
-            // that declares `[backends.apple]` but builds for Android must
-            // still emit no `waterui-apple` pieces.
+            // Selected at invocation, never from declared config.
             apple_backend_selected: false,
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
+            local_sources: local_sources.clone(),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
             backend_project_path: None,
@@ -487,13 +480,12 @@ impl TemplateContext {
     /// Build a context for the CLI's own support applications.
     #[must_use]
     pub fn for_support_app(
-        app_display_name: impl Into<String>,
-        crate_name: CrateName,
-        bundle_identifier: BundleIdentifier,
+        identity: SupportAppIdentity,
         waterui_path: Option<PathBuf>,
         framework: &ResolvedFramework,
         accessory: bool,
         preview_runtime_fingerprint: Option<String>,
+        local_sources: &LocalBackendSources,
     ) -> Self {
         // A support app exists to host one specific WaterUI runtime, so it has
         // to resolve dependencies exactly the way that runtime's own workspace
@@ -504,18 +496,21 @@ impl TemplateContext {
         // different graphics stack than the module it loads, and the module
         // fails to `dlopen` against symbols that no longer match.
         let project_root_path = waterui_path.clone();
-        let app_display_name = app_display_name.into();
+        let SupportAppIdentity {
+            display_name,
+            crate_name,
+            bundle_identifier,
+        } = identity;
         Self {
-            app_name: app_display_name.replace(' ', ""),
-            app_display_name,
+            app_name: display_name.replace(' ', ""),
+            app_display_name: display_name,
             crate_name,
             crate_version: String::new(),
             bundle_identifier,
             author: String::new(),
-            android_backend_path: None,
-            apple_backend_path: None,
             apple_backend_selected: false,
             waterui_path,
+            local_sources: local_sources.clone(),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
             backend_project_path: None,
@@ -776,8 +771,8 @@ impl TemplateContext {
 
     /// Whether the Android project consumes the runtime as the remote
     /// coordinate `android_remote_backend_dependency` names rather than a
-    /// local checkout: true unless `[backends.android] backend_path` names one
-    /// or `waterui_path/backends/android` is a Gradle project.
+    /// local checkout: true unless `waterui_path/backends/android` is a
+    /// Gradle project.
     #[must_use]
     pub fn use_remote_dev_backend(&self) -> bool {
         self.compute_android_backend_path().is_none()
@@ -813,11 +808,7 @@ impl TemplateContext {
     /// when the remote coordinate is used.
     #[must_use]
     pub fn android_runtime_checkout(&self) -> Option<PathBuf> {
-        android_runtime_checkout(
-            self.android_backend_path.as_deref(),
-            self.waterui_workspace_root().as_deref(),
-            self.project_root_path.as_deref(),
-        )
+        self.local_sources.android().map(Path::to_path_buf)
     }
 
     #[must_use]
@@ -851,7 +842,7 @@ impl TemplateContext {
     /// `target`, resolved from the backend project's directory.
     ///
     /// `target` is absolute, or relative to the project root the way
-    /// `waterui_path` and `[backends.apple] backend_path` are. This accounts
+    /// `waterui_path` is. This accounts
     /// for the project being in a generated backend subdirectory.
     fn backend_relative_path(&self, target: &Path) -> String {
         // If `target` is absolute, use it directly. This avoids producing
@@ -902,49 +893,30 @@ impl TemplateContext {
         normalize_path_for_config(&backend_path)
     }
 
-    /// The path to the local Apple backend checkout `[backends.apple]`
-    /// `backend_path` names, resolved from the generated project's directory.
-    /// `None` consumes the remote Swift package instead.
+    /// The path to the local Apple backend checkout at
+    /// `waterui_path/backends/apple`, resolved from the generated project's
+    /// directory. `None` consumes the pinned remote Rust backend instead.
     ///
-    /// Without a manifest override, `waterui_path/backends/apple` is used when
-    /// it is a real Swift package: dropping this silently retargeted every
-    /// local-checkout build — including the backend's own e2e suite — onto the
-    /// pinned remote release.
+    /// The canonical checkout slot is the only local source: without the
+    /// probe every local-checkout build — including the backend's own e2e
+    /// suite — would silently retarget onto the pinned remote release.
     fn compute_apple_backend_path(&self) -> Option<String> {
-        self.apple_backend_path
-            .as_ref()
-            .map(|path| self.backend_relative_path(path))
-            .or_else(|| {
-                let local = self.waterui_workspace_root()?.join("backends/apple");
-                local
-                    .join("Package.swift")
-                    .is_file()
-                    .then(|| self.backend_relative_path(&local))
-            })
+        self.local_sources.apple()?;
+        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join("backends/apple")))
     }
 
-    /// The path to the local Android backend checkout `[backends.android]`
-    /// `backend_path` names, resolved from the Android project's directory.
-    /// `None` consumes the remote runtime coordinate instead.
+    /// The path to the local Android backend checkout at
+    /// `waterui_path/backends/android`, resolved from the Android project's
+    /// directory. `None` consumes the remote runtime coordinate instead.
     ///
-    /// Without a manifest override, `waterui_path/backends/android` is used
-    /// when it is a real Gradle project: the framework tree carries no
-    /// `backends/android` gitlink any more (water-rs/waterui#940), so a local
-    /// checkout without one builds against the runtime the framework
-    /// declares through `android-backend-revision`, while a checkout that
-    /// does carry a runtime there — a backend e2e overlay, an older
-    /// revision — keeps building against it.
+    /// The framework tree carries no `backends/android` gitlink any more
+    /// (water-rs/waterui#940), so a local checkout without one builds against
+    /// the runtime the framework declares through `android-backend-revision`,
+    /// while a checkout that does carry a runtime there — a backend e2e
+    /// overlay, an older revision — keeps building against it.
     fn compute_android_backend_path(&self) -> Option<String> {
-        self.android_backend_path
-            .as_ref()
-            .map(|path| self.backend_relative_path(path))
-            .or_else(|| {
-                let local = self.waterui_workspace_root()?.join("backends/android");
-                local
-                    .join("settings.gradle.kts")
-                    .is_file()
-                    .then(|| self.backend_relative_path(&local))
-            })
+        self.local_sources.android()?;
+        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join("backends/android")))
     }
 
     /// Absolute path of the `WaterUI` workspace root when building against a
@@ -996,10 +968,9 @@ impl TemplateContext {
     }
 
     /// The `waterui-apple` dependency the generated FFI crate declares: a
-    /// `path` into a local Apple backend checkout when `[backends.apple]`
-    /// `backend_path` names one, and the backend repository's git source at
-    /// the resolved pin otherwise — the same `[backends.apple]`-then-channel
-    /// order the scaffolded project applied.
+    /// `path` into the `waterui_path/backends/apple` checkout when one is
+    /// staged, and the backend repository's git source at the resolved pin
+    /// otherwise.
     fn waterui_apple_dependency(&self) -> GeneratedDependencyDetail {
         if let Some(backend_path) = self.compute_apple_backend_path() {
             return GeneratedDependencyDetail {
@@ -1080,31 +1051,138 @@ impl TemplateNamespace {
     }
 }
 
-/// The local Android runtime checkout a project consumes, as an absolute
-/// path: `[backends.android] backend_path` when set, else
-/// `<waterui_path>/backends/android` when it is a Gradle project. `None`
-/// means the generated project resolves the remote coordinate. Relative
-/// inputs resolve against `project_root`.
+/// The canonical local backend sources a `waterui_path` checkout supplies.
 ///
-/// Single source for the same resolution [`TemplateContext`] performs for
-/// template renders — the embedded build needs it again when it publishes
-/// the runtime to `mavenLocal`.
-pub fn android_runtime_checkout(
-    backend_path: Option<&Path>,
-    waterui_path: Option<&Path>,
-    project_root: Option<&Path>,
-) -> Option<PathBuf> {
-    let resolve = |path: &Path| {
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            project_root.map_or_else(|| path.to_path_buf(), |root| root.join(path))
-        }
-    };
-    backend_path.map(resolve).or_else(|| {
-        let local = resolve(waterui_path?).join("backends/android");
-        local.join("settings.gradle.kts").is_file().then_some(local)
+/// Resolved once when a [`crate::project::Project`] opens or is created,
+/// before any template or backend generation runs; the resolved paths are
+/// absolute (a relative `waterui_path` is joined onto the project root).
+/// An absent slot is `None` — the generated project consumes the pinned
+/// remote source; a present-but-malformed slot is an error at resolution,
+/// never a silent remote fallback.
+#[derive(Debug, Clone, Default)]
+pub struct LocalBackendSources {
+    apple: Option<PathBuf>,
+    android: Option<PathBuf>,
+}
+
+impl LocalBackendSources {
+    /// The validated `backends/apple` checkout, when present.
+    #[must_use]
+    pub fn apple(&self) -> Option<&Path> {
+        self.apple.as_deref()
+    }
+
+    /// The validated `backends/android` checkout, when present.
+    #[must_use]
+    pub fn android(&self) -> Option<&Path> {
+        self.android.as_deref()
+    }
+}
+
+/// The identity a CLI-owned support application (the preview host, the
+/// inspector) declares — everything else about it derives from the
+/// `WaterUI` runtime it exists to host.
+#[derive(Debug, Clone)]
+pub struct SupportAppIdentity {
+    /// Human-facing name; the app's crate/binary names derive from it.
+    pub display_name: String,
+    /// Rust crate name of the support binary.
+    pub crate_name: CrateName,
+    /// Platform bundle identifier.
+    pub bundle_identifier: BundleIdentifier,
+}
+
+/// Resolve the canonical local backend sources under a `WaterUI` checkout
+/// root: `backends/apple` must hold a Rust manifest, `backends/android` a
+/// Gradle project. Each slot is an explicit source choice when present —
+/// an absent slot is `None`, a malformed one an error naming the slot and
+/// the manifest it lacks.
+///
+/// # Errors
+/// Returns an error when a slot's entry exists but does not resolve to a
+/// directory containing the required manifest — a dangling symlink, a
+/// non-directory, an unreadable path, or a checkout missing
+/// `Cargo.toml`/`settings.gradle.kts`.
+pub async fn local_backend_sources(waterui_root: &Path) -> eyre::Result<LocalBackendSources> {
+    let (apple, android) = smol::future::zip(
+        canonical_backend_source(waterui_root, "backends/apple", "Cargo.toml"),
+        canonical_backend_source(waterui_root, "backends/android", "settings.gradle.kts"),
+    )
+    .await;
+    Ok(LocalBackendSources {
+        apple: apple?,
+        android: android?,
     })
+}
+
+/// Resolve the canonical local backend sources a project's `waterui_path`
+/// names — `None` (and an empty [`LocalBackendSources`]) means remote
+/// sources. A relative `waterui_path` resolves against `project_root`.
+///
+/// # Errors
+/// Returns an error when a present slot is malformed; see
+/// [`local_backend_sources`].
+pub async fn project_local_backend_sources(
+    waterui_path: Option<&Path>,
+    project_root: &Path,
+) -> eyre::Result<LocalBackendSources> {
+    let Some(waterui_path) = waterui_path else {
+        return Ok(LocalBackendSources::default());
+    };
+    let root = if waterui_path.is_absolute() {
+        waterui_path.to_path_buf()
+    } else {
+        project_root.join(waterui_path)
+    };
+    local_backend_sources(&root).await
+}
+
+/// One canonical `backends/<name>` slot under a checkout root: `Ok(None)`
+/// only when no entry exists at all. Anything that IS there must resolve
+/// through links to a directory containing `probe`.
+async fn canonical_backend_source(
+    waterui_root: &Path,
+    slot: &str,
+    probe: &str,
+) -> eyre::Result<Option<PathBuf>> {
+    use eyre::WrapErr as _;
+
+    let entry = waterui_root.join(slot);
+    match smol::fs::symlink_metadata(&entry).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!("`{slot}` under `{}` cannot be read", waterui_root.display())
+            });
+        }
+    }
+    smol::fs::metadata(&entry)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "`{slot}` under `{}` does not resolve (a dangling link or unreadable target)",
+                waterui_root.display()
+            )
+        })?
+        .is_dir()
+        .then_some(())
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "`{slot}` under `{}` is not a directory — remove it or stage a real checkout there",
+                waterui_root.display()
+            )
+        })?;
+    let manifest = entry.join(probe);
+    match smol::fs::metadata(&manifest).await {
+        Ok(metadata) if metadata.is_file() => Ok(Some(entry)),
+        Ok(_) | Err(_) => Err(eyre::eyre!(
+            "`{slot}` under `{}` is not a backend checkout — it has no `{probe}`; \
+             stage a real backend checkout there, or remove it to consume the pinned \
+             remote source",
+            waterui_root.display()
+        )),
+    }
 }
 
 fn scaffold_template_dispatch_path(namespace: TemplateNamespace, relative_path: &Path) -> String {
@@ -1332,9 +1410,10 @@ define_scaffold_templates! {
 mod tests {
     use super::{
         AndroidPermissionTemplateEntry, BrowserTemplateContext, Esp32TemplateEntry,
-        LaunchTemplateEntry, ResolvedFramework, ResolvedWebViewBackend, TemplateContext,
-        TemplateNamespace, embedded, gtk4, jitpack_dependency_coordinate,
-        normalize_path_for_config, preview_ffi, render_scaffold_template,
+        LaunchTemplateEntry, LocalBackendSources, ResolvedFramework, ResolvedWebViewBackend,
+        SupportAppIdentity, TemplateContext, TemplateNamespace, embedded, gtk4,
+        jitpack_dependency_coordinate, local_backend_sources, normalize_path_for_config,
+        preview_ffi, render_scaffold_template,
     };
     use crate::framework::test_fixtures::{
         dev_framework, nightly_framework, stable_framework, write_apple_revision_checkout,
@@ -1349,6 +1428,13 @@ mod tests {
         backend_project_path: Option<PathBuf>,
         project_root_path: Option<PathBuf>,
     ) -> TemplateContext {
+        let local_sources = smol::block_on(crate::templates::project_local_backend_sources(
+            waterui_path.as_deref(),
+            project_root_path
+                .as_deref()
+                .unwrap_or_else(|| Path::new("")),
+        ))
+        .expect("fixture checkout resolves canonical backend sources");
         TemplateContext {
             app_display_name: String::new(),
             app_name: String::new(),
@@ -1357,10 +1443,9 @@ mod tests {
             bundle_identifier: BundleIdentifier::try_from("com.example.test")
                 .expect("test bundle identifier must be valid"),
             author: String::new(),
-            android_backend_path: None,
-            apple_backend_path: None,
             apple_backend_selected: true,
             waterui_path,
+            local_sources,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
             backend_project_path,
@@ -1421,6 +1506,22 @@ mod tests {
         fn manifest(name: &str, features: &[&str]) -> String {
             fixture_manifest(name, "0.0.0", features)
         }
+        // The root package doubles as the workspace root: the `waterui`
+        // facade resolves to it as a path dependency, so its `[features]`
+        // table is what the forward filter learns for `waterui/*` forwards —
+        // `gpu` and `video` here, so a facade missing `media`/`webview` keeps
+        // those forwards off the generated manifest — and
+        // `local_checkout_dependency` reads `waterui-browser-cef` out of
+        // `[workspace.dependencies]`.
+        std::fs::create_dir_all(root).expect("checkout root");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "{}\n[workspace]\nmembers = [\"ffi\", \"backends/apple\", \"backends/cef\"]\n\n[workspace.dependencies]\nwaterui-browser-cef = {{ path = \"backends/cef\" }}\n",
+                manifest("waterui", &["gpu", "video"])
+            ),
+        )
+        .expect("write waterui manifest");
         std::fs::create_dir_all(root.join("ffi")).expect("ffi manifest dir");
         std::fs::write(
             root.join("ffi/Cargo.toml"),
@@ -1436,6 +1537,11 @@ mod tests {
             manifest("waterui-apple", &["map", "media", "webview"]),
         )
         .expect("write waterui-apple manifest");
+        write_fixture_crate(
+            &root.join("backends/cef"),
+            "waterui-browser-cef",
+            &["chromium", "webview"],
+        );
     }
 
     /// A local checkout without a `backends/android` Gradle project — the
@@ -1480,30 +1586,45 @@ mod tests {
         );
     }
 
-    /// `[backends.android] backend_path` names a local runtime checkout: the
-    /// generated `settings.gradle.kts` includes it as a composite build and
-    /// leaves the `JitPack` repository off. Without the key the project
-    /// resolves the remote runtime coordinate.
+    /// A `waterui_path` checkout's `backends/android` Gradle project is a
+    /// local runtime checkout: the generated `settings.gradle.kts` includes
+    /// it as a composite build and leaves the `JitPack` repository off.
+    /// Without it the project resolves the remote runtime coordinate.
     #[test]
-    fn android_backend_path_renders_a_composite_build() {
-        let manifest: crate::project::Manifest = toml::from_str(
-            r#"
-                [package]
-                name = "Demo"
-                bundle_identifier = "dev.waterui.demo"
-
-                [backends.android]
-                backend_path = "/opt/android-backend"
-            "#,
+    fn android_backends_android_renders_a_composite_build() {
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/android");
+        std::fs::create_dir_all(&backend_dir).expect("android backend dir");
+        std::fs::write(
+            backend_dir.join("settings.gradle.kts"),
+            "// composite build marker\n",
         )
-        .expect("manifest parses");
+        .expect("backend settings.gradle.kts");
+        let mut document = toml::Table::new();
+        document.insert(
+            "waterui_path".into(),
+            waterui_root.path().display().to_string().into(),
+        );
+        let mut package = toml::Table::new();
+        package.insert("name".into(), "Demo".into());
+        package.insert("bundle_identifier".into(), "dev.waterui.demo".into());
+        document.insert("package".into(), package.into());
+        let document = toml::to_string(&document).expect("manifest serializes");
+        let manifest: crate::project::Manifest =
+            toml::from_str(&document).expect("manifest parses");
 
         let context = |manifest: &crate::project::Manifest| {
+            let local_sources = smol::block_on(crate::templates::project_local_backend_sources(
+                manifest.waterui_path.as_deref().map(Path::new),
+                waterui_root.path(),
+            ))
+            .expect("fixture checkout resolves canonical backend sources");
             TemplateContext::for_project_manifest(
                 manifest,
                 CrateName::try_from("demo").expect("crate name"),
                 "Demo",
                 &stable_framework(),
+                &local_sources,
             )
             .with_backend_project_path(PathBuf::from("/proj/android"))
             .with_project_root_path(PathBuf::from("/proj"))
@@ -1526,15 +1647,24 @@ mod tests {
 
         let local = render(&context(&manifest));
         assert!(
-            local.contains("includeBuild(\"/opt/android-backend\")"),
+            local.contains(&format!(
+                "includeBuild(\"{}\")",
+                normalize_path_for_config(&backend_dir)
+            )),
             "{local}"
         );
         // The JitPack repository stays off while the composite build is on.
         assert!(local.contains("if (false) {"), "{local}");
         assert!(local.contains("if (!false) {"), "{local}");
 
-        let mut remote_manifest = manifest;
-        remote_manifest.backends.clear_android();
+        let remote_manifest: crate::project::Manifest = toml::from_str(
+            r#"
+                [package]
+                name = "Demo"
+                bundle_identifier = "dev.waterui.demo"
+            "#,
+        )
+        .expect("remote manifest parses");
         let remote = render(&context(&remote_manifest));
         assert!(remote.contains("if (true) {"), "{remote}");
         assert!(remote.contains("if (!true) {"), "{remote}");
@@ -1560,6 +1690,7 @@ mod tests {
             CrateName::try_from("demo").expect("crate name"),
             "Demo",
             &stable_framework(),
+            &LocalBackendSources::default(),
         )
         .with_backend_project_path(PathBuf::from("/proj/android"))
         .with_project_root_path(PathBuf::from("/proj"))
@@ -1616,10 +1747,15 @@ mod tests {
 
         // A local runtime checkout swaps the module's dependency to the
         // mavenLocal coordinate and draws the composite build in.
-        let checkout = tempfile::tempdir().expect("checkout dir");
-        std::fs::write(checkout.path().join("version.txt"), "7.8.9").expect("version.txt");
+        let waterui_root = tempfile::tempdir().expect("waterui root");
+        let checkout = waterui_root.path().join("backends/android");
+        std::fs::create_dir_all(&checkout).expect("backend dir");
+        std::fs::write(checkout.join("settings.gradle.kts"), "\n").expect("settings.gradle.kts");
+        std::fs::write(checkout.join("version.txt"), "7.8.9").expect("version.txt");
         let mut local_ctx = ctx.clone();
-        local_ctx.android_backend_path = Some(checkout.path().to_path_buf());
+        local_ctx.waterui_path = Some(waterui_root.path().to_path_buf());
+        local_ctx.local_sources = smol::block_on(local_backend_sources(waterui_root.path()))
+            .expect("staged backend checkout resolves");
         let local_module = render("waterui/build.gradle.kts.tpl", &local_ctx);
         assert!(
             local_module.contains("api(\"dev.waterui.android:runtime:7.8.9\")"),
@@ -1659,14 +1795,18 @@ mod tests {
 
     fn support_ctx() -> TemplateContext {
         TemplateContext::for_support_app(
-            "WaterUIApp",
-            CrateName::try_from("waterui_app").expect("test crate name must be valid"),
-            BundleIdentifier::try_from("dev.waterui.support")
-                .expect("test bundle identifier must be valid"),
+            SupportAppIdentity {
+                display_name: "WaterUIApp".to_string(),
+                crate_name: CrateName::try_from("waterui_app")
+                    .expect("test crate name must be valid"),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.support")
+                    .expect("test bundle identifier must be valid"),
+            },
             Some(PathBuf::from("../..")),
             &stable_framework(),
             false,
             None,
+            &LocalBackendSources::default(),
         )
         .with_backend_project_path(PathBuf::from("managed_backends/apple"))
     }
@@ -2006,50 +2146,69 @@ mod tests {
     }
 
     #[test]
-    fn relative_apple_backend_path_produces_clean_relative_backend_path() {
-        let mut ctx = ctx(None, Some(PathBuf::from("managed_backends/apple")), None);
-        ctx.apple_backend_path = Some(PathBuf::from("../apple-backend"));
+    fn relative_waterui_path_produces_clean_relative_backend_path() {
+        let root = tempdir().expect("tempdir");
+        let waterui_root = root.path().join("waterui");
+        let backend_dir = waterui_root.join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
+        let project_root = root.path().join("proj");
+        std::fs::create_dir_all(&project_root).expect("project root");
+
+        let ctx = ctx(
+            Some(PathBuf::from("../waterui")),
+            Some(project_root.join("managed_backends/apple")),
+            Some(project_root.clone()),
+        );
 
         let path = ctx
             .compute_apple_backend_path()
             .expect("expected relative backend path");
+        let expected =
+            pathdiff::diff_paths(&backend_dir, project_root.join("managed_backends/apple"))
+                .expect("backend diff path");
 
-        assert_eq!(path, "../../../apple-backend");
+        assert_eq!(path, normalize_path_for_config(&expected));
         assert!(!path.contains("//"));
     }
 
     #[test]
-    fn absolute_apple_backend_path_is_used_directly() {
-        let abs = if cfg!(windows) {
-            PathBuf::from(r"C:\waterui\backends\apple")
-        } else {
-            PathBuf::from("/waterui/backends/apple")
-        };
+    fn absolute_waterui_path_backends_apple_is_used_directly() {
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
 
-        let mut ctx = ctx(None, Some(PathBuf::from("apple")), None);
-        ctx.apple_backend_path = Some(abs);
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(PathBuf::from("apple")),
+            None,
+        );
         let path = ctx
             .compute_apple_backend_path()
             .expect("expected backend path");
 
-        let expected = if cfg!(windows) {
-            "C:/waterui/backends/apple"
-        } else {
-            "/waterui/backends/apple"
-        };
-        assert_eq!(path, expected);
+        assert_eq!(path, normalize_path_for_config(&backend_dir));
     }
 
     #[test]
-    fn waterui_path_backends_apple_is_used_when_no_manifest_override() {
+    fn waterui_path_backends_apple_is_used() {
         let waterui_root = tempdir().expect("tempdir");
         let backend_dir = waterui_root.path().join("backends/apple");
         std::fs::create_dir_all(&backend_dir).expect("backend dir");
         std::fs::write(
-            backend_dir.join("Package.swift"),
-            "// swift-tools-version:5.9\n",
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\nversion = \"0.1.0\"\n",
         )
-        .expect("Package.swift");
+        .expect("backend Cargo.toml");
         let project_root = tempdir().expect("tempdir");
 
         let ctx = ctx(
@@ -2081,13 +2240,62 @@ mod tests {
         assert!(ctx.compute_apple_backend_path().is_none());
     }
 
+    /// Absent canonical slots select the remote channel; a slot that is
+    /// present but malformed — a directory without its required manifest,
+    /// a non-directory entry, or a dangling symlink — is a resolution
+    /// error naming the slot, never a silent remote fallback (water-rs/cli#276).
+    #[test]
+    fn malformed_local_backend_sources_fail_at_resolution() {
+        let root = tempdir().expect("waterui root");
+
+        let sources = smol::block_on(local_backend_sources(root.path()))
+            .expect("absent slots resolve to the remote source");
+        assert!(sources.apple().is_none());
+        assert!(sources.android().is_none());
+
+        let apple = root.path().join("backends/apple");
+        std::fs::create_dir_all(&apple).expect("empty apple slot");
+        let error = smol::block_on(local_backend_sources(root.path()))
+            .expect_err("a slot without its manifest is malformed");
+        assert!(error.to_string().contains("backends/apple"), "{error}");
+
+        std::fs::remove_dir(&apple).expect("remove empty slot");
+        std::fs::write(&apple, "not a directory\n").expect("file at slot path");
+        let error = smol::block_on(local_backend_sources(root.path()))
+            .expect_err("a non-directory slot is malformed");
+        assert!(error.to_string().contains("backends/apple"), "{error}");
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&apple).expect("remove file slot");
+            std::os::unix::fs::symlink(root.path().join("gone"), &apple).expect("dangling link");
+            let error = smol::block_on(local_backend_sources(root.path()))
+                .expect_err("a dangling symlink is malformed");
+            assert!(error.to_string().contains("backends/apple"), "{error}");
+        }
+    }
+
     #[test]
     fn waterui_apple_dependency_prefers_a_local_checkout() {
-        let mut ctx = ctx(None, Some(PathBuf::from("managed_backends/apple")), None);
-        ctx.apple_backend_path = Some(PathBuf::from("../apple-backend"));
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
+            Some(PathBuf::from("managed_backends/apple")),
+            None,
+        );
 
         let detail = ctx.waterui_apple_dependency();
-        assert_eq!(detail.path.as_deref(), Some("../../../apple-backend"));
+        assert_eq!(
+            detail.path.as_deref(),
+            Some(normalize_path_for_config(&backend_dir).as_str())
+        );
         assert!(detail.git.is_none() && detail.rev.is_none() && detail.tag.is_none());
     }
 
@@ -2106,22 +2314,24 @@ mod tests {
             PathBuf::from("/Users/lexo/.water/build_cache/Users/lexo/demo/managed_backends/apple")
         };
 
-        let mut ctx = ctx(
-            None,
+        let waterui_root = tempdir().expect("waterui root");
+        let backend_dir = waterui_root.path().join("backends/apple");
+        std::fs::create_dir_all(&backend_dir).expect("backend dir");
+        std::fs::write(
+            backend_dir.join("Cargo.toml"),
+            "[package]\nname = \"waterui-apple\"\n",
+        )
+        .expect("backend Cargo.toml");
+        let ctx = ctx(
+            Some(waterui_root.path().to_path_buf()),
             Some(backend_project_path.clone()),
             Some(project_root.clone()),
         );
-        ctx.apple_backend_path = Some(PathBuf::from("../waterui/backends/apple"));
 
         let path = ctx
             .compute_apple_backend_path()
             .expect("expected backend path");
-        let expected_backend_path = pathdiff::diff_paths(
-            project_root.join("../waterui/backends/apple"),
-            &backend_project_path,
-        )
-        .expect("backend diff path");
-        assert_eq!(path, normalize_path_for_config(&expected_backend_path));
+        assert_eq!(path, normalize_path_for_config(&backend_dir));
 
         let expected_project_root =
             pathdiff::diff_paths(&project_root, &backend_project_path).expect("project root diff");
@@ -2158,7 +2368,7 @@ mod tests {
     /// The Apple backend follows the framework's channel: `dev` and
     /// `nightly` pin the `apple-backend-revision` the channel resolved or
     /// certified, never the stable `apple-backend-version` tag — and a
-    /// `[backends.apple]` override still outranks either.
+    /// `waterui_path` checkout still outranks either.
     #[test]
     fn apple_dependency_pins_the_channel_backend_on_dev_and_nightly() {
         let dependency = |framework: ResolvedFramework| {
@@ -2893,7 +3103,7 @@ mod tests {
             .parse::<toml::Table>()
             .expect("ffi Cargo.toml should parse");
         assert_eq!(
-            manifest["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
+            manifest["target"]["cfg(not(target_vendor = \"apple\"))"]["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
             Some(false)
         );
         // The map capability reaches the Rust backend as well as the FFI
@@ -2907,6 +3117,24 @@ mod tests {
             .map(|feature| feature.as_str().expect("feature name"))
             .collect::<Vec<_>>();
         assert_eq!(map_forwards, ["waterui-ffi/map", "waterui-apple/map"]);
+        assert!(manifest["dependencies"].get("waterui-ffi").is_none());
+        assert!(manifest["dependencies"].get("waterui-apple").is_none());
+        assert!(
+            manifest["target"]["cfg(target_vendor = \"apple\")"]["dependencies"]
+                .get("waterui-apple")
+                .is_some()
+        );
+        assert!(
+            manifest["target"]["cfg(target_vendor = \"apple\")"]["dependencies"]
+                .get("waterui-ffi")
+                .is_none()
+        );
+        let lib = std::fs::read_to_string(ffi_dir.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("#[cfg(not(target_vendor = \"apple\"))]\nwaterui_ffi::export!();"));
+        assert!(
+            lib.contains("#[cfg(target_vendor = \"apple\")]\nwaterui_apple::export_app!(app);")
+        );
+        syn::parse_file(&lib).expect("mixed-target native companion parses");
         assert_eq!(manifest["package"]["autobins"].as_bool(), Some(false));
         let bins = manifest["bin"]
             .as_array()
@@ -3179,11 +3407,23 @@ mod tests {
 
         let helper = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-cef-helper.rs"))
             .expect("CEF helper source should be written");
-        assert!(helper.contains("waterui_cef_run_packaged_subprocess"));
+        assert!(helper.contains("waterui_browser_cef::run_packaged_subprocess"));
+        assert!(!helper.contains("waterui_ffi"));
+        assert!(helper.contains("#[cfg(target_os = \"macos\")]"));
+        assert!(helper.contains(
+            "compile_error!(\"The Apple CEF subprocess helper requires a macOS target\")"
+        ));
 
         let main_bin = std::fs::read_to_string(ffi_dir.join("src/bin/waterui-apple-main.rs"))
             .expect("apple main source should be written");
-        assert!(main_bin.contains("waterui_cef_prepare_macos_application"));
+        assert!(main_bin.contains("waterui_browser_cef::initialize_macos_application"));
+        assert!(main_bin.contains("waterui_browser_cef::initialize_sandbox_early"));
+        assert!(
+            manifest["target"]["cfg(target_os = \"macos\")"]["dependencies"]
+                .get("waterui-browser-cef")
+                .is_some()
+        );
+        assert!(!main_bin.contains("waterui_ffi"));
     }
 
     #[test]
@@ -3333,20 +3573,13 @@ mod tests {
             .join("managed_backends")
             .join("preview_ffi");
         let workspace_root = tempdir.path().join("waterui");
-        std::fs::create_dir_all(workspace_root.join("preview/src"))
-            .expect("fixture workspace member dir");
+        std::fs::create_dir_all(&workspace_root).expect("fixture workspace root");
         std::fs::write(
             workspace_root.join("Cargo.toml"),
             "[workspace]\nmembers = [\"preview\"]\n",
         )
         .expect("fixture workspace manifest");
-        std::fs::write(
-            workspace_root.join("preview/Cargo.toml"),
-            "[package]\nname = \"waterui-preview\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .expect("fixture member manifest");
-        std::fs::write(workspace_root.join("preview/src/lib.rs"), "")
-            .expect("fixture member source");
+        write_fixture_crate(&workspace_root.join("preview"), "waterui-preview", &[]);
         // The forward filter reads the `waterui-ffi` table off the checkout.
         write_fixture_crate(
             &workspace_root.join("ffi"),
@@ -3387,13 +3620,17 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest["dependencies"]["waterui-ffi"]["optional"].as_bool(),
+            manifest["target"]["cfg(not(target_vendor = \"apple\"))"]["dependencies"]["waterui-ffi"]["optional"].as_bool(),
             Some(true)
         );
         assert_eq!(
-            manifest["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
+            manifest["target"]["cfg(not(target_vendor = \"apple\"))"]["dependencies"]["waterui-ffi"]["default-features"].as_bool(),
             Some(false)
         );
+        assert!(manifest["dependencies"].get("waterui-ffi").is_none());
+        let targets = manifest["target"].as_table().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert!(targets.contains_key("cfg(not(target_vendor = \"apple\"))"));
         // The module is a member of the support runtime's workspace, never a
         // workspace of its own: one Cargo resolution is what makes the module and
         // the runtime it is loaded into agree on the `-C metadata` hash that ends
@@ -3477,7 +3714,23 @@ mod tests {
     }
 
     #[test]
-    fn generated_ffi_build_script_undefs_every_swift_seam_symbol() {
+    fn apple_scaffold_contains_no_swift_runtime_or_embedded_package() {
+        let mut ctx = project_ctx();
+        ctx.app_name = "WaterUIApp".to_string();
+        let outputs = super::apple::rendered_outputs(&ctx).unwrap();
+        let expected_path = PathBuf::from("WaterUIApp/WaterUIApp.entitlements");
+        let expected = include_bytes!("../templates/apple/AppName/AppName.entitlements.tpl");
+        assert_eq!(outputs, vec![(expected_path.clone(), expected.to_vec())]);
+        let directory = tempdir().unwrap();
+        smol::block_on(super::apple::scaffold(directory.path(), &ctx)).unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join(expected_path)).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn generated_native_build_script_has_no_swift_link_contract() {
         let temp = tempfile::tempdir().expect("temp dir");
         write_fake_framework_checkout(&temp.path().join("waterui"), super::FORWARDED_FFI_FEATURES);
         let ffi_dir = temp.path().join("managed_backends").join("ffi");
@@ -3496,15 +3749,8 @@ mod tests {
 
         let build_script = std::fs::read_to_string(ffi_dir.join("build.rs"))
             .expect("ffi build.rs should be written");
-        // Cargo emits the ffi `cdylib` also as a dependency artifact of
-        // `cargo rustc --bin`, where this build's trailing rustc args never
-        // reach — the crate's own link-arg is the only route that covers both.
-        for symbol in crate::apple::swift_seam::SEAM_SYMBOL_NAMES {
-            assert!(
-                build_script.contains(&format!("\"{symbol}\"")),
-                "ffi build.rs must undef `_waterui_swift_*` seam symbol {symbol}"
-            );
-        }
+        assert!(!build_script.contains("waterui_swift_"));
+        assert!(!build_script.contains("rustc-link-arg-cdylib"));
     }
 
     #[test]
@@ -3802,6 +4048,8 @@ struct SupportCargoManifest {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     features: std::collections::BTreeMap<String, Vec<String>>,
     dependencies: std::collections::BTreeMap<String, SupportDependencyValue>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    target: std::collections::BTreeMap<String, GeneratedTargetSection<SupportDependencyValue>>,
     workspace: SupportWorkspaceSection,
     /// `[patch]` inherited from the runtime's own workspace.
     ///
@@ -3945,6 +4193,16 @@ async fn write_support_cargo_toml(
         }
         None => framework.patches(),
     };
+    let mut dependencies = dependencies;
+    let mut target = std::collections::BTreeMap::new();
+    if let Some(ffi) = dependencies.remove("waterui-ffi") {
+        target.insert(
+            "cfg(not(target_vendor = \"apple\"))".to_string(),
+            GeneratedTargetSection {
+                dependencies: std::collections::BTreeMap::from([("waterui-ffi".to_string(), ffi)]),
+            },
+        );
+    }
     let manifest = SupportCargoManifest {
         package: SupportPackageSection {
             name: crate_name.to_string(),
@@ -3962,6 +4220,7 @@ async fn write_support_cargo_toml(
         features,
         dependencies,
         workspace: SupportWorkspaceSection {},
+        target,
         patch,
     };
 
@@ -6143,17 +6402,46 @@ const FORWARDED_FFI_FEATURES: &[&str] = &[
     "webview-cef",
 ];
 
-/// Additional `dep/feature` forwards a selectable FFI feature emits: pairs of
-/// (feature name, dependency). `map` also turns on `waterui-apple/map` so the
-/// native `MKMapView` leaf compiles only when the app's graph opted in; the
-/// `media` and `webview` capabilities forward the same way, so the `AVKit` and
+/// Additional `dep/feature` forwards a selectable FFI feature emits beyond
+/// `waterui-ffi`: (feature name, destination dependency, the feature it turns
+/// on there). `map` also turns on `waterui-apple/map` so the native
+/// `MKMapView` leaf compiles only when the app's graph opted in; the `media`
+/// and `webview` capabilities forward the same way, so the `AVKit` and
 /// `WebKit` leaves — and the framework links they carry through `cocoa-ui` —
-/// compile only for apps whose graph holds `waterui-video` / `waterui-webview`.
-const BACKEND_FEATURE_FORWARDS: &[(&str, &str)] = &[
-    ("map", "waterui-apple"),
-    ("media", "waterui-apple"),
-    ("webview", "waterui-apple"),
+/// compile only for apps whose graph holds `waterui-video` /
+/// `waterui-webview`. The CEF runtime listens under its own feature names —
+/// `webview-cef` turns on `waterui-browser-cef/webview`.
+const BACKEND_FEATURE_FORWARDS: &[(&str, &str, &str)] = &[
+    ("map", "waterui-apple", "map"),
+    ("media", "waterui-apple", "media"),
+    ("webview", "waterui-apple", "webview"),
+    ("chromium", "waterui-browser-cef", "chromium"),
+    ("webview-cef", "waterui-browser-cef", "webview"),
 ];
+
+/// The selectable FFI features that also reach the `waterui` facade crate —
+/// the gpu/media/video/webview capability surface the native Apple entry
+/// compiles. Emitted only while the Apple backend is selected.
+const APPLE_RUNTIME_FEATURE_FORWARDS: &[&str] = &["gpu", "media", "video", "webview"];
+
+/// The declaration `name` carries in `manifest`, wherever it lives:
+/// `[dependencies]` or a `[target.*.dependencies]` table. A generated
+/// manifest names a package in exactly one table — `waterui` top-level,
+/// `waterui-ffi` behind `cfg(not(target_vendor = "apple"))`,
+/// `waterui-apple` behind `cfg(target_vendor = "apple")`,
+/// `waterui-browser-cef` behind `cfg(target_os = "macos")` — so the first
+/// match is the declaration.
+fn declared_dependency<'m>(
+    manifest: &'m cargo_toml::Manifest<()>,
+    name: &str,
+) -> Option<&'m cargo_toml::Dependency> {
+    manifest.dependencies.get(name).or_else(|| {
+        manifest
+            .target
+            .values()
+            .find_map(|target| target.dependencies.get(name))
+    })
+}
 
 /// The `[features]` tables of the packages a generated manifest forwards
 /// features into, keyed by the dependency's name in that manifest.
@@ -6189,26 +6477,41 @@ fn ffi_feature_forwards(
     if declares(tables, "waterui-ffi", name) {
         forwards.push(format!("waterui-ffi/{name}"));
     }
-    for (_, dep) in BACKEND_FEATURE_FORWARDS
-        .iter()
-        .filter(|(feature, dep)| feature == &name && manifest.dependencies.contains_key(*dep))
+    // The `waterui` facade forwards ride with the native Apple runtime: the
+    // manifest declares `waterui-apple` exactly when that backend was
+    // selected.
+    if APPLE_RUNTIME_FEATURE_FORWARDS.contains(&name)
+        && declared_dependency(manifest, "waterui-apple").is_some()
+        && declares(tables, "waterui", name)
     {
-        if declares(tables, dep, name) {
-            forwards.push(format!("{dep}/{name}"));
+        forwards.push(format!("waterui/{name}"));
+    }
+    for (dep, dep_feature) in BACKEND_FEATURE_FORWARDS
+        .iter()
+        .filter(|(feature, dep, _)| {
+            feature == &name && declared_dependency(manifest, dep).is_some()
+        })
+        .map(|(_, dep, dep_feature)| (dep, dep_feature))
+    {
+        if declares(tables, dep, dep_feature) {
+            forwards.push(format!("{dep}/{dep_feature}"));
         }
     }
     forwards
 }
 
 /// The dependency names a generated manifest's forwards can target:
-/// `waterui-ffi` always, plus each `BACKEND_FEATURE_FORWARDS` destination the
-/// manifest declares — a backend forward references the backend crate, so it
-/// only exists where that backend is a dependency.
+/// `waterui-ffi` always, plus the `waterui` facade and each
+/// `BACKEND_FEATURE_FORWARDS` destination the manifest declares — a backend
+/// forward references the backend crate, so it only exists where that
+/// backend is a dependency.
 fn forward_targets(manifest: &cargo_toml::Manifest<()>) -> Vec<&'static str> {
     let mut targets = vec!["waterui-ffi"];
-    for (_, dep) in BACKEND_FEATURE_FORWARDS {
-        if manifest.dependencies.contains_key(*dep) && !targets.contains(dep) {
-            targets.push(*dep);
+    for dep in
+        std::iter::once("waterui").chain(BACKEND_FEATURE_FORWARDS.iter().map(|(_, dep, _)| *dep))
+    {
+        if declared_dependency(manifest, dep).is_some() && !targets.contains(&dep) {
+            targets.push(dep);
         }
     }
     targets
@@ -6266,10 +6569,8 @@ async fn resolved_forward_tables(
     let mut tables = FeatureTables::new();
     let mut unresolved = Vec::new();
     for &target in targets {
-        let dep_path = manifest
-            .dependencies
-            .get(target)
-            .and_then(|dependency| match dependency {
+        let dep_path =
+            declared_dependency(manifest, target).and_then(|dependency| match dependency {
                 cargo_toml::Dependency::Detailed(detail) => detail.path.as_deref(),
                 _ => None,
             });
@@ -6294,7 +6595,7 @@ async fn resolved_forward_tables(
                     dep_manifest.features.keys().cloned().collect(),
                 );
             }
-            None if manifest.dependencies.contains_key(target) => {
+            None if declared_dependency(manifest, target).is_some() => {
                 unresolved.push(target);
             }
             None => {
@@ -6357,7 +6658,7 @@ fn absolutize_probe_paths(
             }
         }
     }
-    for dependencies in [&mut probe.dev_dependencies, &mut probe.build_dependencies]
+    for (name, dependency) in [&mut probe.dev_dependencies, &mut probe.build_dependencies]
         .into_iter()
         .chain(probe.target.values_mut().flat_map(|target| {
             [
@@ -6366,10 +6667,12 @@ fn absolutize_probe_paths(
                 &mut target.build_dependencies,
             ]
         }))
+        .flat_map(|dependencies| dependencies.iter_mut())
     {
-        for dependency in dependencies.values_mut() {
-            if let cargo_toml::Dependency::Detailed(detail) = dependency {
-                absolutize(&mut detail.path);
+        if let cargo_toml::Dependency::Detailed(detail) = dependency {
+            absolutize(&mut detail.path);
+            if unresolved.iter().any(|target| *target == name) {
+                detail.optional = false;
             }
         }
     }
@@ -6585,38 +6888,8 @@ pub mod ffi {
             .features
             .insert("dev".to_string(), vec![format!("{}/dev", ctx.crate_name)]);
 
-        for (name, source) in [
-            ("waterui", NativeBackendDependencySource::WateruiRoot),
-            (
-                "waterui-ffi",
-                NativeBackendDependencySource::WorkspaceSubdir("ffi"),
-            ),
-        ] {
-            let dependency = generated_dependency_from_spec(
-                ctx,
-                NativeBackendDependencySpec::new(name, &[], source),
-            )?
-            .with_default_features(false)
-            .into_cargo();
-            manifest
-                .dependencies
-                .insert(name.to_owned(), Dependency::Detailed(Box::new(dependency)));
-        }
+        configure_native_dependencies(&mut manifest, ctx)?;
 
-        // The Rust backend owns the app's whole startup through
-        // `waterui_apple::export_app!`. It does not live in the `WaterUI`
-        // workspace, so it resolves against the Apple backend checkout the
-        // project already uses — never the framework registry source the
-        // loop above applies. Only a project that selected the Apple
-        // backend depends on it: an Android-only build never resolves,
-        // fetches, or compiles `waterui-apple`.
-        if ctx.apple_backend_selected {
-            let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
-            manifest.dependencies.insert(
-                "waterui-apple".to_string(),
-                Dependency::Detailed(Box::new(waterui_apple)),
-            );
-        }
         manifest.patch = match ctx.waterui_workspace_root() {
             Some(root) => {
                 smol::unblock(move || super::collect_framework_checkout_patches(&root)).await?
@@ -6645,32 +6918,115 @@ pub mod ffi {
             super::propagate_workspace_patches(&mut manifest, project_root).await?;
         }
 
-        // `waterui-ffi` is a hard dependency here, so the forwards are the
-        // plain `dep/feat` form; see `FORWARDED_FFI_FEATURES` for why they are
-        // manifest-declared at all. Each destination is filtered by the
-        // feature table of the package it actually resolves to — an older
-        // `waterui-ffi` without `inspector` gets no `inspector` forward,
-        // while a backend destination keeps its own entry (`map` still
-        // reaches `waterui-apple/map`). They come last: the probe that learns
-        // the resolved tables runs on this very manifest, so every dependency
-        // and patch must already be in place.
-        let tables = Box::pin(super::resolved_forward_tables(
-            &manifest,
-            base_dir,
-            &super::forward_targets(&manifest),
-        ))
-        .await?;
-        for name in super::FORWARDED_FFI_FEATURES {
-            let forwards = super::ffi_feature_forwards(name, &manifest, &tables);
-            if !forwards.is_empty() {
-                manifest.features.insert((*name).to_string(), forwards);
-            }
-        }
+        configure_capability_forwards(&mut manifest, base_dir).await?;
 
         let toml_string = toml::to_string_pretty(&manifest)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         fs::create_dir_all(base_dir).await?;
         write_file_if_changed(&base_dir.join("Cargo.toml"), toml_string.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Emit each selectable FFI feature's `dep/feat` forwards, filtered by the
+    /// feature table of the package its destination actually resolves to.
+    ///
+    /// `waterui-ffi` is a non-Apple target dependency here, so the forwards are
+    /// the plain `dep/feat` form; see `FORWARDED_FFI_FEATURES` for why they are
+    /// manifest-declared at all. An older `waterui-ffi` without `inspector`
+    /// gets no `inspector` forward, while a backend destination keeps its own
+    /// entry (`map` still reaches `waterui-apple/map`). This runs last in
+    /// `generate_cargo_toml`: the probe that learns the resolved tables runs
+    /// on this very manifest, so every dependency and patch must already be
+    /// in place.
+    async fn configure_capability_forwards(
+        manifest: &mut Manifest<()>,
+        base_dir: &Path,
+    ) -> io::Result<()> {
+        let tables = Box::pin(super::resolved_forward_tables(
+            manifest,
+            base_dir,
+            &super::forward_targets(manifest),
+        ))
+        .await?;
+        for name in super::FORWARDED_FFI_FEATURES {
+            let forwards = super::ffi_feature_forwards(name, manifest, &tables);
+            if !forwards.is_empty() {
+                manifest.features.insert((*name).to_string(), forwards);
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve framework, Apple backend and CEF sources into their target tables.
+    fn configure_native_dependencies(
+        manifest: &mut Manifest<()>,
+        ctx: &TemplateContext,
+    ) -> io::Result<()> {
+        for (name, source) in [
+            ("waterui", NativeBackendDependencySource::WateruiRoot),
+            (
+                "waterui-ffi",
+                NativeBackendDependencySource::WorkspaceSubdir("ffi"),
+            ),
+        ] {
+            let dependency = generated_dependency_from_spec(
+                ctx,
+                NativeBackendDependencySpec::new(name, &[], source),
+            )?
+            .with_default_features(false)
+            .into_cargo();
+            let dependencies = if name == "waterui-ffi" {
+                &mut manifest
+                    .target
+                    .entry("cfg(not(target_vendor = \"apple\"))".to_string())
+                    .or_default()
+                    .dependencies
+            } else {
+                &mut manifest.dependencies
+            };
+            dependencies.insert(name.to_owned(), Dependency::Detailed(Box::new(dependency)));
+        }
+
+        // The Rust backend owns the app's whole startup through
+        // `waterui_apple::export_app!`. It does not live in the `WaterUI`
+        // workspace, so it resolves against the Apple backend checkout the
+        // project already uses — never the framework registry source the
+        // loop above applies. Only a project that selected the Apple
+        // backend depends on it: an Android-only build never resolves,
+        // fetches, or compiles `waterui-apple`.
+        if ctx.apple_backend_selected {
+            let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
+            manifest
+                .target
+                .entry("cfg(target_vendor = \"apple\")".to_string())
+                .or_default()
+                .dependencies
+                .insert(
+                    "waterui-apple".to_string(),
+                    Dependency::Detailed(Box::new(waterui_apple)),
+                );
+        }
+        if ctx.cef_runtime_enabled() {
+            let browser = generated_dependency_from_spec(
+                ctx,
+                NativeBackendDependencySpec::new(
+                    "waterui-browser-cef",
+                    &[],
+                    NativeBackendDependencySource::WorkspaceDependency,
+                ),
+            )?
+            .with_default_features(false)
+            .into_cargo();
+            manifest
+                .target
+                .entry("cfg(target_os = \"macos\")".to_string())
+                .or_default()
+                .dependencies
+                .insert(
+                    "waterui-browser-cef".to_string(),
+                    Dependency::Detailed(Box::new(browser)),
+                );
+        }
         Ok(())
     }
 
@@ -7232,36 +7588,17 @@ pub mod preview_ffi {
                 ..Default::default()
             },
         );
-        manifest.dependencies.insert(
-            "waterui-ffi".to_string(),
-            Dependency::Detailed(Box::new(ffi_dependency)),
-        );
+        manifest
+            .target
+            .entry("cfg(not(target_vendor = \"apple\"))".to_string())
+            .or_default()
+            .dependencies
+            .insert(
+                "waterui-ffi".to_string(),
+                Dependency::Detailed(Box::new(ffi_dependency)),
+            );
 
-        let preview_dependency = if let Some(waterui_path) = &ctx.waterui_path {
-            let waterui_root = Path::new(&compute_native_backend_dependency_path(
-                ctx,
-                waterui_path,
-                None,
-            ))
-            .to_path_buf();
-            let waterui_root = if waterui_root.is_absolute() {
-                waterui_root
-            } else {
-                base_dir.join(waterui_root)
-            };
-            let preview_path =
-                super::preview::resolve_workspace_member_dir(&waterui_root, "waterui-preview")
-                    .await?;
-            DependencyDetail {
-                path: Some(super::normalize_path_for_config(&preview_path)),
-                optional: true,
-                ..Default::default()
-            }
-        } else {
-            let mut dependency = ctx.framework.dependency("waterui-preview");
-            dependency.optional = true;
-            dependency
-        };
+        let preview_dependency = preview_dependency(ctx, base_dir).await?;
         manifest.dependencies.insert(
             "waterui-preview".to_string(),
             Dependency::Detailed(Box::new(preview_dependency)),
@@ -7276,6 +7613,9 @@ pub mod preview_ffi {
         ))
         .await?;
         let ffi_declares = |name: &str| super::declares(&tables, "waterui-ffi", name);
+        // The portable non-Apple preview loader also selects APPLE_ABI_FEATURE.
+        // Its c-api forward only activates the non-Apple target dependency;
+        // Apple targets compile no waterui-ffi dependency through this feature.
         for (feature, ffi_feature) in [
             (APPLE_ABI_FEATURE, "c-api"),
             (ANDROID_ABI_FEATURE, "android-jni"),
@@ -7306,6 +7646,39 @@ pub mod preview_ffi {
         fs::create_dir_all(base_dir).await?;
         write_file_if_changed(&base_dir.join("Cargo.toml"), toml_string.as_bytes()).await?;
         Ok(())
+    }
+
+    /// Locate the `waterui-preview` workspace member in the pinned checkout, or
+    /// fall back to the framework registry source when no checkout is pinned.
+    async fn preview_dependency(
+        ctx: &TemplateContext,
+        base_dir: &Path,
+    ) -> io::Result<DependencyDetail> {
+        if let Some(waterui_path) = &ctx.waterui_path {
+            let waterui_root = Path::new(&compute_native_backend_dependency_path(
+                ctx,
+                waterui_path,
+                None,
+            ))
+            .to_path_buf();
+            let waterui_root = if waterui_root.is_absolute() {
+                waterui_root
+            } else {
+                base_dir.join(waterui_root)
+            };
+            let preview_path =
+                super::preview::resolve_workspace_member_dir(&waterui_root, "waterui-preview")
+                    .await?;
+            Ok(DependencyDetail {
+                path: Some(super::normalize_path_for_config(&preview_path)),
+                optional: true,
+                ..Default::default()
+            })
+        } else {
+            let mut dependency = ctx.framework.dependency("waterui-preview");
+            dependency.optional = true;
+            Ok(dependency)
+        }
     }
 }
 

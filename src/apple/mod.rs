@@ -7,6 +7,8 @@ pub mod backend;
 /// Apple device detection and management.
 pub mod device;
 pub(crate) mod dynamic_runtime;
+/// XCFramework and Swift package assembly for native hosts.
+pub mod embedded;
 /// macOS local device gestures and screenshot.
 #[cfg(target_os = "macos")]
 pub mod local;
@@ -113,7 +115,5 @@ pub mod platform;
 /// Development provisioning profiles: validation and `xcodebuild` acquisition.
 #[cfg(target_os = "macos")]
 pub mod provisioning;
-/// Compiling the backend's Swift seam without `xcodebuild`.
-pub mod swift_seam;
 /// Apple toolchain management.
 pub mod toolchain;

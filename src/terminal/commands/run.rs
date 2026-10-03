@@ -184,7 +184,7 @@ pub struct Args {
 
     /// Android painter the Hydrolysis host draws with (gpu, hwui).
     /// Only valid with `--platform android --backend hydrolysis`; the
-    /// `[backends.hydrolysis] painter` table in `Water.toml` is the project
+    /// `[hydrolysis] painter` table in `Water.toml` is the project
     /// default when omitted.
     #[arg(long, value_enum)]
     painter: Option<HydrolysisAndroidPainter>,
@@ -1138,7 +1138,7 @@ struct BuildRunConfig {
     /// out.
     dev_server: bool,
     /// The Hydrolysis Android painter the run packages with — the `--painter`
-    /// override, `[backends.hydrolysis] painter`, or the GPU default.
+    /// override, `[hydrolysis] painter`, or the GPU default.
     painter: HydrolysisAndroidPainter,
 }
 
