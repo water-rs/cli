@@ -7,13 +7,12 @@ use std::path::PathBuf;
 use clap::{Args as ClapArgs, ValueEnum};
 use color_eyre::eyre::{Result, bail, eyre};
 use dialoguer::{Input, Select, theme::ColorfulTheme};
-use heck::ToSnakeCase;
 
 use crate::shell::Shell;
 use crate::{header, line, success};
 use waterui_cli::framework::FrameworkChannel;
 use waterui_cli::project::{CreateOptions, Project, WebScaffold};
-use waterui_cli::project_types::BundleIdentifier;
+use waterui_cli::project_types::{BundleIdentifier, default_bundle_identifier};
 use waterui_cli::web::{
     self, ExistingFrontendMode, InitAction, InitAnswers, PackageManager, WebSource, plan_init,
 };
@@ -277,10 +276,12 @@ async fn scaffold_shell(
     include_arg: &str,
     name: String,
 ) -> Result<()> {
-    let bundle_id = args
-        .bundle_id
-        .clone()
-        .unwrap_or_else(|| format!("dev.waterui.{}", name.to_snake_case()));
+    let bundle_id = match args.bundle_id.clone() {
+        Some(bundle_id) => bundle_id,
+        None => default_bundle_identifier(&name)
+            .map_err(|error| eyre!("{error}"))?
+            .to_string(),
+    };
 
     let spinner = shell.spinner("Scaffolding the Rust shell...");
     let project = Project::init(

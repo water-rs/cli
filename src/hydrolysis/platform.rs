@@ -443,6 +443,12 @@ async fn package_hydrolysis_macos(
         options,
     }: HydrolysisMacosPackage<'_>,
 ) -> eyre::Result<Artifact> {
+    // The identifier lands in the bundle's `Info.plist` and drives signing —
+    // reject an Apple-invalid one before any staging or SDK work.
+    let bundle_id = project
+        .bundle_identifier()
+        .apple_bundle_identifier()
+        .map_err(|error| eyre::eyre!("{error}"))?;
     let app_name = project
         .manifest()
         .package
@@ -474,7 +480,7 @@ async fn package_hydrolysis_macos(
     let icns = assets::project_macos_icns(project)?;
     let app_path = package_binary_as_app(
         binary_path,
-        project.bundle_identifier(),
+        &bundle_id,
         MacOsAppNames {
             app_name: &app_name,
             executable_name: project.hydrolysis_binary_name().as_str(),
@@ -505,13 +511,8 @@ async fn package_hydrolysis_macos(
         let main_binary = app_path
             .join("Contents/MacOS")
             .join(project.hydrolysis_binary_name().as_str());
-        let _helper_apps = package_cef_helper_app(
-            &app_path,
-            &main_binary,
-            &helper_binary,
-            project.bundle_identifier(),
-        )
-        .await?;
+        let _helper_apps =
+            package_cef_helper_app(&app_path, &main_binary, &helper_binary, &bundle_id).await?;
     }
     let signing = match options.audience() {
         PackageAudience::Development => MacOsSigning::Development {
@@ -524,7 +525,7 @@ async fn package_hydrolysis_macos(
             )?)
         }
     };
-    sign_app(&app_path, project.bundle_identifier(), &signing).await?;
+    sign_app(&app_path, &bundle_id, &signing).await?;
     Ok(Artifact::new(project.bundle_identifier(), app_path))
 }
 

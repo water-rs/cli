@@ -15,6 +15,7 @@ use crate::{
     platform::{DeviceSigning, PackageOptions, TargetPlatform},
     project::Project,
     project_model::templates::TemplateContext,
+    project_types::AppleBundleIdentifier,
     utils::{copy_file, run_command_os},
 };
 
@@ -79,7 +80,7 @@ fn common_info_plist_entries(
     ctx: &TemplateContext,
     deployment_target: &str,
     product_name: &str,
-    bundle_id: &str,
+    bundle_id: &AppleBundleIdentifier,
 ) -> plist::Dictionary {
     let mut dict = plist::Dictionary::new();
     dict.insert(
@@ -131,7 +132,7 @@ pub fn apple_info_plist(
     platform: TargetPlatform,
     deployment_target: &str,
     product_name: &str,
-    bundle_id: &str,
+    bundle_id: &AppleBundleIdentifier,
 ) -> plist::Dictionary {
     let mut dict = common_info_plist_entries(ctx, deployment_target, product_name, bundle_id);
     dict.insert(
@@ -482,6 +483,10 @@ pub async fn sign_apple_app(
     project: &Project,
     deployment_target: &str,
 ) -> eyre::Result<()> {
+    let bundle_id = project
+        .bundle_identifier()
+        .apple_bundle_identifier()
+        .map_err(|error| eyre::eyre!("{error}"))?;
     if platform == TargetPlatform::MacOS {
         #[cfg(target_os = "macos")]
         {
@@ -507,12 +512,7 @@ pub async fn sign_apple_app(
                     )
                 }
             };
-            crate::macos_bundle::sign_macos_app(
-                &layout.app_path,
-                project.bundle_identifier(),
-                &signing,
-            )
-            .await?;
+            crate::macos_bundle::sign_macos_app(&layout.app_path, &bundle_id, &signing).await?;
             return Ok(());
         }
         #[cfg(not(target_os = "macos"))]
@@ -537,7 +537,7 @@ pub async fn sign_apple_app(
         .join(format!("{}.entitlements", backend.scheme));
     sign_device_app(
         layout,
-        project,
+        &bundle_id,
         options,
         platform,
         &entitlements,
@@ -620,7 +620,7 @@ async fn codesign_path(
 #[cfg(target_os = "macos")]
 async fn sign_device_app(
     layout: &AppleAppLayout,
-    project: &Project,
+    bundle_id: &AppleBundleIdentifier,
     options: &PackageOptions,
     platform: TargetPlatform,
     entitlements_path: &Path,
@@ -628,7 +628,6 @@ async fn sign_device_app(
     deployment_target: &str,
 ) -> eyre::Result<()> {
     let host = Host::current();
-    let bundle_id = project.bundle_identifier();
     let team = crate::apple::toolchain::development_team_id(&host).await?;
 
     let project_entitlements = match fs::read(entitlements_path).await {
@@ -659,7 +658,7 @@ async fn sign_device_app(
 
     let request = provisioning::SigningRequest {
         team: &team,
-        bundle_id,
+        bundle_id: bundle_id.as_str(),
         device_udid: options.device_udid(),
         entitlements: &project_entitlements,
         platform,
@@ -716,7 +715,7 @@ async fn sign_device_app(
         &layout.frameworks_dir,
         identity,
         Some(&merged),
-        Some(bundle_id),
+        Some(bundle_id.as_str()),
     )
     .await?;
     info!(
@@ -734,7 +733,7 @@ async fn sign_device_app(
 )]
 async fn sign_device_app(
     _layout: &AppleAppLayout,
-    _project: &Project,
+    _bundle_id: &AppleBundleIdentifier,
     _options: &PackageOptions,
     _platform: TargetPlatform,
     _entitlements_path: &Path,

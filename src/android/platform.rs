@@ -568,6 +568,13 @@ impl AndroidPlatform {
         // an error, never a signing decision.
         let release_signing = prepared.release_signing_for(project.root(), &options)?;
 
+        // The identifier becomes the app's Java package name in the Gradle
+        // build below — reject an Android-invalid one before the SDK runs.
+        let _ = project
+            .bundle_identifier()
+            .android_package_name()
+            .map_err(|error| eyre::eyre!("{error}"))?;
+
         let backend_path = project.backend_path::<AndroidBackend>();
 
         // Copy project assets and dependency fonts

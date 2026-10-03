@@ -68,6 +68,15 @@ impl Backend for AndroidBackend {
     async fn init(project: &Project) -> Result<Self, crate::backend::FailToInitBackend> {
         let manifest = project.manifest();
 
+        // The identifier is rendered into the scaffold below as the app's
+        // Java package name (`applicationId`, `namespace`, Maven `group`) —
+        // check it against the Android grammar before any file lands, rather
+        // than letting Gradle reject it mid-build.
+        let _ = project
+            .bundle_identifier()
+            .android_package_name()
+            .map_err(|error| crate::backend::FailToInitBackend::Config(eyre::eyre!("{error}")))?;
+
         // Derive app name from the display name (remove spaces for filesystem)
         let app_name = manifest
             .package
@@ -193,4 +202,53 @@ pub(crate) fn manifest_permissions(
                 .map(|name| templates::AndroidPermissionTemplateEntry { name })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AndroidBackend;
+    use crate::{
+        backend::Backend,
+        project::{CreateOptions, Project},
+        project_types::BundleIdentifier,
+    };
+
+    /// A hyphenated identifier — valid as `CFBundleIdentifier` but not a Java
+    /// package name — fails the scaffold with an Android-named error before a
+    /// single Gradle file is written.
+    #[test]
+    fn init_rejects_an_android_invalid_bundle_identifier() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("liquid-glass");
+        let project = smol::block_on(Project::create(
+            &root,
+            CreateOptions {
+                name: "Liquid Glass".to_string(),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.liquid-glass")
+                    .expect("the shared identifier grammar accepts hyphens"),
+                waterui_path: None,
+                channel: None,
+                framework_manifest: None,
+                framework: Some(crate::framework::test_fixtures::stable_framework()),
+                framework_lock: None,
+                author: "Lexo Liu".to_string(),
+                web: None,
+            },
+        ))
+        .expect("project creation must succeed");
+
+        let error = smol::block_on(AndroidBackend::init(&project))
+            .expect_err("a hyphenated identifier is not an Android package name");
+        assert!(
+            format!("{error}").contains("Android"),
+            "the rejection names the platform: {error}"
+        );
+        assert!(
+            !project
+                .backend_path::<AndroidBackend>()
+                .join("app")
+                .exists(),
+            "no Gradle module was scaffolded"
+        );
+    }
 }

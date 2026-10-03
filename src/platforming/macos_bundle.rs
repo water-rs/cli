@@ -17,6 +17,7 @@ use smol::stream::StreamExt as _;
 
 // `copy_file` is used by `package_binary_as_app`, which compiles on every
 // host; only the codesign helpers below are macOS-gated.
+use crate::project_types::AppleBundleIdentifier;
 #[cfg(target_os = "macos")]
 use crate::toolchain::Host;
 use crate::utils::copy_file;
@@ -78,7 +79,7 @@ pub struct MacOsAppNames<'a> {
 /// Returns an error if the binary is missing, template rendering fails, or bundle files cannot be created.
 pub async fn package_binary_as_app(
     binary_path: &Path,
-    bundle_id: &str,
+    bundle_id: &AppleBundleIdentifier,
     names: MacOsAppNames<'_>,
     usage_descriptions: &[MacOsUsageDescription],
     resources_dir: Option<&Path>,
@@ -121,7 +122,7 @@ pub async fn package_binary_as_app(
     fs::write(bundle_resources_dir.join("AppIcon.icns"), icns).await?;
 
     let plist = InfoPlistTemplate {
-        bundle_identifier: bundle_id,
+        bundle_identifier: bundle_id.as_str(),
         app_name: names.app_name,
         executable_name: names.executable_name,
         usage_descriptions,
@@ -224,7 +225,7 @@ impl DistributionSigning {
 #[cfg(target_os = "macos")]
 pub async fn sign_macos_app(
     app_path: &Path,
-    bundle_id: &str,
+    bundle_id: &AppleBundleIdentifier,
     signing: &MacOsSigning,
 ) -> eyre::Result<()> {
     let host = crate::toolchain::Host::current();
@@ -249,12 +250,13 @@ pub async fn sign_macos_app(
             } else {
                 "-"
             };
-            let plan = codesign_plan(app_path, identity, bundle_id, None).await?;
+            let plan = codesign_plan(app_path, identity, bundle_id.as_str(), None).await?;
             run_sign_plan(&host, plan).await
         }
         MacOsSigning::Distribution(distribution) => {
             let identity = developer_id_identity(&host, &distribution.team_id).await?;
-            let plan = codesign_plan(app_path, &identity, bundle_id, Some(distribution)).await?;
+            let plan =
+                codesign_plan(app_path, &identity, bundle_id.as_str(), Some(distribution)).await?;
             run_sign_plan(&host, plan).await?;
             notarize_app(&host, app_path, &distribution.notary_profile).await?;
             staple_app(&host, app_path).await
@@ -1035,7 +1037,7 @@ pub async fn package_cef_helper_app(
     app_dir: &Path,
     main_binary_path: &Path,
     helper_binary_path: &Path,
-    bundle_identifier: &str,
+    bundle_identifier: &AppleBundleIdentifier,
 ) -> eyre::Result<Vec<PathBuf>> {
     let executable_name = main_binary_path
         .file_name()
@@ -1218,7 +1220,8 @@ mod tests {
 
             let app = super::package_binary_as_app(
                 &binary,
-                "dev.waterui.demo",
+                &crate::project_types::AppleBundleIdentifier::try_from("dev.waterui.demo")
+                    .expect("bundle identifier"),
                 super::MacOsAppNames {
                     app_name: "Demo",
                     executable_name: "demo-hydrolysis",
@@ -1266,10 +1269,15 @@ mod tests {
             std::fs::write(frameworks.join("libwaterui.dylib"), b"runtime")
                 .expect("fake runtime must be written");
 
-            let helpers =
-                package_cef_helper_app(&app, &binary, &helper_binary, "dev.waterui.browser")
-                    .await
-                    .expect("CEF helper must package");
+            let helpers = package_cef_helper_app(
+                &app,
+                &binary,
+                &helper_binary,
+                &crate::project_types::AppleBundleIdentifier::try_from("dev.waterui.browser")
+                    .expect("bundle identifier"),
+            )
+            .await
+            .expect("CEF helper must package");
             assert_eq!(helpers.len(), 5);
             let helper = &helpers[0];
             let helper_name = "browser Helper";

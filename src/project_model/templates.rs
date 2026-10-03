@@ -746,9 +746,15 @@ impl TemplateContext {
         .rust_ident()
     }
 
+    /// The Android package name the Gradle templates render for
+    /// `applicationId`/`namespace`/`group`. The Android backend validates the
+    /// manifest's identifier against the Java package grammar before it
+    /// scaffolds or packages, so the conversion cannot fail here.
     #[must_use]
-    pub fn android_package_name(&self) -> String {
-        self.bundle_identifier.android_package_name().to_string()
+    pub fn android_package_name(&self) -> crate::project_types::AndroidPackageName {
+        self.bundle_identifier
+            .android_package_name()
+            .expect("the Android path validates bundle_identifier before rendering")
     }
 
     /// The Android API floor the selected framework's metadata declares —

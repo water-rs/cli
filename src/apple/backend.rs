@@ -96,9 +96,21 @@ impl AppleBackend {
     /// # Errors
     ///
     /// Returns an error when the application dependency graph or the
-    /// framework cannot be resolved.
+    /// framework cannot be resolved, or when `bundle_identifier` is not a
+    /// valid Apple `CFBundleIdentifier`.
     pub(crate) async fn template_context(project: &Project) -> eyre::Result<TemplateContext> {
         let manifest = project.manifest();
+        // The manifest's identifier becomes `CFBundleIdentifier` when the app
+        // is packaged — check it against Apple's grammar now, at scaffold
+        // time, rather than letting an invalid value surface inside codesign
+        // or provisioning. An embedded project's identifier is the host
+        // app's concern; it never reaches a `CFBundleIdentifier` here.
+        if !manifest.package.embedded {
+            let _ = project
+                .bundle_identifier()
+                .apple_bundle_identifier()
+                .map_err(|error| eyre::eyre!("{error}"))?;
+        }
         let (_, app_name, crate_name_for_template) = Self::scaffold_names();
         let ios_permissions = manifest
             .permissions
@@ -394,5 +406,84 @@ mod tests {
             "the re-rendered backend is fresh again"
         );
         assert!(derived_data.exists(), "reinit preserves DerivedData");
+    }
+
+    /// An identifier Android accepts but `CFBundleIdentifier` rejects —
+    /// an underscore — fails the scaffold with an Apple-named error before
+    /// the generated project, codesign or provisioning ever see it.
+    #[test]
+    fn template_context_rejects_an_apple_invalid_bundle_identifier() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("menu-example");
+        let project = smol::block_on(Project::create(
+            &root,
+            CreateOptions {
+                name: "Menu Example".to_string(),
+                bundle_identifier: BundleIdentifier::try_from("com.waterui.menu_example")
+                    .expect("the shared identifier grammar accepts underscores"),
+                waterui_path: None,
+                channel: None,
+                framework_manifest: None,
+                framework: Some(crate::framework::test_fixtures::stable_framework()),
+                framework_lock: None,
+                author: "Lexo Liu".to_string(),
+                web: None,
+            },
+        ))
+        .expect("project creation must succeed");
+
+        let error = smol::block_on(AppleBackend::template_context(&project))
+            .expect_err("an underscored identifier is not a CFBundleIdentifier");
+        assert!(
+            format!("{error:#}").contains("Apple"),
+            "the rejection names the platform: {error:#}"
+        );
+    }
+
+    /// A hyphenated identifier — invalid in a Java package name but valid as
+    /// `CFBundleIdentifier` — scaffolds the Apple backend cleanly and comes
+    /// back verbatim: the Apple path neither rejects nor rewrites it.
+    #[test]
+    fn apple_backend_accepts_and_preserves_a_hyphenated_bundle_identifier() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("liquid-glass");
+        smol::block_on(Project::create(
+            &root,
+            CreateOptions {
+                name: "Liquid Glass".to_string(),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.liquid-glass")
+                    .expect("the shared identifier grammar accepts hyphens"),
+                waterui_path: None,
+                channel: None,
+                framework_manifest: None,
+                framework: Some(crate::framework::test_fixtures::stable_framework()),
+                framework_lock: None,
+                author: "Lexo Liu".to_string(),
+                web: None,
+            },
+        ))
+        .expect("project creation must succeed");
+
+        vendor_offline_resolution(&root, &dir.path().join("vendor"));
+
+        let project = smol::block_on(Project::open(
+            &root,
+            ManagedBackends::for_backend(TargetBackend::Apple),
+        ))
+        .expect("the Apple backend scaffolds a hyphenated identifier");
+        assert_eq!(
+            project
+                .bundle_identifier()
+                .apple_bundle_identifier()
+                .expect("Apple accepts a hyphenated CFBundleIdentifier")
+                .as_str(),
+            "dev.waterui.liquid-glass",
+            "the identifier is preserved verbatim, never rewritten"
+        );
+        assert!(
+            !smol::block_on(AppleBackend::requires_regeneration(&project))
+                .expect("staleness check"),
+            "a freshly scaffolded backend is not stale"
+        );
     }
 }
