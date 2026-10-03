@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/water-rs/cli/compare/v0.4.3...v0.4.4) - 2026-10-03
+
+### Added
+
+- *(doctor)* check for spirv-opt on non-Apple targets
+- *(android)* stage dependency Kotlin helpers into the packaged module ([#246](https://github.com/water-rs/cli/pull/246))
+- *(apple)* [**breaking**] build and package Apple apps without an Xcode project ([#240](https://github.com/water-rs/cli/pull/240))
+- *(mcp)* forward drop_files to the app session ([#242](https://github.com/water-rs/cli/pull/242))
+- *(channel)* pin dev to an exact commit with --rev ([#241](https://github.com/water-rs/cli/pull/241))
+- *(cli)* support hydrolysis as an android backend
+- *(android)* embedded projects build an AAR the host app depends on ([#225](https://github.com/water-rs/cli/pull/225))
+- [**breaking**] remove app and playground package types ([#224](https://github.com/water-rs/cli/pull/224))
+- *(apple)* honour the app's last-window policy; re-render on backend_path changes ([#219](https://github.com/water-rs/cli/pull/219))
+- compile WATERUI_APP_ID into every cargo build and the Linux desktop entry
+- water package --unsigned builds an iOS device package without signing
+- [**breaking**] water package builds the release profile by default
+
+### Fixed
+
+- validate bundle identifiers for the selected platform
+- preserve an already canonical Apple shared runtime
+- *(apple)* reuse library dependencies for packaged entry binaries
+- *(apple)* explicitly enable CEF runtime in native scaffolds
+- *(cli)* correct pre-existing Apple embedding build hints
+- *(project)* remove the local Kotlin runtime slot
+- *(project)* validate local backend sources before scaffolding
+- configure Android AAR consumer rules in defaultConfig
+- *(apple)* stage the shared runtime before linking the entry binary
+- *(apple)* read development teams from Xcode account records
+- *(test)* resolve cold-cache scaffold fixtures hermetically
+- *(hydrolysis)* scaffold the Android FFI companion on a cold cache
+- emit the ffi companion's app shim for every backend selection
+- *(doctor)* import Installation only where the install test runs
+- *(cli)* box the Android packaging build future clippy flags on Windows
+- *(apple)* compile the host-only Apple build steps only on macOS
+- *(apple)* emit the ffi rlib the entry link consumes before localizing it
+- emit the ffi companion's apple pieces only for an apple selection
+- satisfy clippy 1.99 assert_is_empty and needless_borrows_for_generic_args ([#249](https://github.com/water-rs/cli/pull/249))
+- *(gc)* never delete a build cache entry the GC cannot prove stale
+- *(run)* resolve the Android ABI from the selected device ([#244](https://github.com/water-rs/cli/pull/244))
+- *(framework)* name both revisions and the remedy in the unresolved-revision error ([#239](https://github.com/water-rs/cli/pull/239))
+- *(cli)* box the large futures clippy flags on Windows
+- *(cli)* import fs only where the unix-only gradlew permission code uses it
+- *(assets)* keep the scaffold assets README out of packaged artifacts
+- *(cli)* diff the scaffolded projectRoot against the android dir
+- *(cli)* validate the host and platform pairing in one place
+- *(cli)* share the gradle wrapper and SDK 37 floor in the hydrolysis android scaffold
+- *(android)* ship a font manifest instead of the WaterUIFonts registry ([#226](https://github.com/water-rs/cli/pull/226))
+- *(hydrolysis)* gate dev-only backend deps behind their mode features
+- *(scaffold)* scaffold no features the template does not use
+- *(preview)* guard host-native platforms and carry resolved targets
+- *(preview)* make hydrolysis the native preview platform on linux and windows
+- *(preview)* box the preview session launch future in the command
+- *(mcp)* box the preview session launch future
+- *(preview)* log the macOS support app to a file, not a pipe ([#197](https://github.com/water-rs/cli/pull/197))
+- *(preview)* make water preview render on macOS ([#197](https://github.com/water-rs/cli/pull/197))
+- *(preview)* write the ffi workspace root before module metadata resolves
+- *(build)* read waterui metadata from the target build's app library
+- seed every managed-crate resolution from the channel's certified lock
+- *(tests)* link fake tools instead of writing copies
+- *(doctor)* enforce the scaffold's JDK version and parse sdkmanager 23.x ids
+- *(cli)* seed the generated crate's lock from one resolution, not a union
+- *(build)* stage each shared library under the name the artifact records
+- *(build)* join the CLI's rustflags with the set Cargo resolves instead of replacing it
+- *(build)* name a marked binary with the target's executable suffix
+- *(build)* launch the binary the build just produced, with its staged resources beside it
+- *(cli)* restage build outputs over the preserved products dir
+- *(cli)* normalize rebased patch paths for generated manifests
+- *(cli)* carry the app's patch table and lockfile into the managed hydrolysis build
+- *(cli)* forward the project's cargo config to managed backend builds
+- *(framework)* state the real reason stable withholds a git-pinned package ([#173](https://github.com/water-rs/cli/pull/173))
+- *(doctor)* correct the Linux package tables and stop masking fixables ([#172](https://github.com/water-rs/cli/pull/172))
+- *(doctor)* install sccache from the pinned release artifact ([#171](https://github.com/water-rs/cli/pull/171))
+- *(doctor)* check for a C compiler and linker on Linux ([#170](https://github.com/water-rs/cli/pull/170))
+- *(doctor)* continue `doctor --fix` past a failed installation ([#168](https://github.com/water-rs/cli/pull/168))
+- *(release)* build an x86_64-unknown-linux-musl artifact for Alpine
+- start the sccache server before Cargo spawns its clients
+
+### Other
+
+- Merge pull request #283 from water-rs/feat/278-apple-framework-source
+- *(project)* compare canonical Gradle paths on Windows
+- [**breaking**] keep generated backends out of project manifests
+- Merge dev into native Apple embedding with resolved capability forwards
+- Merge Android signing into iOS provisioning and preserve the device UDID
+- Merge remote-tracking branch 'origin/dev' into fix/229-ios-provisioning
+- Merge pull request #266 from water-rs/fix/261-hydrolysis-ffi-scaffold
+- Merge pull request #264 from water-rs/fix/1257-inspector-release
+- parse the ffi companion exports structurally
+- escape parentheses in the fake Windows tool versions
+- repin waterui to 29655e649
+- pin the framework to the objc2 framework branch
+- Merge branch 'dev' into feat/281-objc2-apple
+- *(cli)* resolve the android scaffold fixture through the real emission
+- *(cli)* cover the hydrolysis android painter and scaffold
+- *(cli)* pin the canonical-wins seed rule for a divergent patch version
+- install the wasm32 target for the test job
+- *(deps)* target-gate plist to macOS, drop icns jpeg2000
+- *(packaging)* count only shared libraries as staged runtimes
+- *(packaging)* restaging over a stale hashed shared runtime
+- *(build)* cover a second water run reusing the shared build cache
+- *(build)* cover water run staging every shared library the binary records
+- *(cli)* repackage after a backend source change
+- *(cli)* compare cargo-config paths in canonical form
+- Check for git, and install it where the host can ([#169](https://github.com/water-rs/cli/pull/169))
+- Merge pull request #160 from water-rs/fix/151-musl-artifact
+- format sccache.rs with rustfmt --edition 2024
+
 ## [0.4.3](https://github.com/water-rs/cli/compare/v0.4.2...v0.4.3) - 2026-09-21
 
 ### Added
