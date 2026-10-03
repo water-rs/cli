@@ -5,14 +5,14 @@ use std::path::PathBuf;
 use clap::{Args as ClapArgs, ValueEnum};
 use dialoguer::{Input, theme::ColorfulTheme};
 use eyre::{Result, bail, eyre};
-use heck::{ToKebabCase, ToSnakeCase};
+use heck::ToKebabCase;
 
 use crate::shell::Shell;
 use crate::{header, line, success, warn};
 use waterui_cli::FetchOutcome;
 use waterui_cli::framework::FrameworkChannel;
 use waterui_cli::project::{CreateOptions, Project, WebScaffold};
-use waterui_cli::project_types::BundleIdentifier;
+use waterui_cli::project_types::{BundleIdentifier, default_bundle_identifier};
 use waterui_cli::web::PackageManager;
 
 /// Arguments for the create command.
@@ -196,7 +196,7 @@ fn resolve_bundle_id(args: &Args, interactive: bool, name: &str) -> Result<Strin
     match args.bundle_id.clone() {
         Some(bundle_id) => Ok(bundle_id),
         None if interactive => prompt_bundle_id(name),
-        None => Ok(default_bundle_id(name)),
+        None => default_bundle_id(name).map_err(|error| eyre!(error)),
     }
 }
 
@@ -251,16 +251,20 @@ fn prompt_name() -> Result<String> {
         .interact_text()?)
 }
 
-fn default_bundle_id(app_name: &str) -> String {
-    format!("dev.waterui.{}", app_name.to_snake_case())
+/// The bundle identifier a new project gets when `--bundle-id` is not given:
+/// `dev.waterui.<name>` in lower camel case — the one casing valid on every
+/// supported platform. An error means the project name cannot derive one.
+fn default_bundle_id(app_name: &str) -> Result<String, String> {
+    default_bundle_identifier(app_name).map(|identifier| identifier.to_string())
 }
 
 fn prompt_bundle_id(app_name: &str) -> Result<String> {
-    let default = default_bundle_id(app_name);
-    Ok(Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Bundle identifier")
-        .default(default)
-        .interact_text()?)
+    let theme = ColorfulTheme::default();
+    let mut input = Input::<String>::with_theme(&theme).with_prompt("Bundle identifier");
+    if let Ok(default) = default_bundle_id(app_name) {
+        input = input.default(default);
+    }
+    Ok(input.interact_text()?)
 }
 
 /// The command that runs a fresh project on this host, when the host is a
@@ -465,6 +469,42 @@ mod tests {
     struct CreateCommand {
         #[command(flatten)]
         args: Args,
+    }
+
+    /// `water create` derives one identifier every platform accepts —
+    /// `to_snake_case` produced underscores `CFBundleIdentifier` rejects, so
+    /// the default renders the display name in lower camel case instead. An
+    /// explicit `--bundle-id` is preserved verbatim, never rewritten.
+    #[test]
+    fn default_bundle_id_is_platform_neutral() {
+        let shell = Shell::new(true);
+        for name in ["Menu Example", "menu-example", "menu_example"] {
+            let command = CreateCommand::try_parse_from(["water", name]).expect("args");
+            let plan = resolve_create_plan(&shell, &command.args).expect("create plan");
+            assert_eq!(plan.bundle_id, "dev.waterui.menuExample");
+        }
+        let command = CreateCommand::try_parse_from([
+            "water",
+            "Example",
+            "--bundle-id",
+            "com.example.my-app",
+        ])
+        .expect("args");
+        let plan = resolve_create_plan(&shell, &command.args).expect("create plan");
+        assert_eq!(plan.bundle_id, "com.example.my-app");
+    }
+
+    /// A name that cannot derive an identifier every platform accepts —
+    /// here one whose identifier segment would lead with a digit — fails at
+    /// plan resolution naming the rejecting grammar, never a silently
+    /// rewritten identifier.
+    #[test]
+    fn an_underivable_default_bundle_id_is_an_actionable_error() {
+        let command = CreateCommand::try_parse_from(["water", "3D Printer"]).expect("args");
+        let Err(error) = resolve_create_plan(&Shell::new(true), &command.args) else {
+            panic!("an underivable default must be rejected")
+        };
+        assert!(format!("{error:#}").contains("Android"), "{error:#}");
     }
 
     #[test]

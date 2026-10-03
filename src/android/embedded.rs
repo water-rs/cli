@@ -69,6 +69,13 @@ pub async fn build_aar(
     abis: &[AndroidAbi],
 ) -> Result<EmbeddedArtifact> {
     let backend_path = project.backend_path::<AndroidBackend>();
+    // The identifier is the Maven `group` the AAR publishes under — a Java
+    // package name — so it must satisfy the Android grammar before the build
+    // and publish steps run.
+    let package_name = project
+        .bundle_identifier()
+        .android_package_name()
+        .map_err(|error| eyre::eyre!("{error}"))?;
     let module_dir = backend_path.join(EMBEDDED_MODULE);
     if !module_dir.join("build.gradle.kts").is_file() {
         bail!(
@@ -125,11 +132,7 @@ pub async fn build_aar(
 
     let version = read_crate_version(project.root()).await?;
     let aar_path = copy_aar_to_package(project, &module_dir, &version).await?;
-    let coordinate = format!(
-        "{}:{}:{version}",
-        project.bundle_identifier(),
-        project.crate_name()
-    );
+    let coordinate = format!("{package_name}:{}:{version}", project.crate_name());
 
     info!(aar = %aar_path.display(), coordinate, "embedded Android artifact built");
     Ok(EmbeddedArtifact {

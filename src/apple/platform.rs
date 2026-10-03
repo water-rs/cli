@@ -235,6 +235,16 @@ pub(crate) async fn build_rust_lib_with_links(
         .cloned()
         .unwrap_or_else(|| platform.triple());
     validate_architecture(triple.architecture)?;
+    // A packaged app stamps the identifier as `CFBundleIdentifier`; reject an
+    // Apple-invalid one before the Rust build pays for it. An embedded build
+    // produces a library the host app embeds, so its identifier never reaches
+    // an Apple manifest here.
+    if !project.manifest().package.embedded {
+        let _ = project
+            .bundle_identifier()
+            .apple_bundle_identifier()
+            .map_err(|error| eyre::eyre!("{error}"))?;
+    }
     let options = if project.manifest().package.embedded {
         options.with_static_runtime()
     } else {
@@ -638,6 +648,13 @@ pub async fn package_apple(
     let backend = project
         .apple_backend()
         .ok_or_else(|| eyre::eyre!("Apple backend must be configured"))?;
+    // The identifier lands in `Info.plist` as `CFBundleIdentifier` and drives
+    // codesign/provisioning below — reject an Apple-invalid one before any
+    // asset staging or SDK work.
+    let bundle_id = project
+        .bundle_identifier()
+        .apple_bundle_identifier()
+        .map_err(|error| eyre::eyre!("{error}"))?;
     #[cfg(target_os = "macos")]
     let browser_runtime_plan = project
         .browser_runtime_plan(platform, TargetBackend::Apple)
@@ -699,7 +716,7 @@ pub async fn package_apple(
         platform,
         &deployment_target,
         &product_name,
-        project.bundle_identifier(),
+        &bundle_id,
     );
 
     app_bundle::assemble_app_bundle(
@@ -758,13 +775,7 @@ pub async fn package_apple(
                     project.ffi_crate_name().as_str(),
                 ),
             );
-            package_cef_helper_app(
-                &app_path,
-                &main_binary,
-                &helper_binary,
-                project.bundle_identifier(),
-            )
-            .await?;
+            package_cef_helper_app(&app_path, &main_binary, &helper_binary, &bundle_id).await?;
         }
     }
 

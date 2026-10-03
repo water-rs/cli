@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "{{ ctx.bundle_identifier }}.waterui"
+    namespace = "{{ ctx.android_package_name() }}.waterui"
     compileSdk = 37
 
     defaultConfig {
@@ -23,7 +23,7 @@ android {
     }
 }
 
-group = "{{ ctx.bundle_identifier }}"
+group = "{{ ctx.android_package_name() }}"
 version = "{{ ctx.crate_version }}"
 
 dependencies {
@@ -37,7 +37,7 @@ dependencies {
 publishing {
     publications {
         create<MavenPublication>("release") {
-            groupId = "{{ ctx.bundle_identifier }}"
+            groupId = "{{ ctx.android_package_name() }}"
             artifactId = "{{ ctx.crate_name }}"
             version = "{{ ctx.crate_version }}"
 

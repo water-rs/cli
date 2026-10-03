@@ -112,7 +112,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "{{ ctx.bundle_identifier }}"
+        applicationId = "{{ ctx.android_package_name() }}"
         minSdk = {{ ctx.android_min_api_level() }}
         targetSdk = 37
         versionCode = 1

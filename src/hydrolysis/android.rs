@@ -324,6 +324,12 @@ async fn android_template_context(
     painter: HydrolysisAndroidPainter,
     host_project_dir: &Path,
 ) -> eyre::Result<crate::templates::TemplateContext> {
+    // The scaffold renders the identifier as the app's Java package name —
+    // reject an Android-invalid one before the Gradle project exists.
+    let _ = project
+        .bundle_identifier()
+        .android_package_name()
+        .map_err(|error| eyre::eyre!("{error}"))?;
     Ok(HydrolysisBackend::template_context(project)
         .await?
         .with_hydrolysis_android(template_entry(project, painter, host_project_dir).await?)
@@ -535,6 +541,13 @@ pub async fn package_with_abis(
     // enforces; `[signing.android]` is an Android platform contract, not a
     // per-backend feature.
     let release_signing = prepared.release_signing_for(project.root(), options)?;
+
+    // The identifier becomes the app's Java package name in the Gradle
+    // build below — reject an Android-invalid one before the SDK runs.
+    let _ = project
+        .bundle_identifier()
+        .android_package_name()
+        .map_err(|error| eyre::eyre!("{error}"))?;
 
     let host_project_dir = require_painter_module(host, project, painter).await?;
     scaffold_android_project(project, painter, &host_project_dir).await?;
