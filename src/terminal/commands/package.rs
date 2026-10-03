@@ -243,7 +243,7 @@ async fn prepare_packaging_context(shell: &Shell, args: &Args) -> Result<Option<
     let project = Project::open(&project_path, managed_backends).await?;
     if project.manifest().package.embedded {
         bail!(
-            "`water package` does not apply to embedded projects: `water build --platform android` already produces the host-consumable artifact"
+            "`water package` does not apply to embedded projects: `water build` already produces the host-consumable artifact"
         );
     }
 
