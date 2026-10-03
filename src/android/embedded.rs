@@ -113,18 +113,6 @@ pub async fn build_aar(
     )
     .await?;
 
-    // A local runtime checkout must be published too: the embedded module's
-    // POM names `dev.waterui.android:runtime:<version>`, which the host can
-    // only resolve from mavenLocal since it has no composite include of the
-    // backend tree.
-    if let Some(runtime_checkout) = project.local_sources().android() {
-        run_gradle_tasks(
-            runtime_checkout,
-            &[":runtime:publishReleasePublicationToMavenLocal"],
-            &[],
-        )
-        .await?;
-    }
     run_gradle_tasks(
         &backend_path,
         &[

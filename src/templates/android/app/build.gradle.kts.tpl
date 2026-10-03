@@ -177,12 +177,8 @@ dependencies {
     // --- begin waterui android classpath dependencies ---
     // --- end waterui android classpath dependencies ---
 
-    // Use the backend revision embedded into the CLI build in remote mode, local backend otherwise
-    if ({{ ctx.use_remote_dev_backend() }}) {
-        implementation("{{ ctx.android_remote_backend_dependency() }}")
-    } else {
-        implementation("dev.waterui.android:runtime")
-    }
+    // The Kotlin runtime at the revision `android-backend-revision` pins.
+    implementation("{{ ctx.android_runtime_dependency() }}")
 
     implementation("androidx.core:core-ktx:1.19.0")
     // The launch screen: the platform SplashScreen API on 31+, backported below.

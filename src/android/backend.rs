@@ -14,8 +14,8 @@ use crate::{
 ///
 /// Runtime state only — nothing is persisted in `Water.toml`. The project
 /// path locates the Gradle project the CLI generates in the managed build
-/// cache; a local runtime checkout is discovered at
-/// `waterui_path/backends/android`, never declared.
+/// cache; the Kotlin runtime is consumed at the revision
+/// `android-backend-revision` pins, never from a local checkout.
 #[derive(Debug, Clone)]
 pub struct AndroidBackend {
     project_path: PathBuf,
