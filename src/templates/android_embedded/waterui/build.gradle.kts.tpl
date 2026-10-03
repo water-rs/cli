@@ -9,18 +9,14 @@ android {
 
     defaultConfig {
         minSdk = {{ ctx.android_min_api_level() }}
+        // Staged JNI-loaded classes need these consumer rules in every variant.
+        consumerProguardFiles("proguard-rules.pro")
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_{{ ctx.android_jdk_version() }}
         targetCompatibility = JavaVersion.VERSION_{{ ctx.android_jdk_version() }}
     }
-
-    // Staged dependency Kotlin sources and vendored jars are only reached by
-    // name (JNI loadClass); consumer apps minifying with R8 must keep them.
-    // The CLI's android classpath staging maintains the keep block in this
-    // file; consumerProguardFiles ships it inside the AAR.
-    consumerProguardFiles("proguard-rules.pro")
 
     publishing {
         singleVariant("release")
