@@ -494,8 +494,8 @@ async fn localize_archive_symbols(archive: &Path, symbols: &[&str]) -> eyre::Res
 ///
 /// These were `*_DEPLOYMENT_TARGET` build settings in the generated Xcode
 /// project; entry-owning packaging has no project file, so they are declared
-/// here next to the backend that owns them — the same values `Package.swift`
-/// in `apple-backend` publishes.
+/// here next to the backend that owns them — the same values the framework
+/// tree's root `Package.swift` publishes.
 const fn apple_deployment_target_for(platform: TargetPlatform) -> Option<&'static str> {
     match platform {
         TargetPlatform::MacOS
@@ -535,7 +535,7 @@ pub async fn apple_deployment_target(
 /// The checkout the project's `waterui-apple` dependency compiles from —
 /// the source directory `cargo metadata` resolved for the ffi crate's
 /// dependency, whether it names the canonical `waterui_path/backends/apple`
-/// checkout or the pinned remote source.
+/// checkout or the framework repository's member at the selected revision.
 ///
 /// # Errors
 /// Returns an error when the backend source cannot be located.

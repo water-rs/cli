@@ -6,9 +6,9 @@
 //! the same path between two packages — the second must rebuild it rather
 //! than reuse the previous build's intermediates.
 //!
-//! Clones the framework and the backend checkout and drives `xcodebuild`;
-//! marked `#[ignore]` like every test needing a framework checkout or the
-//! network (nightly only).
+//! Clones the framework — whose tree carries `backends/apple` — and drives
+//! `xcodebuild`; marked `#[ignore]` like every test needing a framework
+//! checkout or the network (nightly only).
 
 #![cfg(target_os = "macos")]
 
@@ -36,23 +36,6 @@ fn pinned_framework_revision() -> String {
                 .map(|sha| sha.trim_end_matches('"').to_owned())
         })
         .expect("Cargo.lock records the pinned framework revision")
-}
-
-/// The backend ref the cloned framework manifest pins —
-/// `apple-backend-revision` on a dev channel, else the release's
-/// `apple-backend-version` tag.
-fn pinned_backend_ref(waterui: &Path) -> String {
-    let manifest =
-        fs::read_to_string(waterui.join("Cargo.toml")).expect("read the framework manifest");
-    for key in ["apple-backend-revision", "apple-backend-version"] {
-        if let Some(value) = manifest.lines().find_map(|line| {
-            let (field, value) = line.split_once('=')?;
-            (field.trim() == key).then(|| value.trim().trim_matches('"').to_owned())
-        }) {
-            return value;
-        }
-    }
-    panic!("the framework manifest pins no apple backend ref")
 }
 
 /// A shallow clone of `url` at `git_ref` — a commit sha or a version tag —
@@ -118,6 +101,7 @@ fn packaged_binary(project: &Path) -> PathBuf {
     binaries[0].clone()
 }
 
+/// The backend member's path inside the cloned framework tree.
 fn backend_checkout(root: &Path) -> PathBuf {
     root.join("waterui/backends/apple")
 }
@@ -141,7 +125,7 @@ fn binary_contains(binary: &Path, marker: &str) -> bool {
 /// must invalidate the cache the first run left: the second package
 /// rebuilds and ships the new backend, never the stale artifact.
 #[test]
-#[ignore = "clones the framework and backend checkouts and runs Xcode"]
+#[ignore = "clones the framework checkout and runs Xcode"]
 fn repackaging_after_a_backend_change_rebuilds_the_backend() {
     let temp = tempfile::tempdir().expect("temp dir");
     let root = temp.path();
@@ -153,16 +137,9 @@ fn repackaging_after_a_backend_change_rebuilds_the_backend() {
         &pinned_framework_revision(),
     );
 
-    // The pinned tree carries `backends/apple` as an unmaterialized
-    // gitlink; place a real checkout there at the revision the framework
-    // manifest pins, the way a developer's local checkout lands there.
+    // `backends/apple` is the framework's own workspace member: the clone
+    // already carries the backend the `waterui_path` checkout consumes.
     let backend = backend_checkout(root);
-    fs::create_dir_all(backend.parent().expect("backends dir")).expect("create backends dir");
-    clone_at(
-        &backend,
-        "https://github.com/water-rs/apple-backend",
-        &pinned_backend_ref(&waterui),
-    );
     write_probe(&backend, MARKER_BEFORE);
 
     water(

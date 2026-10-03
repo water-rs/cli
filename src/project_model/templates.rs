@@ -10,7 +10,7 @@ use std::{
 
 use askama::Template;
 
-use crate::framework::{FrameworkChannel, ResolvedFramework};
+use crate::framework::ResolvedFramework;
 use crate::project::ResolvedWebViewBackend;
 
 use include_dir::{Dir, include_dir};
@@ -916,44 +916,39 @@ impl TemplateContext {
 
     /// The `waterui-apple` dependency the generated FFI crate declares: a
     /// `path` into the `waterui_path/backends/apple` checkout when one is
-    /// staged, and the backend repository's git source at the resolved pin
-    /// otherwise.
-    fn waterui_apple_dependency(&self) -> GeneratedDependencyDetail {
+    /// staged, and the framework's own repository at the selected revision
+    /// otherwise — the backend is a framework workspace member, so the
+    /// channel's `(repository, revision)` pins it the same way the Rust
+    /// packages and the root `Package.swift` are pinned.
+    ///
+    /// A `waterui_path` checkout that carries no `backends/apple` cannot
+    /// supply the crate — there is no remote fallback for a missing local
+    /// backend — and a selected framework revision that declares no
+    /// `apple-backend-path` carries no native backend either.
+    fn waterui_apple_dependency(&self) -> io::Result<GeneratedDependencyDetail> {
         if let Some(backend_path) = self.compute_apple_backend_path() {
-            return GeneratedDependencyDetail {
+            return Ok(GeneratedDependencyDetail {
                 path: Some(backend_path),
                 ..GeneratedDependencyDetail::default()
-            };
+            });
         }
-        let mut detail = GeneratedDependencyDetail {
-            git: Some(
-                self.framework
-                    .scaffold_value("apple-backend-url")
-                    .to_string(),
-            ),
+        if let Some(waterui_path) = &self.waterui_path {
+            return Err(io::Error::other(format!(
+                "the WaterUI checkout `{}` carries no `backends/apple` crate — \
+                 the native Apple backend cannot be resolved",
+                waterui_path.display()
+            )));
+        }
+        let source = self.framework.apple_backend_source().map_err(|error| {
+            io::Error::other(format!(
+                "the selected framework supplies no native Apple backend: {error:#}"
+            ))
+        })?;
+        Ok(GeneratedDependencyDetail {
+            git: source.git,
+            rev: source.rev,
             ..GeneratedDependencyDetail::default()
-        };
-        match self.framework.channel() {
-            Some(FrameworkChannel::Dev | FrameworkChannel::Nightly) => {
-                if let Some(revision) = self.framework.apple_backend_revision() {
-                    detail.rev = Some(revision.to_string());
-                } else if let Some(version) = self.framework.apple_backend_version() {
-                    detail.tag = Some(version.to_string());
-                } else {
-                    panic!("resolved framework carries no Apple backend pin");
-                }
-            }
-            Some(FrameworkChannel::Stable) | None => {
-                if let Some(version) = self.framework.apple_backend_version() {
-                    detail.tag = Some(version.to_string());
-                } else if let Some(revision) = self.framework.apple_backend_revision() {
-                    detail.rev = Some(revision.to_string());
-                } else {
-                    panic!("resolved framework carries no Apple backend pin");
-                }
-            }
-        }
-        detail
+        })
     }
 }
 
@@ -1003,9 +998,11 @@ impl TemplateNamespace {
 /// Resolved once when a [`crate::project::Project`] opens or is created,
 /// before any template or backend generation runs; the resolved paths are
 /// absolute (a relative `waterui_path` is joined onto the project root).
-/// An absent slot is `None` — the generated project consumes the pinned
-/// remote source; a present-but-malformed slot is an error at resolution,
-/// never a silent remote fallback.
+/// An absent slot is `None` — Android consumes the declared remote
+/// coordinate while the Apple member has no remote fallback: a checkout
+/// without `backends/apple` fails the generated dependency instead.
+/// A present-but-malformed slot is an error at resolution, never a silent
+/// remote fallback.
 #[derive(Debug, Clone, Default)]
 pub struct LocalBackendSources {
     apple: Option<PathBuf>,
@@ -1347,8 +1344,12 @@ mod tests {
         jitpack_dependency_coordinate, local_backend_sources, normalize_path_for_config,
         preview_ffi, render_scaffold_template,
     };
-    use crate::framework::test_fixtures::{
-        dev_framework, nightly_framework, stable_framework, write_apple_revision_checkout,
+    use crate::framework::{
+        framework_repository,
+        test_fixtures::{
+            dev_framework, nightly_framework, stable_framework, write_apple_pathless_checkout,
+            write_local_checkout,
+        },
     };
     use crate::project_types::{BundleIdentifier, CrateName};
     use include_dir::Dir;
@@ -2102,8 +2103,11 @@ mod tests {
         );
     }
 
+    /// A `waterui_path` checkout with no `backends/apple` crate cannot supply
+    /// `waterui-apple`: the dependency errors naming the checkout rather than
+    /// silently retargeting a remote source (water-rs/cli#278).
     #[test]
-    fn missing_local_apple_backend_falls_back_to_remote_package() {
+    fn missing_local_apple_backend_is_an_error() {
         let waterui_root = tempdir().expect("tempdir");
         std::fs::create_dir_all(waterui_root.path().join("backends")).expect("backends dir");
 
@@ -2114,6 +2118,8 @@ mod tests {
         );
 
         assert!(ctx.compute_apple_backend_path().is_none());
+        let error = ctx.waterui_apple_dependency().err().unwrap().to_string();
+        assert!(error.contains("backends/apple"), "{error}");
     }
 
     /// Absent canonical slots select the remote channel; a slot that is
@@ -2166,7 +2172,7 @@ mod tests {
             None,
         );
 
-        let detail = ctx.waterui_apple_dependency();
+        let detail = ctx.waterui_apple_dependency().unwrap();
         assert_eq!(
             detail.path.as_deref(),
             Some(normalize_path_for_config(&backend_dir).as_str())
@@ -2240,43 +2246,97 @@ mod tests {
         ));
     }
 
-    /// The Apple backend follows the framework's channel: `dev` and
-    /// `nightly` pin the `apple-backend-revision` the channel resolved or
-    /// certified, never the stable `apple-backend-version` tag — and a
-    /// `waterui_path` checkout still outranks either.
+    /// The Apple backend is a framework workspace member: every channel pins
+    /// `waterui-apple` to the framework's own repository at the framework's
+    /// selected revision — `stable` resolves the certified release's
+    /// provenance — never a backend repository, tag or HEAD of its own.
     #[test]
-    fn apple_dependency_pins_the_channel_backend_on_dev_and_nightly() {
+    fn apple_dependency_pins_the_framework_source_on_every_channel() {
         let dependency = |framework: ResolvedFramework| {
             let mut context = project_ctx();
             context.framework = framework;
-            context.waterui_apple_dependency()
+            context.waterui_apple_dependency().unwrap()
         };
-        let revision = 'd'.to_string().repeat(40);
-        for (channel, detail) in [
-            ("dev", dependency(dev_framework())),
-            ("nightly", dependency(nightly_framework(true))),
+        let repository = framework_repository();
+        for (channel, framework) in [
+            ("stable", stable_framework()),
+            ("dev", dev_framework()),
+            ("nightly", nightly_framework()),
         ] {
-            assert_eq!(detail.rev.as_deref(), Some(revision.as_str()), "{channel}");
-            assert!(detail.tag.is_none(), "{channel}");
+            let detail = dependency(framework);
+            assert_eq!(detail.git.as_deref(), Some(repository), "{channel}");
+            assert_eq!(
+                detail.rev.as_deref(),
+                Some('a'.to_string().repeat(40).as_str()),
+                "{channel}"
+            );
+            assert!(detail.tag.is_none() && detail.path.is_none(), "{channel}");
         }
-        // A nightly certification that names no backend revision certifies
-        // the manifest's declared tag.
-        let detail = dependency(nightly_framework(false));
-        assert_eq!(detail.tag.as_deref(), Some("0.3.0-dev.2"));
-        assert!(detail.rev.is_none());
     }
 
+    /// A framework revision from before the backend's return declares no
+    /// `apple-backend-path`: the dependency fails clearly rather than falling
+    /// back to a repository or pin the framework does not declare.
     #[test]
-    fn declared_apple_revision_becomes_the_ffi_dependency_rev() {
+    fn a_framework_without_apple_backend_path_is_an_error() {
+        let mut context = project_ctx();
+        let mut persisted: toml::Value =
+            toml::from_str(&toml::to_string(&context.framework).unwrap()).unwrap();
+        persisted["metadata"]
+            .as_table_mut()
+            .unwrap()
+            .remove("apple-backend-path");
+        context.framework = persisted.try_into().unwrap();
+        let error = context
+            .waterui_apple_dependency()
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("apple-backend-path"), "{error}");
+    }
+
+    /// A local checkout declares `apple-backend-path` but has no crate there:
+    /// the staged source is missing, and no remote source substitutes for it.
+    #[test]
+    fn declared_local_apple_backend_missing_its_crate_is_an_error() {
         let directory = tempdir().unwrap();
         let root = directory.path().join("waterui");
-        let revision = "dddddddddddddddddddddddddddddddddddddddd";
-        write_apple_revision_checkout(&root, revision);
-        let mut context = project_ctx();
+        write_local_checkout(&root);
+        let mut context = ctx(
+            Some(root.clone()),
+            Some(PathBuf::from("managed_backends/apple")),
+            None,
+        );
         context.framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
 
-        let detail = context.waterui_apple_dependency();
-        assert_eq!(detail.rev.as_deref(), Some(revision));
+        let error = context
+            .waterui_apple_dependency()
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("backends/apple"), "{error}");
+    }
+
+    /// A local checkout whose manifest predates the backend's return carries
+    /// no `apple-backend-path` and no backend crate: the same clear error.
+    #[test]
+    fn a_checkout_without_apple_backend_path_is_an_error() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("waterui");
+        write_apple_pathless_checkout(&root);
+        let mut context = ctx(
+            Some(root.clone()),
+            Some(PathBuf::from("managed_backends/apple")),
+            None,
+        );
+        context.framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
+
+        let error = context
+            .waterui_apple_dependency()
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("backends/apple"), "{error}");
     }
 
     #[test]
@@ -6870,7 +6930,7 @@ pub mod ffi {
         // backend depends on it: an Android-only build never resolves,
         // fetches, or compiles `waterui-apple`.
         if ctx.apple_backend_selected {
-            let waterui_apple = ctx.waterui_apple_dependency().into_cargo();
+            let waterui_apple = ctx.waterui_apple_dependency()?.into_cargo();
             manifest
                 .target
                 .entry("cfg(target_vendor = \"apple\")".to_string())
