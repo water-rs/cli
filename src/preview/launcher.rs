@@ -1580,14 +1580,19 @@ async fn scaffold_preview_app(path: &Path, requirements: &PreviewRequirements) -
     manifest.save(project.root()).await?;
 
     let ctx = TemplateContext::for_support_app(
-        "WaterUI Preview",
-        project.crate_name().clone(),
-        crate::project_types::BundleIdentifier::try_from("dev.waterui.preview")
+        crate::templates::SupportAppIdentity {
+            display_name: "WaterUI Preview".to_string(),
+            crate_name: project.crate_name().clone(),
+            bundle_identifier: crate::project_types::BundleIdentifier::try_from(
+                "dev.waterui.preview",
+            )
             .expect("preview support bundle identifier must be valid"),
+        },
         waterui_path,
         &requirements.framework,
         true,
         Some(requirements.runtime_fingerprint.clone()),
+        project.local_sources(),
     )
     .with_preview_runtime_features(requirements.runtime_features.clone())
     .with_preview_app_dependency(

@@ -343,6 +343,9 @@ pub struct TemplateContext {
     pub apple_backend_selected: bool,
     /// Path to local `WaterUI` repository (for dev mode)
     pub waterui_path: Option<PathBuf>,
+    /// The canonical local backend sources the `waterui_path` checkout
+    /// supplies, resolved before the context was built.
+    pub local_sources: LocalBackendSources,
     /// Persisted framework source and native backend revisions.
     pub framework: ResolvedFramework,
     /// Browser engine and component selections for generated backend manifests.
@@ -398,6 +401,7 @@ impl TemplateContext {
         options: &crate::project::CreateOptions,
         crate_name: CrateName,
         framework: &ResolvedFramework,
+        local_sources: &LocalBackendSources,
     ) -> Self {
         let waterui_path = options.waterui_path.clone();
         Self {
@@ -409,6 +413,7 @@ impl TemplateContext {
             author: options.author.clone(),
             apple_backend_selected: false,
             waterui_path,
+            local_sources: local_sources.clone(),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
             backend_project_path: None,
@@ -428,12 +433,16 @@ impl TemplateContext {
     }
 
     /// Build a context from an existing project manifest for backend scaffolding.
+    /// `local_sources` is the manifest's `waterui_path` resolved through
+    /// [`project_local_backend_sources`], never the raw manifest path — a
+    /// checkout carrying a malformed canonical slot already failed there.
     #[must_use]
     pub fn for_project_manifest(
         manifest: &crate::project::Manifest,
         crate_name: CrateName,
         app_name: impl Into<String>,
         framework: &ResolvedFramework,
+        local_sources: &LocalBackendSources,
     ) -> Self {
         Self {
             app_display_name: manifest.package.name.clone(),
@@ -445,6 +454,7 @@ impl TemplateContext {
             // Selected at invocation, never from declared config.
             apple_backend_selected: false,
             waterui_path: manifest.waterui_path.as_ref().map(PathBuf::from),
+            local_sources: local_sources.clone(),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
             backend_project_path: None,
@@ -470,13 +480,12 @@ impl TemplateContext {
     /// Build a context for the CLI's own support applications.
     #[must_use]
     pub fn for_support_app(
-        app_display_name: impl Into<String>,
-        crate_name: CrateName,
-        bundle_identifier: BundleIdentifier,
+        identity: SupportAppIdentity,
         waterui_path: Option<PathBuf>,
         framework: &ResolvedFramework,
         accessory: bool,
         preview_runtime_fingerprint: Option<String>,
+        local_sources: &LocalBackendSources,
     ) -> Self {
         // A support app exists to host one specific WaterUI runtime, so it has
         // to resolve dependencies exactly the way that runtime's own workspace
@@ -487,16 +496,21 @@ impl TemplateContext {
         // different graphics stack than the module it loads, and the module
         // fails to `dlopen` against symbols that no longer match.
         let project_root_path = waterui_path.clone();
-        let app_display_name = app_display_name.into();
+        let SupportAppIdentity {
+            display_name,
+            crate_name,
+            bundle_identifier,
+        } = identity;
         Self {
-            app_name: app_display_name.replace(' ', ""),
-            app_display_name,
+            app_name: display_name.replace(' ', ""),
+            app_display_name: display_name,
             crate_name,
             crate_version: String::new(),
             bundle_identifier,
             author: String::new(),
             apple_backend_selected: false,
             waterui_path,
+            local_sources: local_sources.clone(),
             framework: framework.clone(),
             browser: BrowserTemplateContext::default(),
             backend_project_path: None,
@@ -794,10 +808,7 @@ impl TemplateContext {
     /// when the remote coordinate is used.
     #[must_use]
     pub fn android_runtime_checkout(&self) -> Option<PathBuf> {
-        android_runtime_checkout(
-            self.waterui_workspace_root().as_deref(),
-            self.project_root_path.as_deref(),
-        )
+        self.local_sources.android().map(Path::to_path_buf)
     }
 
     #[must_use]
@@ -890,16 +901,8 @@ impl TemplateContext {
     /// probe every local-checkout build — including the backend's own e2e
     /// suite — would silently retarget onto the pinned remote release.
     fn compute_apple_backend_path(&self) -> Option<String> {
-        let slot = Path::new("backends/apple");
-        if !self
-            .waterui_workspace_root()?
-            .join(slot)
-            .join("Cargo.toml")
-            .is_file()
-        {
-            return None;
-        }
-        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join(slot)))
+        self.local_sources.apple()?;
+        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join("backends/apple")))
     }
 
     /// The path to the local Android backend checkout at
@@ -912,16 +915,8 @@ impl TemplateContext {
     /// while a checkout that does carry a runtime there — a backend e2e
     /// overlay, an older revision — keeps building against it.
     fn compute_android_backend_path(&self) -> Option<String> {
-        let slot = Path::new("backends/android");
-        if !self
-            .waterui_workspace_root()?
-            .join(slot)
-            .join("settings.gradle.kts")
-            .is_file()
-        {
-            return None;
-        }
-        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join(slot)))
+        self.local_sources.android()?;
+        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join("backends/android")))
     }
 
     /// Absolute path of the `WaterUI` workspace root when building against a
@@ -1056,25 +1051,138 @@ impl TemplateNamespace {
     }
 }
 
-/// The local Android runtime checkout a project consumes, as an absolute
-/// path: `<waterui_path>/backends/android` when it is a Gradle project.
-/// `None` means the generated project resolves the remote coordinate.
+/// The canonical local backend sources a `waterui_path` checkout supplies.
 ///
-/// Single source for the same resolution [`TemplateContext`] performs for
-/// template renders — the embedded build needs it again when it publishes
-/// the runtime to `mavenLocal`.
-pub fn android_runtime_checkout(
+/// Resolved once when a [`crate::project::Project`] opens or is created,
+/// before any template or backend generation runs; the resolved paths are
+/// absolute (a relative `waterui_path` is joined onto the project root).
+/// An absent slot is `None` — the generated project consumes the pinned
+/// remote source; a present-but-malformed slot is an error at resolution,
+/// never a silent remote fallback.
+#[derive(Debug, Clone, Default)]
+pub struct LocalBackendSources {
+    apple: Option<PathBuf>,
+    android: Option<PathBuf>,
+}
+
+impl LocalBackendSources {
+    /// The validated `backends/apple` checkout, when present.
+    #[must_use]
+    pub fn apple(&self) -> Option<&Path> {
+        self.apple.as_deref()
+    }
+
+    /// The validated `backends/android` checkout, when present.
+    #[must_use]
+    pub fn android(&self) -> Option<&Path> {
+        self.android.as_deref()
+    }
+}
+
+/// The identity a CLI-owned support application (the preview host, the
+/// inspector) declares — everything else about it derives from the
+/// `WaterUI` runtime it exists to host.
+#[derive(Debug, Clone)]
+pub struct SupportAppIdentity {
+    /// Human-facing name; the app's crate/binary names derive from it.
+    pub display_name: String,
+    /// Rust crate name of the support binary.
+    pub crate_name: CrateName,
+    /// Platform bundle identifier.
+    pub bundle_identifier: BundleIdentifier,
+}
+
+/// Resolve the canonical local backend sources under a `WaterUI` checkout
+/// root: `backends/apple` must hold a Rust manifest, `backends/android` a
+/// Gradle project. Each slot is an explicit source choice when present —
+/// an absent slot is `None`, a malformed one an error naming the slot and
+/// the manifest it lacks.
+///
+/// # Errors
+/// Returns an error when a slot's entry exists but does not resolve to a
+/// directory containing the required manifest — a dangling symlink, a
+/// non-directory, an unreadable path, or a checkout missing
+/// `Cargo.toml`/`settings.gradle.kts`.
+pub async fn local_backend_sources(waterui_root: &Path) -> eyre::Result<LocalBackendSources> {
+    let (apple, android) = smol::future::zip(
+        canonical_backend_source(waterui_root, "backends/apple", "Cargo.toml"),
+        canonical_backend_source(waterui_root, "backends/android", "settings.gradle.kts"),
+    )
+    .await;
+    Ok(LocalBackendSources {
+        apple: apple?,
+        android: android?,
+    })
+}
+
+/// Resolve the canonical local backend sources a project's `waterui_path`
+/// names — `None` (and an empty [`LocalBackendSources`]) means remote
+/// sources. A relative `waterui_path` resolves against `project_root`.
+///
+/// # Errors
+/// Returns an error when a present slot is malformed; see
+/// [`local_backend_sources`].
+pub async fn project_local_backend_sources(
     waterui_path: Option<&Path>,
-    project_root: Option<&Path>,
-) -> Option<PathBuf> {
-    let path = waterui_path?;
-    let root = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.map_or_else(|| path.to_path_buf(), |root| root.join(path))
+    project_root: &Path,
+) -> eyre::Result<LocalBackendSources> {
+    let Some(waterui_path) = waterui_path else {
+        return Ok(LocalBackendSources::default());
     };
-    let local = root.join("backends/android");
-    local.join("settings.gradle.kts").is_file().then_some(local)
+    let root = if waterui_path.is_absolute() {
+        waterui_path.to_path_buf()
+    } else {
+        project_root.join(waterui_path)
+    };
+    local_backend_sources(&root).await
+}
+
+/// One canonical `backends/<name>` slot under a checkout root: `Ok(None)`
+/// only when no entry exists at all. Anything that IS there must resolve
+/// through links to a directory containing `probe`.
+async fn canonical_backend_source(
+    waterui_root: &Path,
+    slot: &str,
+    probe: &str,
+) -> eyre::Result<Option<PathBuf>> {
+    use eyre::WrapErr as _;
+
+    let entry = waterui_root.join(slot);
+    match smol::fs::symlink_metadata(&entry).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!("`{slot}` under `{}` cannot be read", waterui_root.display())
+            });
+        }
+    }
+    smol::fs::metadata(&entry)
+        .await
+        .wrap_err_with(|| {
+            format!(
+                "`{slot}` under `{}` does not resolve (a dangling link or unreadable target)",
+                waterui_root.display()
+            )
+        })?
+        .is_dir()
+        .then_some(())
+        .ok_or_else(|| {
+            eyre::eyre!(
+                "`{slot}` under `{}` is not a directory — remove it or stage a real checkout there",
+                waterui_root.display()
+            )
+        })?;
+    let manifest = entry.join(probe);
+    match smol::fs::metadata(&manifest).await {
+        Ok(metadata) if metadata.is_file() => Ok(Some(entry)),
+        Ok(_) | Err(_) => Err(eyre::eyre!(
+            "`{slot}` under `{}` is not a backend checkout — it has no `{probe}`; \
+             stage a real backend checkout there, or remove it to consume the pinned \
+             remote source",
+            waterui_root.display()
+        )),
+    }
 }
 
 fn scaffold_template_dispatch_path(namespace: TemplateNamespace, relative_path: &Path) -> String {
@@ -1302,9 +1410,10 @@ define_scaffold_templates! {
 mod tests {
     use super::{
         AndroidPermissionTemplateEntry, BrowserTemplateContext, Esp32TemplateEntry,
-        LaunchTemplateEntry, ResolvedFramework, ResolvedWebViewBackend, TemplateContext,
-        TemplateNamespace, embedded, gtk4, jitpack_dependency_coordinate,
-        normalize_path_for_config, preview_ffi, render_scaffold_template,
+        LaunchTemplateEntry, LocalBackendSources, ResolvedFramework, ResolvedWebViewBackend,
+        SupportAppIdentity, TemplateContext, TemplateNamespace, embedded, gtk4,
+        jitpack_dependency_coordinate, local_backend_sources, normalize_path_for_config,
+        preview_ffi, render_scaffold_template,
     };
     use crate::framework::test_fixtures::{
         dev_framework, nightly_framework, stable_framework, write_apple_revision_checkout,
@@ -1319,6 +1428,13 @@ mod tests {
         backend_project_path: Option<PathBuf>,
         project_root_path: Option<PathBuf>,
     ) -> TemplateContext {
+        let local_sources = smol::block_on(crate::templates::project_local_backend_sources(
+            waterui_path.as_deref(),
+            project_root_path
+                .as_deref()
+                .unwrap_or_else(|| Path::new("")),
+        ))
+        .expect("fixture checkout resolves canonical backend sources");
         TemplateContext {
             app_display_name: String::new(),
             app_name: String::new(),
@@ -1329,6 +1445,7 @@ mod tests {
             author: String::new(),
             apple_backend_selected: true,
             waterui_path,
+            local_sources,
             framework: stable_framework(),
             browser: BrowserTemplateContext::default(),
             backend_project_path,
@@ -1483,24 +1600,31 @@ mod tests {
             "// composite build marker\n",
         )
         .expect("backend settings.gradle.kts");
-        let manifest: crate::project::Manifest = toml::from_str(&format!(
-            r#"
-                waterui_path = "{}"
-
-                [package]
-                name = "Demo"
-                bundle_identifier = "dev.waterui.demo"
-            "#,
-            waterui_root.path().display()
-        ))
-        .expect("manifest parses");
+        let mut document = toml::Table::new();
+        document.insert(
+            "waterui_path".into(),
+            waterui_root.path().display().to_string().into(),
+        );
+        let mut package = toml::Table::new();
+        package.insert("name".into(), "Demo".into());
+        package.insert("bundle_identifier".into(), "dev.waterui.demo".into());
+        document.insert("package".into(), package.into());
+        let document = toml::to_string(&document).expect("manifest serializes");
+        let manifest: crate::project::Manifest =
+            toml::from_str(&document).expect("manifest parses");
 
         let context = |manifest: &crate::project::Manifest| {
+            let local_sources = smol::block_on(crate::templates::project_local_backend_sources(
+                manifest.waterui_path.as_deref().map(Path::new),
+                waterui_root.path(),
+            ))
+            .expect("fixture checkout resolves canonical backend sources");
             TemplateContext::for_project_manifest(
                 manifest,
                 CrateName::try_from("demo").expect("crate name"),
                 "Demo",
                 &stable_framework(),
+                &local_sources,
             )
             .with_backend_project_path(PathBuf::from("/proj/android"))
             .with_project_root_path(PathBuf::from("/proj"))
@@ -1563,6 +1687,7 @@ mod tests {
             CrateName::try_from("demo").expect("crate name"),
             "Demo",
             &stable_framework(),
+            &LocalBackendSources::default(),
         )
         .with_backend_project_path(PathBuf::from("/proj/android"))
         .with_project_root_path(PathBuf::from("/proj"))
@@ -1626,6 +1751,8 @@ mod tests {
         std::fs::write(checkout.join("version.txt"), "7.8.9").expect("version.txt");
         let mut local_ctx = ctx.clone();
         local_ctx.waterui_path = Some(waterui_root.path().to_path_buf());
+        local_ctx.local_sources = smol::block_on(local_backend_sources(waterui_root.path()))
+            .expect("staged backend checkout resolves");
         let local_module = render("waterui/build.gradle.kts.tpl", &local_ctx);
         assert!(
             local_module.contains("api(\"dev.waterui.android:runtime:7.8.9\")"),
@@ -1665,14 +1792,18 @@ mod tests {
 
     fn support_ctx() -> TemplateContext {
         TemplateContext::for_support_app(
-            "WaterUIApp",
-            CrateName::try_from("waterui_app").expect("test crate name must be valid"),
-            BundleIdentifier::try_from("dev.waterui.support")
-                .expect("test bundle identifier must be valid"),
+            SupportAppIdentity {
+                display_name: "WaterUIApp".to_string(),
+                crate_name: CrateName::try_from("waterui_app")
+                    .expect("test crate name must be valid"),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.support")
+                    .expect("test bundle identifier must be valid"),
+            },
             Some(PathBuf::from("../..")),
             &stable_framework(),
             false,
             None,
+            &LocalBackendSources::default(),
         )
         .with_backend_project_path(PathBuf::from("managed_backends/apple"))
     }
@@ -2104,6 +2235,41 @@ mod tests {
         );
 
         assert!(ctx.compute_apple_backend_path().is_none());
+    }
+
+    /// Absent canonical slots select the remote channel; a slot that is
+    /// present but malformed — a directory without its required manifest,
+    /// a non-directory entry, or a dangling symlink — is a resolution
+    /// error naming the slot, never a silent remote fallback (water-rs/cli#276).
+    #[test]
+    fn malformed_local_backend_sources_fail_at_resolution() {
+        let root = tempdir().expect("waterui root");
+
+        let sources = smol::block_on(local_backend_sources(root.path()))
+            .expect("absent slots resolve to the remote source");
+        assert!(sources.apple().is_none());
+        assert!(sources.android().is_none());
+
+        let apple = root.path().join("backends/apple");
+        std::fs::create_dir_all(&apple).expect("empty apple slot");
+        let error = smol::block_on(local_backend_sources(root.path()))
+            .expect_err("a slot without its manifest is malformed");
+        assert!(error.to_string().contains("backends/apple"), "{error}");
+
+        std::fs::remove_dir(&apple).expect("remove empty slot");
+        std::fs::write(&apple, "not a directory\n").expect("file at slot path");
+        let error = smol::block_on(local_backend_sources(root.path()))
+            .expect_err("a non-directory slot is malformed");
+        assert!(error.to_string().contains("backends/apple"), "{error}");
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&apple).expect("remove file slot");
+            std::os::unix::fs::symlink(root.path().join("gone"), &apple).expect("dangling link");
+            let error = smol::block_on(local_backend_sources(root.path()))
+                .expect_err("a dangling symlink is malformed");
+            assert!(error.to_string().contains("backends/apple"), "{error}");
+        }
     }
 
     #[test]

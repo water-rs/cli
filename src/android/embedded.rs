@@ -117,13 +117,9 @@ pub async fn build_aar(
     // POM names `dev.waterui.android:runtime:<version>`, which the host can
     // only resolve from mavenLocal since it has no composite include of the
     // backend tree.
-    let manifest = project.manifest();
-    if let Some(runtime_checkout) = crate::templates::android_runtime_checkout(
-        manifest.waterui_path.as_deref().map(Path::new),
-        Some(project.root()),
-    ) {
+    if let Some(runtime_checkout) = project.local_sources().android() {
         run_gradle_tasks(
-            &runtime_checkout,
+            runtime_checkout,
             &[":runtime:publishReleasePublicationToMavenLocal"],
             &[],
         )

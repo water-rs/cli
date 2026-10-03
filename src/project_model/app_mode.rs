@@ -33,13 +33,17 @@ impl AppModeLeftovers {
         let keys: Vec<String> = APP_MODE_KEYS
             .iter()
             .filter(|(table, key)| {
-                let Some(table) = table
-                    .iter()
-                    .try_fold(manifest, |table, name| table.get(*name)?.as_table())
-                else {
+                // Intermediate path segments must resolve to tables; the
+                // last segment need only be present — a scalar
+                // `backends = "…"` still names the retired table.
+                let Some(value) = manifest.get(table[0]).and_then(|value| {
+                    table[1..]
+                        .iter()
+                        .try_fold(value, |value, name| value.as_table()?.get(*name))
+                }) else {
                     return false;
                 };
-                key.is_empty() || table.contains_key(*key)
+                key.is_empty() || value.as_table().is_some_and(|t| t.contains_key(*key))
             })
             .map(|(table, key)| {
                 let mut dotted = table.join(".");
@@ -118,13 +122,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("retired backends table: {manifest}"));
             assert_eq!(leftovers.keys, ["backends"]);
         }
-        // A top-level dotted table header names `backends` the same way.
-        let manifest = parse(
-            "backends.apple.scheme = \"demo\"\n\n[package]\nname = \"Demo\"\nbundle_identifier = \"dev.waterui.demo\"",
-        );
-        let leftovers = AppModeLeftovers::find(&manifest)
-            .unwrap_or_else(|| panic!("retired backends table: {manifest}"));
-        assert_eq!(leftovers.keys, ["backends"]);
+        // A top-level dotted table header or scalar names `backends` the
+        // same way — the key is retired whatever shape it takes.
+        for manifest in ["backends.apple.scheme = \"demo\"", "backends = \"retired\""] {
+            let manifest = parse(&format!(
+                "{manifest}\n\n[package]\nname = \"Demo\"\nbundle_identifier = \"dev.waterui.demo\""
+            ));
+            let leftovers = AppModeLeftovers::find(&manifest)
+                .unwrap_or_else(|| panic!("retired backends table: {manifest}"));
+            assert_eq!(leftovers.keys, ["backends"]);
+        }
     }
 
     #[test]

@@ -146,6 +146,10 @@ pub struct Project {
     /// persisted. Persisted backend-facing configuration lives in the
     /// manifest's typed tables (`[esp32]`, `[hydrolysis]`).
     backends: Backends,
+    /// The canonical local backend sources the manifest's `waterui_path`
+    /// checkout supplies, resolved before any template or backend
+    /// generation ran — a malformed slot already failed the open.
+    local_sources: crate::templates::LocalBackendSources,
     /// Whether the ffi companion's manifest existed before this open
     /// re-rendered it — a backend init audits only a companion carried
     /// over from a prior open, not the fresh render its own build
@@ -620,6 +624,13 @@ impl Project {
         self.manifest.esp32.as_ref()
     }
 
+    /// The canonical local backend sources the `waterui_path` checkout
+    /// supplies, resolved at open — empty means the pinned remote sources.
+    #[must_use]
+    pub const fn local_sources(&self) -> &crate::templates::LocalBackendSources {
+        &self.local_sources
+    }
+
     /// Get the manifest of the project.
     #[must_use]
     pub const fn manifest(&self) -> &Manifest {
@@ -965,6 +976,11 @@ pub enum FailToOpenProject {
     #[error("Failed to refresh the [patch] tables from the local checkout: {0}")]
     LocalPatches(eyre::Report),
 
+    /// A canonical `backends/<name>` slot under the `waterui_path` checkout
+    /// is present but not a usable backend source.
+    #[error("Invalid local backend source under `waterui_path`: {0}")]
+    LocalSources(eyre::Report),
+
     /// Missing crate name in Cargo.toml.
     #[error("Invalid Cargo.toml: missing crate name")]
     MissingCrateName,
@@ -988,6 +1004,10 @@ pub enum FailToCreateProject {
     /// Failed to resolve a coherent framework distribution.
     #[error("Failed to resolve framework: {0}")]
     Framework(eyre::Report),
+    /// A canonical `backends/<name>` slot under the `waterui_path` checkout
+    /// is present but not a usable backend source.
+    #[error("Invalid local backend source under `waterui_path`: {0}")]
+    LocalSources(eyre::Report),
     /// The project directory already exists.
     #[error("Directory already exists: {0}")]
     DirectoryExists(PathBuf),
@@ -1171,6 +1191,7 @@ impl Project {
             self.crate_name().clone(),
             app_name,
             &framework,
+            self.local_sources(),
         )
         .with_backend_project_path(self.ffi_crate_path())
         .with_project_root_path(self.root.clone())
@@ -1221,6 +1242,7 @@ impl Project {
             self.crate_name().clone(),
             app_name,
             &framework,
+            self.local_sources(),
         )
         .with_backend_project_path(self.preview_ffi_crate_path(workspace_root))
         .with_project_root_path(self.root.clone());
@@ -1298,8 +1320,21 @@ impl Project {
             .await
             .map_err(FailToCreateProject::CreateDir)?;
 
+        // The canonical local source slots a `waterui_path` checkout
+        // declares are validated once here — a malformed slot is an error,
+        // never a silent remote fallback during template rendering.
+        let local_sources =
+            crate::templates::project_local_backend_sources(options.waterui_path.as_deref(), &path)
+                .await
+                .map_err(FailToCreateProject::LocalSources)?;
+
         // Build template context for root files
-        let ctx = TemplateContext::for_create_options(&options, crate_name.clone(), &framework);
+        let ctx = TemplateContext::for_create_options(
+            &options,
+            crate_name.clone(),
+            &framework,
+            &local_sources,
+        );
 
         // The assets root is derived once and shared with both the scaffold and
         // the manifest, so the created directory and `Water.toml` cannot disagree.
@@ -1387,6 +1422,7 @@ impl Project {
             enabled_features: Arc::new(async_lock::OnceCell::new()),
             managed_backends_root,
             backends: Backends::default(),
+            local_sources,
             ffi_companion_preexisting: false,
         })
     }
@@ -1553,6 +1589,12 @@ impl Project {
                 .validate_cli()
                 .map_err(FailToOpenProject::Framework)?;
         }
+        let local_sources = crate::templates::project_local_backend_sources(
+            manifest.waterui_path.as_deref().map(Path::new),
+            &path,
+        )
+        .await
+        .map_err(FailToOpenProject::LocalSources)?;
         if let Some(local) = &manifest.waterui_path {
             validate_local_cli(&path.join(local))
                 .await
@@ -1618,6 +1660,7 @@ impl Project {
             enabled_features: Arc::new(async_lock::OnceCell::new()),
             managed_backends_root,
             backends: Backends::default(),
+            local_sources,
             ffi_companion_preexisting: false,
         };
 

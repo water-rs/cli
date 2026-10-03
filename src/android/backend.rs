@@ -107,6 +107,7 @@ impl Backend for AndroidBackend {
                 .resolved_framework()
                 .await
                 .map_err(crate::backend::FailToInitBackend::Config)?,
+            project.local_sources(),
         )
         .with_backend_project_path(project.backend_path::<Self>())
         .with_project_root_path(project.root().to_path_buf())

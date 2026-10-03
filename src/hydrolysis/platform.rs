@@ -915,13 +915,17 @@ mod tests {
 
     fn demo_context() -> TemplateContext {
         TemplateContext::for_support_app(
-            "Demo",
-            CrateName::try_from("demo").expect("crate name must be valid"),
-            BundleIdentifier::try_from("dev.waterui.demo").expect("bundle id must be valid"),
+            crate::templates::SupportAppIdentity {
+                display_name: "Demo".to_string(),
+                crate_name: CrateName::try_from("demo").expect("crate name must be valid"),
+                bundle_identifier: BundleIdentifier::try_from("dev.waterui.demo")
+                    .expect("bundle id must be valid"),
+            },
             None,
             &stable_framework(),
             false,
             None,
+            &crate::templates::LocalBackendSources::default(),
         )
     }
 

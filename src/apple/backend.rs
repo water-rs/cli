@@ -127,6 +127,7 @@ impl AppleBackend {
             crate_name_for_template,
             app_name,
             &project.resolved_framework().await?,
+            project.local_sources(),
         )
         .with_backend_project_path(project.backend_path::<Self>())
         .with_project_root_path(project.root().to_path_buf())
