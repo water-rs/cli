@@ -561,7 +561,7 @@ async fn prepare_run_context(shell: &Shell, args: &Args) -> Result<Option<RunCon
     let mut project = Project::open(&project_path, managed_backends).await?;
     if project.manifest().package.embedded {
         bail!(
-            "`water run` does not apply to embedded projects: the crate is a library the host app embeds — build the artifact with `water build --platform android` and run the host app"
+            "`water run` does not apply to embedded projects: the crate is a library the host app embeds — build the artifact with `water build` and run the host app"
         );
     }
 
