@@ -290,13 +290,26 @@ pub(crate) async fn build_rust_lib_with_links(
         // `cdylib` alone leaves the rlib unwritten on a clean target
         // dir; the dylib is picked out of Cargo's report by extension.
         AppleHostLibrary::Dynamic => build.build_dylib(options.is_release()).await?,
-        AppleHostLibrary::Archive => {
+        // An embedded project never builds the entry binary, so the archive
+        // keeps its single-crate-type build and the `native_static_libraries`
+        // call below stays in the same dependency mode — a union emit here
+        // would leave the override compiling the whole graph a second time.
+        AppleHostLibrary::Archive if project.manifest().package.embedded => {
             build
                 .clone()
                 .with_crate_type_override(host_library.crate_type())
                 .build_lib(options.is_release())
                 .await?
         }
+        // Everywhere else the entry (and any CEF helper) binary follows in the
+        // same target dir. A `--crate-type` selection narrows the lib to one
+        // artifact and puts its dependencies in a mode the binary builds
+        // cannot reuse — under LTO they get `-Clinker-plugin-lto` while the
+        // binaries' graph wants plain objects, so the entire dependency
+        // graph compiled a second time. Emitting the manifest's declared
+        // types shares one dependency fingerprint set across every build;
+        // the `.a` is picked out of Cargo's report by extension.
+        AppleHostLibrary::Archive => build.build_staticlib(options.is_release()).await?,
     };
 
     let staged_dir = options.output_dir().map(PathBuf::from);
