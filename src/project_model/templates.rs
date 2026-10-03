@@ -769,50 +769,11 @@ impl TemplateContext {
         crate::build_info::ANDROID_JDK_VERSION
     }
 
-    /// Whether the Android project consumes the runtime as the remote
-    /// coordinate `android_remote_backend_dependency` names rather than a
-    /// local checkout: true unless `waterui_path/backends/android` is a
-    /// Gradle project.
-    #[must_use]
-    pub fn use_remote_dev_backend(&self) -> bool {
-        self.compute_android_backend_path().is_none()
-    }
-
-    /// The local runtime the Android project includes as a composite build;
-    /// empty in remote mode, where the templates never read it.
-    #[must_use]
-    pub fn android_backend_path(&self) -> String {
-        self.compute_android_backend_path().unwrap_or_default()
-    }
-
-    /// The runtime coordinate the embedded module's POM declares for
-    /// `dev.waterui.android:runtime`: remote mode names the `JitPack`
-    /// coordinate; a local checkout names the version `version.txt` pins,
-    /// which `water build` publishes to `mavenLocal`.
+    /// The Kotlin runtime coordinate the generated Android project and the
+    /// embedded module's POM declare — the `JitPack` coordinate of the
+    /// revision `android-backend-revision` pins.
     #[must_use]
     pub fn android_runtime_dependency(&self) -> String {
-        self.android_runtime_checkout().map_or_else(
-            || self.android_remote_backend_dependency(),
-            |checkout| {
-                let version = std::fs::read_to_string(checkout.join("version.txt")).map_or_else(
-                    |_| "0.0.0".to_string(),
-                    |version| version.trim().to_string(),
-                );
-                format!("dev.waterui.android:runtime:{version}")
-            },
-        )
-    }
-
-    /// Absolute path of the local Android runtime checkout the generated
-    /// project consumes — the same directory `includeBuild` names — or `None`
-    /// when the remote coordinate is used.
-    #[must_use]
-    pub fn android_runtime_checkout(&self) -> Option<PathBuf> {
-        self.local_sources.android().map(Path::to_path_buf)
-    }
-
-    #[must_use]
-    pub fn android_remote_backend_dependency(&self) -> String {
         jitpack_dependency_coordinate(
             self.framework.scaffold_value("android-backend-url"),
             self.framework.scaffold_value("android-backend-revision"),
@@ -903,20 +864,6 @@ impl TemplateContext {
     fn compute_apple_backend_path(&self) -> Option<String> {
         self.local_sources.apple()?;
         Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join("backends/apple")))
-    }
-
-    /// The path to the local Android backend checkout at
-    /// `waterui_path/backends/android`, resolved from the Android project's
-    /// directory. `None` consumes the remote runtime coordinate instead.
-    ///
-    /// The framework tree carries no `backends/android` gitlink any more
-    /// (water-rs/waterui#940), so a local checkout without one builds against
-    /// the runtime the framework declares through `android-backend-revision`,
-    /// while a checkout that does carry a runtime there — a backend e2e
-    /// overlay, an older revision — keeps building against it.
-    fn compute_android_backend_path(&self) -> Option<String> {
-        self.local_sources.android()?;
-        Some(self.backend_relative_path(&self.waterui_path.as_ref()?.join("backends/android")))
     }
 
     /// Absolute path of the `WaterUI` workspace root when building against a
@@ -1062,7 +1009,6 @@ impl TemplateNamespace {
 #[derive(Debug, Clone, Default)]
 pub struct LocalBackendSources {
     apple: Option<PathBuf>,
-    android: Option<PathBuf>,
 }
 
 impl LocalBackendSources {
@@ -1070,12 +1016,6 @@ impl LocalBackendSources {
     #[must_use]
     pub fn apple(&self) -> Option<&Path> {
         self.apple.as_deref()
-    }
-
-    /// The validated `backends/android` checkout, when present.
-    #[must_use]
-    pub fn android(&self) -> Option<&Path> {
-        self.android.as_deref()
     }
 }
 
@@ -1093,26 +1033,18 @@ pub struct SupportAppIdentity {
 }
 
 /// Resolve the canonical local backend sources under a `WaterUI` checkout
-/// root: `backends/apple` must hold a Rust manifest, `backends/android` a
-/// Gradle project. Each slot is an explicit source choice when present —
+/// root: `backends/apple` must hold a Rust manifest. The slot is an explicit
+/// source choice when present —
 /// an absent slot is `None`, a malformed one an error naming the slot and
 /// the manifest it lacks.
 ///
 /// # Errors
 /// Returns an error when a slot's entry exists but does not resolve to a
 /// directory containing the required manifest — a dangling symlink, a
-/// non-directory, an unreadable path, or a checkout missing
-/// `Cargo.toml`/`settings.gradle.kts`.
+/// non-directory, an unreadable path, or a checkout missing `Cargo.toml`.
 pub async fn local_backend_sources(waterui_root: &Path) -> eyre::Result<LocalBackendSources> {
-    let (apple, android) = smol::future::zip(
-        canonical_backend_source(waterui_root, "backends/apple", "Cargo.toml"),
-        canonical_backend_source(waterui_root, "backends/android", "settings.gradle.kts"),
-    )
-    .await;
-    Ok(LocalBackendSources {
-        apple: apple?,
-        android: android?,
-    })
+    let apple = canonical_backend_source(waterui_root, "backends/apple", "Cargo.toml").await?;
+    Ok(LocalBackendSources { apple })
 }
 
 /// Resolve the canonical local backend sources a project's `waterui_path`
@@ -1544,13 +1476,12 @@ mod tests {
         );
     }
 
-    /// A local checkout without a `backends/android` Gradle project — the
-    /// framework tree since water-rs/waterui#940 — consumes the remote
-    /// runtime the framework declares; one that carries the runtime (a
-    /// backend e2e overlay, an older revision) is included as a composite
-    /// build.
+    /// A local checkout always builds Android against the runtime
+    /// `android-backend-revision` pins — including a checkout that carries
+    /// the `waterui-android` Rust crate at `backends/android`
+    /// (water-rs/waterui#1429), which is not a runtime source slot.
     #[test]
-    fn android_uses_the_local_runtime_only_when_the_checkout_carries_one() {
+    fn android_checkout_crate_builds_against_the_pinned_runtime() {
         let workspace = tempdir().expect("tempdir");
         let waterui = workspace.path().join("waterui");
         let project = workspace.path().join("app");
@@ -1564,42 +1495,28 @@ mod tests {
             )
         };
 
-        let bare = context();
-        assert!(bare.use_remote_dev_backend());
-        assert_eq!(bare.android_backend_path(), "");
-        assert!(
-            bare.android_remote_backend_dependency()
-                .contains(&"c".repeat(40)),
-            "the remote coordinate names the declared android-backend-revision"
-        );
+        let pinned = |ctx: &TemplateContext| {
+            assert!(
+                ctx.android_runtime_dependency().contains(&"c".repeat(40)),
+                "the coordinate names the declared android-backend-revision"
+            );
+        };
+        pinned(&context());
 
-        std::fs::create_dir_all(waterui.join("backends/android")).expect("runtime");
-        std::fs::write(waterui.join("backends/android/settings.gradle.kts"), "").expect("gradle");
-        let overlaid = context();
-        assert!(!overlaid.use_remote_dev_backend());
-        assert!(
-            overlaid
-                .android_backend_path()
-                .ends_with("backends/android"),
-            "{}",
-            overlaid.android_backend_path()
-        );
+        // `backends/android` holding the tracked `waterui-android` crate
+        // changes nothing: the project stays on the pinned runtime.
+        let rust_backend = waterui.join("backends/android");
+        std::fs::create_dir_all(&rust_backend).expect("rust backend dir");
+        std::fs::write(rust_backend.join("Cargo.toml"), "").expect("rust manifest");
+        pinned(&context());
     }
 
-    /// A `waterui_path` checkout's `backends/android` Gradle project is a
-    /// local runtime checkout: the generated `settings.gradle.kts` includes
-    /// it as a composite build and leaves the `JitPack` repository off.
-    /// Without it the project resolves the remote runtime coordinate.
+    /// The generated `settings.gradle.kts` resolves the runtime through
+    /// `JitPack` unconditionally — the pinned remote coordinate is the only
+    /// source, local checkout or not.
     #[test]
-    fn android_backends_android_renders_a_composite_build() {
+    fn android_settings_resolves_the_pinned_runtime() {
         let waterui_root = tempdir().expect("waterui root");
-        let backend_dir = waterui_root.path().join("backends/android");
-        std::fs::create_dir_all(&backend_dir).expect("android backend dir");
-        std::fs::write(
-            backend_dir.join("settings.gradle.kts"),
-            "// composite build marker\n",
-        )
-        .expect("backend settings.gradle.kts");
         let mut document = toml::Table::new();
         document.insert(
             "waterui_path".into(),
@@ -1645,29 +1562,21 @@ mod tests {
             .expect("settings.gradle.kts render")
         };
 
-        let local = render(&context(&manifest));
-        assert!(
-            local.contains(&format!(
-                "includeBuild(\"{}\")",
-                normalize_path_for_config(&backend_dir)
-            )),
-            "{local}"
-        );
-        // The JitPack repository stays off while the composite build is on.
-        assert!(local.contains("if (false) {"), "{local}");
-        assert!(local.contains("if (!false) {"), "{local}");
-
-        let remote_manifest: crate::project::Manifest = toml::from_str(
-            r#"
-                [package]
-                name = "Demo"
-                bundle_identifier = "dev.waterui.demo"
-            "#,
-        )
-        .expect("remote manifest parses");
-        let remote = render(&context(&remote_manifest));
-        assert!(remote.contains("if (true) {"), "{remote}");
-        assert!(remote.contains("if (!true) {"), "{remote}");
+        for manifest in [
+            &manifest,
+            &toml::from_str::<crate::project::Manifest>(
+                r#"
+                    [package]
+                    name = "Demo"
+                    bundle_identifier = "dev.waterui.demo"
+                "#,
+            )
+            .expect("remote manifest parses"),
+        ] {
+            let rendered = render(&context(manifest));
+            assert!(rendered.contains("https://jitpack.io"), "{rendered}");
+            assert!(!rendered.contains("includeBuild"), "{rendered}");
+        }
     }
 
     /// Embedded mode scaffolds a Gradle *library* project (`:waterui`, an
@@ -1731,49 +1640,16 @@ mod tests {
         // `api`, not `implementation`: the runtime's `WaterUiRootView` must
         // stay on the host app's compile classpath.
         assert!(
-            module.contains(&format!(
-                "api(\"{}\")",
-                ctx.android_remote_backend_dependency()
-            )),
+            module.contains(&format!("api(\"{}\")", ctx.android_runtime_dependency())),
             "{module}"
         );
 
-        // Remote mode keeps JitPack on the repository list for the published
-        // runtime coordinate and the composite build stays guarded off.
+        // JitPack stays on the repository list for the pinned runtime
+        // coordinate.
         let settings = render("settings.gradle.kts.tpl", &ctx);
         assert!(settings.contains("include(\":waterui\")"), "{settings}");
-        assert!(settings.contains("if (true) {"), "{settings}");
-        assert!(settings.contains("if (!true) {"), "{settings}");
-
-        // A local runtime checkout swaps the module's dependency to the
-        // mavenLocal coordinate and draws the composite build in.
-        let waterui_root = tempfile::tempdir().expect("waterui root");
-        let checkout = waterui_root.path().join("backends/android");
-        std::fs::create_dir_all(&checkout).expect("backend dir");
-        std::fs::write(checkout.join("settings.gradle.kts"), "\n").expect("settings.gradle.kts");
-        std::fs::write(checkout.join("version.txt"), "7.8.9").expect("version.txt");
-        let mut local_ctx = ctx.clone();
-        local_ctx.waterui_path = Some(waterui_root.path().to_path_buf());
-        local_ctx.local_sources = smol::block_on(local_backend_sources(waterui_root.path()))
-            .expect("staged backend checkout resolves");
-        let local_module = render("waterui/build.gradle.kts.tpl", &local_ctx);
-        assert!(
-            local_module.contains("api(\"dev.waterui.android:runtime:7.8.9\")"),
-            "{local_module}"
-        );
-        let local_settings = render("settings.gradle.kts.tpl", &local_ctx);
-        assert!(
-            local_settings.contains(&format!(
-                "includeBuild(\"{}\")",
-                local_ctx.android_backend_path()
-            )),
-            "{local_settings}"
-        );
-        assert!(
-            local_settings.contains("substitute(module(\"dev.waterui.android:runtime\"))"),
-            "{local_settings}"
-        );
-        assert!(local_settings.contains("if (false) {"), "{local_settings}");
+        assert!(settings.contains("https://jitpack.io"), "{settings}");
+        assert!(!settings.contains("includeBuild"), "{settings}");
 
         // Declared permissions render into the library's manifest so the AAR
         // merges them into the host's.
@@ -2251,7 +2127,6 @@ mod tests {
         let sources = smol::block_on(local_backend_sources(root.path()))
             .expect("absent slots resolve to the remote source");
         assert!(sources.apple().is_none());
-        assert!(sources.android().is_none());
 
         let apple = root.path().join("backends/apple");
         std::fs::create_dir_all(&apple).expect("empty apple slot");

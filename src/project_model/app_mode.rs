@@ -11,8 +11,8 @@ use std::fmt;
 /// names the whole table.
 const APP_MODE_KEYS: &[(&[&str], &str)] = &[
     (&["package"], "type"),
-    // `Water.toml` carries no `[backends]` table at all: local runtime
-    // checkouts live at `waterui_path/backends/{apple,android}`, the ESP32
+    // `Water.toml` carries no `[backends]` table at all: the local runtime
+    // checkout lives at `waterui_path/backends/apple`, the ESP32
     // device configuration is `[esp32]`, and the Hydrolysis painter is
     // `[hydrolysis]` — the whole table is retired, keys and subtables alike.
     (&["backends"], ""),
