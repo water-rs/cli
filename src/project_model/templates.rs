@@ -3353,10 +3353,20 @@ mod tests {
             .expect("apple main source should be written");
         assert!(main_bin.contains("waterui_browser_cef::initialize_macos_application"));
         assert!(main_bin.contains("waterui_browser_cef::initialize_sandbox_early"));
+        let browser = &manifest["target"]["cfg(target_os = \"macos\")"]["dependencies"]["waterui-browser-cef"];
+        assert_eq!(
+            browser["default-features"].as_bool(),
+            Some(false),
+            "the CEF dependency must not pull the engine's default features"
+        );
+        let features = browser["features"]
+            .as_array()
+            .expect("CEF dependency features should be an array");
         assert!(
-            manifest["target"]["cfg(target_os = \"macos\")"]["dependencies"]
-                .get("waterui-browser-cef")
-                .is_some()
+            features
+                .iter()
+                .any(|feature| feature.as_str() == Some("cef-runtime")),
+            "the CEF dependency must enable the cef-runtime feature: {features:?}"
         );
         assert!(!main_bin.contains("waterui_ffi"));
     }
@@ -6946,7 +6956,7 @@ pub mod ffi {
                 ctx,
                 NativeBackendDependencySpec::new(
                     "waterui-browser-cef",
-                    &[],
+                    &["cef-runtime"],
                     NativeBackendDependencySource::WorkspaceDependency,
                 ),
             )?
