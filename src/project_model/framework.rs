@@ -482,6 +482,18 @@ impl ResolvedFramework {
         Ok(())
     }
 
+    /// The framework checkout's root when the selection is a local
+    /// `waterui_path` checkout — `None` on every channel. An in-tree
+    /// Hydrolysis Android host resolves its Gradle root inside this
+    /// checkout, so it is the only place the host tree already exists on
+    /// disk.
+    pub(crate) fn local_checkout_root(&self) -> Option<&Path> {
+        match &self.source {
+            Source::Local { root } => Some(root.as_path()),
+            Source::Stable { .. } | Source::Dev { .. } | Source::Nightly { .. } => None,
+        }
+    }
+
     pub(crate) fn scaffold_value(&self, key: &str) -> &str {
         self.scaffold
             .get(key)
@@ -609,7 +621,24 @@ impl ResolvedFramework {
                     )
                 })
         };
-        Ok(HydrolysisAndroidHost {
+        // A manifest declaring no `hydrolysis-android-host-url` carries the
+        // host in-tree (water-rs/waterui#1428): the Gradle root the
+        // subdirectory names lives inside the framework checkout itself.
+        // Only a local checkout already has that tree on disk — the
+        // channel resolution it replaces (cloning the framework at the
+        // selected revision) is water-rs/cli#279's remaining work.
+        if !self.scaffold.contains_key("hydrolysis-android-host-url") {
+            let subdirectory = value("subdirectory")?;
+            let root = self.local_checkout_root().ok_or_else(|| {
+                eyre!(
+                    "the resolved framework declares an in-tree hydrolysis Android host and \
+                     is not a local checkout; in-tree host resolution on the dev, nightly \
+                     and stable channels is not implemented yet"
+                )
+            })?;
+            return Ok(HydrolysisAndroidHost::InTree { root, subdirectory });
+        }
+        Ok(HydrolysisAndroidHost::Repository {
             url: value("url")?,
             revision: value("revision")?,
             subdirectory: value("subdirectory")?,
@@ -2161,18 +2190,46 @@ fn validate_revision(revision: &str) -> Result<()> {
     Ok(())
 }
 
-/// The Hydrolysis Android host coordinates a resolved framework carries:
-/// where to fetch the host repository, the exact commit to check out, and
-/// the subdirectory inside that checkout that is the Gradle project the
-/// generated app `includeBuild`s.
+/// Where the resolved framework's Hydrolysis Android host comes from:
+/// the independently pinned host repository, or the host tree inside the
+/// framework checkout itself (water-rs/waterui#1428). The generated app's
+/// Gradle project `includeBuild`s the `subdirectory` of either.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct HydrolysisAndroidHost<'a> {
-    /// Git URL the host checkout is fetched from.
-    pub url: &'a str,
-    /// Full commit hash the checkout pins.
-    pub revision: &'a str,
-    /// Gradle root inside the checkout (e.g. `android`).
-    pub subdirectory: &'a str,
+pub(crate) enum HydrolysisAndroidHost<'a> {
+    /// The independent host repository the manifest pins by url and
+    /// revision — the shape frameworks carried while Hydrolysis lived in
+    /// its own repository. The CLI materializes it into a managed checkout.
+    Repository {
+        /// Git URL the host checkout is fetched from.
+        url: &'a str,
+        /// Full commit hash the checkout pins.
+        revision: &'a str,
+        /// Gradle root inside the checkout (e.g. `android`).
+        subdirectory: &'a str,
+    },
+    /// The host tree inside a local framework checkout: `root` joined with
+    /// `subdirectory` is the Gradle composite root. The checkout the
+    /// framework resolves to already carries the host at exactly the
+    /// framework's revision, so no managed checkout exists.
+    InTree {
+        /// The local framework checkout's root.
+        root: &'a Path,
+        /// Gradle root inside the checkout (e.g.
+        /// `backends/hydrolysis/android`).
+        subdirectory: &'a str,
+    },
+}
+
+impl<'a> HydrolysisAndroidHost<'a> {
+    /// The Gradle root inside the host's root directory, whichever source
+    /// carries it.
+    pub(crate) const fn subdirectory(&self) -> &'a str {
+        match *self {
+            Self::Repository { subdirectory, .. } | Self::InTree { subdirectory, .. } => {
+                subdirectory
+            }
+        }
+    }
 }
 
 /// A `{name}-host-subdirectory` names the Gradle root inside the host
@@ -4877,10 +4934,17 @@ nami = { git = "https://github.com/water-rs/nami", rev = "f1db5017f5d64cb45b9b30
     #[test]
     fn resolved_framework_carries_the_hydrolysis_android_host_pin() {
         let framework = stable_framework();
-        let host = framework.hydrolysis_android_host().unwrap();
-        assert_eq!(host.url, "https://github.com/water-rs/hydrolysis.git");
-        assert_eq!(host.revision, "d".repeat(40));
-        assert_eq!(host.subdirectory, "android");
+        let HydrolysisAndroidHost::Repository {
+            url,
+            revision,
+            subdirectory,
+        } = framework.hydrolysis_android_host().unwrap()
+        else {
+            panic!("a repository-pinned host resolves as Repository")
+        };
+        assert_eq!(url, "https://github.com/water-rs/hydrolysis.git");
+        assert_eq!(revision, "d".repeat(40));
+        assert_eq!(subdirectory, "android");
 
         let mut missing = stable_framework();
         missing.scaffold.remove("hydrolysis-android-host-revision");
@@ -4889,6 +4953,54 @@ nami = { git = "https://github.com/water-rs/nami", rev = "f1db5017f5d64cb45b9b30
             error.contains("hydrolysis-android-host-revision"),
             "{error}"
         );
+    }
+
+    /// A local checkout whose manifest declares only
+    /// `hydrolysis-android-host-subdirectory` carries the host in-tree
+    /// (water-rs/waterui#1428): the Gradle root resolves inside the
+    /// checkout itself — no managed checkout, no independent repository.
+    #[test]
+    fn a_local_checkout_with_an_in_tree_hydrolysis_host_resolves_inside_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("waterui");
+        write_local_checkout(&root);
+        let manifest_path = root.join("Cargo.toml");
+        let mut manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let metadata = manifest["package"]["metadata"]["waterui"]
+            .as_table_mut()
+            .unwrap();
+        metadata.remove("hydrolysis-android-host-url");
+        metadata.remove("hydrolysis-android-host-revision");
+        metadata["hydrolysis-android-host-subdirectory"] =
+            toml::Value::String("backends/hydrolysis/android".to_owned());
+        std::fs::write(&manifest_path, toml::to_string(&manifest).unwrap()).unwrap();
+
+        let framework = smol::block_on(ResolvedFramework::for_local_checkout(&root)).unwrap();
+        let HydrolysisAndroidHost::InTree {
+            root: host_root,
+            subdirectory,
+        } = framework.hydrolysis_android_host().unwrap()
+        else {
+            panic!("an in-tree host resolves as InTree")
+        };
+        assert_eq!(host_root, root.as_path());
+        assert_eq!(subdirectory, "backends/hydrolysis/android");
+    }
+
+    /// The same in-tree declaration on a channel framework is a clear
+    /// error, not a fallback to the independent repository: channel
+    /// resolution for in-tree hosts is water-rs/cli#279's remaining work.
+    #[test]
+    fn a_channel_framework_with_an_in_tree_hydrolysis_host_errors() {
+        let mut framework = stable_framework();
+        framework.scaffold.remove("hydrolysis-android-host-url");
+        framework
+            .scaffold
+            .remove("hydrolysis-android-host-revision");
+        let error = framework.hydrolysis_android_host().unwrap_err().to_string();
+        assert!(error.contains("in-tree"), "{error}");
+        assert!(error.contains("not a local checkout"), "{error}");
     }
 
     #[test]

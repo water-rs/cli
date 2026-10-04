@@ -1,13 +1,17 @@
 //! The Hydrolysis Android host integration.
 //!
-//! The framework pins the Kotlin host (URL, revision and the subdirectory
-//! the Gradle project lives in) through `hydrolysis-android-host-*`
-//! scaffold metadata. The CLI clones that checkout into the managed backend
-//! directory, renders the generated Gradle app against it, and drives the
-//! same NDK/Gradle/ABI/signing/asset machinery the Android platform backend
-//! uses — the launcher crate `templates::hydrolysis` already produces is the
-//! cdylib the Kotlin activity loads. Nothing here routes through the widget
-//! FFI companion.
+//! The framework names the Kotlin host through `hydrolysis-android-host-*`
+//! scaffold metadata: an independent repository pin
+//! (`url`/`revision`/`subdirectory`), or — since the host moved in-tree
+//! (water-rs/waterui#1428) — only `subdirectory`, which names the Gradle
+//! root inside the framework checkout itself. A repository pin is cloned
+//! into the managed backend directory; an in-tree host is already
+//! materialized, so a local framework checkout's root is used directly.
+//! The generated Gradle app is rendered against the host either way and
+//! driven by the same NDK/Gradle/ABI/signing/asset machinery the Android
+//! platform backend uses — the launcher crate `templates::hydrolysis`
+//! already produces is the cdylib the Kotlin activity loads. Nothing here
+//! routes through the widget FFI companion.
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +36,7 @@ use crate::{
     hydrolysis::backend::HydrolysisBackend,
     platform::PackageOptions,
     project::Project,
+    project_model::framework::HydrolysisAndroidHost,
     templates::{self, HydrolysisAndroidTemplateEntry},
     toolchain::Host,
 };
@@ -162,15 +167,21 @@ fn android_dir(backend_path: &Path) -> PathBuf {
 /// the git fetch fails.
 pub async fn ensure_android_host(project: &Project, host: &Host) -> eyre::Result<PathBuf> {
     let resolved = project.resolved_framework().await?;
-    let coordinates = resolved.hydrolysis_android_host()?;
+    let (url, revision) = match resolved.hydrolysis_android_host()? {
+        HydrolysisAndroidHost::Repository { url, revision, .. } => (url, revision),
+        // An in-tree host is already materialized: the framework checkout
+        // carries it at the framework's own revision, and `subdirectory`
+        // resolves against that root.
+        HydrolysisAndroidHost::InTree { root, .. } => return Ok(root.to_path_buf()),
+    };
     let backend_path = project.backend_path::<HydrolysisBackend>();
-    let host_dir = android_host_dir(&backend_path, coordinates.revision);
+    let host_dir = android_host_dir(&backend_path, revision);
 
     let stamped = fs::read_to_string(host_dir.join(HOST_STAMP_FILE))
         .await
         .ok()
         .map(|contents| contents.trim().to_string());
-    if stamped.as_deref() == Some(coordinates.revision) {
+    if stamped.as_deref() == Some(revision) {
         return Ok(host_dir);
     }
 
@@ -188,19 +199,9 @@ pub async fn ensure_android_host(project: &Project, host: &Host) -> eyre::Result
                 host_dir.display()
             )
         })?;
-    host.run(
-        "git",
-        [
-            "-C",
-            dir.as_str(),
-            "remote",
-            "add",
-            "origin",
-            coordinates.url,
-        ],
-    )
-    .await
-    .wrap_err("failed to configure the hydrolysis android host remote")?;
+    host.run("git", ["-C", dir.as_str(), "remote", "add", "origin", url])
+        .await
+        .wrap_err("failed to configure the hydrolysis android host remote")?;
     host.run(
         "git",
         [
@@ -211,14 +212,13 @@ pub async fn ensure_android_host(project: &Project, host: &Host) -> eyre::Result
             "--depth",
             "1",
             "origin",
-            coordinates.revision,
+            revision,
         ],
     )
     .await
     .wrap_err_with(|| {
         format!(
-            "failed to fetch the hydrolysis android host at revision {} from {}",
-            coordinates.revision, coordinates.url
+            "failed to fetch the hydrolysis android host at revision {revision} from {url}",
         )
     })?;
     host.run(
@@ -235,10 +235,10 @@ pub async fn ensure_android_host(project: &Project, host: &Host) -> eyre::Result
     .await
     .wrap_err("failed to check out the pinned hydrolysis android host")?;
 
-    fs::write(host_dir.join(HOST_STAMP_FILE), coordinates.revision).await?;
+    fs::write(host_dir.join(HOST_STAMP_FILE), revision).await?;
     info!(
         "Checked out hydrolysis android host {} into {}",
-        coordinates.revision,
+        revision,
         host_dir.display()
     );
     Ok(host_dir)
@@ -260,7 +260,7 @@ async fn require_painter_module(
     let host_root = ensure_android_host(project, host).await?;
     let resolved = project.resolved_framework().await?;
     let coordinates = resolved.hydrolysis_android_host()?;
-    let host_project_dir = host_root.join(coordinates.subdirectory);
+    let host_project_dir = host_root.join(coordinates.subdirectory());
     let module_dir = host_project_dir.join(painter.host_module());
     if !module_dir.is_dir() {
         bail!(
